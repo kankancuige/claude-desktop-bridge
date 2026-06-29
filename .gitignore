@@ -1,2 +1,12 @@
 .git/
 .idea/
+desktop-ui/dist/
+desktop-ui/dist-electron/
+desktop-ui/dist-electron-build/
+gateway/node_modules/
+desktop-ui/node_modules/
+gateway/.env
+gateway/bridge-logs/
+*.log
+.DS_Store
+Thumbs.db
