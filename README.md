@@ -40,6 +40,7 @@
 - [Claude Code CLI 路径检测](#claude-code-cli-路径检测)
 - [安全注意事项](#安全注意事项)
 - [License](#license)
+- [请我喝杯奶茶](#请我喝杯奶茶)
 - [常见问题](#常见问题)
 
 ---
@@ -769,3 +770,15 @@ cat gateway/bridge-logs/error.$(date +%Y-%m-%d).*.log
 ### 日志占用磁盘过大
 
 已自动按 `LOG_MAX_SIZE`（默认 10MB）和 `LOG_RETAIN_DAYS`（默认 30 天）管理。调整 `.env` 中的这两个值即可，极端场景可设 `LOG_LEVEL=warn` 只记录警告及以上。
+
+---
+
+## 请我喝杯奶茶
+
+如果这个项目帮到了你，可以请我喝杯奶茶 : )
+
+<div align="center">
+  <img src="./微信.jpg" width="260" alt="微信收款码" />
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="./支付宝.jpg" width="260" alt="支付宝收款码" />
+</div>
