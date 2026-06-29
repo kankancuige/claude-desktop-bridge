@@ -70,15 +70,19 @@
       "owner": "kankancuige",
       "repo": "claude-desktop-bridge"
     },
+    "icon": "public/logo.png",
     "win": {
-      "target": "portable"
+      "target": "portable",
+      "icon": "public/logo.png"
     },
     "mac": {
       "target": "dmg",
+      "icon": "public/logo.png",
       "category": "public.app-category.developer-tools"
     },
     "linux": {
       "target": "AppImage",
+      "icon": "public/logo.png",
       "category": "Development"
     }
   }

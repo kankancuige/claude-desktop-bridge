@@ -1,8 +1,11 @@
+
 # Claude Desktop Bridge
 
 自建 Claude Code 桌面客户端，支持 **Windows / macOS / Linux** 三平台。Vue 3 Electron 桌面壳 + Node.js Gateway + 多 IM 平台适配器。
 
 **核心亮点**：微信 / 飞书 / 钉钉消息**直接注入当前活跃 session**，桌面端实时同步显示 Claude 回复。
+
+喜欢这个项目可以点个star哦~
 
 ---
 
@@ -778,7 +781,7 @@ cat gateway/bridge-logs/error.$(date +%Y-%m-%d).*.log
 如果这个项目帮到了你，可以请我喝杯奶茶 : )
 
 <div align="center">
-  <img src="./微信.jpg" width="260" alt="微信收款码" />
+  <img src="./desktop-ui/public/pay/微信.jpg" width="260" alt="微信收款码" />
   &nbsp;&nbsp;&nbsp;&nbsp;
-  <img src="./支付宝.jpg" width="260" alt="支付宝收款码" />
+  <img src="./desktop-ui/public/pay/支付宝.jpg" width="260" alt="支付宝收款码" />
 </div>

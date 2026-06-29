@@ -286,11 +286,13 @@ function createWindow() {
  * SIDE_EFFECT: 设置 tray 全局变量
  */
 function createTray() {
-  // 用 nativeImage 程序化生成托盘图标（16x16 白色桥形图标）
-  const icon = nativeImage.createFromDataURL(
-    'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAMklEQVQ4T2NkYPj/n4EBBJgYKAQM1AyYqCV5Og0wjUZzNBrDM5qGM5qGM5qGM5qGgQYANRwJw4Y/BvMAAAAASUVORK5CYII='
-  )
-  tray = new Tray(icon)
+  // 托盘图标使用 logo.png
+  const isDev = !!process.env.VITE_DEV_SERVER_URL
+  const logoPath = isDev
+    ? path.join(__dirname, '..', 'public', 'logo.png')
+    : path.join(__dirname, '..', 'dist', 'logo.png')
+  const icon = nativeImage.createFromPath(logoPath)
+  tray = new Tray(icon.resize({ width: 16, height: 16 }))
   tray.setToolTip('Claude Desktop Bridge')
 
   // 右键菜单
