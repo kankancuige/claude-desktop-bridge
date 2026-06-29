@@ -1,0 +1,159 @@
+/* ═══════════════ Claude Desktop Bridge — Design System ═══════════════
+ * source: github.com/kankancuige/claude-desktop-bridge
+ * Dashboard Dark + Glassmorphism + Bento Grid
+ * Ref: EasyVibe design principles
+ */
+
+/* ── CSS Variables ── */
+:root {
+  --bg-deep:       #1A1D28;
+  --bg-base:       #212430;
+  --bg-raised:     #282C38;
+  --bg-glass:      rgba(33, 36, 48, 0.88);
+  --border:        #323642;
+  --border-hover:  #434958;
+  --accent:        #E94560;
+  --accent-gold:   #D4A853;
+  --accent-blue:   #6BAEE0;
+  --text-primary:  #D8DCE3;
+  --text-secondary:#8E929B;
+  --text-muted:    #5E6370;
+  --success:       #3FB950;
+  --warning:       #D29922;
+  --error:         #F85149;
+
+  /* Shadows */
+  --shadow-sm:     0 1px 3px rgba(0,0,0,0.2);
+  --shadow-md:     0 4px 16px rgba(0,0,0,0.25);
+  --shadow-lg:     0 8px 32px rgba(0,0,0,0.35);
+  --shadow-glow:   0 0 20px rgba(233,69,96,0.15);
+  --shadow-gold:   0 4px 20px rgba(212,168,83,0.15);
+
+  /* Radius */
+  --radius-btn:    8px;
+  --radius-input:  8px;
+  --radius-card:   12px;
+  --radius-modal:  16px;
+  --radius-bubble: 12px;
+
+  /* Transitions */
+  --ease-out:      cubic-bezier(0.4, 0, 0.2, 1);
+  --transition-fast: 150ms var(--ease-out);
+  --transition-normal: 200ms var(--ease-out);
+  --transition-slow: 300ms var(--ease-out);
+
+  /* Fonts */
+  --font-heading:  'Space Grotesk', system-ui, sans-serif;
+  --font-body:     'Plus Jakarta Sans', system-ui, sans-serif;
+  --font-mono:     'JetBrains Mono', 'Cascadia Code', 'Fira Code', monospace;
+}
+
+/* ── Light Theme (柔和暖白) ── */
+:root[data-theme="light"] {
+  --bg-deep:       #F7F4EF;
+  --bg-base:       #EDE9E3;
+  --bg-raised:     #E5E0D9;
+  --bg-glass:      rgba(237, 233, 227, 0.92);
+  --border:        #D6D0C8;
+  --border-hover:  #B8B0A6;
+  --accent:        #D94050;
+  --accent-gold:   #B8903A;
+  --accent-blue:   #4A8BC2;
+  --text-primary:  #2D2A26;
+  --text-secondary:#635F5A;
+  --text-muted:    #928D87;
+  --success:       #2E8B57;
+  --warning:       #B8860B;
+  --error:         #D94050;
+
+  --shadow-sm:     0 1px 3px rgba(0,0,0,0.06);
+  --shadow-md:     0 4px 12px rgba(0,0,0,0.08);
+  --shadow-lg:     0 8px 24px rgba(0,0,0,0.10);
+  --shadow-glow:   0 0 18px rgba(217,64,80,0.12);
+  --shadow-gold:   0 4px 16px rgba(184,144,58,0.12);
+}
+
+/* ── Reset ── */
+*, *::before, *::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--font-body);
+  font-weight: 400;
+  font-size: 15px;
+  line-height: 1.55;
+  color: var(--text-primary);
+  background: var(--bg-deep);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#app {
+  width: 100%;
+  height: 100%;
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--border-hover); }
+* { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+
+/* ── Global Glassmorphism utility ── */
+.glass {
+  background: var(--bg-glass);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+/* ── Focus ring ── */
+input:focus-visible, textarea:focus-visible, select:focus-visible, button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ── Selection ── */
+::selection {
+  background: rgba(233, 69, 96, 0.25);
+  color: var(--text-primary);
+}
+
+/* ── Keyframe animations ── */
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes pulseGlow {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(233, 69, 96, 0); }
+  50%      { box-shadow: 0 0 0 4px rgba(233, 69, 96, 0.15); }
+}
+
+@keyframes breathe {
+  0%, 100% { border-color: rgba(210, 153, 34, 0.2); }
+  50%      { border-color: rgba(210, 153, 34, 0.6); }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}

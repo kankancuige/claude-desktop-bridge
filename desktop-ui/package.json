@@ -1,0 +1,85 @@
+{
+  "name": "desktop-ui",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev:web": "vite",
+    "dev:electron": "concurrently -k \"vite\" \"wait-on http://localhost:5173 && cross-env VITE_DEV_SERVER_URL=http://localhost:5173 electron .\"",
+    "prebuild": "node scripts/prebuild.cjs",
+    "build": "vite build && electron-builder --win nsis",
+    "build:mac": "vite build && electron-builder --mac",
+    "build:linux": "vite build && electron-builder --linux",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.9",
+    "monaco-editor": "^0.55.1",
+    "phaser": "^4.2.0",
+    "pinia": "^3.0.4",
+    "vue": "^3.5.34",
+    "vue-router": "^4.6.4"
+  },
+  "devDependencies": {
+    "@types/node": "^24.12.3",
+    "@vitejs/plugin-vue": "^6.0.6",
+    "@vue/tsconfig": "^0.9.1",
+    "concurrently": "^10.0.3",
+    "cross-env": "^10.1.0",
+    "electron": "^42.4.1",
+    "electron-builder": "^26.15.3",
+    "esbuild": "^0.28.1",
+    "typescript": "~6.0.2",
+    "vite": "^8.0.12",
+    "vite-plugin-monaco-editor": "^1.1.0",
+    "vue-tsc": "^3.2.8",
+    "wait-on": "^9.0.10"
+  },
+  "build": {
+    "appId": "com.ckd.claude-desktop-bridge",
+    "productName": "Claude Desktop Bridge",
+    "copyright": "kankancuige/claude-desktop-bridge",
+    "directories": {
+      "output": "dist-electron"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "../gateway",
+        "to": "gateway",
+        "filter": [
+          "**/*",
+          "!.env"
+        ]
+      },
+      {
+        "from": "../rtk-bin",
+        "to": "rtk",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "afterPack": "./scripts/after-pack.cjs",
+    "publish": {
+      "provider": "github",
+      "owner": "kankancuige",
+      "repo": "claude-desktop-bridge"
+    },
+    "win": {
+      "target": "portable"
+    },
+    "mac": {
+      "target": "dmg",
+      "category": "public.app-category.developer-tools"
+    },
+    "linux": {
+      "target": "AppImage",
+      "category": "Development"
+    }
+  }
+}
