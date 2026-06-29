@@ -1,0 +1,136 @@
+name: 三平台构建
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: Windows
+            target: win
+            electronBuilderArgs: --win portable
+          - os: macos-latest
+            label: macOS
+            target: mac
+            electronBuilderArgs: --mac
+          - os: ubuntu-latest
+            label: Linux
+            target: linux
+            electronBuilderArgs: --linux
+
+    timeout-minutes: 20
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # ════════════════════════════════════════════════════════════
+      # Node.js + pnpm
+      # ════════════════════════════════════════════════════════════
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: latest
+
+      # ════════════════════════════════════════════════════════════
+      # Linux 环境依赖
+      # ════════════════════════════════════════════════════════════
+      - name: 安装 Linux 打包依赖 (libfuse2 + 编译工具)
+        if: matrix.target == 'linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libfuse2 build-essential python3
+
+      # ════════════════════════════════════════════════════════════
+      # Gateway 依赖
+      # ════════════════════════════════════════════════════════════
+      - name: 安装 Gateway 依赖
+        working-directory: gateway
+        run: npm install
+
+      # ════════════════════════════════════════════════════════════
+      # Desktop UI 依赖 + 构建
+      # ════════════════════════════════════════════════════════════
+      - name: 安装 Desktop UI 依赖
+        working-directory: desktop-ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Vite 构建前端
+        working-directory: desktop-ui
+        run: npx vite build
+
+      - name: electron-builder 打包
+        working-directory: desktop-ui
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npx electron-builder ${{ matrix.electronBuilderArgs }}
+
+      # ════════════════════════════════════════════════════════════
+      # 上传构建产物
+      # ════════════════════════════════════════════════════════════
+      - name: 上传 Windows
+        if: matrix.target == 'win'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Claude-Desktop-Bridge-Windows
+          path: desktop-ui/dist-electron/*.exe
+          if-no-files-found: error
+
+      - name: 上传 macOS
+        if: matrix.target == 'mac'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Claude-Desktop-Bridge-macOS
+          path: desktop-ui/dist-electron/*.dmg
+          if-no-files-found: error
+
+      - name: 上传 Linux
+        if: matrix.target == 'linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Claude-Desktop-Bridge-Linux
+          path: desktop-ui/dist-electron/*.AppImage
+          if-no-files-found: error
+
+  # ══════════════════════════════════════════════════════════════════
+  # 发布 Release（仅 tag 推送触发）
+  # ══════════════════════════════════════════════════════════════════
+  release:
+    name: 发布 GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载所有构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: 列出产物
+        run: ls -lhR artifacts/
+
+      - name: 创建 Release 并上传产物
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          draft: true
+          files: artifacts/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
