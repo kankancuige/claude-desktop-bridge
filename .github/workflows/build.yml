@@ -143,6 +143,14 @@ jobs:
           echo "Linux zip 生成完成"
 
       - name: 上传 Linux
+        if: matrix.target == 'linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Claude-Desktop-Bridge-Linux
+          path: |
+            desktop-ui/dist-electron/*.AppImage
+            desktop-ui/dist-electron/*.zip
+          if-no-files-found: error
 
   # ══════════════════════════════════════════════════════════════════
   # 发布 Release（仅 tag 推送触发）
