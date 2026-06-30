@@ -132,7 +132,7 @@ jobs:
       - name: 列出产物
         run: ls -lhR artifacts/
 
-      - name: 创建 Release 并上传产物
+      - name: 创建 GitHub Release 并上传产物
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ github.ref_name }}
@@ -140,3 +140,36 @@ jobs:
           files: artifacts/**/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ════════════════════════════════════════════════════════════════
+      # 同步 Release 到 Gitee
+      # ════════════════════════════════════════════════════════════════
+      - name: 同步 Release 到 Gitee
+        if: env.GITEE_TOKEN != ''
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # 如果 Gitee 已有同名 Release 则删除
+          RELEASES=$(curl -s "https://gitee.com/api/v5/repos/kankancuige/claude-desktop-bridge/releases?access_token=$GITEE_TOKEN")
+          EXISTING_ID=$(echo "$RELEASES" | jq -r --arg TAG "$TAG" '.[] | select(.tag_name==$TAG) | .id')
+          if [ -n "$EXISTING_ID" ]; then
+            echo "删除已有 release id=$EXISTING_ID"
+            curl -s -X DELETE "https://gitee.com/api/v5/repos/kankancuige/claude-desktop-bridge/releases/$EXISTING_ID?access_token=$GITEE_TOKEN"
+          fi
+
+          # 创建 Release
+          CREATE_RESP=$(curl -s -X POST "https://gitee.com/api/v5/repos/kankancuige/claude-desktop-bridge/releases" \
+            -H "Content-Type: application/json" \
+            -d "{\"access_token\":\"$GITEE_TOKEN\",\"tag_name\":\"$TAG\",\"name\":\"$TAG\",\"body\":\"自动同步自 GitHub Release\"}")
+          RELEASE_ID=$(echo "$CREATE_RESP" | jq -r '.id')
+          echo "Gitee Release 创建成功, id=$RELEASE_ID"
+
+          # 上传附件
+          for f in artifacts/*; do
+            echo "上传: $f"
+            curl -s -X POST "https://gitee.com/api/v5/repos/kankancuige/claude-desktop-bridge/releases/$RELEASE_ID/attach_files" \
+              -F "access_token=$GITEE_TOKEN" \
+              -F "file=@$f"
+          done
+          echo "Gitee 同步完成"
