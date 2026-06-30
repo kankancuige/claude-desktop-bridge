@@ -145,7 +145,7 @@ jobs:
       # 同步 Release 到 Gitee
       # ════════════════════════════════════════════════════════════════
       - name: 同步 Release 到 Gitee
-        if: env.GITEE_TOKEN != ''
+        continue-on-error: true
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
           TAG: ${{ github.ref_name }}
