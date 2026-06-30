@@ -146,24 +146,32 @@ jobs:
       # ════════════════════════════════════════════════════════════════
       - name: 同步 Release 到 Gitee
         continue-on-error: true
+        timeout-minutes: 60
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
           GH_RELEASE="https://github.com/kankancuige/claude-desktop-bridge/releases/tag/$TAG"
-          BODY="> 此 Release 自动同步自 GitHub，含 Windows/macOS/Linux 安装包。
+          BODY="GitHub: $GH_RELEASE"
 
-          **GitHub 下载**: $GH_RELEASE
-          **加速下载**: 将文件 URL 中 \`github.com\` 替换为 \`ghproxy.com/https://github.com\`"
-
-          # 删除同名 Release
-          RELEASES=$(curl -s "https://gitee.com/api/v5/repos/kankancuige/claude-desktop-bridge/releases?access_token=$GITEE_TOKEN")
+          RELEASES=$(curl -s --retry 3 "https://gitee.com/api/v5/repos/kankancuige/claude-desktop-bridge/releases?access_token=$GITEE_TOKEN")
           EXISTING_ID=$(echo "$RELEASES" | jq -r --arg TAG "$TAG" '.[] | select(.tag_name==$TAG) | .id')
           if [ -n "$EXISTING_ID" ]; then
+            echo "删除已有 release id=$EXISTING_ID"
             curl -s -X DELETE "https://gitee.com/api/v5/repos/kankancuige/claude-desktop-bridge/releases/$EXISTING_ID?access_token=$GITEE_TOKEN"
           fi
 
-          curl -s -X POST "https://gitee.com/api/v5/repos/kankancuige/claude-desktop-bridge/releases" \
+          CREATE_RESP=$(curl -s --retry 3 -X POST "https://gitee.com/api/v5/repos/kankancuige/claude-desktop-bridge/releases" \
             -H "Content-Type: application/json" \
-            -d "{\"access_token\":\"$GITEE_TOKEN\",\"tag_name\":\"$TAG\",\"name\":\"$TAG\",\"body\":$(echo "$BODY" | jq -Rs .)}"
-          echo "Gitee Release 同步完成"
+            -d "{\"access_token\":\"$GITEE_TOKEN\",\"tag_name\":\"$TAG\",\"name\":\"$TAG\",\"body\":$(echo "$BODY" | jq -Rs .)}")
+          RELEASE_ID=$(echo "$CREATE_RESP" | jq -r '.id')
+          echo "Gitee Release 创建成功, id=$RELEASE_ID"
+
+          for f in artifacts/*; do
+            echo "上传: $(basename $f)"
+            curl -s --retry 3 -X POST "https://gitee.com/api/v5/repos/kankancuige/claude-desktop-bridge/releases/$RELEASE_ID/attach_files" \
+              -F "access_token=$GITEE_TOKEN" \
+              -F "file=@$f"
+            echo ""
+          done
+          echo "Gitee 同步完成"
