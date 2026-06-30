@@ -72,7 +72,7 @@
     },
     "icon": "public/logo.png",
     "win": {
-      "target": "portable",
+      "target": ["portable", "zip"],
       "icon": "public/logo.png"
     },
     "mac": {
