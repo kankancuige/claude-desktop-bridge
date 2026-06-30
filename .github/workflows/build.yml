@@ -81,6 +81,17 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: npx electron-builder ${{ matrix.electronBuilderArgs }} --publish never
 
+      # Windows：手动打 zip 解压包（electron-builder 的 zip target 在 NSIS 下可能不产出）
+      - name: 生成 Windows zip
+        if: matrix.target == 'win'
+        shell: bash
+        working-directory: desktop-ui
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          cd dist-electron/win-unpacked
+          zip -r "../Claude Desktop Bridge-${VERSION}-win.zip" .
+          echo "zip 生成完成"
+
       # ════════════════════════════════════════════════════════════
       # 上传构建产物
       # ════════════════════════════════════════════════════════════
@@ -94,6 +105,21 @@ jobs:
             desktop-ui/dist-electron/*.zip
           if-no-files-found: error
 
+      - name: 生成 macOS zip
+        if: matrix.target == 'mac'
+        shell: bash
+        working-directory: desktop-ui
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if [ -d dist-electron/mac-arm64 ]; then
+            cd dist-electron/mac-arm64
+            zip -r "../Claude Desktop Bridge-${VERSION}-mac-arm64.zip" .
+          elif [ -d dist-electron/mac ]; then
+            cd dist-electron/mac
+            zip -r "../Claude Desktop Bridge-${VERSION}-mac.zip" .
+          fi
+          echo "macOS zip 生成完成"
+
       - name: 上传 macOS
         if: matrix.target == 'mac'
         uses: actions/upload-artifact@v4
@@ -104,15 +130,19 @@ jobs:
             desktop-ui/dist-electron/*.zip
           if-no-files-found: error
 
-      - name: 上传 Linux
+      - name: 生成 Linux zip
         if: matrix.target == 'linux'
-        uses: actions/upload-artifact@v4
-        with:
-          name: Claude-Desktop-Bridge-Linux
-          path: |
-            desktop-ui/dist-electron/*.AppImage
-            desktop-ui/dist-electron/*.zip
-          if-no-files-found: error
+        shell: bash
+        working-directory: desktop-ui
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if [ -d dist-electron/linux-unpacked ]; then
+            cd dist-electron/linux-unpacked
+            zip -r "../Claude Desktop Bridge-${VERSION}-linux.zip" .
+          fi
+          echo "Linux zip 生成完成"
+
+      - name: 上传 Linux
 
   # ══════════════════════════════════════════════════════════════════
   # 发布 Release（仅 tag 推送触发）
