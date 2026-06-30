@@ -62,7 +62,7 @@ jobs:
       # ════════════════════════════════════════════════════════════
       - name: 安装 Gateway 依赖
         working-directory: gateway
-        run: npm install
+        run: npm install --legacy-peer-deps
 
       # ════════════════════════════════════════════════════════════
       # Desktop UI 依赖 + 构建
