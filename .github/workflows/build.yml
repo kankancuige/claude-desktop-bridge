@@ -99,7 +99,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Claude-Desktop-Bridge-macOS
-          path: desktop-ui/dist-electron/*.dmg
+          path: |
+            desktop-ui/dist-electron/*.dmg
+            desktop-ui/dist-electron/*.zip
           if-no-files-found: error
 
       - name: 上传 Linux
@@ -107,7 +109,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Claude-Desktop-Bridge-Linux
-          path: desktop-ui/dist-electron/*.AppImage
+          path: |
+            desktop-ui/dist-electron/*.AppImage
+            desktop-ui/dist-electron/*.zip
           if-no-files-found: error
 
   # ══════════════════════════════════════════════════════════════════

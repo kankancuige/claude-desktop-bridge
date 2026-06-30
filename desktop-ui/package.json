@@ -76,12 +76,12 @@
       "icon": "public/logo.png"
     },
     "mac": {
-      "target": "dmg",
+      "target": ["dmg", "zip"],
       "icon": "public/logo.png",
       "category": "public.app-category.developer-tools"
     },
     "linux": {
-      "target": "AppImage",
+      "target": ["AppImage", "zip"],
       "icon": "public/logo.png",
       "category": "Development"
     }
