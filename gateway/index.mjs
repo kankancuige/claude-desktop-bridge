@@ -1885,6 +1885,7 @@ const httpServer = createServer(async (req, res) => {
                     if (c) saveProjectCache(workDir, c)
                 }).catch(e => log.warn({err: e, workDir}, '后台 project-cache 构建失败'))
             }
+            invalidateProjectsCache()
             res.writeHead(201);
             res.end(JSON.stringify({sessionId, workDir, resumed: !!body.resume}))
         } catch (e) {
@@ -2022,7 +2023,7 @@ const httpServer = createServer(async (req, res) => {
             for (const ws of [...s.clients]) {
                 try { ws.close(4001, JSON.stringify({error: 'session deleted'})) } catch {}
             }
-            ;sessions.delete(id)
+            ;sessions.delete(id); invalidateProjectsCache()
         }
         if (url.searchParams.get('deleteFiles') === '1') {
             try {
@@ -4880,7 +4881,13 @@ function readFileHeadLines(path, maxBytes = 4096) {
 }
 
 // ---- Project scanning (hand-rolled) ----
+let _projectsCache = null, _projectsCacheTs = 0
+const PROJECTS_CACHE_TTL = 10_000  // 10s 内复用缓存，避免每次 /p 命令触发全量扫描
+
 async function scanProjects() {
+    const now = Date.now()
+    if (_projectsCache && (now - _projectsCacheTs) < PROJECTS_CACHE_TTL) return _projectsCache
+
     const base = join(CLAUDE_HOME, 'projects');
     const results = []
     try {
@@ -4944,8 +4951,10 @@ async function scanProjects() {
     } catch {
     }
     ;results.sort((a, b) => (b.lastActive || 0) - (a.lastActive || 0));
+    _projectsCache = results; _projectsCacheTs = Date.now()
     return results
 }
+function invalidateProjectsCache() { _projectsCache = null }
 
 async function listProjectSessions(ed) {
     const base = join(CLAUDE_HOME, 'projects', ed);
