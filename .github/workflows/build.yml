@@ -79,7 +79,7 @@ jobs:
         working-directory: desktop-ui
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-        run: npx electron-builder ${{ matrix.electronBuilderArgs }}
+        run: npx electron-builder ${{ matrix.electronBuilderArgs }} --publish never
 
       # ════════════════════════════════════════════════════════════
       # 上传构建产物
