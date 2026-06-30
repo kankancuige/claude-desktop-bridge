@@ -20,6 +20,7 @@ import {join} from 'node:path'
 import {homedir} from 'node:os'
 import WebSocket from 'ws'
 import {createLogger} from './logger.mjs'
+import {detectCommand, executeCommand} from './im-commands.mjs'
 
 const log = createLogger('wechat')
 
@@ -182,6 +183,15 @@ export function startWeChatAdapter() {
         if (!text) return
         log.info({userId: uid?.slice(0, 8), text: text.slice(0, 50)}, '← 消息')
 
+        // ── 第0层: IM 自定义命令 ──
+        const cmd = detectCommand(text)
+        if (cmd) {
+            executeCommand(cmd).then(r => {
+                if (r?.replyText) sendMsg(uid, ctx, r.replyText).catch(() => {})
+            })
+            return
+        }
+
         // ── 第1层: 配对鉴权 ──
         // 未配对用户需发送配对码，否则提示并拒绝后续处理
         if (!pairedUsers.has(uid)) {
@@ -241,9 +251,8 @@ export function startWeChatAdapter() {
             } catch {
             }
             if (noActive) {
-                // 没有活跃会话时静默跳过，不回复错误消息
-                // 避免轮询重复触发导致刷屏"无活跃会话"提示
-                log.info({userId: uid?.slice(0, 8)}, '无活跃 session，消息已忽略')
+                // 有活跃 session 才处理正常消息；无则明确提示
+                await sendMsg(uid, ctx, '尚无活跃 Session，请在桌面端打开一个项目后再发送消息。')
                 return
             }
             if (!sid) {
@@ -276,31 +285,20 @@ export function startWeChatAdapter() {
         return new Promise(async (resolve) => {
             const ws = new WebSocket(`ws://127.0.0.1:3456/ws/${sessionId}?source=wechat`)
             let toolCount = 0, done = false, replyText = ''
+            let mirrorOn = false
 
-            // WS 连接时预查 mirror 状态，用于即时事件（tool_use_start / permission_request 等，
-            // 这些事件到达瞬时触发，时差可忽略）；finish() 中会再次实时查询，避免长对话中状态变化
-            let mirrorOn = await shouldSkipReply(sessionId)
-
-            // 实时查询 mirror 状态——对话可能持续数分钟，中途 mirror 开关会被用户切换
-            async function isMirrorActive() {
-                return await shouldSkipReply(sessionId)
-            }
-
-            // ── finish ──
-            // 功能说明: 标记完成并发送回复(防重入确保只执行一次)
-            // 实现方式: done 标志位防重入，mirror 开启时跳过独立回复(由 gateway 统一广播)，
-            //          否则通过 /api/wechat/reply 发送
-            const finish = async () => {
+            // ── finish ── 必须在所有事件处理器之前定义
+            const finish = async (reason) => {
                 if (done) return;
                 done = true;
-                try {
-                    ws.close()
-                } catch {
-                }
-                if (await isMirrorActive()) {
+                try { ws.close() } catch {}
+                if (await shouldSkipReply(sessionId)) {
                     log.info({sessionId: sessionId?.slice(0, 8)}, 'mirror 已开启，跳过独立回复');
-                    resolve();
-                    return
+                    resolve(); return
+                }
+                if (!replyText.trim()) {
+                    await sendMsg(userId, ctx, reason === 'result' ? '处理完成，无文本回复' : '处理超时或连接中断，请稍后重试').catch(() => {})
+                    resolve(); return
                 }
                 fetch(`${GW}/api/wechat/reply`, {
                     method: 'POST',
@@ -315,40 +313,31 @@ export function startWeChatAdapter() {
                 }).catch(e => log.error({err: e, sessionId: sessionId?.slice(0, 8)}, 'reply 失败')).finally(resolve)
             }
 
-            // ── WS 连接建立 → 发送用户消息 ──
+            // 所有事件处理器必须在任何 await 之前注册，防止事件竞态丢失
+            ws.onerror = () => finish('ws_error')
+            ws.onclose = () => finish('ws_close')
+            setTimeout(() => finish('timeout'), 5 * 60 * 1000 + 30000)
+
             ws.onopen = () => {
                 ws.send(JSON.stringify({type: 'user_message', content: text}));
                 log.info({sessionId: sessionId?.slice(0, 8), text: text.slice(0, 50)}, '→session')
             }
 
-            // ── WS 消息事件处理 ──
-            // 功能说明: 根据 Gateway WS 推送的事件类型分派处理
-            // 事件类型一览:
-            //   - assistant_message: 完整 assistant 消息块(含 text blocks) → 收集 replyText
-            //   - text_delta: 增量文本流片段 → 拼接到 replyText(用于流式场景)
-            //   - tool_use_start: 工具调用开始 → 计数 + 发进度提示
-            //   - permission_request: 权限确认 → 写入 pendingConfirm + 询问用户
-            //   - choice_request: 选项请求 → 写入 pendingConfirm + 展示选项列表
-            //   - confirmation_resolved: 另一通道已处理确认 → 清除本地 pendingConfirm
-            //   - result: Claude 回复完成 → 延时 500ms 后触发 finish(给最后一条消息发送时间)
             ws.onmessage = (e) => {
                 try {
                     const msg = JSON.parse(e.data)
                     if (msg.type === 'assistant_message') {
-                        // 收集完整 assistant 消息中的所有 text blocks
                         const parts = []
                         for (const block of (msg.message?.content || [])) {
                             if (block.type === 'text' && block.text) parts.push(block.text)
                         }
                         replyText = parts.join('\n')
                     } else if (msg.type === 'text_delta' && msg.text) {
-                        // 增量文本流拼接
                         replyText += msg.text
                     } else if (msg.type === 'tool_use_start') {
                         toolCount++
                         if (!mirrorOn) sendMsg(userId, ctx, `⏳ [${toolCount}] 🔧 ${msg.tool_name || '工具'}...`)
                     } else if (msg.type === 'permission_request') {
-                        // mirror 开启时确认通过钩子下发，不走内联路径避免重复
                         if (!mirrorOn) {
                             pendingConfirm.set(userId, {sessionId, requestId: msg.requestId, type: 'permission'})
                             sendMsg(userId, ctx, `🔐 需要授权\n工具: ${msg.toolName}\n${permSummary(msg.input)}\n\n回复 y/确认 允许，n/拒绝 拒绝`)
@@ -358,36 +347,24 @@ export function startWeChatAdapter() {
                             const lines = []
                             const q = msg.questions?.[0]
                             if (q?.question) lines.push(q.question)
-                            ;
-                            (q?.options || []).forEach((o, i) => lines.push(`${i + 1}. ${o.label}`))
-                            pendingConfirm.set(userId, {
-                                sessionId,
-                                requestId: msg.requestId,
-                                type: 'choice',
-                                questions: msg.questions
-                            })
+                            ;(q?.options || []).forEach((o, i) => lines.push(`${i + 1}. ${o.label}`))
+                            pendingConfirm.set(userId, {sessionId, requestId: msg.requestId, type: 'choice', questions: msg.questions})
                             sendMsg(userId, ctx, `🔢 请选择\n${lines.join('\n')}\n\n回复选项编号`)
                         }
                     } else if (msg.type === 'confirmation_resolved') {
-                        // 另一通道（桌面端）已处理 → 清除本地挂起的确认
                         if (msg.wonBy && msg.wonBy !== 'wechat' && pendingConfirm.has(userId)) {
                             pendingConfirm.delete(userId)
                             if (!mirrorOn) sendMsg(userId, ctx, '桌面端已处理该确认')
                         }
                     } else if (msg.type === 'result') {
-                        // Claude 完成回复，延时发送确保最后一条进度消息已发出
                         if (toolCount > 0 && !mirrorOn) sendMsg(userId, ctx, `✅ 共执行 ${toolCount} 个工具，正在整理回复...`)
-                        setTimeout(finish, 500)
+                        setTimeout(() => finish('result'), 500)
                     }
-                } catch {
-                }
+                } catch {}
             }
 
-            // ── WS 异常/关闭 → 直接完成 ──
-            ws.onerror = () => finish();
-            ws.onclose = () => finish()
-            // 含权限确认时 query 会阻塞在 canUseTool，超时需 > 5 分钟
-            setTimeout(() => finish(), 5 * 60 * 1000 + 30000)
+            // 事件处理器全部就位后才做 async 操作
+            mirrorOn = await shouldSkipReply(sessionId)
         })
     }
 

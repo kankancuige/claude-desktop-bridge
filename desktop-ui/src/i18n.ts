@@ -389,7 +389,7 @@ const messages: Record<Locale, Record<string, string>> = {
     // ────────────────────────────────────────────────────────────────────────
     'ws.copy': '复制', 'ws.copied': '已复制', 'ws.refill': '回填到输入框',
     'ws.export': '导出', 'ws.exportMD': 'Markdown', 'ws.exportJSON': 'JSON (完整)', 'ws.exportJSONL': 'JSONL (CLI兼容)',
-    'ws.exportTime': '导出时间',
+    'ws.exportTime': '导出时间', 'ws.scrollBottom': '回到底部',
     'ws.toolsOps': '{n} 个工具操作',
     'ws.thinkBadge': '思考', 'ws.thinkContent': '思考内容', 'ws.thinking': '深度思考中...', 'ws.thinkDone': '思考完成',
 
@@ -555,6 +555,14 @@ const messages: Record<Locale, Record<string, string>> = {
     'ws.projAdded': '当前项目已添加',
     'ws.promptDir': '输入项目文件夹绝对路径（如 D:/projects/foo）',
     'ws.costToast': '本会话费用 ¥{cost} 已达余额的 {pct}%，注意 token 消耗',
+    'ws.nudgeSwitched': '桌面端已切换到 {label}',
+    'ws.nudgeNewSession': '已在 {label} 创建新会话',
+    'ws.nudgeStopped': '已发送停止指令',
+    'ws.deleteFailed': '删除失败，请重试',
+    'ws.hideProject': '隐藏项目',
+    'ws.showProject': '显示项目',
+    'ws.hiddenProjects': '已隐藏项目',
+    'ws.noHiddenProjects': '无隐藏项目',
 
     // ────────────────────────────────────────────────────────────────────────
     // Claude 未找到弹窗 —— 首次启动时检测到 claude CLI 不可用的引导提示
@@ -815,7 +823,7 @@ const messages: Record<Locale, Record<string, string>> = {
     // ── Bubble ──
     'ws.copy': 'Copy', 'ws.copied': 'Copied', 'ws.refill': 'Refill input',
     'ws.export': 'Export', 'ws.exportMD': 'Markdown', 'ws.exportJSON': 'JSON (full)', 'ws.exportJSONL': 'JSONL (CLI compat)',
-    'ws.exportTime': 'Export time',
+    'ws.exportTime': 'Export time', 'ws.scrollBottom': 'Scroll to bottom',
     'ws.toolsOps': '{n} tool ops',
     'ws.thinkBadge': 'Thinking', 'ws.thinkContent': 'Thinking', 'ws.thinking': 'Thinking deeply...', 'ws.thinkDone': 'Thinking done',
 
@@ -953,6 +961,14 @@ const messages: Record<Locale, Record<string, string>> = {
     'ws.projAdded': 'This project is already added',
     'ws.promptDir': 'Enter absolute project folder path (e.g. D:/projects/foo)',
     'ws.costToast': 'Session cost ¥{cost} reached {pct}% of balance',
+    'ws.nudgeSwitched': 'Desktop switched to {label}',
+    'ws.nudgeNewSession': 'New session created in {label}',
+    'ws.nudgeStopped': 'Stop command sent',
+    'ws.deleteFailed': 'Delete failed, please retry',
+    'ws.hideProject': 'Hide project',
+    'ws.showProject': 'Show project',
+    'ws.hiddenProjects': 'Hidden projects',
+    'ws.noHiddenProjects': 'No hidden projects',
 
     // ── Claude not found ──
     'claudeMissing.title': 'Claude Code Not Found',

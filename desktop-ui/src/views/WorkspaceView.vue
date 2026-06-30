@@ -153,6 +153,17 @@ const sessionPageSize = 5
 const showAllProjects = ref(false)
 /** 侧栏项目列表分页大小 */
 const projectPageSize = 10
+/** 已隐藏的项目路径集合（持久化到 localStorage） */
+const STORAGE_KEY_HIDDEN = 'bridge-hidden-projects'
+function loadHiddenProjects(): Set<string> {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_HIDDEN)
+    return raw ? new Set(JSON.parse(raw)) : new Set()
+  } catch { return new Set() }
+}
+const hiddenProjects = ref<Set<string>>(loadHiddenProjects())
+/** 隐藏项目折叠区是否展开 */
+const showHiddenSection = ref(false)
 
 /** 可见项目列表：未展开时只返回前 projectPageSize 条，避免长列表卡顿 */
 const visibleProjects = computed(() => {
@@ -174,6 +185,31 @@ function toggleShowAll(workDir: string) {
   showAllSessions.value = s
 }
 
+/** 持久化 hiddenProjects 到 localStorage */
+function persistHidden() {
+  try { localStorage.setItem(STORAGE_KEY_HIDDEN, JSON.stringify([...hiddenProjects.value])) } catch {}
+}
+
+/** 隐藏项目：加入 hiddenProjects，如果是当前活跃项目则清理状态 */
+function hideProject(workDir: string) {
+  const s = new Set(hiddenProjects.value)
+  s.add(workDir)
+  hiddenProjects.value = s
+  persistHidden()
+  if (activeProject.value === workDir) {
+    activeProject.value = ''
+    sessionId.value = ''
+  }
+}
+
+/** 显示项目：从 hiddenProjects 移除 */
+function showProject(workDir: string) {
+  const s = new Set(hiddenProjects.value)
+  s.delete(workDir)
+  hiddenProjects.value = s
+  persistHidden()
+}
+
 /** 删除会话前弹出二次确认弹窗（先设置 pendingDelete，用户确认后执行 confirmDelete） */
 async function deleteSession(sid: string) {
   pendingDelete.value = {sid}
@@ -190,21 +226,36 @@ function confirmCloseTab() {
   pendingCloseTabId.value = null
 }
 
-/** 确认删除会话：调用 Gateway DELETE API，清理 localStorage 缓存的 token/费用数据 */
+/** 确认删除会话：调用 Gateway DELETE API，清理 localStorage 缓存的 token/费用数据，并清理当前活跃 session 状态 */
 async function confirmDelete() {
   if (!pendingDelete.value) return
   const {sid} = pendingDelete.value
   pendingDelete.value = null
   try {
     const res = await fetch(`${GW}/api/sessions/${sid}?deleteFiles=1`, {method: 'DELETE'})
-    if (res.ok) {
-      try {
-        localStorage.removeItem(usageKey(sid))
-      } catch {
-      }  // 一并清理 token/费用记忆，防止脏数据残留
-      await loadProjects()  // 从 Gateway 重新扫描，确保本地列表准确
+    if (!res.ok) {
+      showToast(t('ws.deleteFailed'))
+      return
     }
+    // 清理 localStorage 缓存的 token/费用记忆
+    try { localStorage.removeItem(usageKey(sid)) } catch {}
+    // 如果删除的是当前前台活跃 session，清理 UI 状态
+    const tab = tabSessions.value.find(t => t.state.sessionId === sid)
+    if (tab) tabSessions.value = tabSessions.value.filter(t => t.id !== tab.id)
+    if (sessionId.value === sid) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try { ws.close() } catch {}
+      }
+      ws = null
+      sessionId.value = null
+      connected.value = false
+      status.value = 'idle'
+      messages.value = []
+      activeProject.value = ''
+    }
+    await loadProjects()
   } catch {
+    showToast(t('ws.deleteFailed'))
   }
 }
 
@@ -698,6 +749,8 @@ const connecting = ref(false)
 const activeProject = ref<string | null>(null)
 /** 消息区域 DOM 引用，用于自动滚动到底部 */
 const chatRef = ref<HTMLElement | null>(null)
+/** 用户是否手动上滑离开了底部（抑制任务执行中的自动滚动） */
+const userScrolledUp = ref(false)
 /** 当前活跃的会话 ID（用于侧栏高亮选中会话） */
 const activeSessionId = ref<string | null>(null)
 
@@ -955,11 +1008,19 @@ let lastUserMessage = ''
 /** 队列自增 ID 计数器 */
 let queueId = 0
 
-/** 过滤后的项目列表：根据搜索关键词筛选（不区分大小写，匹配 workDir 路径） */
+/** 过滤后的项目列表：根据搜索关键词筛选（不区分大小写，匹配 workDir 路径），并排除已隐藏的项目 */
 const filteredProjects = computed(() => {
   const q = projectSearch.value.toLowerCase()
-  if (!q) return projects.value
-  return projects.value.filter(p => p.workDir.toLowerCase().includes(q))
+  if (!q) return projects.value.filter(p => !hiddenProjects.value.has(p.workDir))
+  return projects.value.filter(p => p.workDir.toLowerCase().includes(q) && !hiddenProjects.value.has(p.workDir))
+})
+
+/** 隐藏项目列表：根据搜索关键词筛选（不区分大小写） */
+const filteredHiddenProjects = computed(() => {
+  const q = projectSearch.value.toLowerCase()
+  const pool = projects.value.filter(p => hiddenProjects.value.has(p.workDir))
+  if (!q) return pool
+  return pool.filter(p => p.workDir.toLowerCase().includes(q))
 })
 
 /** 账户余额信息：余额、货币单位、已使用金额 */
@@ -1068,6 +1129,8 @@ onMounted(async () => {
   await Promise.all([loadProjects(), loadBalance(), loadProviderModels(), loadSlashCommands(), loadIMStatus()])
   // Esc 关闭 diff/文件 modal
   window.addEventListener('keydown', onGlobalKeydown)
+  // 建立控制通道 WS：独立于 session，启动即连，接收 IM nudge 事件
+  connectControlWS()
 })
 
 /** 全局键盘快捷键：Esc 关闭 / Ctrl+S 保存 */
@@ -1097,6 +1160,7 @@ onActivated(() => {
   petEnabledGlob.value = localStorage.getItem('claude-bridge-pet-enabled') !== 'false'
   loadProviderModels()
   tabAutoSyncTimer = setInterval(syncCurrentTabState, 5000)
+  userScrolledUp.value = false
   let tries = 0
   const go = () => {
     if (chatRef.value && chatRef.value.scrollHeight > 0) {
@@ -1188,6 +1252,13 @@ async function addProject() {
     sessions: [],
     lastActive: Date.now()
   })
+  // 如果之前被隐藏过，清除隐藏标记
+  if (hiddenProjects.value.has(wd)) {
+    const s = new Set(hiddenProjects.value)
+    s.delete(wd)
+    hiddenProjects.value = s
+    persistHidden()
+  }
   projectSearch.value = ''      // 清空搜索，确保新项目可见
   activeProject.value = wd
 }
@@ -1271,6 +1342,167 @@ async function handleNewSession(workDir: string, encodedDir?: string, histSessio
   }
 }
 
+/** IM 控制命令处理：接收 Gateway nudge 事件，执行桌面端 UI 操作 */
+const seenNudgeIds = new Set<string>()
+async function handleNudge(msg: any) {
+  const { action, args, nudgeId } = msg
+  if (nudgeId) {
+    if (seenNudgeIds.has(nudgeId)) return  // 去重：控制通道和 session WS 各收到一次
+    seenNudgeIds.add(nudgeId)
+    if (seenNudgeIds.size > 200) seenNudgeIds.clear()  // 防止内存泄漏
+  }
+  try {
+    switch (action) {
+      case 'switch_project': {
+        // 切换项目：支持 projectPath（wechat-ack.sh）或 projectName（adapter）
+        const { projectPath, projectName, encodedDir, label, sessionId, sessionIndex } = args
+        await loadProjects() // 确保项目列表最新
+        // 项目匹配优先级：projectPath > projectName > label
+        let resolvedPath = projectPath
+        let resolvedEncoded = encodedDir
+        let resolvedLabel = label
+        if (!resolvedPath && projectName) {
+          const pn = projectName.toLowerCase()
+          let exact: any = null, partial: any = null
+          for (const p of projects.value) {
+            const dn = (p.workDir || '').replace(/\\/g, '/').split('/').filter(Boolean).pop() || ''
+            if (dn.toLowerCase() === pn) { exact = p; break }
+            if (!partial && (dn.toLowerCase().includes(pn) || (p.workDir || '').toLowerCase().includes(pn))) {
+              partial = p
+            }
+          }
+          const match = exact || partial
+          if (match) {
+            resolvedPath = match.workDir
+            resolvedEncoded = match.encodedDir
+            resolvedLabel = (match.workDir || '').replace(/\\/g, '/').split('/').filter(Boolean).pop() || ''
+          }
+        }
+        if (!resolvedPath) { showToast(`项目 "${projectName || ''}" 未找到`); break }
+        // 检查是否已有活跃标签页 → 直接切换，不创建新 session
+        const existingTab = tabSessions.value.find(t => t.projectPath === resolvedPath && t.websocket && t.websocket.readyState === WebSocket.OPEN)
+        if (existingTab) {
+          expandedProjects.value.add(resolvedPath)
+          activeProject.value = resolvedPath
+          switchToTab(existingTab.id)
+          showToast(t('ws.nudgeSwitched', { label: resolvedLabel || '' }))
+          break
+        }
+        expandedProjects.value.add(resolvedPath)
+        activeProject.value = resolvedPath
+        const proj = projects.value.find(p => p.workDir === resolvedPath)
+        let histSessionId: string | undefined
+        if (sessionId) {
+          const match = proj?.sessions?.find(s => s.id.toLowerCase().startsWith(sessionId.toLowerCase()))
+          histSessionId = match?.id || sessionId
+        } else if (sessionIndex && proj?.sessions?.length) {
+          const idx = Math.max(0, Math.min((Number(sessionIndex) || 1) - 1, proj.sessions.length - 1))
+          histSessionId = proj.sessions[idx]?.id
+        } else if (proj?.sessions?.length) {
+          // sessions 已按 mtime 倒序，sessions[0] 即最新活跃 session
+          histSessionId = proj.sessions[0]?.id
+        }
+        await handleNewSession(resolvedPath, resolvedEncoded || '', histSessionId)
+        showToast(t('ws.nudgeSwitched', { label: resolvedLabel || '' }))
+        break
+      }
+      case 'switch_session': {
+        // 切换 session：支持编号（当前活跃项目下 1-based）或 sessionId（前缀，全局搜）
+        const { sessionId, sessionIndex } = args
+        let histSessionId: string | undefined
+        let targetProjectPath = ''
+        let targetEncodedDir = ''
+
+        if (sessionId) {
+          // 跨所有项目搜，找到第一个匹配 sessionId 前缀的
+          for (const p of projects.value) {
+            const match = p.sessions?.find(s => s.id.toLowerCase().startsWith(sessionId.toLowerCase()))
+            if (match) {
+              histSessionId = match.id
+              targetProjectPath = p.workDir
+              targetEncodedDir = p.encodedDir
+              break
+            }
+          }
+          if (!histSessionId) { showToast('Session 不存在'); break }
+        } else if (sessionIndex) {
+          // 编号只看当前活跃项目（activeProject）
+          const proj = projects.value.find(p => p.workDir === activeProject.value)
+          if (!proj) { showToast('请先切换到目标项目'); break }
+          const idx = Math.max(0, Math.min((Number(sessionIndex) || 1) - 1, (proj.sessions?.length || 1) - 1))
+          const s = proj.sessions?.[idx]
+          if (!s) { showToast('Session 编号不存在'); break }
+          histSessionId = s.id
+          targetProjectPath = proj.workDir
+          targetEncodedDir = proj.encodedDir
+        } else {
+          showToast('请指定 Session 编号或 ID'); break
+        }
+
+        expandedProjects.value.add(targetProjectPath)
+        activeProject.value = targetProjectPath
+        await handleNewSession(targetProjectPath, targetEncodedDir, histSessionId)
+        showToast(`已切换会话 ${histSessionId.slice(0, 8)}`)
+        break
+      }
+      case 'new_session': {
+        // 新建 session：不指定项目 → 用当前活跃项目；指定 → 查找匹配项目
+        const { projectPath, projectName, encodedDir, label } = args
+        let resolvedPath = projectPath
+        let resolvedEncoded = encodedDir
+        let resolvedLabel = label
+        if (!resolvedPath && projectName) {
+          const pn = projectName.toLowerCase()
+          let exact: any = null, partial: any = null
+          for (const p of projects.value) {
+            const dn = (p.workDir || '').replace(/\\/g, '/').split('/').filter(Boolean).pop() || ''
+            if (dn.toLowerCase() === pn) { exact = p; break }
+            if (!partial && (dn.toLowerCase().includes(pn) || (p.workDir || '').toLowerCase().includes(pn))) {
+              partial = p
+            }
+          }
+          const match = exact || partial
+          if (match) {
+            resolvedPath = match.workDir; resolvedEncoded = match.encodedDir
+            resolvedLabel = (match.workDir || '').replace(/\\/g, '/').split('/').filter(Boolean).pop() || ''
+          }
+        }
+        // 没指定项目也没有 projectPath → 用桌面端当前活跃项目
+        if (!resolvedPath && activeProject.value) {
+          const ap = projects.value.find(p => p.workDir === activeProject.value)
+          if (ap) { resolvedPath = ap.workDir; resolvedEncoded = ap.encodedDir; resolvedLabel = (ap.workDir || '').replace(/\\/g, '/').split('/').filter(Boolean).pop() || '' }
+        }
+        if (!resolvedPath) { showToast('请先打开一个项目，或指定：/ns <项目>'); break }
+        expandedProjects.value.add(resolvedPath)
+        activeProject.value = resolvedPath
+        await handleNewSession(resolvedPath, resolvedEncoded || '')
+        showToast(t('ws.nudgeNewSession', { label: resolvedLabel || '' }))
+        break
+      }
+      case 'stop': {
+        // 停止当前活跃标签页的 agent
+        const tab = tabSessions.value.find(t => t.id === activeTabId.value)
+        if (tab?.websocket && tab.websocket.readyState === WebSocket.OPEN) {
+          tab.websocket.send(JSON.stringify({ type: 'stop_generation' }))
+          showToast('已发送停止指令')
+        }
+        break
+      }
+      case 'toggle_mirror': {
+        const { platform, enabled } = args
+        if (platform && typeof enabled === 'boolean') {
+          mirrorState.value[platform] = enabled
+          try { localStorage.setItem(`bridge-mirror-${platform}`, enabled ? '1' : '0') } catch {}
+          showToast(enabled ? t('ws.mirrorOnToast') : t('ws.mirrorOffToast'))
+        }
+        break
+      }
+    }
+  } catch (e) {
+    // 静默：nudge 操作失败不阻塞
+  }
+}
+
 /** 加载历史会话的消息记录（恢复会话时展示，仅文本角色，不含思考/工具） */
 async function loadHistory(encodedDir: string, sId: string) {
   try {
@@ -1285,6 +1517,21 @@ async function loadHistory(encodedDir: string, sId: string) {
   } catch {
   }
   scrollDown()
+}
+
+/** 控制通道 WebSocket：不绑定 session，启动即连，接收 IM nudge 事件 */
+let controlWS: WebSocket | null = null
+function connectControlWS() {
+  if (controlWS && controlWS.readyState === WebSocket.OPEN) return
+  controlWS = new WebSocket('ws://127.0.0.1:3456/ws/control')
+  controlWS.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data)
+      if (msg.type === 'nudge') handleNudge(msg)
+    } catch {}
+  }
+  controlWS.onclose = () => { controlWS = null; setTimeout(connectControlWS, 5000) }
+  controlWS.onerror = () => { controlWS?.close() }
 }
 
 /**
@@ -1476,7 +1723,7 @@ function connectWS(sid: string, resumed = false) {
         const srcName = {wechat: '微信', feishu: '飞书', dingtalk: '钉钉'}[msg.source] || msg.source
         messages.value.push({role: 'user', text: `[${srcName}] ${msg.content}`, time: Date.now()})
         status.value = 'thinking'
-        if (fg) nextTick(scrollDown)
+        if (fg) nextTick(() => scrollDown())
         break
 
       case 'permission_request':
@@ -1695,6 +1942,10 @@ function connectWS(sid: string, resumed = false) {
           wfRunState.value.status = 'error'
         }
         break
+
+      case 'nudge':
+        handleNudge(msg)
+        break
     }
 
     if (!fg) {
@@ -1703,7 +1954,7 @@ function connectWS(sid: string, resumed = false) {
       restoreTabState(_saved!)
       _swappingTab = false
     } else {
-      nextTick(scrollDown)
+      nextTick(() => scrollDown())
     }
   }
 
@@ -1884,7 +2135,7 @@ async function sendMessage() {
     queueId++
     msgQueue.value.push({id: queueId, text, time: Date.now()})
     inputText.value = ''
-    nextTick(scrollDown)
+    nextTick(() => scrollDown(true))
     return
   }
 
@@ -2022,7 +2273,7 @@ function doSend(text: string, wire?: string) {
     permissionMode: permissionMode.value,
     thinkingLevel: thinkingLevel.value
   }))
-  nextTick(scrollDown)
+  nextTick(() => scrollDown(true))
 }
 
 /**
@@ -2039,7 +2290,7 @@ function cancelTask() {
     lastUserMessage = ''
   }
   messages.value.push({role: 'system', text: t('ws.taskCanceled'), time: Date.now()})
-  nextTick(scrollDown)
+  nextTick(() => scrollDown(true))
 }
 
 // ── 双通道权限确认响应 ──
@@ -2058,7 +2309,7 @@ function respondPermission(decision: 'allow' | 'deny') {
     time: Date.now()
   })
   pendingPermission.value = null
-  nextTick(scrollDown)
+  nextTick(() => scrollDown(true))
 }
 
 /** 用户选择方案后，回传 optionIndex 给 Gateway */
@@ -2077,7 +2328,7 @@ function respondChoice(optionIndex: number) {
     time: Date.now()
   })
   pendingChoice.value = null
-  nextTick(scrollDown)
+  nextTick(() => scrollDown(true))
 }
 
 // ── 消息队列操作 ──
@@ -2353,14 +2604,27 @@ function handleKeydown(e: KeyboardEvent) {
 }
 
 /**
+ * 消息区域滚动事件：检测用户是否手动离开底部。
+ * 距底部 >50px 视为"用户上滑查看历史"，抑制任务执行中的自动回滚。
+ */
+function onMessagesScroll() {
+  if (!chatRef.value) return
+  const el = chatRef.value
+  const dist = el.scrollHeight - el.scrollTop - el.clientHeight
+  userScrolledUp.value = dist > 50
+}
+
+/**
  * 滚动消息区域到底部。
  * 使用双层 nextTick 确保 Vue 渲染完成 + DOM 高度已更新后再滚动。
  * （单层 nextTick 可能在 v-for 中新元素插入后 scrollHeight 尚未更新）
+ * @param force 忽略用户滚动位置，强制执行（用户主动操作时传 true）
  */
-function scrollDown() {
+function scrollDown(force?: boolean) {
+  if (force) userScrolledUp.value = false
   nextTick(() => {
     nextTick(() => {
-      if (chatRef.value) {
+      if (chatRef.value && (force || !userScrolledUp.value)) {
         chatRef.value.scrollTop = chatRef.value.scrollHeight
       }
     })
@@ -3425,6 +3689,9 @@ const tokenTooltip = computed(() => {
       :running-agent-count="agentRuns.filter(a => a.status === 'running').length"
       :project-page-size="projectPageSize"
       :session-page-size="sessionPageSize"
+      :hidden-projects="hiddenProjects"
+      :filtered-hidden-projects="filteredHiddenProjects"
+      :show-hidden-section="showHiddenSection"
       @go-settings="router.push('/settings')"
       @search="projectSearch = $event"
       @add-project="addProject"
@@ -3432,6 +3699,9 @@ const tokenTooltip = computed(() => {
       @toggle-project="toggleProject"
       @new-session="(workDir: string, encodedDir: string, sid?: string) => handleNewSession(workDir, encodedDir, sid)"
       @delete-session="deleteSession"
+      @hide-project="hideProject"
+      @show-project="showProject"
+      @toggle-hidden-section="showHiddenSection = !showHiddenSection"
       @toggle-show-all="toggleShowAll"
       @toggle-show-all-projects="showAllProjects = !showAllProjects"
     />
@@ -3548,7 +3818,7 @@ const tokenTooltip = computed(() => {
         </div>
 
         <!-- 消息列表区域：v-for 遍历 messages，按 role 切换渲染模板 -->
-        <div ref="chatRef" class="messages" @click="onMessageClick">
+        <div ref="chatRef" class="messages" @click="onMessageClick" @scroll="onMessagesScroll">
           <!-- 每条消息行：根据 role 控制对齐方向和动画延迟 -->
           <div v-for="(msg, i) in messages" :key="i" class="msg-row" :class="msg.role"
                :style="{ animationDelay: `${Math.min(i * 20, 300)}ms` }">
@@ -3772,6 +4042,14 @@ const tokenTooltip = computed(() => {
             <span class="think-dot"></span>
             <span class="think-dot"></span>
           </div>
+
+          <!-- 回到底部悬浮按钮：sticky 贴消息区底部，用户上滑后出现 -->
+          <button v-if="userScrolledUp" class="scroll-bottom-btn" @click="scrollDown(true)" :title="t('ws.scrollBottom')">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="6 9 12 15 18 9"/>
+            </svg>
+          </button>
 
         </div>
 
@@ -5532,6 +5810,32 @@ const tokenTooltip = computed(() => {
   gap: 16px;
 }
 
+.scroll-bottom-btn {
+  align-self: flex-end;
+  flex-shrink: 0;
+  position: sticky;
+  bottom: 8px;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: var(--shadow-md);
+  z-index: 10;
+  transition: opacity .2s, transform .2s;
+  animation: fade-in-up .2s ease;
+}
+.scroll-bottom-btn:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+  transform: translateY(-2px);
+}
+
 .msg-row {
   display: flex;
 }
@@ -5862,6 +6166,42 @@ const tokenTooltip = computed(() => {
   color: var(--text-secondary);
 }
 
+/* 用户气泡内 markdown 子元素 — 蓝底白字覆盖 */
+:deep(.bubble.user .md-h),
+:deep(.bubble.user strong),
+:deep(.bubble.user em) {
+  color: #fff;
+}
+
+:deep(.bubble.user .md-code) {
+  background: rgba(0, 0, 0, 0.25);
+  border-color: rgba(255, 255, 255, 0.15);
+  color: rgba(255, 255, 255, 0.85);
+}
+
+:deep(.bubble.user .md-inline) {
+  background: rgba(0, 0, 0, 0.22);
+  border-color: rgba(255, 255, 255, 0.15);
+  color: rgba(255, 255, 255, 0.92);
+}
+
+:deep(.bubble.user .md-link) {
+  color: rgba(255, 255, 255, 0.9);
+  text-decoration-color: rgba(255, 255, 255, 0.5);
+}
+
+:deep(.bubble.user .md-blockquote) {
+  background: rgba(255, 255, 255, 0.08);
+  border-left-color: rgba(255, 255, 255, 0.35);
+  color: rgba(255, 255, 255, 0.85);
+}
+
+:deep(.bubble.user .md-table th),
+:deep(.bubble.user .md-table td) {
+  color: rgba(255, 255, 255, 0.88);
+  border-color: rgba(255, 255, 255, 0.15);
+}
+
 /* ── 思考动画骨架 Thinking skeleton ── */
 /* 三个呼吸圆点，表示 AI 正在生成回复 */
 .thinking-indicator {
@@ -5945,7 +6285,7 @@ const tokenTooltip = computed(() => {
 }
 
 .bubble.user {
-  background: var(--accent);
+  background: var(--bubble-user-bg);
   color: #fff;
   border-radius: var(--radius-bubble) var(--radius-bubble) 4px var(--radius-bubble);
   box-shadow: var(--shadow-sm);

@@ -41,6 +41,12 @@ defineProps<{
   projectPageSize: number
   /** 会话分页大小 */
   sessionPageSize: number
+  /** 已隐藏项目集合 */
+  hiddenProjects: Set<string>
+  /** 过滤后的隐藏项目列表 */
+  filteredHiddenProjects: Project[]
+  /** 隐藏区是否展开 */
+  showHiddenSection: boolean
 }>()
 
 // ═══════════════════════════════════════════
@@ -54,6 +60,9 @@ const emit = defineEmits<{
   (e: 'toggleProject', workDir: string): void
   (e: 'newSession', workDir: string, encodedDir: string, sid?: string): void
   (e: 'deleteSession', sid: string): void
+  (e: 'hideProject', workDir: string): void
+  (e: 'showProject', workDir: string): void
+  (e: 'toggleHiddenSection'): void
   (e: 'toggleShowAll', workDir: string): void
   (e: 'toggleShowAllProjects'): void
 }>()
@@ -174,6 +183,13 @@ function visibleSessions(p: Project, showAllSessions: Set<string>, pageSize: num
               <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
             </svg>
           </button>
+          <button class="project-hide" @click.stop="emit('hideProject', p.workDir)" :title="t('ws.hideProject')">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/>
+              <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/>
+              <line x1="1" y1="1" x2="23" y2="23"/>
+            </svg>
+          </button>
         </div>
 
         <!-- 会话子列表 -->
@@ -206,6 +222,30 @@ function visibleSessions(p: Project, showAllSessions: Set<string>, pageSize: num
       <button v-if="filteredProjects.length > projectPageSize" class="show-more-btn" @click="emit('toggleShowAllProjects')">
         {{ showAllProjects ? t('ws.collapse') : t('ws.showAllProjects', { n: filteredProjects.length }) }}
       </button>
+
+      <!-- 已隐藏项目折叠区 -->
+      <div class="hidden-section">
+        <div class="hidden-section-header" @click="emit('toggleHiddenSection')">
+          <svg class="hidden-chevron" :class="{ open: showHiddenSection }" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+          <span>{{ t('ws.hiddenProjects') }}</span>
+          <span class="hidden-count" v-if="filteredHiddenProjects.length">{{ filteredHiddenProjects.length }}</span>
+        </div>
+        <div v-if="showHiddenSection" class="hidden-section-body">
+          <div v-if="filteredHiddenProjects.length === 0" class="hidden-empty">{{ t('ws.noHiddenProjects') }}</div>
+          <div v-for="p in filteredHiddenProjects" :key="p.workDir" class="hidden-item">
+            <div class="hidden-item-info">
+              <span class="hidden-item-name">{{ dirName(p.workDir) }}</span>
+              <span class="hidden-item-path">{{ p.workDir }}</span>
+            </div>
+            <button class="hidden-show-btn" @click.stop="emit('showProject', p.workDir)" :title="t('ws.showProject')">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                <circle cx="12" cy="12" r="3"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+      </div>
 
       <!-- 空状态 -->
       <div v-if="filteredProjects.length === 0 && !searchText" class="empty-state">
@@ -330,6 +370,15 @@ function visibleSessions(p: Project, showAllSessions: Set<string>, pageSize: num
 .project-card:hover .add-session-btn { opacity: 1; }
 .add-session-btn:hover { color: var(--accent-blue); background: var(--bg-deep); }
 
+.project-hide {
+  background: none; border: none; color: var(--text-muted);
+  cursor: pointer; padding: 4px; border-radius: 6px;
+  display: flex; align-items: center; opacity: 0;
+  transition: all .12s;
+}
+.project-card:hover .project-hide { opacity: 1; }
+.project-hide:hover { color: var(--accent); background: var(--bg-deep); }
+
 .session-sublist {
   padding-left: 28px; padding-right: 4px; padding-bottom: 4px;
   display: flex; flex-direction: column; gap: 2px;
@@ -362,6 +411,50 @@ function visibleSessions(p: Project, showAllSessions: Set<string>, pageSize: num
   padding: 6px; cursor: pointer; text-align: center;
 }
 .show-more-btn:hover { text-decoration: underline; }
+
+/* ── 已隐藏项目折叠区 ── */
+.hidden-section {
+  margin-top: 8px; border-top: 1px solid var(--border);
+  padding-top: 6px;
+}
+.hidden-section-header {
+  display: flex; align-items: center; gap: 6px;
+  padding: 8px 10px; cursor: pointer; border-radius: 8px;
+  font-size: 12px; font-weight: 500; color: var(--text-muted);
+  text-transform: uppercase; letter-spacing: .5px;
+  transition: background .12s;
+}
+.hidden-section-header:hover { background: var(--bg-raised); }
+.hidden-chevron {
+  transition: transform .2s; flex-shrink: 0; color: var(--text-muted);
+}
+.hidden-chevron.open { transform: rotate(180deg); }
+.hidden-count {
+  background: var(--bg-raised); color: var(--text-muted);
+  font-size: 11px; padding: 1px 6px; border-radius: 8px;
+  margin-left: auto;
+}
+.hidden-section-body { padding: 4px 0; }
+.hidden-empty {
+  text-align: center; padding: 12px; font-size: 12px; color: var(--text-muted);
+}
+.hidden-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px; border-radius: 8px; cursor: default;
+  transition: background .1s; opacity: 0.65;
+}
+.hidden-item:hover { background: var(--bg-raised); opacity: 1; }
+.hidden-item-info { flex: 1; min-width: 0; }
+.hidden-item-name { font-size: 13px; color: var(--text-secondary); }
+.hidden-item-path { font-size: 11px; font-family: var(--font-mono); color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hidden-show-btn {
+  background: none; border: none; color: var(--text-muted);
+  cursor: pointer; padding: 4px; border-radius: 6px;
+  display: flex; align-items: center; opacity: 0;
+  transition: all .12s;
+}
+.hidden-item:hover .hidden-show-btn { opacity: 1; }
+.hidden-show-btn:hover { color: var(--accent-blue); background: var(--bg-deep); }
 
 .sidebar-bottom {
   padding: 10px 16px; border-top: 1px solid var(--border);

@@ -34,6 +34,7 @@ import {homedir} from 'node:os'
 import {DWClient, TOPIC_ROBOT} from 'dingtalk-stream'
 import WebSocket from 'ws'
 import {createLogger} from './logger.mjs'
+import {detectCommand, executeCommand} from './im-commands.mjs'
 
 const log = createLogger('dingtalk')
 
@@ -173,6 +174,14 @@ export function startDingTalkAdapter() {
     // ── handleMessage ── 消息处理入口
     // 功能说明: 单条钉钉消息的处理入口，按优先级依次检查: 配对状态 → 挂起确认 → 正常对话
     async function handleMessage(uid, text) {
+        // ── 第0层: IM 自定义命令 ──
+        const cmd = detectCommand(text)
+        if (cmd) {
+            const r = await executeCommand(cmd)
+            if (r?.replyText) await sendMsg(uid, r.replyText)
+            return
+        }
+
         // ── 第1层: 配对鉴权 ──
         if (!pairedUsers.has(uid)) {
             if (text.trim() === pairCode) {
@@ -230,7 +239,7 @@ export function startDingTalkAdapter() {
                 log.error({err: e}, 'resolve 异常')
             }
             if (noActive) {
-                log.info({userId: uid?.slice(0, 8)}, '无活跃 session，消息已忽略')
+                await sendMsg(uid, '尚无活跃 Session，请在桌面端打开一个项目后再发送消息。')
                 return
             }
             if (!sid) {

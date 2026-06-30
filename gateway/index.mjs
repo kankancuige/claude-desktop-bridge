@@ -5,7 +5,7 @@
  */
 
 import {createServer} from 'node:http'
-import {readdirSync, statSync, readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, rmdirSync} from 'node:fs'
+import {readdirSync, statSync, readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, rmdirSync, openSync, readSync, closeSync} from 'node:fs'
 import {execSync, spawn} from 'node:child_process'
 import {homedir} from 'node:os'
 import {join, dirname, basename, relative, resolve, extname as pathExtname} from 'node:path'
@@ -637,6 +637,16 @@ function saveCavemanConfig(cfg) {
     writeJSON(join(CLAUDE_HOME, 'settings.json'), s)
 }
 
+// ── Caveman 系统提示词生成（会话级 systemPrompt.append 注入，不污染任何 CLAUDE.md）──
+function buildCavemanSystemPrompt(cfg) {
+    if (!cfg || !cfg.enabled || !cfg.level) return null
+    const base = 'Use caveman compression (level: ' + cfg.level + '): drop filler/hedging/articles, use fragments and short synonyms. Keep all technical substance, code, error strings exact. No emoji, no tool-call narration. Speak user\'s language. Resume normal style for security warnings and destructive actions.'
+    if (cfg.level === 'wenyan' || cfg.level.startsWith('wenyan')) {
+        return base + ' Use classical Chinese (文言文) style.'
+    }
+    return base
+}
+
 // ── RTK 二进制定位 + 版本检查 + 配置 ──
 // 功能说明: rtk（MIT）是 Rust 命令行压缩工具，bridge 打包内置，PostToolUse hook 调用
 //   开发环境从 ../rtk-bin/ 找；生产环境从 process.resourcesPath/rtk/ 找
@@ -1172,6 +1182,9 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
             return e
         })(),
     }
+    // Caveman: 会话级 systemPrompt.append 注入，仅对 bridge 会话生效，不污染任何 CLAUDE.md
+    const cavemanPrompt = buildCavemanSystemPrompt(cliS.caveman)
+    if (cavemanPrompt) opts.systemPrompt = {type: 'preset', preset: 'claude_code', append: cavemanPrompt}
     // 有 native binary 路径时才传，否则 SDK 自动走自带的 cli.js
     if (exe) opts.pathToClaudeCodeExecutable = exe
     // 非 bypass 模式才注册 canUseTool（bypass 下 SDK 不触发回调）
@@ -1518,6 +1531,19 @@ const BUILTIN_COMMANDS = [
     {name: 'basilica', description: 'Basilica 模式', argumentHint: ''},
 ]
 
+// IM 自定义命令（微信/飞书/钉钉通用，显示在设置页"命令"Tab 自定义分组）
+const IM_CUSTOM_COMMANDS = [
+    {name: 'p', description: '列出所有已注册项目', argumentHint: '', aliases: ['projects', '项目']},
+    {name: 'ss', description: '列出项目下所有Session', argumentHint: '[项目]', aliases: ['sessions', '会话']},
+    {name: 'sw', description: '切换项目并同步桌面', argumentHint: '<项目> [编号]', aliases: ['switch', '切换']},
+    {name: 'sws', description: '当前项目下切换会话', argumentHint: '<编号>', aliases: ['switch-session', '切换会话']},
+    {name: 'ns', description: '新建会话并同步桌面', argumentHint: '[项目]', aliases: ['新会话']},
+    {name: 'm', description: '开启/关闭平台镜像同步', argumentHint: '<微信/飞书/钉钉> [on/off]', aliases: ['mirror', '镜像']},
+    {name: 'stop', description: '停止当前正在运行的 agent', argumentHint: '', aliases: ['停止']},
+    {name: 'i', description: '当前项目/Session/桌面状态', argumentHint: '', aliases: ['info', '信息']},
+    {name: 'h', description: '列出所有可用命令', argumentHint: '', aliases: ['help', '帮助']},
+]
+
 // SDK 内置 Skills 兜底列表（冷启动无活跃 session 时用）
 const BUILTIN_SKILLS = [
     'avalonia-ui', 'db-sql', 'device-driver', 'embedded-c', 'project-router',
@@ -1852,18 +1878,6 @@ const httpServer = createServer(async (req, res) => {
                 log.warn({err: e, sessionId: sessionId?.slice(0, 8)}, 'load checkpoints 失败')
             }
             focusedSessionId = sessionId
-            // 注入 Caveman 激活词（~5 tokens，仅当全局开关 enabled 且非 resume 时）
-            const cavemanCfg = loadCavemanConfig()
-            if (cavemanCfg.enabled && !body.resume) {
-                pushStream.push({
-                    type: 'user', session_id: sessionId,
-                    message: {
-                        role: 'user',
-                        content: [{type: 'text', text: `caveman ${cavemanCfg.level}`}]
-                    },
-                    parent_tool_use_id: null,
-                })
-            }
             startStreamPump(sessionId)
             // 后台异步构建项目结构缓存（仅首次，后续会话直接复用）
             if (!existsSync(cacheFilePath(workDir))) {
@@ -1957,6 +1971,28 @@ const httpServer = createServer(async (req, res) => {
         res.writeHead(200); res.end(JSON.stringify({ok: true, focused: sid.slice(0, 8)}))
         return
     }
+    // ── POST /api/desktop/nudge —— IM 控制命令中继到桌面端 ──
+    // 功能说明: 微信/飞书/钉钉发送控制命令后，通过此接口将命令广播给所有 desktop WS 客户端
+    //   桌面端收到 nudge 事件后执行对应 UI 操作（切换项目、新建 session、镜像开关、停止 agent）
+    // body: { action: 'switch_project'|'new_session'|'switch_session'|'toggle_mirror'|'stop', args: {...}, source?: string }
+    // 关键数据流: POST → 遍历 sessions → 广播给 source=desktop 的 WS → 200 {ok, delivered, nudgeId}
+    if (req.method === 'POST' && url.pathname === '/api/desktop/nudge') {
+        const body = await readBody(req)
+        const nudge = {type: 'nudge', action: body.action, args: body.args || {}, nudgeId: crypto.randomUUID(), source: body.source || 'hook'}
+        let delivered = false
+        // 先发给控制通道（桌面端无 session 时也能收到）
+        for (const ws of controlClients) {
+            if (ws.readyState === 1) { ws.send(JSON.stringify(nudge)); delivered = true }
+        }
+        // 再发给所有 session 级的 desktop 客户端
+        for (const [, s] of sessions) {
+            for (const ws of s.clients) {
+                if (ws._source === 'desktop' && ws.readyState === 1) { ws.send(JSON.stringify(nudge)); delivered = true }
+            }
+        }
+        res.writeHead(200); res.end(JSON.stringify({ok: true, delivered, nudgeId: nudge.nudgeId}))
+        return
+    }
 
     const delM = url.pathname.match(/^\/api\/sessions\/([^/]+)$/)
     // ── DELETE /api/sessions/:id —— 删除会话 ──
@@ -1981,6 +2017,10 @@ const httpServer = createServer(async (req, res) => {
                 s.pushStream?.close();
                 s.query?.return?.()
             } catch {
+            }
+            // 关闭所有 WS 客户端连接，触发桌面端 onclose 清理 UI 状态
+            for (const ws of [...s.clients]) {
+                try { ws.close(4001, JSON.stringify({error: 'session deleted'})) } catch {}
             }
             ;sessions.delete(id)
         }
@@ -2325,6 +2365,46 @@ const httpServer = createServer(async (req, res) => {
         }
         return
     }
+    // POST /api/mirror —— IM 命令专用：一次调用完成镜像查询/设置/翻转
+    // body: { platform, action?: 'query'|'set'|'toggle', enabled? }
+    if (req.method === 'POST' && url.pathname === '/api/mirror') {
+        const b = await readBody(req)
+        const platform = b.platform
+        // 查询所有镜像状态
+        if (!platform) {
+            if (!focusedSessionId || !sessions.has(focusedSessionId)) {
+                res.writeHead(200); res.end(JSON.stringify({ok: true, mirrors: {wechat: false, feishu: false, dingtalk: false}, hasSession: false})); return
+            }
+            const s = sessions.get(focusedSessionId)
+            res.writeHead(200); res.end(JSON.stringify({ok: true, mirrors: s.mirrors || {wechat: false, feishu: false, dingtalk: false}, hasSession: true})); return
+        }
+        if (!['wechat', 'feishu', 'dingtalk'].includes(platform)) { res.writeHead(400); res.end(JSON.stringify({error: 'bad platform'})); return }
+        if (!focusedSessionId || !sessions.has(focusedSessionId)) {
+            res.writeHead(200); res.end(JSON.stringify({ok: true, error: 'no_session', hasSession: false})); return
+        }
+        const s = sessions.get(focusedSessionId)
+        s.mirrors = s.mirrors || {wechat: false, feishu: false, dingtalk: false}
+        let enabled
+        if (b.action === 'set') {
+            enabled = !!b.enabled
+        } else {
+            // toggle → 翻转
+            enabled = !s.mirrors[platform]
+        }
+        s.mirrors[platform] = enabled
+        // nudge 桌面端同步按钮状态
+        const nudge = {type: 'nudge', action: 'toggle_mirror', args: {platform, enabled}, nudgeId: crypto.randomUUID(), source: 'adapter'}
+        for (const ws of controlClients) {
+            if (ws.readyState === 1) ws.send(JSON.stringify(nudge))
+        }
+        for (const [, ss] of sessions) {
+            for (const ws of ss.clients) {
+                if (ws._source === 'desktop' && ws.readyState === 1) ws.send(JSON.stringify(nudge))
+            }
+        }
+        res.writeHead(200); res.end(JSON.stringify({ok: true, platform, enabled})); return
+    }
+
     // POST /api/sessions/:id/mirror { platform, enabled } —— 切换 IM 平台镜像同步开关
     // GET  /api/sessions/:id/mirror —— 查当前各平台镜像开关状态
     const mirrorM = url.pathname.match(/^\/api\/sessions\/([^/]+)\/mirror$/)
@@ -3535,7 +3615,9 @@ const httpServer = createServer(async (req, res) => {
             }
         }
         ;const commandsList = (dynamicCache.commands?.length ? dynamicCache.commands : null) || BUILTIN_COMMANDS;
-        const tagged = commandsList.map(c => ({...c, source: 'builtin'}));
+        const builtin = commandsList.map(c => ({...c, source: 'builtin'}));
+        const custom = IM_CUSTOM_COMMANDS.map(c => ({...c, source: 'custom'}));
+        const tagged = [...builtin, ...custom];
         res.writeHead(200);
         res.end(JSON.stringify({commands: tagged, live: !!q, cachedAt: dynamicCache.updatedAt}));
         return
@@ -4326,6 +4408,29 @@ const httpServer = createServer(async (req, res) => {
         return
     }
 
+    // ── POST /api/sessions-by-label —— IM 命令专用：按项目名查会话
+    // body: { label: 'claude-desktop-bridge' }
+    // 一次调用完成"查项目→查session"，返回 {ok, label, sessions}
+    if (req.method === 'POST' && url.pathname === '/api/sessions-by-label') {
+        const b = await readBody(req)
+        const label = (b.label || '').toLowerCase()
+        if (!label) { res.writeHead(400); res.end(JSON.stringify({error: 'label required'})); return }
+        const projects = await scanProjects()
+        let match = projects.find(p => {
+            const dn = (p.workDir || '').replace(/\\/g, '/').split('/').filter(Boolean).pop() || ''
+            return dn.toLowerCase() === label
+        })
+        if (!match) {
+            match = projects.find(p => {
+                const dn = (p.workDir || '').replace(/\\/g, '/').split('/').filter(Boolean).pop() || ''
+                return dn.toLowerCase().includes(label) || (p.workDir || '').toLowerCase().includes(label)
+            })
+        }
+        if (!match) { res.writeHead(200); res.end(JSON.stringify({ok: true, label: b.label, sessions: []})); return }
+        const sessions = await listProjectSessions(match.encodedDir)
+        res.writeHead(200); res.end(JSON.stringify({ok: true, label: b.label, sessions: sessions.map(s => ({id: s.id, title: s.title}))})); return
+    }
+
     // ── GET /api/projects —— 扫描所有项目 ──
     // 功能说明: 扫描 ~/.claude/projects/ 目录，返回所有项目的列表（含 session 摘要和最后活跃时间）
     //   去重按 workDir 合并多 session 的同一项目
@@ -4551,6 +4656,9 @@ const httpServer = createServer(async (req, res) => {
 })
 
 // ---- WebSocket ----
+// 控制通道客户端池：独立于 session，用于接收 nudge 等全局事件
+const controlClients = new Set()
+
 const wss = new WebSocketServer({server: httpServer})
 wss.on('connection', (ws, req) => {
     const urlStr = req.url || '';
@@ -4562,6 +4670,14 @@ wss.on('connection', (ws, req) => {
     for (const p of qPart.split('&')) {
         const [k, v] = p.split('=');
         if (k) params[decodeURIComponent(k)] = decodeURIComponent(v || '')
+    }
+    // 控制通道：不绑定 session，桌面端启动即连，用于接收 nudge 事件
+    if (pathPart === '/ws/control' || pathPart === '/ws/control/') {
+        ws._source = 'desktop'
+        controlClients.add(ws)
+        ws.send(JSON.stringify({type: 'control_connected'}))
+        ws.on('close', () => { controlClients.delete(ws) })
+        return
     }
     if (!sessionId || !sessions.has(sessionId)) {
         ws.close(4000, JSON.stringify({error: 'unknown session'}));
@@ -4749,6 +4865,20 @@ httpServer.listen(PORT, '127.0.0.1', () => {
     })
 })
 
+// 只读文件头 N 字节，按行切分，丢弃可能截断的最后一行
+function readFileHeadLines(path, maxBytes = 4096) {
+    const fd = openSync(path, 'r');
+    try {
+        const buf = Buffer.alloc(maxBytes);
+        const n = readSync(fd, buf, 0, maxBytes, 0);
+        const text = buf.toString('utf8', 0, n);
+        const lastNL = text.lastIndexOf('\n');
+        return (lastNL >= 0 ? text.slice(0, lastNL) : text).split('\n');
+    } finally {
+        closeSync(fd);
+    }
+}
+
 // ---- Project scanning (hand-rolled) ----
 async function scanProjects() {
     const base = join(CLAUDE_HOME, 'projects');
@@ -4757,11 +4887,15 @@ async function scanProjects() {
         for (const name of readdirSync(base)) {
             const full = join(base, name);
             if (!statSync(full).isDirectory()) continue
-            const files = readdirSync(full).filter(f => f.endsWith('.jsonl'));
+            const files = readdirSync(full).filter(f => f.endsWith('.jsonl'))
+                .map(f => ({name: f, mtime: statSync(join(full, f)).mtimeMs}))
+                .sort((a, b) => b.mtime - a.mtime)
+                .map(f => f.name);
             if (!files.length) continue
             let wd = null
             try {
-                const c = readFileSync(join(full, files[0]), 'utf8');
+                const head = readFileHeadLines(join(full, files[0]), 4096);
+                const c = head.join('\n');
                 const m = c.match(/"cwd":\s*"([^"]+)"/);
                 if (m) wd = m[1].replace(/\\/g, '/')
             } catch {
@@ -4773,8 +4907,8 @@ async function scanProjects() {
                 const id = f.replace('.jsonl', '');
                 let t = id.slice(0, 8);
                 try {
-                    const l = readFileSync(join(full, f), 'utf8').split('\n');
-                    for (let i = 0; i < Math.min(l.length, 10); i++) {
+                    const l = readFileHeadLines(join(full, f), 4096);
+                    for (let i = 0; i < l.length; i++) {
                         if (!l[i].trim()) continue;
                         const e = JSON.parse(l[i]);
                         let x = e.content || '';
@@ -4822,8 +4956,8 @@ async function listProjectSessions(ed) {
             const st = statSync(join(base, f));
             let t = id.slice(0, 8);
             try {
-                const l = readFileSync(join(base, f), 'utf8').split('\n');
-                for (let i = 0; i < Math.min(l.length, 10); i++) {
+                const l = readFileHeadLines(join(base, f), 4096);
+                for (let i = 0; i < l.length; i++) {
                     if (!l[i].trim()) continue;
                     const e = JSON.parse(l[i]);
                     let x = e.content || '';

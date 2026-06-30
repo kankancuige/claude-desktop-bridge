@@ -32,6 +32,7 @@ import {homedir} from 'node:os'
 import {WSClient, EventDispatcher, Client, LoggerLevel} from '@larksuiteoapi/node-sdk'
 import WebSocket from 'ws'
 import {createLogger} from './logger.mjs'
+import {detectCommand, executeCommand} from './im-commands.mjs'
 
 const log = createLogger('feishu')
 
@@ -154,6 +155,14 @@ export function startFeishuAdapter() {
     //   3. 正常对话→resolve session → injectAndWait
     // 关键数据流: raw msg → 配对检查 → session resolve → injectAndWait → 结果回传飞书
     async function handleMessage(uid, text) {
+        // ── 第0层: IM 自定义命令 ──
+        const cmd = detectCommand(text)
+        if (cmd) {
+            const r = await executeCommand(cmd)
+            if (r?.replyText) await sendMsg(uid, r.replyText)
+            return
+        }
+
         // ── 第1层: 配对鉴权 ──
         if (!pairedUsers.has(uid)) {
             if (text.trim() === pairCode) {
@@ -213,7 +222,7 @@ export function startFeishuAdapter() {
                 log.error({err: e}, 'resolve 异常')
             }
             if (noActive) {
-                log.info({userId: uid?.slice(0, 8)}, '无活跃 session，消息已忽略')
+                await sendMsg(uid, '尚无活跃 Session，请在桌面端打开一个项目后再发送消息。')
                 return
             }
             if (!sid) {
