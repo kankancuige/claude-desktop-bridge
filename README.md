@@ -113,7 +113,9 @@ SDK 触发工具调用 → canUseTool 回调 → 广播确认请求
 |------|------|
 | **多供应商 AI** | DeepSeek / Anthropic / OpenAI / 智谱 / Kimi / Gemini / Codex / Qwen / OpenRouter / Ollama / 火山引擎 + 自定义，支持动态模型列表 |
 | **多平台桌面端** | Windows / macOS / Linux，Electron 原生窗口 + 自定义标题栏 + 系统托盘 |
-| **IM 集成** | 微信 (iLink Bot)、飞书 (企业自建应用)、钉钉 (内部应用 Stream 模式)，支持配对授权 |
+| **IM 集成** | 微信 (iLink Bot)、飞书 (企业自建应用)、钉钉 (内部应用 Stream 模式)，支持配对授权、IM 自定义命令远程控制桌面端 |
+| **IM 命令引擎** | 9 条跨平台命令（/p /ss /sw /sws /ns /m /stop /i /h），支持微信/飞书/钉钉远程切换项目/会话/镜像开关，送达状态实时反馈 |
+| **项目隐藏** | 长期不用的项目可隐藏到折叠区，减少侧栏视觉噪音，持久化到 localStorage |
 | **实时对话** | WebSocket 流式推送，text_delta 逐字渲染，tool_use_start 工具进度实时可见，thinking 折叠展开 |
 | **确认/授权** | 工具调用需要用户确认，支持桌面端弹窗 + IM 回复双通道，5 分钟超时自动拒绝 |
 | **Mirror 同步** | 桌面端 Claude 回复可自动推送到已绑定 IM 用户（开启后 IM 侧无需手动输入） |
@@ -187,6 +189,7 @@ claude-desktop-bridge/
 │   ├── wechat.mjs                  # 微信适配器 (iLink Bot 长轮询)
 │   ├── feishu.mjs                  # 飞书适配器 (WS 长连接)
 │   ├── dingtalk.mjs                # 钉钉适配器 (Stream 模式)
+│   ├── im-commands.mjs             # IM 自定义命令引擎 (9条远程控制命令)
 │   ├── workflow-runner.mjs         # Workflow 多 Agent 编排引擎 (VM 沙箱)
 │   ├── deepseek-proxy.mjs          # DeepSeek 兼容代理 (thinking/reasoning_content)
 │   ├── project-cache.mjs           # 项目结构缓存 (tree-sitter AST + 依赖图)
@@ -474,6 +477,22 @@ Gateway 每次启动时为每个已连接的平台生成一个 6 位**授权码*
 3. Claude 回复 → 桌面端实时显示 + IM 用户收到回复
 4. 权限确认 → 可跨通道（桌面弹窗 or IM 回复）完成
 ```
+
+**IM 自定义命令**（`im-commands.mjs` 引擎，支持微信/飞书/钉钉）：
+
+| 命令 | 别名 | 功能 |
+|------|------|------|
+| `/p` | `/项目` `/projects` | 列出所有已注册项目及会话数 |
+| `/ss <项目>` | `/会话` `/sessions` | 列出指定项目下所有 Session |
+| `/sw <项目>` | `/切换` `/switch` | 切换项目，自动恢复最新会话 |
+| `/sws <编号>` | `/切换会话` | 切换当前项目下指定 Session |
+| `/ns [项目]` | `/新会话` | 在指定/当前项目下新建 Session |
+| `/m [平台] [on/off]` | `/镜像` `/mirror` | 查看/设置 IM 平台镜像同步开关 |
+| `/stop` | `/停止` | 停止当前桌面端 Agent 任务 |
+| `/i` | `/信息` `/info` | 查看当前项目/Session/桌面在线状态 |
+| `/h` | `/帮助` `/help` | 列出所有可用命令 |
+
+命令与桌面端实时联动，送达失败会明确反馈"桌面端离线"提示。
 
 ### Workflow 多 Agent 编排
 
