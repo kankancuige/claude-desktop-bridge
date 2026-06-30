@@ -72,7 +72,7 @@
     },
     "icon": "public/logo.png",
     "win": {
-      "target": ["portable", "zip"],
+      "target": ["nsis", "zip"],
       "icon": "public/logo.png"
     },
     "mac": {

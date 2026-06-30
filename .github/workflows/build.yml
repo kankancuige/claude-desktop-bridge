@@ -19,7 +19,7 @@ jobs:
           - os: windows-latest
             label: Windows
             target: win
-            electronBuilderArgs: --win portable
+            electronBuilderArgs: --win nsis
           - os: macos-latest
             label: macOS
             target: mac
