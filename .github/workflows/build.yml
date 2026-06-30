@@ -81,16 +81,15 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: npx electron-builder ${{ matrix.electronBuilderArgs }} --publish never
 
-      # Windows：手动打 zip 解压包（electron-builder 的 zip target 在 NSIS 下可能不产出）
+      # Windows：手动打 zip 解压包（Windows runner 没有 zip 命令，用 PowerShell）
       - name: 生成 Windows zip
         if: matrix.target == 'win'
-        shell: bash
+        shell: pwsh
         working-directory: desktop-ui
         run: |
-          VERSION=$(node -p "require('./package.json').version")
-          cd dist-electron/win-unpacked
-          zip -r "../Claude Desktop Bridge-${VERSION}-win.zip" .
-          echo "zip 生成完成"
+          $VERSION = node -p "require('./package.json').version"
+          Compress-Archive -Path dist-electron/win-unpacked/* -DestinationPath "dist-electron/Claude Desktop Bridge-${VERSION}-win.zip"
+          Write-Host "zip 生成完成"
 
       # ════════════════════════════════════════════════════════════
       # 上传构建产物
