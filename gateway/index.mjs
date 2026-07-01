@@ -2237,7 +2237,15 @@ const httpServer = createServer(async (req, res) => {
         logHttpRequest(log, req, res.statusCode, httpStart)
         return _end(...args)
     }
-    res.setHeader('Access-Control-Allow-Origin', '*')
+    // 动态白名单 CORS: 仅本机 renderer(file://→null origin / dev localhost)放行
+    // 跨域网页(malicious.com)不返 CORS 头 → 浏览器默认同源策略挡住读响应
+    const origin = req.headers.origin
+    const safeOrigin = (!origin || origin === 'null'
+        || /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin))
+    if (safeOrigin) {
+        res.setHeader('Access-Control-Allow-Origin', origin || 'null')
+        res.setHeader('Vary', 'Origin')
+    }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-bridge-token')
     if (req.method === 'OPTIONS') {
@@ -2245,8 +2253,11 @@ const httpServer = createServer(async (req, res) => {
         res.end();
         return
     }
-    // 本地 API 认证: POST/PUT/DELETE 须携带有效 bridge-token
-    if (req.method === 'POST' || req.method === 'PUT' || req.method === 'DELETE') {
+    // URL 解析需提前到认证之前（认证白名单依赖 pathname）
+    const url = new URL(req.url, `http://127.0.0.1:${PORT}`)
+    // 本地 API 认证: 所有方法都校 token，仅白名单端点豁免
+    // 白名单 /api/bridge-token: dev/浏览器环境首次取 token 用（本机同源，跨域恶意网页被 CORS 挡）
+    if (url.pathname !== '/api/bridge-token') {
         const token = req.headers['x-bridge-token']
         if (token !== BRIDGE_TOKEN) {
             res.writeHead(403)
@@ -2255,7 +2266,6 @@ const httpServer = createServer(async (req, res) => {
         }
     }
     res.setHeader('Content-Type', 'application/json')
-    const url = new URL(req.url, `http://127.0.0.1:${PORT}`)
 
     // GET /api/bridge-token —— 非 Electron 环境(dev/browser)读取本地认证 token
     if (url.pathname === '/api/bridge-token' && req.method === 'GET') {

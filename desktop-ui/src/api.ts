@@ -34,13 +34,15 @@ async function resolveToken(): Promise<string | null> {
   return _tokenPromise
 }
 
-// ── 全局 fetch 拦截器: 对 gateway POST/PUT/DELETE 请求自动注入 token ──
+// ── 全局 fetch 拦截器: 对 gateway 所有请求自动注入 token ──
+// GET 也注入: gateway 已对敏感 GET API 加 token 校验（防跨域恶意网页读本地 API）
+//唯一豁免 /api/bridge-token: 取 token 前还没有 token, 不能注
 const _origFetch = window.fetch.bind(window)
 window.fetch = async function (input: RequestInfo | URL, init?: RequestInit) {
   const url = typeof input === 'string' ? input : (input instanceof Request ? input.url : input.toString())
   const method = (init?.method || (input instanceof Request ? input.method : 'GET') || 'GET').toUpperCase()
 
-  if (url.includes('127.0.0.1:3456') && (method === 'POST' || method === 'PUT' || method === 'DELETE')) {
+  if (url.includes('127.0.0.1:3456') && !url.includes('/api/bridge-token')) {
     const token = await resolveToken()
     if (token) {
       const headers = new Headers(init?.headers)
