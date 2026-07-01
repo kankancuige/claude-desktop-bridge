@@ -2256,8 +2256,10 @@ const httpServer = createServer(async (req, res) => {
     // URL 解析需提前到认证之前（认证白名单依赖 pathname）
     const url = new URL(req.url, `http://127.0.0.1:${PORT}`)
     // 本地 API 认证: 所有方法都校 token，仅白名单端点豁免
-    // 白名单 /api/bridge-token: dev/浏览器环境首次取 token 用（本机同源，跨域恶意网页被 CORS 挡）
-    if (url.pathname !== '/api/bridge-token') {
+    // 白名单 /api/bridge-token 仅 GET: dev/浏览器环境首次取 token 用（本机同源，跨域恶意网页被 CORS 挡）
+    // 限制为 GET 避免其他方法绕过认证白名单（虽然无 POST handler 返 token，但收紧认证面）
+    const isTokenEndpoint = req.method === 'GET' && url.pathname === '/api/bridge-token'
+    if (!isTokenEndpoint) {
         const token = req.headers['x-bridge-token']
         if (token !== BRIDGE_TOKEN) {
             res.writeHead(403)
@@ -5177,9 +5179,10 @@ wss.on('connection', (ws, req) => {
             s.pushStream = null;
             s.pendingTurn = null  // 清理未完成的回合快照，防止内存泄漏 + finalizeCheckpoint 误判
             // 清理并发 rebuild 状态: 防止 rebuild finally 块把刚清掉的 pushStream 重新写入
-            // 注意: 不清 _pendingMessages —— rebuild finally 依赖它取回积压消息，
-            //   若此刻清空会丢失 rebuild 期间排队进入的用户消息（无任何提示）
+            // 注意: 同步清 _pendingMessages——若保留，旧 rebuild 的 finally 会取走积压消息却因 pushStream 已 null 而丢弃但无提示，
+            //   且 stop 后新消息触发的 rebuild 会与旧 rebuild finally 竞态覆盖 _pendingMessages。stop=取消，清队列符合语义。
             s._rebuildPromise = null
+            s._pendingMessages = null
             s.lastSessionId = s.lastSessionId || sessionId
             ws.send(JSON.stringify({type: 'generation_stopped'}))
             return

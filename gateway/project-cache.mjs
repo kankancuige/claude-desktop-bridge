@@ -1092,10 +1092,22 @@ function detectStack(workDir) {
         result.buildTool = 'Go Modules'
     }
 
-    // .NET
-    if (existsSync(join(workDir, 'src', 'UI', '*.csproj'))) {
-        result.language = 'C#';
-        result.runtime = '.NET'
+    // .NET / C# —— existsSync 不支持 glob 通配符，需扫目录找 .csproj
+    // 兼容路径: src/UI/*.csproj(本仓库布局) 或 根目录 *.csproj(常规 .NET 项目)
+    try {
+        const csprojDirs = [join(workDir, 'src', 'UI'), workDir]
+        for (const d of csprojDirs) {
+            if (!existsSync(d)) continue
+            for (const e of readdirSync(d)) {
+                if (e.endsWith('.csproj')) {
+                    result.language = 'C#';
+                    result.runtime = '.NET';
+                    result.buildTool = 'MSBuild';
+                    return result
+                }
+            }
+        }
+    } catch {
     }
 
     return result

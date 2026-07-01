@@ -4,7 +4,7 @@
 // 特性: vm 沙箱 | Journal/Resume | Schema 验证+重试 | Worktree 隔离 | Budget 硬上限 | 节点暂停/恢复 | effort 参数
 import {createContext, runInContext} from 'node:vm'
 import {createHash} from 'node:crypto'
-import {readdirSync, readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, rmSync} from 'node:fs'
+import {readdirSync, readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, rmSync, statSync, mkdtempSync} from 'node:fs'
 import {execSync} from 'node:child_process'
 import {join, extname} from 'node:path'
 import {homedir, cpus, tmpdir} from 'node:os'
@@ -1178,6 +1178,8 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
         }
         _broadcast({type: 'workflow_phase', workflowId: wfId, phase: title, phases: [...phases]})
         logFn('[Phase] ' + title, title)
+        // 同步刷新 runState.phases，确保前端 getRunState 轮询也能拿到最新阶段（不只依赖 broadcast 事件）
+        syncRunState?.()
         // 每个 phase 切换时持久化 journal
         saveJournal(wfId, {
             name,
