@@ -915,7 +915,7 @@ function extractJSON(text) {
 }
 
 // ── 单个 agent() 执行（核心） ──
-async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCache, wfId, budgetRef) {
+async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCache, wfId, budgetRef, abortedRef) {
     const {
         label, schema, model, phase: agentPhase, isolation,
         agentType: rawAgentType, maxTurns, permissionMode, effort,
@@ -990,6 +990,11 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
         try {
             for await (const sdkMsg of q) {
                 if (resolved) break
+                // 暂停信号: 立即中断迭代并 q.return() 让 SDK 关闭底层 query，终止 agent 后台运行避免继续耗 token
+                if (abortedRef?.()) {
+                    try { await q.return?.() } catch {}
+                    break
+                }
                 if (sdkMsg.type === 'assistant') {
                     for (const block of (sdkMsg.message?.content || [])) {
                         if (block.type === 'text' && block.text) output += block.text
@@ -1017,6 +1022,9 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
         logFn('[Agent:' + agLabel + '] ' + e.message, agentPhase)
     } finally {
         resolved = true
+        // 无论正常结束/超时/暂停，都显式调 q.return() 关闭底层 SDK query，
+        //   防止 agent 在超时/暂停后仍后台运行继续消耗 API token
+        try { await q.return?.() } catch {}
     }
 
     // ── 清理 worktree ──
@@ -1054,7 +1062,7 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
             const retryResult = await executeAgent(retryPrompt, {
                 label: agLabel + '-retry' + (retries + 1), agentType, model,
                 maxTurns: Math.max(3, (maxTurns || DEFAULT_MAX_TURNS) - 5),
-            }, workDir, broadcast, logFn, journalCache, wfId, budgetRef)
+            }, workDir, broadcast, logFn, journalCache, wfId, budgetRef, abortedRef)
             parsed = extractJSON(typeof retryResult === 'string' ? retryResult : JSON.stringify(retryResult))
             retries++
         }
@@ -1205,7 +1213,7 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
         const {phase: agentPhase} = opts
         if (agentPhase && agentPhase !== currentPhase) phase(agentPhase)
 
-        const result = await executeAgent(prompt, opts, workDir, _broadcast, logFn, journalCache, wfId, budgetRef)
+        const result = await executeAgent(prompt, opts, workDir, _broadcast, logFn, journalCache, wfId, budgetRef, () => aborted)
 
         // 更新 token 统计
         const h = hashContent(prompt, {

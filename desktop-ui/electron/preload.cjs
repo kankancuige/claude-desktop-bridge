@@ -59,7 +59,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // ── 主进程通知发送 IPC ──
   onTrayNotification: (callback) => {
-    ipcRenderer.on('tray:notification', (_e, data) => callback(data))
+    const handler = (_e, data) => callback(data)
+    ipcRenderer.on('tray:notification', handler)
+    // 返回 cleanup 函数，与 onUpdate* 系列一致，防止组件重复挂载累积 listener
+    return () => ipcRenderer.removeListener('tray:notification', handler)
   },
 
   // ── 检查当前是否最大化 ──

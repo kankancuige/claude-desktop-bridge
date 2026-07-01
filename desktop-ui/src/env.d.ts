@@ -15,7 +15,7 @@ declare global {
     openExternal: (url: string) => Promise<boolean>
     showWindow: () => void
     quitApp: () => void
-    onTrayNotification: (callback: (data: any) => void) => void
+    onTrayNotification: (callback: (data: any) => void) => (() => void)
     isMaximized: () => Promise<boolean>
     getAppVersion: () => Promise<string>
     getBridgeToken: () => Promise<string | null>

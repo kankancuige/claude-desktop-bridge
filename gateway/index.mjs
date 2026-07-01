@@ -5179,9 +5179,10 @@ wss.on('connection', (ws, req) => {
             s.pushStream = null;
             s.pendingTurn = null  // 清理未完成的回合快照，防止内存泄漏 + finalizeCheckpoint 误判
             // 清理并发 rebuild 状态: 防止 rebuild finally 块把刚清掉的 pushStream 重新写入
-            // 注意: 同步清 _pendingMessages——若保留，旧 rebuild 的 finally 会取走积压消息却因 pushStream 已 null 而丢弃但无提示，
-            //   且 stop 后新消息触发的 rebuild 会与旧 rebuild finally 竞态覆盖 _pendingMessages。stop=取消，清队列符合语义。
+            // 注: 清 _pendingMessages 符合 stop=取消 语义；同时失效 _rebuildId 让在途旧 rebuild
+            //   finally 看到代际不匹配，不再触碰 pending（防旧 rebuild 覆盖此后新 rebuild 的状态）
             s._rebuildPromise = null
+            s._rebuildId = null
             s._pendingMessages = null
             s.lastSessionId = s.lastSessionId || sessionId
             ws.send(JSON.stringify({type: 'generation_stopped'}))
@@ -5263,6 +5264,10 @@ wss.on('connection', (ws, req) => {
                     return
                 }
                 s._pendingMessages = [msg.content]
+                // rebuild 代际 ID: stop_generation 或新 rebuild 启动时旧 rebuild 的 finally
+                //   见此 ID 不匹配 → 不消费 pending（防止旧 rebuild 覆盖新 rebuild 的积压）
+                const myRebuildId = Symbol('rebuild')
+                s._rebuildId = myRebuildId
                 s._rebuildPromise = (async () => {
                     try {
                         const cliS = loadCliSettings()
@@ -5277,9 +5282,16 @@ wss.on('connection', (ws, req) => {
                         s.runtimeEnv = opts.runtimeEnv  // 模型变更重建后刷新 runtimeEnv
                         startStreamPump(sessionId)
                     } finally {
-                        const pending = s._pendingMessages || []
-                        s._pendingMessages = null
-                        s._rebuildPromise = null
+                        // CAS 守护: 仅当本 rebuild 仍是当前代际时才消费/清理 pending
+                        // 若 stop 或新 rebuild 已把 _rebuildId 换掉，说明本 rebuild 已作废，
+                        //   pending 属于新代际，本旧 rebuild 不应触碰
+                        const isCurrent = s._rebuildId === myRebuildId
+                        const pending = isCurrent ? (s._pendingMessages || []) : []
+                        if (isCurrent) {
+                            s._pendingMessages = null
+                            s._rebuildPromise = null
+                            s._rebuildId = null
+                        }
                         // 重建完成后处理积压消息：先置 null 再消费，避免新消息写入旧数组
                         // 守护 pushStream: stop_generation 可能并发清空了 s.pushStream
                         if (s.query && s.pushStream && pending.length) {

@@ -222,10 +222,23 @@ function onDrop(e: DragEvent) {
 // Auto Layout
 function autoLayout() {
   if (nodes.value.length === 0) return
+  // 拓扑层级计算: 递归求深度，单遍 + 缓存，避免依赖节点未遍历时层级偏低
+  // 用 DFS + memo，环引用兜底(depth 上限)防止死循环
+  const nodeMap = new Map(nodes.value.map(n => [n.id, n]))
   const lv = new Map<string, number>()
-  for (const n of nodes.value) {
-    lv.set(n.id, n.dependsOn.length === 0 ? 0 : Math.max(...n.dependsOn.map(d => lv.get(d) ?? 0)) + 1)
+  const computing = new Set<string>()  // 检测环
+  const depthOf = (id: string): number => {
+    if (lv.has(id)) return lv.get(id)!
+    const n = nodeMap.get(id)
+    if (!n || n.dependsOn.length === 0) { lv.set(id, 0); return 0 }
+    if (computing.has(id)) { lv.set(id, 0); return 0 }  // 环引用兜底
+    computing.add(id)
+    const d = Math.max(...n.dependsOn.map(d => depthOf(d))) + 1
+    computing.delete(id)
+    lv.set(id, d)
+    return d
   }
+  for (const n of nodes.value) depthOf(n.id)
   const maxLv = Math.max(...lv.values(), 0)
   const lay: typeof nodes.value[] = Array.from({length: maxLv + 1}, () => [])
   for (const n of nodes.value) lay[lv.get(n.id) ?? 0].push(n)
