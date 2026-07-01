@@ -44,7 +44,7 @@ const CLAUDE_HOME = join(homedir(), '.claude')   // Claude 配置根目录
 // 实现方式: 使用闭包保存内部状态，返回镜像钩子供 Gateway 调用。
 //          返回 null 表示凭据加载失败，适配器无法启动。
 // 关键数据流: adapters.json 加载凭据 → 创建 Client + WSClient → 注册事件处理器 → 启动 WS → 返回钩子对象
-export function startFeishuAdapter() {
+export function startFeishuAdapter(token) {
     let appId, appSecret
 
     // ── reloadCreds ──
@@ -285,7 +285,7 @@ export function startFeishuAdapter() {
         return new Promise(async (resolve) => {
             let ws2
             try {
-                ws2 = new WebSocket(`ws://127.0.0.1:3456/ws/${sessionId}?source=feishu`)
+                ws2 = new WebSocket(`ws://127.0.0.1:3456/ws/${sessionId}?source=feishu&token=${encodeURIComponent(token)}`)
             } catch (e) {
                 resolve()
                 return
@@ -322,6 +322,9 @@ export function startFeishuAdapter() {
                 await sendMsg(userId, replyText.trim())
                 resolve()
             }
+
+            // mirrorOn 须在事件处理器注册前获取，防止 mirror 开启时事件回调内 mirrorOn 仍为 false
+            mirrorOn = await shouldSkipReply(sessionId)
 
             // ── WS 事件处理（必须在任何 await 之前注册，防止事件竞态丢失）──
             ws2.onerror = () => finish('ws_error')
@@ -375,8 +378,6 @@ export function startFeishuAdapter() {
                 }
             }
 
-            // 事件处理器全部就位后才做 async 操作
-            mirrorOn = await shouldSkipReply(sessionId)
         })
     }
 

@@ -47,7 +47,7 @@ const CLAUDE_HOME = join(homedir(), '.claude')   // Claude 配置根目录
 //          返回 null 表示凭据加载失败，适配器无法启动。
 // 关键数据流: adapters.json 加载凭据 → 获取 access_token → 创建 DWClient → 注册回调
 //          → connect() → 返回钩子对象
-export function startDingTalkAdapter() {
+export function startDingTalkAdapter(token) {
     let appKey, appSecret
 
     // ── reloadCreds ──
@@ -305,7 +305,7 @@ export function startDingTalkAdapter() {
         return new Promise(async (resolve) => {
             let ws2
             try {
-                ws2 = new WebSocket(`ws://127.0.0.1:3456/ws/${sessionId}?source=dingtalk`)
+                ws2 = new WebSocket(`ws://127.0.0.1:3456/ws/${sessionId}?source=dingtalk&token=${encodeURIComponent(token)}`)
             } catch (e) {
                 resolve()  // WebSocket 构造失败直接结束
                 return
@@ -340,6 +340,9 @@ export function startDingTalkAdapter() {
                 await sendMsg(userId, replyText.trim())
                 resolve()
             }
+
+            // mirrorOn 须在事件处理器注册前获取，防止 mirror 开启时事件回调内 mirrorOn 仍为 false
+            mirrorOn = await shouldSkipReply(sessionId)
 
             // ── WS 事件处理（必须在任何 await 之前注册，防止事件竞态丢失）──
             ws2.onerror = () => finish('ws_error')
@@ -393,8 +396,6 @@ export function startDingTalkAdapter() {
                 }
             }
 
-            // 事件处理器全部就位后才做 async 操作
-            mirrorOn = await shouldSkipReply(sessionId)
         })
     }
 

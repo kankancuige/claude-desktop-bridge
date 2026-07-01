@@ -107,6 +107,7 @@ function startGateway() {
   gatewayProcess.on('exit', (code) => {
     logToFile(`[EXIT] code=${code}`)
     gatewayProcess = null
+    if (_isQuitting) return  // 退出中，不重启
     if (code !== 0 && gatewayRestarts < MAX_RESTARTS) {
       gatewayRestarts++
       logToFile(`[RESTART] ${gatewayRestarts}/${MAX_RESTARTS}`)
@@ -395,7 +396,9 @@ app.on('window-all-closed', () => {
  * 功能说明: 应用即将退出前做清理
  * 实现方式: 确保 gateway 子进程被终止，防止孤儿进程；清理托盘图标
  */
+let _isQuitting = false
 app.on('before-quit', () => {
+  _isQuitting = true
   stopGateway()
   if (tray) {
     tray.destroy()

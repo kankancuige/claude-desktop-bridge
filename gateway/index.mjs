@@ -5,7 +5,7 @@
  */
 
 import {createServer} from 'node:http'
-import {readdirSync, statSync, readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, rmdirSync, renameSync, openSync, readSync, closeSync} from 'node:fs'
+import {readdirSync, statSync, readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, rmdirSync, renameSync, openSync, readSync, closeSync, realpathSync} from 'node:fs'
 import {execSync, spawn, spawnSync} from 'node:child_process'
 import crypto from 'node:crypto'
 import {homedir} from 'node:os'
@@ -41,7 +41,9 @@ import {
     cacheFilePath
 } from './project-cache.mjs'
 import {startDeepSeekProxy, getProxyUrl, stopDeepSeekProxy, isProxyRunning} from './deepseek-proxy.mjs'
+import {startOpenCodeProxy, getOpenCodeProxyUrl, stopOpenCodeProxy, isOpenCodeProxyRunning} from './opencode-proxy.mjs'
 let _proxyStarting = null
+let _ocProxyStarting = null
 import cron from 'node-cron'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -69,7 +71,11 @@ function resolveFromPkgDir(pkgDir) {
 let _exe = null
 
 function getClaudeExe() {
-    if (_exe) return _exe
+    // 缓存失效：文件不存在时重置 _exe 强制重新扫描（防止卸载后残留路径）
+    if (_exe) {
+        if (existsSync(_exe)) return _exe
+        _exe = null
+    }
 
     // ── 1. 显式指定 ──
     if (process.env.CLAUDE_EXE) return (_exe = process.env.CLAUDE_EXE)
@@ -244,7 +250,9 @@ function getLiveQuery() {
 // 实现方式: Promise.race(原始, setTimeout(reject)) → 超时 ms 后 reject 或原始完成则正常 resolve
 // 关键数据流: promise + timeout → race → resolve 或 reject('timeout')
 function withTimeout(promise, ms) {
-    return Promise.race([promise, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))])
+    let timer
+    const timeout = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('timeout')), ms) })
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
 }
 
 // ---- 文件快照 Diff：常量 ----
@@ -311,6 +319,13 @@ class PushStream {
 const sessions = new Map()
 let focusedSessionId = null
 const pendingQRCodes = new Map()
+// 每 60s 清理过期二维码（5 分钟有效期，保守清理）
+setInterval(() => {
+    const now = Date.now()
+    for (const [pid, entry] of pendingQRCodes) {
+        if (now > entry.expires) pendingQRCodes.delete(pid)
+    }
+}, 60_000).unref()
 
 // ---- 确认请求注册表（权限/方案选择双通道）----
 let reqCounter = 0
@@ -324,13 +339,18 @@ const confirmHooks = []   // [{platform, onConfirmRequest, onConfirmResolved, fi
 // 关键数据流: msg 对象 → JSON.stringify → forEach ws.send(raw) → 桌面端 WebSocket onmessage
 function broadcast(sid, msg) {
     const s = sessions.get(sid);
-    if (s) {
-        const raw = JSON.stringify(msg);
-        // 防御性拷贝: onclose 回调可能删除 s.clients 成员，遍历 Set 时并发修改会漏发
-        for (const w of [...s.clients]) {
-            if (w.readyState === 1) {
-                try { w.send(raw) } catch {}
-            }
+    if (!s) return
+    let raw
+    try {
+        raw = JSON.stringify(msg)
+    } catch {
+        // 循环引用或 BigInt 等不可序列化值 → 静默丢弃，避免中断整个 broadcast pipeline
+        return
+    }
+    // 防御性拷贝: onclose 回调可能删除 s.clients 成员，遍历 Set 时并发修改会漏发
+    for (const w of [...s.clients]) {
+        if (w.readyState === 1) {
+            try { w.send(raw) } catch {}
         }
     }
 }
@@ -434,11 +454,13 @@ function makeCanUseTool(sessionId) {
         entry.timeout = setTimeout(() => {
             settlePending(sessionId, requestId, {behavior: 'deny', message: '确认超时', interrupt: true}, 'timeout')
         }, 5 * 60 * 1000)
+        // entry 须在 addEventListener 之前写入 pending，防止 signal 已处于 aborted 状态时
+        // 回调同步执行却找不到 entry 导致只能等 5 分钟 timeout 清理
+        s.pending.set(requestId, entry)
         // query 被中止（stop_generation / abort）→ 拒绝并中断
         if (signal) signal.addEventListener('abort', () => {
             settlePending(sessionId, requestId, {behavior: 'deny', message: '已取消', interrupt: true}, 'abort')
         }, {once: true})
-        s.pending.set(requestId, entry)
         log.info({sessionId: sessionId?.slice(0, 8), requestId, type: entry.type, toolName}, '确认请求')
         // 推 desktop
         broadcast(sessionId, isChoice
@@ -532,6 +554,61 @@ function backupFile(p) {
 // 关键数据流: ~/.claude/settings.json → readFileSync → JSON.parse → 配置对象 或 {}
 function loadCliSettings() {
     return readJSON(join(CLAUDE_HOME, 'settings.json')) || {}
+}
+
+// ── Hook 脚本存在性校验 ──
+// 启动时扫描 settings.json hooks，剔除脚本文件不存在的条目，防止 CLI 进程崩溃 (ZodError)
+// SIDE_EFFECT: 修改 ~/.claude/settings.json
+function validateHooks() {
+    const sp = join(CLAUDE_HOME, 'settings.json')
+    const s = readJSON(sp)
+    if (!s || !s.hooks || typeof s.hooks !== 'object') return
+
+    let changed = false
+    const hooksDir = join(CLAUDE_HOME, 'hooks')
+
+    for (const [eventType, entries] of Object.entries(s.hooks)) {
+        if (!Array.isArray(entries)) continue
+        const kept = []
+        for (const entry of entries) {
+            const validHooks = (entry.hooks || []).filter(h => {
+                if (h.type !== 'command') return true  // 非 command 类型不做文件校验
+                const cmd = h.command || ''
+                // 提取脚本路径: bash $HOME/.claude/hooks/foo.sh → foo.sh
+                const scriptFile = cmd.split(/\s+/).pop() || ''
+                if (!scriptFile) return true  // 无法提取文件名，保留
+                const scriptPath = join(hooksDir, scriptFile)
+                if (existsSync(scriptPath)) return true
+                log.warn({eventType, script: scriptFile}, 'Hook 脚本缺失，已自动剔除')
+                return false
+            })
+            // 必须在赋值前比较长度，赋值后原长度已丢；长度变化才标 dirty 避免无变更也触发 disk write
+            if (validHooks.length !== (entry.hooks || []).length) changed = true
+            if (validHooks.length > 0) {
+                entry.hooks = validHooks
+                kept.push(entry)
+            } else {
+                changed = true
+            }
+        }
+        if (kept.length > 0) {
+            if (kept.length !== entries.length) changed = true
+            s.hooks[eventType] = kept
+        } else {
+            delete s.hooks[eventType]
+            changed = true
+        }
+    }
+
+    if (Object.keys(s.hooks).length === 0) {
+        delete s.hooks
+        changed = true
+    }
+
+    if (changed) {
+        writeJSON(sp, s)
+        log.info('已清理无效 hooks 配置')
+    }
 }
 
 // workflow 全局开关
@@ -835,11 +912,11 @@ async function downloadAndReplaceRtk(targetVersion) {
 }
 
 // ── RTK PostToolUse hook 处理器 ──
-// 功能说明: 拦截 Bash 工具的结果，将 stdout 通过 rtk 管道压缩后替换 tool_response
+// 功能说明: 拦截 Bash 工具的结果，将 stdout 通过 rtk pipe 管道压缩后替换 tool_response
 //   含两道安全检查：压缩比异常 → 驳回；致命关键词漏网 → 驳回
 //   失败/超时/不可用 → 静默降级，原样返回
-// 实现方式: spawn rtk <command> → stdin 写入 stdout 原文 → 收集输出 → 检查 → updatedMCPToolOutput
-// 关键数据流: tool_response → spawn rtk → 压缩结果 → 安全检查 → {continue: true, hookSpecificOutput}
+// 实现方式: spawn rtk pipe → stdin 写入 stdout 原文 → 收集输出 → 检查 → updatedMCPToolOutput
+// 关键数据流: tool_response → spawn rtk pipe → 压缩结果 → 安全检查 → {continue: true, hookSpecificOutput}
 //   或 驳回/降级 → {continue: true}（不修改 tool_response）
 async function rtkPostToolUseHandler(input, _toolUseID, _options) {
     const rtkPath = locateRtk()
@@ -861,6 +938,9 @@ async function rtkPostToolUseHandler(input, _toolUseID, _options) {
     const cmd = (input.tool_input && typeof input.tool_input === 'object' && input.tool_input.command)
         ? String(input.tool_input.command)
         : ''
+
+    // RTK 会重新执行命令来获取压缩输出，仅对只读命令安全
+    if (!isReadOnlyCommand(cmd)) return {continue: true}
 
     // 调用 rtk 压缩
     let compressed = null
@@ -904,18 +984,72 @@ async function rtkPostToolUseHandler(input, _toolUseID, _options) {
 // 功能说明: spawn rtk，stdin 传入要压缩的文本，收集 stdout 返回压缩结果
 // 实现方式: child_process.spawn → stdin.write + stdin.end → 拼接 stdout chunks
 //   5 秒超时，任何异常（崩溃/超时/spawn 失败）抛给调用方
+// ── parseShellArgs — 将 shell 命令字符串拆分为 argv 数组 ──
+// 处理引号、转义；忽略管道和重定向之后的部分
+function parseShellArgs(cmd) {
+    const args = []
+    let cur = ''
+    let quote = ''
+    for (let i = 0; i < cmd.length; i++) {
+        const ch = cmd[i]
+        if (quote) {
+            if (ch === '\\' && quote === '"' && i + 1 < cmd.length) {
+                cur += cmd[++i]
+            } else if (ch === quote) {
+                quote = ''
+            } else {
+                cur += ch
+            }
+        } else if (ch === '"' || ch === "'") {
+            quote = ch
+        } else if (ch === ' ' || ch === '\t') {
+            if (cur) { args.push(cur); cur = '' }
+        } else if (ch === '|' || ch === '>' || ch === '&') {
+            // 管道/重定向/后台: 截断后续
+            if (cur) args.push(cur)
+            return args
+        } else {
+            cur += ch
+        }
+    }
+    if (cur) args.push(cur)
+    return args
+}
+
+// ── RTK 安全: 只读命令白名单，防止重执行时产生副作用 ──
+const RTK_READONLY_PREFIXES = [
+    'wc', 'grep', 'rg', 'ls', 'dir', 'find', 'cat', 'head', 'tail', 'sort',
+    'uniq', 'cut', 'tr', 'awk', 'sed', 'echo', 'printf', 'date', 'env',
+    'printenv', 'pwd', 'whoami', 'uname', 'hostname', 'which', 'type',
+    'git log', 'git diff', 'git show', 'git status', 'git branch', 'git tag',
+    'git stash list', 'git remote', 'git config', 'file', 'stat', 'du', 'df',
+    'tree', 'read', 'node -e', 'node -p', 'python -c',
+    'npm view', 'npm list', 'npm ls', 'npm outdated',
+    'dotnet --list', 'dotnet --info', 'cargo search', 'cargo tree',
+    'npx --help', 'npx -v',
+]
+function isReadOnlyCommand(cmd) {
+    if (!cmd || typeof cmd !== 'string') return false
+    const lower = cmd.trim().toLowerCase()
+    for (const prefix of RTK_READONLY_PREFIXES) {
+        if (lower.startsWith(prefix)) return true
+    }
+    return false
+}
+
 // ── spawnRtk — 启动 RTK 子进程处理文本压缩 ──
-// 功能说明: 将文本通过 stdin 传入 RTK 二进制，通过 stdout 收集压缩/解压结果
+// 功能说明: 拆分 shell 命令为 argv 传参 RTK，由 RTK 执行原生命令并压缩输出
 //   用于 Bash 命令输出压缩（减少 token 消耗）和解压（还原原始输出）
-// 实现方式: child_process.spawn(rtkPath, [cmd]) → stdin.write(text) → 监听 stdout/stderr/close
+// 实现方式: parseShellArgs(cmd) → child_process.spawn(rtkPath, argv) → 监听 stdout/stderr/close
 //   exit code 非 0 时 reject 并携带 stderr 前 200 字符用于诊断
 // @param {string} rtkPath - RTK 可执行文件绝对路径
-// @param {string} cmd - RTK 命令（c=compress, d=decompress, v=version）
-// @param {string} text - 待处理文本（通过 stdin 输入）
+// @param {string} cmd - 原始 shell 命令（拆分为 argv 传入 RTK）
+// @param {string} _text - 已废弃（RTK 子命令自行执行，不从 stdin 读取）
 // @returns {Promise<string>} stdout 输出
-function spawnRtk(rtkPath, cmd, text) {
+function spawnRtk(rtkPath, cmd, _text) {
     return new Promise((resolve, reject) => {
-        const args = cmd ? [cmd] : []
+        const args = cmd ? parseShellArgs(cmd) : []
+        if (args.length === 0) { resolve(''); return }
         const child = spawn(rtkPath, args, {
             stdio: ['pipe', 'pipe', 'pipe'],
             timeout: RTK_TIMEOUT,
@@ -923,17 +1057,28 @@ function spawnRtk(rtkPath, cmd, text) {
         })
         let stdout = ''
         let stderr = ''
+        let settled = false
+        const finish = (err, result) => {
+            if (settled) return
+            settled = true
+            // 清理 listener，防止 MaxListeners 累积
+            child.stdout.removeAllListeners('data')
+            child.stderr.removeAllListeners('data')
+            child.removeAllListeners('close')
+            child.removeAllListeners('error')
+            if (err) reject(err); else resolve(result)
+        }
         child.stdout.on('data', (d) => { stdout += d.toString() })
         child.stderr.on('data', (d) => { stderr += d.toString() })
-        child.on('close', (code) => {
+        child.once('close', (code) => {
             if (code !== 0 && code !== null) {
-                reject(new Error(`rtk exit ${code}: ${stderr.slice(0, 200)}`))
+                finish(new Error(`rtk exit ${code}: ${stderr.slice(0, 200)}`))
                 return
             }
-            resolve(stdout)
+            finish(null, stdout)
         })
-        child.on('error', reject)
-        child.stdin.write(text, 'utf8')
+        child.once('error', (e) => finish(e))
+        // RTK 子命令自己执行原生命令，不需要 stdin 输入
         child.stdin.end()
     })
 }
@@ -991,20 +1136,29 @@ function encodeProjectName(wd) {
 function readBody(req) {
     return new Promise(r => {
         let d = '';
+        const cleanup = () => {
+            if (!settled) { settled = true; r({_bodyError: true}) }
+        }
+        let settled = false
         req.on('data', c => {
             d += c
             if (d.length > 10_000_000) {  // 10MB 上限，防止 OOM
+                settled = true
                 req.destroy()
                 r({_bodyTooLarge: true})
             }
         });
         req.on('end', () => {
+            if (settled) return
+            settled = true
             try {
                 r(JSON.parse(d || '{}'))
             } catch {
                 r({_parseError: true})
             }
         })
+        req.on('error', cleanup)
+        req.on('aborted', cleanup)
     })
 }
 
@@ -1014,8 +1168,24 @@ function readBody(req) {
 function parseMultipart(req) {
     return new Promise((resolve, reject) => {
         const chunks = []
-        req.on('data', c => chunks.push(c))
+        const MAX_MULTIPART = 10_000_000  // 10MB 上限，与 readBody 一致
+        let totalLen = 0
+        let settled = false
+        const onData = (c) => {
+            totalLen += c.length
+            if (totalLen > MAX_MULTIPART) {
+                settled = true
+                req.destroy()
+                req.removeListener('data', onData)
+                reject(new Error('upload too large'))
+                return
+            }
+            chunks.push(c)
+        }
+        req.on('data', onData)
         req.on('end', () => {
+            if (settled) return
+            settled = true
             try {
                 const buf = Buffer.concat(chunks)
                 const ct = req.headers['content-type'] || ''
@@ -1190,18 +1360,21 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
 
     // DeepSeek 兼容代理: 自动路由请求通过本地代理修复参数冲突
     if (baseUrl && baseUrl.includes('deepseek') && !isProxyRunning()) {
-        // 防并发启动：同一时刻多个 session 创建只触发一次启动
         if (!_proxyStarting) {
             _proxyStarting = startDeepSeekProxy(baseUrl).finally(() => { _proxyStarting = null })
         }
-        try {
-            await _proxyStarting
-        } catch (e) {
-            log.error({err: e}, 'DeepSeek proxy 启动失败')
-        }
+        try { await _proxyStarting } catch (e) { log.error({err: e}, 'DeepSeek proxy 启动失败') }
     }
-    const effectiveBaseUrl = (baseUrl && baseUrl.includes('deepseek') && isProxyRunning())
-        ? getProxyUrl()
+    // OpenCode 协议翻译代理: Anthropic Messages → OpenAI Chat Completions
+    // Zen /v1/messages 仅 Claude/Qwen，其他模型须走 /chat/completions
+    if (baseUrl && baseUrl.includes('opencode') && !isOpenCodeProxyRunning()) {
+        if (!_ocProxyStarting) {
+            _ocProxyStarting = startOpenCodeProxy().finally(() => { _ocProxyStarting = null })
+        }
+        try { await _ocProxyStarting } catch (e) { log.error({err: e}, 'OpenCode proxy 启动失败') }
+    }
+    const effectiveBaseUrl = (baseUrl && baseUrl.includes('deepseek') && isProxyRunning()) ? getProxyUrl()
+        : (baseUrl && baseUrl.includes('opencode') && isOpenCodeProxyRunning()) ? getOpenCodeProxyUrl()
         : baseUrl
 
     const opts = {
@@ -1220,6 +1393,7 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
                 ...process.env,
                 CLAUDE_CODE_ENTRYPOINT: 'claude',
                 ANTHROPIC_API_KEY: apiKey,
+                ANTHROPIC_AUTH_TOKEN: apiKey,
                 ANTHROPIC_BASE_URL: effectiveBaseUrl,
                 ANTHROPIC_MODEL: mapModel(body.model) || cliS.model || MODEL, ...extraEnv
             };
@@ -1294,7 +1468,7 @@ async function startStreamPump(sessionId) {
     try {
         for await (const sdkMsg of myQuery) {
             if (sdkMsg.type === 'system' && sdkMsg.subtype === 'init') {
-                if (sdkMsg.session_id) s.lastSessionId = sdkMsg.session_id
+                if (sdkMsg.session_id) { s.lastSessionId = sdkMsg.session_id; s._hasConversation = true }
                 // 顺手把 init 暴露的命令/agent 名单缓存下来，供设置页冷启动读取
                 if (Array.isArray(sdkMsg.slash_commands)) {
                     dynamicCache.commands = sdkMsg.slash_commands.map(n => ({
@@ -1510,6 +1684,8 @@ function maybeMirrorProgress(sid, toolName) {
 // 实现方式: isExplorationAttempt 判定 → loadProjectCache 读缓存 → pushStream.push 注入
 function maybeInjectProjectCache(sessionId, s, wsMsg) {
     if (s._cacheInjected) return
+    // stop_generation 后 pushStream 被置 null，此时注入会抛 NPE
+    if (!s.pushStream) return
     const toolName = wsMsg.tool_name
     const input = wsMsg.input
     if (!isExplorationAttempt(toolName, input)) return
@@ -1656,6 +1832,14 @@ async function executeScheduledTask(id) {
     const opts = await makeQueryOptions(body, task.workDir, cliS, {}, sessionId)
     if (task.sessionId) opts.resume = task.sessionId
     const q = query({prompt: pushStream, options: opts})
+    // 若 sessionId 已存在，先清理旧资源再覆盖，防止 WS 监听器/query 泄漏
+    const old = sessions.get(sessionId)
+    if (old) {
+        try { old.pushStream?.close() } catch {}
+        try { old.query?.return?.() } catch {}
+        old.query = null
+        old.pushStream = null
+    }
     sessions.set(sessionId, {
         query: q, workDir: task.workDir,
         pushStream, clients: new Set(),
@@ -1863,6 +2047,29 @@ const PROVIDERS = [
             {id: 'kimi-k2.7-code', name: 'Kimi K2.7 Code', contextWindow: '256K'},
         ],
         pricing: {input: '0.95 USD/1M tokens', output: '4 USD/1M tokens'},
+    },
+    {
+        id: 'opencode', name: 'OpenCode', icon: 'OC',
+        baseUrl: 'https://opencode.ai/zen/v1',
+        officialUrl: 'https://opencode.ai',
+        docsUrl: 'https://opencode.ai/docs',
+        models: [
+            {id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', contextWindow: '1M'},
+            {id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', contextWindow: '256K'},
+            {id: 'glm-5.2', name: 'GLM-5.2', contextWindow: '128K'},
+            {id: 'glm-5.1', name: 'GLM-5.1', contextWindow: '128K'},
+            {id: 'kimi-k2.7-code', name: 'Kimi K2.7 Code', contextWindow: '256K'},
+            {id: 'kimi-k2.6', name: 'Kimi K2.6', contextWindow: '256K'},
+            {id: 'kimi-k2.5', name: 'Kimi K2.5', contextWindow: '256K'},
+            {id: 'minimax-m2.7', name: 'MiniMax M2.7', contextWindow: '256K'},
+            {id: 'minimax-m2.5', name: 'MiniMax M2.5', contextWindow: '256K'},
+            {id: 'mimo-v2.5-pro', name: 'MiMo V2.5 Pro', contextWindow: '128K'},
+            {id: 'mimo-v2.5', name: 'MiMo V2.5', contextWindow: '128K'},
+            {id: 'qwen3.7-max', name: 'Qwen3.7 Max', contextWindow: '128K'},
+            {id: 'qwen3.6-plus', name: 'Qwen3.6 Plus', contextWindow: '128K'},
+            {id: 'qwen3.5-plus', name: 'Qwen3.5 Plus', contextWindow: '128K'},
+        ],
+        pricing: {input: '$10/月(Go)', output: 'Zen 按量'},
     },
     {
         id: 'anthropic', name: 'Anthropic', icon: 'A',
@@ -2082,6 +2289,14 @@ const httpServer = createServer(async (req, res) => {
                 opts.resume = body.resume
             }
             const q = query({prompt: pushStream, options: opts})
+            // 若 sessionId 已存在（resume/reconnect），先清理旧资源
+            const oldSess = sessions.get(sessionId)
+            if (oldSess) {
+                try { oldSess.pushStream?.close() } catch {}
+                try { oldSess.query?.return?.() } catch {}
+                oldSess.query = null
+                oldSess.pushStream = null
+            }
             sessions.set(sessionId, {
                 query: q,
                 workDir,
@@ -2386,7 +2601,7 @@ const httpServer = createServer(async (req, res) => {
                 let ocrText = ''
                 try {
                     const { createWorker } = await import('tesseract.js')
-                    const worker = await createWorker('eng')
+                    const worker = await createWorker('chi_sim+eng')
                     const { data } = await worker.recognize(destPath)
                     ocrText = data.text || ''
                     await worker.terminate()
@@ -2805,7 +3020,7 @@ const httpServer = createServer(async (req, res) => {
             res.end(JSON.stringify({error: 'checkpointId required'}));
             return
         }
-        const r = rewindToCheckpoint(s, rwM[1], b.checkpointId, !!b.dryRun)  // SIDE_EFFECT: 写工作目录文件
+        const r = rewindToCheckpoint(rwM[1], b.checkpointId, !!b.dryRun)  // SIDE_EFFECT: 写工作目录文件
         // 撤回后增量更新缓存（仅重提取被还原的文件）
         if (!b.dryRun && r.ok && r.reverted?.length) {
             try {
@@ -3786,16 +4001,41 @@ const httpServer = createServer(async (req, res) => {
             // 不同供应商 /models 端点位置不同
             let modelsUrl
             if (baseUrl.includes('dashscope.aliyuncs.com')) {
-                // 阿里云百炼：Anthropic 端点 /apps/anthropic，models 在 /compatible-mode/v1/models
                 modelsUrl = baseUrl.replace(/\/apps\/anthropic\/?$/, '/compatible-mode/v1/models')
+            } else if (baseUrl.endsWith('/v1/messages')) {
+                modelsUrl = baseUrl.replace(/\/v1\/messages\/?$/, '/v1/models')
+            } else if (baseUrl && baseUrl.includes('opencode')) {
+                modelsUrl = baseUrl.replace(/\/+$/, '').replace(/\/zen\/v\d+/, '/zen/go/v1') + '/models'
             } else {
-                // DeepSeek/智谱/Moonshot 等：Anthropic 端点在根路径 /anthropic，models 在 /models
                 modelsUrl = baseUrl.replace(/\/anthropic\/?$/, '').replace(/\/+$/, '') + '/models'
             }
-            const r = await fetch(modelsUrl, {
+            let r = await fetch(modelsUrl, {
                 headers: {Authorization: `Bearer ${key}`},
                 signal: AbortSignal.timeout(8000)
             })
+            // 404 回退：部分供应商 models 不在根路径（如 OpenCode Zen /zen/v1/models）
+            if (!r.ok && r.status === 404) {
+                try {
+                    const u = new URL(baseUrl)
+                    const origin = u.origin
+                    const pathBase = u.pathname.replace(/\/+$/, '')
+                    // 候选：pathBase/v1/models > parentPath/v1/models > origin/v1/models
+                    const candidates = [origin + '/v1/models']
+                    if (pathBase && pathBase !== '/') {
+                        candidates.unshift(origin + pathBase + '/v1/models')
+                        const parent = pathBase.replace(/\/[^/]+$/, '')
+                        if (parent && parent !== '/' && parent !== pathBase) candidates.unshift(origin + parent + '/v1/models')
+                    }
+                    for (const fb of candidates) {
+                        if (fb === modelsUrl) continue
+                        const r2 = await fetch(fb, {
+                            headers: {Authorization: `Bearer ${key}`},
+                            signal: AbortSignal.timeout(8000)
+                        })
+                        if (r2.ok) { r = r2; modelsUrl = fb; break }
+                    }
+                } catch {}
+            }
             if (!r.ok) {
                 res.writeHead(200);
                 res.end(JSON.stringify({models: [], error: `http_${r.status}`}));
@@ -3831,13 +4071,40 @@ const httpServer = createServer(async (req, res) => {
             let modelsUrl
             if (qBaseUrl.includes('dashscope.aliyuncs.com')) {
                 modelsUrl = qBaseUrl.replace(/\/apps\/anthropic\/?$/, '/compatible-mode/v1/models')
+            } else if (qBaseUrl.endsWith('/v1/messages')) {
+                modelsUrl = qBaseUrl.replace(/\/v1\/messages\/?$/, '/v1/models')
+            } else if (qBaseUrl && qBaseUrl.includes('opencode')) {
+                modelsUrl = qBaseUrl.replace(/\/+$/, '').replace(/\/zen\/v\d+/, '/zen/go/v1') + '/models'
             } else {
                 modelsUrl = qBaseUrl.replace(/\/anthropic\/?$/, '').replace(/\/+$/, '') + '/models'
             }
-            const r = await fetch(modelsUrl, {
+            let r = await fetch(modelsUrl, {
                 headers: {Authorization: `Bearer ${qApiKey}`},
                 signal: AbortSignal.timeout(10000)
             })
+            // 404 回退：部分供应商 models 不在根路径（如 OpenCode Zen /zen/v1/models）
+            if (!r.ok && r.status === 404) {
+                try {
+                    const u = new URL(qBaseUrl)
+                    const origin = u.origin
+                    const pathBase = u.pathname.replace(/\/+$/, '')
+                    // 候选：pathBase/v1/models > parentPath/v1/models > origin/v1/models
+                    const candidates = [origin + '/v1/models']
+                    if (pathBase && pathBase !== '/') {
+                        candidates.unshift(origin + pathBase + '/v1/models')
+                        const parent = pathBase.replace(/\/[^/]+$/, '')
+                        if (parent && parent !== '/' && parent !== pathBase) candidates.unshift(origin + parent + '/v1/models')
+                    }
+                    for (const fb of candidates) {
+                        if (fb === modelsUrl) continue
+                        const r2 = await fetch(fb, {
+                            headers: {Authorization: `Bearer ${qApiKey}`},
+                            signal: AbortSignal.timeout(10000)
+                        })
+                        if (r2.ok) { r = r2; modelsUrl = fb; break }
+                    }
+                } catch {}
+            }
             if (!r.ok) {
                 let detail = `HTTP ${r.status}`
                 try {
@@ -4785,6 +5052,30 @@ const httpServer = createServer(async (req, res) => {
 const controlClients = new Set()
 
 const wss = new WebSocketServer({server: httpServer, maxPayload: 1048576})
+// WS 心跳: 每 30s ping 一次，60s 无 pong 则断开死连接
+const WS_PING_INTERVAL = 30_000
+const WS_PING_TIMEOUT = 60_000
+const wsPingTimer = setInterval(() => {
+    for (const ws of wss.clients) {
+        if (ws.readyState !== 1) continue
+        if (!ws._lastPong) ws._lastPong = Date.now()
+        if (Date.now() - ws._lastPong > WS_PING_TIMEOUT) {
+            ws.terminate()
+            continue
+        }
+        ws.ping()
+    }
+    // 同时清理控制通道死连接
+    for (const ws of controlClients) {
+        if (ws.readyState !== 1) { controlClients.delete(ws); continue }
+        if (!ws._lastPong) ws._lastPong = Date.now()
+        if (Date.now() - ws._lastPong > WS_PING_TIMEOUT) {
+            ws.terminate()
+            controlClients.delete(ws)
+        }
+    }
+}, WS_PING_INTERVAL)
+wsPingTimer.unref()
 wss.on('connection', (ws, req) => {
     // WebSocket 认证: 检查 upgrade 请求中的 bridge-token（兼容 header 和 query param）
     const wsToken = req.headers['x-bridge-token'] || (() => {
@@ -4815,6 +5106,8 @@ wss.on('connection', (ws, req) => {
     if (pathPart === '/ws/control' || pathPart === '/ws/control/') {
         ws._source = 'desktop'
         controlClients.add(ws)
+        ws._lastPong = Date.now()
+        ws.on('pong', () => { ws._lastPong = Date.now() })
         ws.send(JSON.stringify({type: 'control_connected'}))
         ws.on('close', () => { controlClients.delete(ws) })
         return
@@ -4857,6 +5150,9 @@ wss.on('connection', (ws, req) => {
             s.query = null;
             s.pushStream = null;
             s.pendingTurn = null  // 清理未完成的回合快照，防止内存泄漏 + finalizeCheckpoint 误判
+            // 清理并发 rebuild 状态: 防止 rebuild finally 块把刚清掉的 pushStream 重新写入
+            s._rebuildPromise = null
+            s._pendingMessages = null
             s.lastSessionId = s.lastSessionId || sessionId
             ws.send(JSON.stringify({type: 'generation_stopped'}))
             return
@@ -4921,7 +5217,9 @@ wss.on('connection', (ws, req) => {
                 }
                 s.query = null;
                 s.pushStream = null;
-                s.lastSessionId = s.lastSessionId || sessionId
+                // 仅当有实际 conversation 时才记 lastSessionId 用于 resume
+                // 模型首次变更时 SDK 还没创建 conversation，设了会导致 resume 到不存在的会话
+                if (s._hasConversation) s.lastSessionId = s.lastSessionId || sessionId
             }
             // query 为 null（被中止过或设置变更重建）→ 懒重建，resume 续接原会话
             if (!s.query) {
@@ -4940,7 +5238,7 @@ wss.on('connection', (ws, req) => {
                         const cliS = loadCliSettings()
                         s.pushStream = new PushStream()
                         const opts = await makeQueryOptions({
-                            resume: s.lastSessionId || sessionId,
+                            resume: s.lastSessionId || undefined,
                             model: s.queryOpts?.model,
                             permissionMode: s.permissionMode,
                             thinkingLevel: s.thinkingLevel
@@ -4952,7 +5250,8 @@ wss.on('connection', (ws, req) => {
                         s._pendingMessages = null
                         s._rebuildPromise = null
                         // 重建完成后处理积压消息：先置 null 再消费，避免新消息写入旧数组
-                        if (s.query && pending.length) {
+                        // 守护 pushStream: stop_generation 可能并发清空了 s.pushStream
+                        if (s.query && s.pushStream && pending.length) {
                             for (const content of pending) {
                                 s.pushStream.push({
                                     type: 'user', session_id: sessionId,
@@ -4985,6 +5284,10 @@ wss.on('connection', (ws, req) => {
             }
         }
     })
+
+    // 注册 pong 处理器更新心跳时间戳（仅 session 连接）
+    ws._lastPong = Date.now()
+    ws.on('pong', () => { ws._lastPong = Date.now() })
 
     ws.on('close', () => {
         s.clients.delete(ws);
@@ -5031,26 +5334,29 @@ try {
     }
 } catch {
 }
+// Hook 脚本存在性校验 —— 剔除 settings.json 中脚本缺失的 hooks，防止 CLI ZodError
+validateHooks()
 // Caveman skill 安装（首次/升级后自动写入 ~/.claude/skills/caveman/SKILL.md）
 ensureCavemanSkill()
 // Caveman 版本检查（每次启动检测 GitHub 是否有新版本）
 checkCavemanUpdate().catch(e => log.warn({err: e}, 'Caveman 版本检查异常'))
 // RTK 版本检查（每次启动检测 GitHub 是否有新版本）
 checkRtkUpdate().catch(e => log.warn({err: e}, 'RTK 版本检查异常'))
+// 注册所有 IM 适配器 hooks（在 server listen 之前注册，确保首批请求即可用 mirror/确认功能）
+;[
+    {fn: startWeChatAdapter, platform: 'wechat'},
+    {fn: startFeishuAdapter, platform: 'feishu'},
+    {fn: startDingTalkAdapter, platform: 'dingtalk'},
+].forEach(({fn, platform}) => {
+    const hooks = fn(BRIDGE_TOKEN)
+    if (hooks) confirmHooks.push({...hooks, platform})
+})
 httpServer.listen(PORT, '127.0.0.1', () => {
     log.info({port: PORT}, `Gateway 已启动`)
     resumeScheduledTasks()
     // 启动时预启动 DeepSeek 代理（固定端口 8787），供 settings.json ANTHROPIC_BASE_URL 引用
     startDeepSeekProxy('https://api.deepseek.com/anthropic').catch(e => log.warn({err: e}, 'proxy boot 启动失败'))
-    // 注册所有 IM 适配器（各适配器返回钩子，由 gateway 统一管理确认/镜像/同步）
-    ;[
-        {fn: startWeChatAdapter, platform: 'wechat'},
-        {fn: startFeishuAdapter, platform: 'feishu'},
-        {fn: startDingTalkAdapter, platform: 'dingtalk'},
-    ].forEach(({fn, platform}) => {
-        const hooks = fn()
-        if (hooks) confirmHooks.push({...hooks, platform})
-    })
+    startOpenCodeProxy().catch(e => log.warn({err: e}, 'opencode proxy boot 启动失败'))
 })
 
 // 只读文件头 N 字节，按行切分，丢弃可能截断的最后一行
@@ -5070,10 +5376,14 @@ function readFileHeadLines(path, maxBytes = 4096) {
 // ---- Project scanning (hand-rolled) ----
 let _projectsCache = null, _projectsCacheTs = 0
 const PROJECTS_CACHE_TTL = 10_000  // 10s 内复用缓存，避免每次 /p 命令触发全量扫描
+// 互斥锁: 并发调用共享同一个扫描 Promise，避免重复 IO
+let _scanningProjects = null
 
 async function scanProjects() {
     const now = Date.now()
     if (_projectsCache && (now - _projectsCacheTs) < PROJECTS_CACHE_TTL) return _projectsCache
+    if (_scanningProjects) return _scanningProjects
+    _scanningProjects = (async () => {
 
     const base = join(CLAUDE_HOME, 'projects');
     const results = []
@@ -5137,9 +5447,11 @@ async function scanProjects() {
         }
     } catch {
     }
-    ;results.sort((a, b) => (b.lastActive || 0) - (a.lastActive || 0));
-    _projectsCache = results; _projectsCacheTs = Date.now()
-    return results
+        ;results.sort((a, b) => (b.lastActive || 0) - (a.lastActive || 0));
+        _projectsCache = results; _projectsCacheTs = Date.now()
+        return results
+    })().finally(() => { _scanningProjects = null })
+    return _scanningProjects
 }
 function invalidateProjectsCache() { _projectsCache = null }
 
@@ -5600,6 +5912,8 @@ function finalizeCheckpoint(sessionId) {
     if (!s.checkpoints) s.checkpoints = []
     s.checkpointSeq = (s.checkpointSeq || 0) + 1
     s.checkpoints.push({id: `cp-${s.checkpointSeq}`, prompt, time, files, revertible})
+    // 裁剪上限，防止长会话无界增长
+    if (s.checkpoints.length > 50) s.checkpoints.splice(0, s.checkpoints.length - 50)
     saveCheckpoints(s, sessionId)
     // 注意：不要在这里重置 session.snapshot —— 文件面板「仅改动」依赖会话起始基线，
     // 重置会让累计改动清零导致「仅改动」空白。记录点用自己的 per-turn preSnapshot，互不影响。

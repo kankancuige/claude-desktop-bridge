@@ -315,11 +315,16 @@ class PetScene extends Phaser.Scene {
 // ── 游戏生命周期 ──
 // ═══════════════════════════════════════════
 
+let _initPhaserRetries = 0
 function initPhaser() {
   if (!gameContainer.value || game) return
   const w = gameContainer.value.clientWidth
   const h = gameContainer.value.clientHeight
-  if (w === 0 || h === 0) { setTimeout(initPhaser, 100); return }
+  if (w === 0 || h === 0) {
+    if (++_initPhaserRetries > 50) return  // 50 次重试上限（~5s），放弃初始化
+    setTimeout(initPhaser, 100); return
+  }
+  _initPhaserRetries = 0
   game = new Phaser.Game({
     type: Phaser.CANVAS, parent: gameContainer.value, width: w, height: h,
     transparent: true, backgroundColor: undefined,

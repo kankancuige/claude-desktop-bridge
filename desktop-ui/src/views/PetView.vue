@@ -81,20 +81,23 @@ function scheduleBehavior() {
   }, delay)
 }
 
+let _blinkTimer: ReturnType<typeof setTimeout> | null = null
+let _tailWagTimer: ReturnType<typeof setTimeout> | null = null
+let _earTwitchTimer: ReturnType<typeof setTimeout> | null = null
 function doBlink() {
   if (!_mounted) return
   behavior.value = 'blinking'
-  setTimeout(() => { if (!_mounted) return; behavior.value = 'idle'; scheduleBehavior() }, 200)
+  _blinkTimer = setTimeout(() => { if (!_mounted) return; behavior.value = 'idle'; scheduleBehavior() }, 200)
 }
 function doTailWag() {
   if (!_mounted) return
   behavior.value = 'tail_wagging'
-  setTimeout(() => { if (!_mounted) return; behavior.value = 'idle'; scheduleBehavior() }, 1500)
+  _tailWagTimer = setTimeout(() => { if (!_mounted) return; behavior.value = 'idle'; scheduleBehavior() }, 1500)
 }
 function doEarTwitch() {
   if (!_mounted) return
   behavior.value = 'ear_twitch'
-  setTimeout(() => { if (!_mounted) return; behavior.value = 'idle'; scheduleBehavior() }, 400)
+  _earTwitchTimer = setTimeout(() => { if (!_mounted) return; behavior.value = 'idle'; scheduleBehavior() }, 400)
 }
 function doWalk() {
   if (!_mounted) return
@@ -151,7 +154,7 @@ const svgStyle = computed(() => ({
 }))
 
 onMounted(() => { _mounted = true; scheduleBehavior() })
-onBeforeUnmount(() => { _mounted = false; clearTimers(); clearTimeout(t0); clearTimeout(t1) })
+onBeforeUnmount(() => { _mounted = false; clearTimers(); clearTimeout(t0); clearTimeout(t1); clearTimeout(_blinkTimer!); clearTimeout(_tailWagTimer!); clearTimeout(_earTwitchTimer!) })
 </script>
 
 <template>

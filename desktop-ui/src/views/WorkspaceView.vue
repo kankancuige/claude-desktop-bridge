@@ -23,7 +23,7 @@
  * - keep-alive 兼容：onActivated 中重新加载模型列表并滚动到底部
  */
 defineOptions({name: 'WorkspaceView'})
-import {ref, shallowRef, nextTick, onMounted, onActivated, onBeforeUnmount, computed, watch, defineAsyncComponent} from 'vue'
+import {ref, shallowRef, nextTick, onMounted, onActivated, onDeactivated, onBeforeUnmount, computed, watch, defineAsyncComponent} from 'vue'
 import * as monaco from 'monaco-editor'
 import {useRouter} from 'vue-router'
 import {t, setLocale} from '../i18n'
@@ -1070,25 +1070,27 @@ async function loadProviderModels() {
     const sBody = sr.ok ? (await sr.json()) : null
     const baseUrl = sBody?.env?.ANTHROPIC_BASE_URL || ''
     // 多来源取 apiKey: ANTHROPIC_AUTH_TOKEN(settings) / ANTHROPIC_API_KEY(.env)
-    const apiKey = sBody?.env?.ANTHROPIC_AUTH_TOKEN || sBody?.env?.ANTHROPIC_API_KEY || ''
+    savedApiKey.value = sBody?.env?.ANTHROPIC_AUTH_TOKEN || sBody?.env?.ANTHROPIC_API_KEY || ''
     const curModel = sBody?.model || ''  // 每次实时读取，不用模块级缓存
 
     const pr = await fetch(`${GW}/api/config/providers`)
     if (!pr.ok) return
-    const {providers} = await pr.json()
+    const {providers: plist} = await pr.json()
+    providers.value = plist
 
     let provider = null
     const inputUrl = baseUrl.toLowerCase()
     if (inputUrl) {
-      for (const p of providers) {
+      for (const p of plist) {
         const pUrl = (p.baseUrl || '').toLowerCase()
         if (pUrl && (inputUrl.includes(p.id) || inputUrl.includes(pUrl.replace(/\/v\d+.*$/, '').replace('https://', '')))) {
           provider = p; break
         }
       }
     }
-    if (!provider) provider = providers?.find((p: any) => {
+    if (!provider) provider = plist?.find((p: any) => {
       if (p.id === 'deepseek' && baseUrl.includes('deepseek')) return true;
+      if (p.id === 'opencode' && baseUrl.includes('opencode')) return true;
       if (p.id === 'anthropic' && baseUrl.includes('anthropic')) return true;
       if (p.id === 'codex' && (baseUrl.includes('openai') || baseUrl.includes('codex'))) return true;
       if (p.id === 'openrouter' && baseUrl.includes('openrouter')) return true;
@@ -1102,10 +1104,12 @@ async function loadProviderModels() {
     })
     // 无 baseUrl 且未匹配到供应商 → 自定义厂商，不用预设模型列表，仅保留用户手动输入的模型
     if (!provider) {
+      providerId.value = ''
       models.value = curModel ? [{id: curModel, name: curModel, contextWindow: undefined}] : []
       if (curModel) model.value = curModel
       return
     }
+    providerId.value = provider.id
 
     // 存为对象数组（id/name/contextWindow），选模型时可取元数据
     if (provider?.models?.length) {
@@ -1119,7 +1123,7 @@ async function loadProviderModels() {
       const endpoint = provider?.id === 'anthropic' ? '/api/config/models' : '/api/config/live-models'
       const body: any = {}
       if (provider?.baseUrl) body.baseUrl = provider.baseUrl
-      if (apiKey) body.apiKey = apiKey
+      if (savedApiKey.value) body.apiKey = savedApiKey.value
       const mr = await fetch(`${GW}${endpoint}`, {
         method: provider?.id === 'anthropic' ? 'GET' : 'POST',
         headers: provider?.id === 'anthropic' ? {} : {'Content-Type': 'application/json'},
@@ -1137,10 +1141,9 @@ async function loadProviderModels() {
     } catch {
     }
 
-    // settings 里存了模型 ID 但不在预设/动态列表中 → 自定义厂商场景，仅显示该模型
+    // settings 里存了模型 ID 但不在模型列表中 → 追加到列表末尾（不丢失动态列表）
     if (curModel && !models.value.find(m => m.id === curModel)) {
-      models.value = [{id: curModel, name: curModel, contextWindow: undefined}]
-      model.value = curModel
+      models.value.push({id: curModel, name: curModel, contextWindow: undefined})
     }
     if (!model.value && models.value.length) model.value = models.value[0]!.id
   } catch {
@@ -1155,6 +1158,9 @@ let settingsModel = ''
 // 组件挂载：加载项目列表、余额、模型列表、斜杠命令、IM 绑定状态
 // 同时注册全局键盘快捷键（Esc 关闭弹窗）
 onMounted(async () => {
+  // 组件重建时复位控制通道停止标志，确保 connectControlWS 能正常建立连接
+  _ctrlRetryCount = 0
+  _controlWSStopped = false
   // 先拿到当前模型再加载供应商，确保模型选择器默认选中 settings 中保存的模型
   try {
     const sr = await fetch(`${GW}/api/config/settings`)
@@ -1211,6 +1217,7 @@ let tabAutoSyncTimer: ReturnType<typeof setInterval> | null = null
 onActivated(() => {
   petEnabledGlob.value = localStorage.getItem('claude-bridge-pet-enabled') !== 'false'
   loadProviderModels()
+  if (tabAutoSyncTimer) clearInterval(tabAutoSyncTimer)
   tabAutoSyncTimer = setInterval(syncCurrentTabState, 5000)
   userScrolledUp.value = false
   let tries = 0
@@ -1223,6 +1230,12 @@ onActivated(() => {
     }
   }
   nextTick(() => setTimeout(go, 50))
+})
+
+/** keep-alive 隐藏时暂停定时器，避免后台消耗 */
+onDeactivated(() => {
+  if (tabAutoSyncTimer) { clearInterval(tabAutoSyncTimer); tabAutoSyncTimer = null }
+  pauseTimers()
 })
 
 /** 从 Gateway 加载账户余额 */
@@ -1330,7 +1343,7 @@ async function handleNewSession(workDir: string, encodedDir?: string, histSessio
     tab = createTabSession(workDir)
     tabSessions.value.push(tab)
   }
-  switchToTab(tab.id)
+  if (activeTabId.value !== tab.id) switchToTab(tab.id)
 
   connecting.value = true
   activeProject.value = workDir
@@ -1353,11 +1366,14 @@ async function handleNewSession(workDir: string, encodedDir?: string, histSessio
 
   try {
     const curModelInfo = models.value.find(m => m.id === model.value)
+    const curProvider = providers.value.find((p: any) => p.id === providerId.value)
     const body: any = {
       workDir,
       model: model.value,
       permissionMode: permissionMode.value,
       thinkingLevel: thinkingLevel.value,
+      baseUrl: curProvider?.baseUrl || '',
+      apiKey: savedApiKey.value || '',
       modelMeta: curModelInfo ? {contextWindow: curModelInfo.contextWindow, pricing: pricing.value} : null
     }
     if (encodedDir && histSessionId) body.resume = histSessionId
@@ -1559,9 +1575,12 @@ async function handleNudge(msg: any) {
 }
 
 /** 加载历史会话的消息记录（恢复会话时展示，仅文本角色，不含思考/工具） */
+let _loadHistorySeq = 0
 async function loadHistory(encodedDir: string, sId: string) {
+  const seq = ++_loadHistorySeq
   try {
     const res = await fetch(`${GW}/api/projects/${encodedDir}/sessions/${sId}/messages`)
+    if (seq !== _loadHistorySeq) return  // 已有更新的请求，丢弃旧响应
     const data = await res.json()
     if (data.messages?.length) {
       _loadedHistoryTexts = new Set()
@@ -1572,6 +1591,7 @@ async function loadHistory(encodedDir: string, sId: string) {
       }
     }
   } catch (e) {
+    if (seq !== _loadHistorySeq) return
     console.error('[loadHistory] 请求历史消息失败:', e)
     messages.value.push({role: 'error', text: t('err.historyLoad'), time: Date.now()})
   }
@@ -1618,7 +1638,11 @@ async function connectControlWS() {
  * 注意：ws 是模块级非响应式变量（let），避免 Vue Proxy 干扰 WebSocket 原生事件。
  */
 async function connectWS(sid: string, resumed = false) {
-  if (ws) ws.close()
+  if (ws) {
+    ws.onclose = null   // 先解除回调再关闭，防止旧 onclose 异步触发污染新连接状态
+    ws.onerror = null
+    ws.close()
+  }
   const wsConnectUrl = await wsUrl(`/ws/${sid}`)
   ws = new WebSocket(wsConnectUrl)
 
@@ -1633,6 +1657,8 @@ async function connectWS(sid: string, resumed = false) {
   ws.onopen = () => {
     const tab = tabSessions.value.find(t => t.id === myTabId)
     if (tab) tab.state.connected = true
+    // 重连后自动恢复队列中的消息发送（flush 中途断连时回填了队列）
+    if (msgQueue.value.length > 0) flushMsgQueue()
     if (isFg()) {
       connected.value = true
       syncPetState('connected', { message: 'Connected', bubble: petPick(BUBBLE_CONNECTED, myProject) })
@@ -2058,6 +2084,7 @@ async function connectWS(sid: string, resumed = false) {
     if (!fg) {
       // 后台标签页: 写回 tab 快照 → 恢复前台全局状态
       // 序列号检查: 若已有更新的 handler 启动，放弃写回以避免状态交叉污染
+      // 安全前提: snapshotTabState/restoreTabState 必须同步执行，不可加 await
       if (mySeq === _handlerSeq) {
         tab.state = snapshotTabState()
         try { restoreTabState(_saved!) } catch {}
@@ -2242,8 +2269,8 @@ async function sendMessage() {
   if (!text) return
   if (!ws || ws.readyState !== 1) return
 
-  if (status.value === 'thinking') {
-    // thinking 期间输入进入排队队列，用户可稍后手动选择发送/注入
+  if (status.value === 'thinking' || _flushingQueue) {
+    // thinking/队列清空中: 新消息进入排队，避免与 flushMsgQueue 交织
     queueId++
     msgQueue.value.push({id: queueId, text, time: Date.now()})
     inputText.value = ''
@@ -2364,7 +2391,10 @@ async function buildWireText(text: string): Promise<string> {
  * 这样用户在界面上看到的是简洁的 `#文件名` 引用，但模型收到的是含文件内容的完整消息。
  */
 async function dispatch(text: string) {
+  // 捕获当前 sessionId，防止 await 期间切换会话导致跨会话发送
+  const mySid = sessionId.value
   const wire = await buildWireText(text)
+  if (sessionId.value !== mySid) return  // 会话已切换，丢弃消息
   doSend(text, wire)
 }
 
@@ -2461,13 +2491,30 @@ function removeQueued(item: QItem) {
   msgQueue.value = msgQueue.value.filter(q => q.id !== item.id)
 }
 
+/** flushMsgQueue 重入互斥锁：防止 result+sendMessage 并发交织消息 */
+let _flushingQueue = false
+
 /** thinking 结束后自动发送所有排队消息，逐条 dispatch 避免并发乱序 */
 async function flushMsgQueue() {
-  const items = [...msgQueue.value]
-  msgQueue.value = []
-  for (const item of items) {
-    if (!ws || ws.readyState !== 1) break
-    await dispatch(item.text)
+  if (_flushingQueue) return
+  _flushingQueue = true
+  try {
+    const items = [...msgQueue.value]
+    msgQueue.value = []
+    for (let i = 0; i < items.length; i++) {
+      if (!ws || ws.readyState !== 1) {
+        // WS 断开: 剩余消息回填队列头部，等重连后再发
+        msgQueue.value.unshift(...items.slice(i))
+        break
+      }
+      try {
+        await dispatch(items[i].text)
+      } catch {
+        // dispatch 异常不中断循环，继续处理剩余消息
+      }
+    }
+  } finally {
+    _flushingQueue = false
   }
 }
 
@@ -2772,13 +2819,17 @@ function toggleFilePanel() {
 }
 
 /** 从 Gateway 加载当前会话的文件列表和快照状态，增量同步到文件树 */
+let _loadFileTreeSeq = 0
 async function loadFileTree() {
   if (!sessionId.value) return
+  const seq = ++_loadFileTreeSeq
   fileTreeLoading.value = true
   try {
     const res = await fetch(`${GW}/api/sessions/${sessionId.value}/files`)
+    if (seq !== _loadFileTreeSeq) return
     if (res.ok) {
       const d = await res.json()
+      if (seq !== _loadFileTreeSeq) return
       syncFileTree(d.files || [])
       hasSnapshot.value = !!d.hasSnapshot
       snapshotAt.value = d.snapshotAt || null
@@ -3185,6 +3236,7 @@ document.addEventListener('visibilitychange', onPageVisibility)
 // 组件卸载时清理 Monaco 实例及外部 model
 onBeforeUnmount(() => {
   document.removeEventListener('visibilitychange', onPageVisibility)
+  window.removeEventListener('keydown', onGlobalKeydown)
   if (tabAutoSyncTimer) clearInterval(tabAutoSyncTimer)
   if (sessionDurationTimer) clearInterval(sessionDurationTimer)
   if (agentRefreshTimer) clearInterval(agentRefreshTimer)
@@ -3192,6 +3244,7 @@ onBeforeUnmount(() => {
   if (petBubbleTimer) clearTimeout(petBubbleTimer)
   if (longTaskBubbleTimer) clearTimeout(longTaskBubbleTimer)
   if (toastTimer) clearTimeout(toastTimer)
+  if (_petPersistTimer) clearTimeout(_petPersistTimer)
   try {
     if (diffOriginalModel) { diffOriginalModel.dispose(); diffOriginalModel = null }
     if (diffModifiedModel) { diffModifiedModel.dispose(); diffModifiedModel = null }
@@ -3205,6 +3258,19 @@ onBeforeUnmount(() => {
     controlWS.onerror = null
     controlWS.close()
     controlWS = null
+  }
+  // 关闭主 session WebSocket（keep-alive 失活/路由离开时释放连接）
+  if (ws) {
+    ws.onclose = null; ws.onerror = null
+    ws.close(); ws = null
+  }
+  // 关闭所有标签页 WebSocket
+  for (const tab of tabSessions.value) {
+    if (tab.websocket) {
+      tab.websocket.onclose = null; tab.websocket.onerror = null
+      try { tab.websocket.close() } catch {}
+      tab.websocket = null
+    }
   }
 })
 
@@ -3432,6 +3498,12 @@ function toggleProject(workDir: string) {
 const model = ref('')
 /** 可用模型列表（loadProviderModels 动态填充，含 id/name/contextWindow） */
 const models = ref<{id: string, name: string, contextWindow?: string}[]>([])
+/** 供应商预设列表（loadProviderModels 从 /api/config/providers 拉取） */
+const providers = ref<any[]>([])
+/** 当前供应商 ID（loadProviderModels 根据 settings baseUrl 推断） */
+const providerId = ref('')
+/** 当前 API Key（loadProviderModels 从 settings 读取） */
+const savedApiKey = ref('')
 /** 权限模式：default=每次询问 / acceptEdits=自动接受编辑 / plan=仅规划 / bypassPermissions=全部允许 */
 const permissionMode = ref('default')
 /** 权限模式选项（i18n 计算属性，支持语言切换） */
@@ -3979,7 +4051,7 @@ const tokenTooltip = computed(() => {
         <!-- 消息列表区域：v-for 遍历 messages，按 role 切换渲染模板 -->
         <div ref="chatRef" class="messages" @click="onMessageClick" @scroll="onMessagesScroll">
           <!-- 每条消息行：根据 role 控制对齐方向和动画延迟 -->
-          <div v-for="(msg, i) in messages" :key="i" class="msg-row" :class="msg.role"
+          <div v-for="(msg, i) in messages" :key="(msg.time || 0) + '-' + i + '-' + msg.role" class="msg-row" :class="msg.role"
                :style="{ animationDelay: `${Math.min(i * 20, 300)}ms` }">
             <!-- 系统消息：时间 + 文本，居中显示 -->
             <template v-if="msg.role === 'system'">
@@ -4111,7 +4183,7 @@ const tokenTooltip = computed(() => {
               </svg>
               <span class="agent-runs-title">Agent 活动 ({{ agentRuns.length }})</span>
               <span class="agent-runs-summary">
-                <template v-for="(ag, ai) in agentRuns" :key="ag.id + ag.source">
+                <template v-for="(ag, ai) in agentRuns" :key="(ag.spawnTime || 0) + '-' + ag.agentType + '-' + ai">
                   <span v-if="ai > 0" class="agent-runs-sep">·</span>
                   <span class="agent-runs-mini" :class="ag.status"><span v-html="agentIcon(ag.agentType)"
                                                                          style="display:inline-flex;align-items:center"></span> {{
@@ -4121,7 +4193,7 @@ const tokenTooltip = computed(() => {
               </span>
             </div>
             <!-- 各 agent 行 -->
-            <div v-for="ag in agentRuns" :key="ag.id + ag.source" class="agent-run-item">
+            <div v-for="ag in agentRuns" :key="(ag.spawnTime || 0) + '-' + ag.agentType" class="agent-run-item">
               <!-- 收起行 -->
               <div class="agent-run-summary" @click="ag.expanded = !ag.expanded">
                 <svg class="agent-run-chevron" :class="{ open: ag.expanded }" width="12" height="12" viewBox="0 0 24 24"
@@ -4638,7 +4710,7 @@ const tokenTooltip = computed(() => {
           </div>
           <div class="ag-panel-list">
             <div v-if="agentRuns.length === 0" class="ag-panel-empty">暂无 Agent 活动</div>
-            <div v-for="ag in agentRuns" :key="ag.id + ag.source" class="ag-panel-card" :class="ag.status">
+            <div v-for="ag in agentRuns" :key="(ag.spawnTime || 0) + '-' + ag.agentType" class="ag-panel-card" :class="ag.status">
               <!-- 卡片头部：类型 + 状态 + 耗时 -->
               <div class="ag-card-head">
                 <span class="ag-card-dot" :class="ag.status"

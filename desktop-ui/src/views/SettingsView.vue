@@ -189,6 +189,11 @@ function applyTheme(t: string) {
 
 // 主题/语言改为「保存配置」后才生效（不在选择时即时预览），故此处不再 watch settings.theme/language
 let _stvThemeHandler: (() => void) | null = null
+// 自动更新 IPC 监听器取消函数
+let _cleanupUpdateAvailable: (() => void) | undefined
+let _cleanupUpdateProgress: (() => void) | undefined
+let _cleanupUpdateDownloaded: (() => void) | undefined
+let _cleanupUpdateError: (() => void) | undefined
 if (typeof window !== 'undefined') {
   _stvThemeHandler = () => {
     if (settings.value?.theme === 'system') document.documentElement.dataset.theme = detectSystemTheme()
@@ -248,6 +253,7 @@ async function loadSettings() {
         // 供应商推断：按 baseUrl 特征匹配，与 WorkspaceView loadProviderModels 保持一致
         const urlL = url.toLowerCase()
         if (urlL.includes('deepseek')) providerId.value = 'deepseek'
+        else if (urlL.includes('opencode')) providerId.value = 'opencode'
         else if (urlL.includes('anthropic')) providerId.value = 'anthropic'
         else if (urlL.includes('openai') || urlL.includes('codex')) providerId.value = 'codex'
         else if (urlL.includes('bigmodel')) providerId.value = 'zhipu'
@@ -528,10 +534,11 @@ function initAppUpdate() {
   // 启动时静默检查一次
   checkAppUpdate()
   // 主进程推送
-  api.onUpdateAvailable?.((info: any) => { updateAvailable.value = info })
-  api.onUpdateDownloadProgress?.((p: any) => { updateProgress.value = Math.round(p.percent || 0) })
-  api.onUpdateDownloaded?.((info: any) => { updateDownloading.value = false; updateDownloaded.value = true; updateAvailable.value = info })
-  api.onUpdateError?.((e: any) => { updateDownloading.value = false; updateError.value = e.message || String(e) })
+  // 保存返回的取消函数，供 onUnmounted 清理
+  _cleanupUpdateAvailable = api.onUpdateAvailable?.((info: any) => { updateAvailable.value = info })
+  _cleanupUpdateProgress = api.onUpdateDownloadProgress?.((p: any) => { updateProgress.value = Math.round(p.percent || 0) })
+  _cleanupUpdateDownloaded = api.onUpdateDownloaded?.((info: any) => { updateDownloading.value = false; updateDownloaded.value = true; updateAvailable.value = info })
+  _cleanupUpdateError = api.onUpdateError?.((e: any) => { updateDownloading.value = false; updateError.value = e.message || String(e) })
 }
 onMounted(() => { initAppUpdate() })
 
@@ -2066,6 +2073,10 @@ onUnmounted(() => {
   if (pendingDeleteSkillTimer) clearTimeout(pendingDeleteSkillTimer)
   if (pendingDeleteRuleTimer) clearTimeout(pendingDeleteRuleTimer)
   if (_stvThemeHandler) window.matchMedia?.('(prefers-color-scheme: dark)').removeEventListener('change', _stvThemeHandler)
+  _cleanupUpdateAvailable?.()
+  _cleanupUpdateProgress?.()
+  _cleanupUpdateDownloaded?.()
+  _cleanupUpdateError?.()
 })
 </script>
 

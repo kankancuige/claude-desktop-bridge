@@ -19,6 +19,7 @@ const log = createLogger('proxy')
 
 let proxyPort = 0
 let proxyServer = null
+let _startPromise = null
 
 // ── thinking 块缓存 (fingerprint → [{index, thinking, signature}]) ──
 const thinkingCache = new Map()
@@ -75,7 +76,8 @@ function getSessionFingerprint(body) {
  * @returns {Promise<{server, port}>}
  */
 export function startDeepSeekProxy(upstream) {
-    return new Promise((resolve, reject) => {
+    if (_startPromise) return _startPromise
+    _startPromise = new Promise((resolve, reject) => {
         if (proxyServer) {
             resolve({server: proxyServer, port: proxyPort})
             return
@@ -90,14 +92,15 @@ export function startDeepSeekProxy(upstream) {
         const TRY_PORT = 8787
         proxyServer.on('error', (e) => {
             if (e.code === 'EADDRINUSE') {
-                // 8787 被占用 → 回退到随机端口
-                proxyServer.listen(0, '127.0.0.1', () => {
-                    proxyPort = proxyServer.address().port
-                    log.info({port: proxyPort, upstream, fallback: true}, '代理已启动（fallback 端口）')
-                    resolve({server: proxyServer, port: proxyPort})
-                })
+                // 固定端口被占 → 直接报错，不静默回退随机端口
+                // 回退随机端口会让 settings.json 里写死的 8787 静态引用失效（脱离 gateway 直跑 CLI 时连不上）
+                proxyServer = null
+                _startPromise = null
+                reject(new Error('端口 8787 被占用，DeepSeek 代理无法启动。请关闭占用 8787 的进程后重启。'))
             } else {
                 log.error({err: e}, '代理服务异常')
+                proxyServer = null
+                _startPromise = null
                 reject(e)
             }
         })
@@ -107,6 +110,7 @@ export function startDeepSeekProxy(upstream) {
             resolve({server: proxyServer, port: proxyPort})
         })
     })
+    return _startPromise
 }
 
 export function getProxyPort() {

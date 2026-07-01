@@ -24,6 +24,7 @@ function hasUpdateConfig() {
 // 惰性加载 electron-updater —— yml 不存在或 dev 模式下不加载
 /** @type {import('electron-updater').AppUpdater|null} */
 let _autoUpdater = null
+let _updateCheckTimer = null
 function getAutoUpdater() {
   if (!_autoUpdater && !isDev && hasUpdateConfig()) {
     try {
@@ -100,7 +101,7 @@ function checkForUpdates() {
 function startUpdateCheckInterval(intervalMs = 4 * 60 * 60 * 1000) {
   if (isDev) return
   checkForUpdates()
-  setInterval(checkForUpdates, intervalMs)
+  _updateCheckTimer = setInterval(checkForUpdates, intervalMs)
 }
 
 /**

@@ -93,7 +93,12 @@ export const useGatewayStore = defineStore('gateway', () => {
         const data = await res.json()
         if (!res.ok) throw new Error(data.error || 'create session failed')
         sessionId.value = data.sessionId
-        connect(data.sessionId)
+        try {
+            await connect(data.sessionId)
+        } catch {
+            sessionId.value = null  // connect 失败时清除脏 sessionId
+            throw new Error('WebSocket 连接失败')
+        }
         return data
     }
 
@@ -111,11 +116,13 @@ export const useGatewayStore = defineStore('gateway', () => {
      */
     async function connect(sid) {
         if (ws) ws.close()
-        const url = await wsUrl(`/ws/${sid}`)
-        ws = new WebSocket(url)
+        // 旧 ws 的 onclose 可能在新 ws onopen 之后异步触发，
+        // 用 _wsInstance 标记避免旧连接覆盖新连接的 connected 状态
+        const thisWs = new WebSocket(await wsUrl(`/ws/${sid}`))
+        ws = thisWs
 
         // ── 连接成功 ──
-        ws.onopen = () => {
+        thisWs.onopen = () => {
             connected.value = true
             messages.value.push({
                 role: 'system',
@@ -126,7 +133,7 @@ export const useGatewayStore = defineStore('gateway', () => {
 
         // ── 接收消息 ──
         // 所有来自 gateway 的消息都通过 handleMessage 统一分发
-        ws.onmessage = (e) => {
+        thisWs.onmessage = (e) => {
             try {
                 const msg = JSON.parse(e.data)
                 handleMessage(msg)
@@ -136,15 +143,16 @@ export const useGatewayStore = defineStore('gateway', () => {
         }
 
         // ── 连接关闭 ──
-        // 可能是主动关闭或 gateway 断开，恢复 idle 状态
-        ws.onclose = () => {
+        // 仅当当前 ws 还是本连接实例时才写状态，防止旧连接 onclose 覆盖新连接状态
+        thisWs.onclose = () => {
+            if (ws !== thisWs) return
             connected.value = false
             status.value = 'idle'
         }
 
         // ── 连接错误 ──
-        // WebSocket 级别的错误（如无法连接），标记为断开
-        ws.onerror = () => {
+        thisWs.onerror = () => {
+            if (ws !== thisWs) return
             connected.value = false
         }
     }
