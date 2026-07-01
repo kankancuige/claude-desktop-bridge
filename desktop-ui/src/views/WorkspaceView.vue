@@ -72,6 +72,10 @@ interface Message {
   tools?: ToolUse[]
   /** 工具调用列表展开/折叠 */
   toolsExpanded?: boolean
+  /** 本条消息估算 token 数（~前缀表示估算值） */
+  tokens?: number
+  /** 本条消息估算费用（CNY） */
+  cost?: number
 }
 
 // ── 文件快照 Diff ──
@@ -305,6 +309,8 @@ interface TabState {
   thinkingLevel: string
   permissionMode: string
   model: string
+  maxTokens: number
+  pricing: {inputPrice: number, outputPrice: number, currency: string} | null
   turnThinkingText: string
   lastUserMessage: string
   mirrorState: Record<string, boolean>
@@ -329,6 +335,8 @@ function initialTabState(): TabState {
     thinkingLevel: 'auto',
     permissionMode: 'default',
     model: model.value,
+    maxTokens: maxTokens.value,
+    pricing: pricing.value,
     turnThinkingText: '',
     lastUserMessage: '',
     mirrorState: { wechat: false, feishu: false, dingtalk: false },
@@ -354,6 +362,8 @@ function snapshotTabState(): TabState {
     thinkingLevel: thinkingLevel.value,
     permissionMode: permissionMode.value,
     model: model.value,
+    maxTokens: maxTokens.value,
+    pricing: pricing.value,
     turnThinkingText,
     lastUserMessage,
     mirrorState: { ...mirrorState.value },
@@ -378,6 +388,8 @@ function restoreTabState(s: TabState) {
   thinkingLevel.value = s.thinkingLevel
   permissionMode.value = s.permissionMode
   model.value = s.model
+  maxTokens.value = s.maxTokens
+  pricing.value = s.pricing
   turnThinkingText = s.turnThinkingText
   lastUserMessage = s.lastUserMessage
   mirrorState.value = { ...s.mirrorState }
@@ -417,7 +429,7 @@ function switchToTab(tabId: string) {
     restoreTabState(tab.state)
     activeProject.value = tab.projectPath
     ws = null  // 切断旧 tab 的 ws 引用，防止 connectWS 误关
-    // await 确保历史消息加载完成后才返回，异常不被静默吞掉
+    // handleNewSession 异步恢复会话，不阻塞 switchToTab 返回
     handleNewSession(tab.projectPath, encodeProjectName(tab.projectPath), tab.state.sessionId)
     return
   }
@@ -536,6 +548,7 @@ const petState = ref('idle')
 const petMessage = ref('')
 const petBubble = ref('')  // 气泡持续显示，手动清除
 let petBubbleTimer: ReturnType<typeof setTimeout> | null = null
+let petTimer: ReturnType<typeof setTimeout> | null = null
 /** 后台 tab 数组交换期间置 true，阻止 watch 回调触发 pet 污染 */
 let _swappingTab = false
 function syncPetState(state: string, extra?: Record<string, any>) {
@@ -827,6 +840,8 @@ let cachedEditorContent = ''
 
 /** WebSocket 实例（模块级变量，不响应式，避免 Proxy 包装干扰 WebSocket 原生行为） */
 let ws: WebSocket | null = null
+// loadHistory 已加载的消息文本集合，用于 user_message_echo 去重
+let _loadedHistoryTexts: Set<string> | null = null
 /** 当前 assistant 回复中待调用的工具列表（在 tool_use_start → assistant_message 之间累积） */
 const pendingTools = ref<ToolUse[]>([])
 
@@ -1032,20 +1047,22 @@ const balance = ref({balance: 0, currency: 'CNY', used: 0})
  * 2. 从 Gateway 获取该供应商的模型列表（优先实时 /live-models，回退到预设 /providers）
  * 这确保模型选择器始终显示当前供应商实际可用模型
  */
+let _loadingProviderModels = false
 async function loadProviderModels() {
+  if (_loadingProviderModels) return  // 防重入：onMounted/onActivated 可能并发
+  _loadingProviderModels = true
   try {
-    // 1. 读 settings 判断当前供应商
     const sr = await fetch(`${GW}/api/config/settings`)
     const sBody = sr.ok ? (await sr.json()) : null
     const baseUrl = sBody?.env?.ANTHROPIC_BASE_URL || ''
-    const apiKey = sBody?.env?.ANTHROPIC_AUTH_TOKEN || ''
+    // 多来源取 apiKey: ANTHROPIC_AUTH_TOKEN(settings) / ANTHROPIC_API_KEY(.env)
+    const apiKey = sBody?.env?.ANTHROPIC_AUTH_TOKEN || sBody?.env?.ANTHROPIC_API_KEY || ''
+    const curModel = sBody?.model || ''  // 每次实时读取，不用模块级缓存
 
-    // 2. 加载供应商预设
     const pr = await fetch(`${GW}/api/config/providers`)
     if (!pr.ok) return
     const {providers} = await pr.json()
 
-    // 3. 匹配当前供应商：遍历所有 provider，按 baseUrl 包含关系推断
     let provider = null
     const inputUrl = baseUrl.toLowerCase()
     if (inputUrl) {
@@ -1069,31 +1086,52 @@ async function loadProviderModels() {
       if (p.id === 'gemini' && baseUrl.includes('googleapi')) return true;
       return false
     })
-    if (!provider) provider = providers?.[0] // fallback: 第一个
-
-    if (provider?.models?.length) {
-      models.value = provider.models.map((m: any) => m.id)
-      // 读 settings 里设置的默认模型
-      if (settingsModel) model.value = settingsModel
+    // 无 baseUrl 且未匹配到供应商 → 自定义厂商，不用预设模型列表，仅保留用户手动输入的模型
+    if (!provider) {
+      models.value = curModel ? [{id: curModel, name: curModel, contextWindow: undefined}] : []
+      if (curModel) model.value = curModel
+      return
     }
-    // 叠加真实模型：Anthropic 用 supportedModels()，DeepSeek/OpenAI 用其 /models 接口
+
+    // 存为对象数组（id/name/contextWindow），选模型时可取元数据
+    if (provider?.models?.length) {
+      models.value = provider.models.map((m: any) => ({id: m.id, name: m.name, contextWindow: m.contextWindow}))
+      if (curModel) model.value = curModel
+      else if (!model.value) model.value = models.value[0]?.id || ''
+    }
+
+    // 叠加真实模型
     try {
       const endpoint = provider?.id === 'anthropic' ? '/api/config/models' : '/api/config/live-models'
-      const ep = new URLSearchParams()
-      if (provider?.baseUrl) ep.set('baseUrl', provider.baseUrl)
-      if (apiKey) ep.set('apiKey', apiKey)
-      const qs = ep.toString() ? `?${ep.toString()}` : ''
-      const mr = await fetch(`${GW}${endpoint}${qs}`)
+      const body: any = {}
+      if (provider?.baseUrl) body.baseUrl = provider.baseUrl
+      if (apiKey) body.apiKey = apiKey
+      const mr = await fetch(`${GW}${endpoint}`, {
+        method: provider?.id === 'anthropic' ? 'GET' : 'POST',
+        headers: provider?.id === 'anthropic' ? {} : {'Content-Type': 'application/json'},
+        body: provider?.id === 'anthropic' ? undefined : JSON.stringify(body),
+      })
       if (mr.ok) {
         const {models: dyn} = await mr.json()
         if (Array.isArray(dyn) && dyn.length) {
-          models.value = dyn.map((m: any) => m.value)
-          if (settingsModel) model.value = settingsModel
+          // 动态模型无 name/contextWindow，id 即显示名
+          models.value = dyn.map((m: any) => ({id: m.value || m.id, name: m.displayName || m.value || m.id, contextWindow: undefined}))
+          if (curModel) model.value = curModel
+          else if (!model.value) model.value = models.value[0]?.id || ''
         }
       }
     } catch {
     }
+
+    // settings 里存了模型 ID 但不在预设/动态列表中 → 自定义厂商场景，仅显示该模型
+    if (curModel && !models.value.find(m => m.id === curModel)) {
+      models.value = [{id: curModel, name: curModel, contextWindow: undefined}]
+      model.value = curModel
+    }
+    if (!model.value && models.value.length) model.value = models.value[0]!.id
   } catch {
+  } finally {
+    _loadingProviderModels = false
   }
 }
 
@@ -1285,6 +1323,7 @@ async function handleNewSession(workDir: string, encodedDir?: string, histSessio
   activeSessionId.value = histSessionId || null
   // 重置对话状态：清空消息、token 计数、费用
   messages.value = []
+  _loadedHistoryTexts = null
   usage.value = {input: 0, output: 0, thinking: 0, total: 0}
   turnThinkingText = ''
   costTotal.value = 0
@@ -1299,11 +1338,13 @@ async function handleNewSession(workDir: string, encodedDir?: string, histSessio
   syncCurrentTabState()
 
   try {
+    const curModelInfo = models.value.find(m => m.id === model.value)
     const body: any = {
       workDir,
       model: model.value,
       permissionMode: permissionMode.value,
-      thinkingLevel: thinkingLevel.value
+      thinkingLevel: thinkingLevel.value,
+      modelMeta: curModelInfo ? {contextWindow: curModelInfo.contextWindow, pricing: pricing.value} : null
     }
     if (encodedDir && histSessionId) body.resume = histSessionId
 
@@ -1509,12 +1550,16 @@ async function loadHistory(encodedDir: string, sId: string) {
     const res = await fetch(`${GW}/api/projects/${encodedDir}/sessions/${sId}/messages`)
     const data = await res.json()
     if (data.messages?.length) {
+      _loadedHistoryTexts = new Set()
       messages.value.push({role: 'system', text: t('sys.history', {n: data.messages.length}), time: Date.now()})
       for (const m of data.messages) {
+        _loadedHistoryTexts.add(m.text)
         messages.value.push({role: m.role, text: m.text, time: new Date(m.time).getTime()})
       }
     }
-  } catch {
+  } catch (e) {
+    console.error('[loadHistory] 请求历史消息失败:', e)
+    messages.value.push({role: 'error', text: t('err.historyLoad'), time: Date.now()})
   }
   scrollDown()
 }
@@ -1567,24 +1612,34 @@ function connectWS(sid: string, resumed = false) {
   }
 
   ws.onmessage = (e) => {
-    const tab = tabSessions.value.find(t => t.id === myTabId)
-    if (!tab) return  // 标签页已关闭
-
-    const fg = isFg()
-
-    // 后台标签页: 保存当前前台状态 → 将全局 ref 指向 tab 快照 → 处理完后恢复
     let _saved: TabState | null = null
-    if (!fg) {
-      _saved = snapshotTabState()
-      restoreTabState(tab.state)
-      _swappingTab = true
-    }
+    try {
+      const tab = tabSessions.value.find(t => t.id === myTabId)
+      if (!tab) return  // 标签页已关闭
 
-    const msg = JSON.parse(e.data)
-    switch (msg.type) {
+      const fg = isFg()
+
+      // 后台标签页: 保存当前前台状态 → 将全局 ref 指向 tab 快照 → 处理完后恢复
+      if (!fg) {
+        _saved = snapshotTabState()
+        restoreTabState(tab.state)
+        _swappingTab = true
+      }
+
+      let msg
+      try {
+        msg = JSON.parse(e.data)
+      } catch {
+        // 无法解析的消息静默丢弃；若已交换后台 tab 状态则先恢复前台
+        if (_saved) restoreTabState(_saved!)
+        return
+      }
+      switch (msg.type) {
       case 'system_init':
-        // 模型初始化信息：显示当前使用的模型和工作目录
+        // 模型初始化信息：显示当前使用的模型和工作目录，同时捕获 contextWindow 和定价
         messages.value.push({role: 'system', text: t('sys.model', {model: msg.model, cwd: msg.cwd}), time: Date.now()})
+        if (msg.contextWindow) maxTokens.value = msg.contextWindow
+        if (msg.pricing) pricing.value = msg.pricing
         break
 
       case 'assistant_message': {
@@ -1594,15 +1649,19 @@ function connectWS(sid: string, resumed = false) {
         pendingTools.value = []
         for (const block of msg.message?.content || []) {
           if (block.type === 'text' && block.text) {
-            messages.value.push({role: 'assistant', text: block.text, time: Date.now(), tools})
+            const tk = estimateTokens(block.text)
+            messages.value.push({role: 'assistant', text: block.text, time: Date.now(), tools, tokens: tk, cost: estCost(tk)})
           } else if (block.type === 'thinking' && block.thinking) {
             turnThinkingText += block.thinking  // 累计本轮思考文本, result 时估算思考 token
+            const tk = estimateTokens(block.thinking)
             messages.value.push({
               role: 'thinking',
               text: t('ws.thinkContent'),
               time: Date.now(),
               thinkingContent: block.thinking,
               expanded: false,
+              tokens: tk,
+              cost: estCost(tk),
             })
             // 宠物气泡：思考内容摘要
             const bubbleText = block.thinking.slice(0, 80).replace(/\n/g, ' ')
@@ -1665,20 +1724,20 @@ function connectWS(sid: string, resumed = false) {
       }
 
       case 'user_message_echo': {
-        // resume 时 SDK 会重放历史用户消息（防止重复显示）
+        // resume 时 SDK 重放历史用户消息，若 loadHistory 已加载则跳过
         const text = typeof msg.message?.content === 'string'
             ? msg.message.content
             : msg.message?.content?.map((b: any) => b.type === 'text' ? b.text : '').join(' ') || ''
-        if (text.trim()) {
-          messages.value.push({role: 'user', text: text.trim(), time: Date.now()})
+        const trimmed = text.trim()
+        if (trimmed) {
+          if (_loadedHistoryTexts?.has(trimmed)) break
+          const ts = msg.timestamp ? new Date(msg.timestamp).getTime() : Date.now()
+          messages.value.push({role: 'user', text: trimmed, time: ts})
         }
         break
       }
 
-      case 'connected':
-        // Gateway 确认连接，已在 onopen 中处理
-        break
-        // 注：下面的代码是 dead code（break 后不可达），保留但注释说明
+      case 'thinking_start':
         messages.value.push({
           role: 'thinking',
           text: t('ws.thinking'),
@@ -1697,9 +1756,14 @@ function connectWS(sid: string, resumed = false) {
       }
 
       case 'content_block_stop': {
-        // 思考块结束：将标签文本改为"思考完成"
+        // 思考块结束：计算 token/费用，改标签为"思考完成"
         const tmm = [...messages.value].reverse().find(m => m.role === 'thinking' && m.thinkingId === msg.index)
-        if (tmm) tmm.text = t('ws.thinkDone')
+        if (tmm) {
+          const tk = estimateTokens(tmm.thinkingContent || '')
+          tmm.tokens = tk
+          tmm.cost = estCost(tk)
+          tmm.text = t('ws.thinkDone')
+        }
         break
       }
 
@@ -1712,7 +1776,7 @@ function connectWS(sid: string, resumed = false) {
         if (msg.usage?.input_tokens && usage.value.total === 0) {
           usage.value.input = msg.usage.input_tokens
           usage.value.total = msg.usage.input_tokens
-          contextPercent.value = Math.min(100, Math.round(usage.value.total / (maxTokens / 100)))
+          contextPercent.value = Math.min(100, Math.round(usage.value.total / (maxTokens.value / 100)))
           saveUsage()
         }
         break
@@ -1762,7 +1826,7 @@ function connectWS(sid: string, resumed = false) {
         const inp = msg.usage?.input_tokens || 0
         const rawOut = msg.usage?.output_tokens || 0
         // 思考 token: SDK 不单独拆分, 用本轮思考文本估算; 纯输出 = 总输出 - 思考(下限 0)
-        const think = Math.min(rawOut, estimateThinkingTokens(turnThinkingText))
+        const think = Math.min(rawOut, estimateTokens(turnThinkingText))
         const pureOut = Math.max(0, rawOut - think)
         messages.value.push({
           role: 'system',
@@ -1774,8 +1838,10 @@ function connectWS(sid: string, resumed = false) {
           usage.value.thinking = think
           usage.value.output = pureOut
           usage.value.total = inp + rawOut  // context 占用按真实总量(含思考)
-          contextPercent.value = Math.min(100, Math.round(usage.value.total / (maxTokens / 100)))
-          const cost = (inp / 1e6) * PRICE_INPUT + (rawOut / 1e6) * PRICE_OUTPUT  // 费用按真实总输出(思考也计费)
+          contextPercent.value = Math.min(100, Math.round(usage.value.total / (maxTokens.value / 100)))
+          const pi = pricing.value?.inputPrice || 0
+          const po = pricing.value?.outputPrice || 0
+          const cost = (inp / 1e6) * pi + (rawOut / 1e6) * po
           costTotal.value += cost
           saveUsage()  // 持久化本轮累计 token/费用，resume 后可恢复
           loadBalance()
@@ -1952,9 +2018,11 @@ function connectWS(sid: string, resumed = false) {
       // 后台标签页: 写回 tab 快照 → 恢复前台全局状态
       tab.state = snapshotTabState()
       restoreTabState(_saved!)
-      _swappingTab = false
     } else {
       nextTick(() => scrollDown())
+    }
+    } finally {
+      if (_saved) _swappingTab = false
     }
   }
 
@@ -2267,11 +2335,14 @@ function doSend(text: string, wire?: string) {
   clearAgentRuns()       // 新一轮开始: 清空上一轮的 agent 运行卡片
   // resume 走 SDK，claude.exe 自带完整历史，无需前端手动注入 <context>
   messages.value.push({role: 'user', text, time: Date.now()})  // 界面显示用户原文
+  const curModelMeta = models.value.find(m => m.id === model.value)
   ws!.send(JSON.stringify({
     type: 'user_message',
     content: wire ?? text,
     permissionMode: permissionMode.value,
-    thinkingLevel: thinkingLevel.value
+    thinkingLevel: thinkingLevel.value,
+    model: model.value,
+    modelMeta: curModelMeta ? {contextWindow: curModelMeta.contextWindow, pricing: pricing.value} : null
   }))
   nextTick(() => scrollDown(true))
 }
@@ -3059,13 +3130,24 @@ onBeforeUnmount(() => {
   document.removeEventListener('visibilitychange', onPageVisibility)
   if (tabAutoSyncTimer) clearInterval(tabAutoSyncTimer)
   if (sessionDurationTimer) clearInterval(sessionDurationTimer)
+  if (agentRefreshTimer) clearInterval(agentRefreshTimer)
   if (petTimer) clearTimeout(petTimer)
+  if (petBubbleTimer) clearTimeout(petBubbleTimer)
+  if (longTaskBubbleTimer) clearTimeout(longTaskBubbleTimer)
+  if (toastTimer) clearTimeout(toastTimer)
   try {
     if (diffOriginalModel) { diffOriginalModel.dispose(); diffOriginalModel = null }
     if (diffModifiedModel) { diffModifiedModel.dispose(); diffModifiedModel = null }
     monacoDiffEditor.value?.dispose()
   } catch {}
   try { monacoEditor.value?.dispose() } catch {}
+  // 控制通道 WebSocket 清理（防止卸载后自动重连泄漏）
+  if (controlWS) {
+    controlWS.onclose = null
+    controlWS.onerror = null
+    controlWS.close()
+    controlWS = null
+  }
 })
 
 // ═══════════════════════════════════════════
@@ -3288,10 +3370,10 @@ function toggleProject(workDir: string) {
 // ── 控制栏：模型选择 / 权限模式 / 思考等级 ──
 // ═══════════════════════════════════════════
 
-/** 当前选中的模型 ID（默认值，会被 settings 覆盖） */
-const model = ref('deepseek-v4-pro')
-/** 可用的模型列表（由 loadProviderModels 动态填充） */
-const models = ref<string[]>(['deepseek-v4-pro', 'deepseek-v4-flash'])
+/** 当前选中的模型 ID（默认空，由 loadProviderModels 从 settings 填充） */
+const model = ref('')
+/** 可用模型列表（loadProviderModels 动态填充，含 id/name/contextWindow） */
+const models = ref<{id: string, name: string, contextWindow?: string}[]>([])
 /** 权限模式：default=每次询问 / acceptEdits=自动接受编辑 / plan=仅规划 / bypassPermissions=全部允许 */
 const permissionMode = ref('default')
 /** 权限模式选项（i18n 计算属性，支持语言切换） */
@@ -3322,12 +3404,12 @@ const thinkings = computed(() => [
 const contextPercent = ref(0)
 /** 本轮 token 消耗明细：input=输入 / output=纯输出(不含思考) / thinking=思考估算 / total=总量(含思考) */
 const usage = ref({input: 0, output: 0, thinking: 0, total: 0})
-/** 模型最大上下文 token 数（用于百分比计算） */
-const maxTokens = 1000000
+/** 模型最大上下文 token 数，由 system_init 动态设置（默认 1M 兜底） */
+const maxTokens = ref(1000000)
 /**
  * 本轮思考文本累计 —— SDK usage 不单独拆分 thinking（含在 output_tokens 内），
  * 因此需要在每次 thinking block / thinking_delta 时累计文本，
- * 在 result 时用 estimateThinkingTokens() 估算思考 token 数。
+ * 在 result 时用 estimateTokens() 估算思考 token 数。
  */
 let turnThinkingText = ''
 
@@ -3337,33 +3419,36 @@ function fmtTok(n: number): string {
 }
 
 /**
- * 估算思考 token 数（启发式算法）：
+ * 估算 token 数（启发式算法）：
  * - CJK 字符（中日韩统一表意文字、假名、全角符号）：约 1 token/字
  * - 其他字符（英文、数字、ASCII 符号）：约 4 字符/token
  * 仅为估算值，界面展示时标记「~」前缀表示约数。
  */
-function estimateThinkingTokens(text: string): number {
+function estimateTokens(text: string): number {
   if (!text) return 0
   let cjk = 0, other = 0
   for (const ch of text) {
     const code = ch.codePointAt(0) || 0
-    // Unicode 范围：中日韩统一表意 + 扩展A + CJK符号/假名/标点 + 全角字符
     if ((code >= 0x4E00 && code <= 0x9FFF) || (code >= 0x3400 && code <= 0x4DBF) || (code >= 0x3000 && code <= 0x30FF) || (code >= 0xFF00 && code <= 0xFFEF)) cjk++
     else other++
   }
   return Math.round(cjk + other / 4)
 }
 
+/** 估算费用，按输出 token 单价计算（有 pricing 时用实际价格，否则回退 CNY） */
+function estCost(tokens: number): number {
+  if (pricing.value) return (tokens / 1e6) * pricing.value.outputPrice
+  return (tokens / 1e6) * 16  // fallback: DeepSeek 输出价 16 CNY/M，pricing 到位后覆盖
+}
+
 // ═══════════════════════════════════════════
 // ── 费用计算 ──
 // ═══════════════════════════════════════════
 
-/** 累计费用（美元），每轮 result 时累加 */
+/** 累计费用（按供应商货币），每轮 result 时累加 */
 const costTotal = ref(0)
-/** 输入 token 单价：$4 / 百万 token */
-const PRICE_INPUT = 4
-/** 输出 token 单价：$16 / 百万 token（思考也按输出价格计费） */
-const PRICE_OUTPUT = 16
+/** 由 system_init 携带的定价信息：{inputPrice, outputPrice, currency}，null 表示尚未收到 */
+const pricing = ref<{inputPrice: number, outputPrice: number, currency: string} | null>(null)
 
 // ═══════════════════════════════════════════
 // ── Toast 通知系统 ──
@@ -3466,7 +3551,11 @@ function renderMarkdown(raw: string): string {
   html = html.replace(/~~([^~]+)~~/g, '<del class="md-del">$1</del>')
 
   // 链接 [text](url) —— 不设 target，由消息区域的 delegated click 拦截来决定打开方式
-  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" class="md-link">$1</a>')
+  // 仅允许 https?:// 和相对/绝对路径（无协议），阻止 javascript:/data: 等危险 scheme
+  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m: string, text: string, url: string) => {
+    const safe = /^(https?:\/\/|\/|[a-zA-Z]:[\\/]|[^.\\/][^:]*$)/i.test(url.trim())
+    return safe ? `<a href="${url}" class="md-link">${text}</a>` : `<span class="md-link-blocked">${text}</span>`
+  })
 
   // 9. 水平线 ---
   html = html.replace(/^---+$/gm, '<hr class="md-hr">')
@@ -3627,7 +3716,9 @@ function saveUsage() {
     localStorage.setItem(usageKey(sid), JSON.stringify({
       usage: usage.value,
       costTotal: costTotal.value,
-      contextPercent: contextPercent.value
+      contextPercent: contextPercent.value,
+      maxTokens: maxTokens.value,
+      pricing: pricing.value,
     }))
   } catch {
   }
@@ -3642,6 +3733,8 @@ function loadUsage(sid: string) {
     if (d.usage) usage.value = {input: 0, output: 0, thinking: 0, total: 0, ...d.usage}
     if (typeof d.costTotal === 'number') costTotal.value = d.costTotal
     if (typeof d.contextPercent === 'number') contextPercent.value = d.contextPercent
+    if (typeof d.maxTokens === 'number') maxTokens.value = d.maxTokens
+    if (d.pricing) pricing.value = d.pricing
   } catch {
   }
 }
@@ -3654,18 +3747,22 @@ function loadUsage(sid: string) {
 const tokenTooltip = computed(() => {
   const u = usage.value
   const rawOut = u.output + u.thinking  // 真实总输出 token(思考也计费, 故费用按此算)
-  const costThisTurn = (u.input / 1e6) * PRICE_INPUT + (rawOut / 1e6) * PRICE_OUTPUT
+  const pi = pricing.value?.inputPrice || 0
+  const po = pricing.value?.outputPrice || 0
+  const costThisTurn = (u.input / 1e6) * pi + (rawOut / 1e6) * po
   const bal = balance.value.balance || 0
   const remaining = bal - costTotal.value
+  const mt = maxTokens.value
   return {
-    used: `${(u.total / 1000).toFixed(1)}K / ${(maxTokens / 1e6).toFixed(1)}M`,
-    pct: ((u.total / maxTokens) * 100).toFixed(1) + '%',
+    used: `${(u.total / 1000).toFixed(1)}K / ${(mt / 1e6).toFixed(1)}M`,
+    pct: ((u.total / mt) * 100).toFixed(1) + '%',
     input: fmtTok(u.input),
     thinking: u.thinking > 0 ? '~' + fmtTok(u.thinking) : '—',
     output: fmtTok(u.output),
     costTurn: costThisTurn.toFixed(4),
     costTotal: costTotal.value.toFixed(4),
     remaining: Math.max(0, remaining).toFixed(2),
+    currency: pricing.value?.currency || 'CNY',
   }
 })
 </script>
@@ -3841,6 +3938,7 @@ const tokenTooltip = computed(() => {
                       (msg.thinkingContent || msg.text).slice(0, 60).replace(/\n/g, ' ')
                     }}{{ (msg.thinkingContent || '').length > 60 ? '...' : '' }}</span>
                   <span class="think-time">{{ formatTime(msg.time) }}</span>
+                  <span v-if="msg.tokens" class="think-tokens">~{{ fmtTok(msg.tokens) }} tokens{{ msg.cost ? ' · ¥' + msg.cost.toFixed(4) : '' }}</span>
                 </summary>
                 <div class="think-content" v-html="renderMarkdown(msg.thinkingContent || msg.text)"></div>
               </details>
@@ -3877,6 +3975,7 @@ const tokenTooltip = computed(() => {
                       </svg>
                     </button>
                   </div>
+                  <div v-if="msg.role === 'assistant' && msg.tokens" class="bubble-tokens">~{{ fmtTok(msg.tokens) }} tokens · ¥{{ msg.cost!.toFixed(4) }}</div>
                 </div>
                 <!-- 工具调用记录：仅 assistant 消息且有工具调用时显示 -->
                 <div v-if="msg.role === 'assistant' && msg.tools?.length" class="tools-box">
@@ -4059,7 +4158,7 @@ const tokenTooltip = computed(() => {
           <div class="control-group">
             <span class="control-label">{{ t('ws.ctlModel') }}</span>
             <select v-model="model" class="control-select">
-              <option v-for="m in models" :key="m" :value="m">{{ m }}</option>
+              <option v-for="m in models" :key="m.id" :value="m.id">{{ m.id }}</option>
             </select>
           </div>
           <!-- 权限模式选择器 -->
@@ -5950,6 +6049,14 @@ const tokenTooltip = computed(() => {
   font-size: 11px;
 }
 
+.think-tokens {
+  flex-shrink: 0;
+  opacity: 0.4;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+}
+
 .think-content {
   padding: 10px 14px 12px;
   font-size: 13px;
@@ -6252,6 +6359,14 @@ const tokenTooltip = computed(() => {
 
 .bubble:hover .bubble-actions {
   opacity: 1;
+}
+
+.bubble-tokens {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  opacity: 0.5;
+  padding: 2px 0 0 2px;
 }
 
 .bubble-act-btn {

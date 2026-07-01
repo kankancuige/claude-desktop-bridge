@@ -267,7 +267,8 @@ function createWindow() {
   // 功能说明: 拦截 window.open 调用，改为在系统默认浏览器中打开
   // 实现方式: shell.openExternal 打开外部 URL，返回 { action: 'deny' } 阻止新窗口创建
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url)
+    // 仅允许 http/https URL，阻止 file:/// javascript: 等危险 scheme
+    if (/^https?:\/\//i.test(url)) shell.openExternal(url)
     return { action: 'deny' }
   })
 

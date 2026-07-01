@@ -29,7 +29,7 @@ function getAutoUpdater() {
     try {
       _autoUpdater = require('electron-updater').autoUpdater
       _autoUpdater.autoDownload = false
-      _autoUpdater.allowDowngrade = true
+      _autoUpdater.allowDowngrade = false
       _autoUpdater.fullChangelog = true
 
       _autoUpdater.on('update-available', (info) => {

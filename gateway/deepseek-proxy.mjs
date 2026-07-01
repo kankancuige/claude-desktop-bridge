@@ -12,6 +12,7 @@
 // https://github.com/kankancuige/claude-desktop-bridge
 import {createServer as createHttpServer} from 'node:http'
 import {request as httpsRequest} from 'node:https'
+import {createHash} from 'node:crypto'
 import {createLogger} from './logger.mjs'
 
 const log = createLogger('proxy')
@@ -19,9 +20,43 @@ const log = createLogger('proxy')
 let proxyPort = 0
 let proxyServer = null
 
-// ── thinking 块缓存 (sessionId → [{index, thinking, signature}]) ──
+// ── thinking 块缓存 (fingerprint → [{index, thinking, signature}]) ──
 const thinkingCache = new Map()
 const MAX_CACHE_PER_SESSION = 50
+/** 全局 TTL: 30 分钟清理一次过期 session，防止长时间运行内存膨胀 */
+const CACHE_TTL_MS = 30 * 60 * 1000
+let _cacheCleanupTimer = setInterval(() => {
+    const cutoff = Date.now() - CACHE_TTL_MS
+    for (const [k, v] of thinkingCache) {
+        const lastCached = v[v.length - 1]?.cachedAt || 0
+        if (lastCached < cutoff) thinkingCache.delete(k)
+    }
+}, CACHE_TTL_MS)
+if (_cacheCleanupTimer.unref) _cacheCleanupTimer.unref()
+
+// ── 从请求体提取会话指纹，不同对话自动隔离 thinking 缓存 ──
+function getSessionFingerprint(body) {
+    if (!body || !body.messages) return 'default'
+    const model = body.model || 'default'
+    // 用第一条 user 消息内容 + 消息总数做 fingerprint
+    // SHA256 取 16 位 hex，碰撞空间 2^64，比 8 位 MD5 (2^32) 安全得多
+    const firstUser = body.messages.find(m => m.role === 'user')
+    if (firstUser) {
+        const content = typeof firstUser.content === 'string'
+            ? firstUser.content
+            : (Array.isArray(firstUser.content)
+                ? firstUser.content.filter(b => b.type === 'text').map(b => b.text).join('')
+                : '')
+        if (content) {
+            const h = createHash('sha256')
+                .update(content.slice(0, 500))
+                .update(String(body.messages.length))
+                .digest('hex').slice(0, 16)
+            return model + '-' + h
+        }
+    }
+    return model
+}
 
 /**
  * 启动代理服务器
@@ -40,17 +75,8 @@ export function startDeepSeekProxy(upstream) {
             handleProxyRequest(req, res, upstreamUrl)
         })
 
-        proxyServer.on('error', (e) => {
-            log.error({err: e}, '代理服务异常')
-        })
-
         // 固定端口 8787，供 Claude Desktop settings.json 配置引用
         const TRY_PORT = 8787
-        proxyServer.listen(TRY_PORT, '127.0.0.1', () => {
-            proxyPort = TRY_PORT
-            log.info({port: proxyPort, upstream}, '代理已启动')
-            resolve({server: proxyServer, port: proxyPort})
-        })
         proxyServer.on('error', (e) => {
             if (e.code === 'EADDRINUSE') {
                 // 8787 被占用 → 回退到随机端口
@@ -59,7 +85,14 @@ export function startDeepSeekProxy(upstream) {
                     log.info({port: proxyPort, upstream, fallback: true}, '代理已启动（fallback 端口）')
                     resolve({server: proxyServer, port: proxyPort})
                 })
+            } else {
+                log.error({err: e}, '代理服务异常')
             }
+        })
+        proxyServer.listen(TRY_PORT, '127.0.0.1', () => {
+            proxyPort = TRY_PORT
+            log.info({port: proxyPort, upstream}, '代理已启动')
+            resolve({server: proxyServer, port: proxyPort})
         })
     })
 }
@@ -80,7 +113,11 @@ export function isProxyRunning() {
 export function stopDeepSeekProxy() {
     if (proxyServer) {
         try {
+            // 强制关闭所有活跃连接，防止 keep-alive 导致 server.close() hang
+            proxyServer.closeAllConnections?.()
             proxyServer.close()
+            // 兜底：2 秒后 unref，进程可以退出
+            setTimeout(() => { proxyServer?.unref() }, 2000)
         } catch {
         }
         proxyServer = null
@@ -196,8 +233,9 @@ async function handleProxyRequest(clientReq, clientRes, upstreamUrl) {
         }
 
         // ── 3. 综合修复 ──
+        const sessionFp = body ? getSessionFingerprint(body) : 'default'
         if (body) {
-            body = applyAllFixes(body)
+            body = applyAllFixes(body, sessionFp)
         }
 
         const modifiedBody = body ? JSON.stringify(body) : rawBody
@@ -222,7 +260,7 @@ async function handleProxyRequest(clientReq, clientRes, upstreamUrl) {
             upstreamRes.on('data', (chunk) => responseChunks.push(chunk))
             upstreamRes.on('end', () => {
                 const responseBody = Buffer.concat(responseChunks).toString('utf8')
-                cacheResponseThinking(clientReq.url, responseBody)
+                cacheResponseThinking(sessionFp, responseBody)
 
                 // 透传响应
                 clientRes.writeHead(upstreamRes.statusCode, upstreamRes.headers)
@@ -272,9 +310,9 @@ function fixThinkingDisabled(body) {
 // ── 综合修复入口 ──
 // ══════════════════════════════════════════════════════
 
-function applyAllFixes(body) {
+function applyAllFixes(body, sessionFp) {
     body = fixThinkingDisabled(body)
-    body = injectThinkingBlocks(body)
+    body = injectThinkingBlocks(body, sessionFp)
     return body
 }
 
@@ -288,7 +326,7 @@ function applyAllFixes(body) {
  *   Anthropic: content[].thinking 块
  *   OpenAI:    reasoning_content 字段
  */
-function cacheResponseThinking(url, responseBody) {
+function cacheResponseThinking(fingerprint, responseBody) {
     try {
         const data = JSON.parse(responseBody)
 
@@ -296,8 +334,6 @@ function cacheResponseThinking(url, responseBody) {
         if (data.content && Array.isArray(data.content)) {
             const thinkingBlocks = data.content.filter(b => b.type === 'thinking')
             if (thinkingBlocks.length > 0) {
-                // 用 stop_reason 作为简易 session 指纹
-                const fingerprint = data.stop_reason || data.model || 'default'
                 if (!thinkingCache.has(fingerprint)) {
                     thinkingCache.set(fingerprint, [])
                 }
@@ -308,7 +344,6 @@ function cacheResponseThinking(url, responseBody) {
                         signature: tb.signature || '',
                         cachedAt: Date.now(),
                     })
-                    // 限制缓存大小
                     while (cache.length > MAX_CACHE_PER_SESSION) cache.shift()
                 }
             }
@@ -318,7 +353,6 @@ function cacheResponseThinking(url, responseBody) {
         if (data.choices && Array.isArray(data.choices)) {
             for (const choice of data.choices) {
                 if (choice.message?.reasoning_content) {
-                    const fingerprint = data.model || 'default'
                     if (!thinkingCache.has(fingerprint)) {
                         thinkingCache.set(fingerprint, [])
                     }
@@ -331,6 +365,8 @@ function cacheResponseThinking(url, responseBody) {
             }
         }
     } catch {
+        // 响应非 JSON（HTTP 错误页等），正常跳过，不影响主响应透传
+        log.debug({fingerprint, len: (responseBody || '').length}, 'thinking 缓存: 响应非 JSON，跳过')
     }
 }
 
@@ -338,10 +374,9 @@ function cacheResponseThinking(url, responseBody) {
  * 向请求的 messages 中注入缺失的 reasoning_content
  * 遍历 assistant 消息: 有 tool_calls 但缺 thinking 块 → 从缓存注入
  */
-function injectThinkingBlocks(body) {
+function injectThinkingBlocks(body, fingerprint) {
     if (!body.messages || !Array.isArray(body.messages)) return body
 
-    const fingerprint = body.model || 'default'
     const cache = thinkingCache.get(fingerprint)
     if (!cache || cache.length === 0) return body
 

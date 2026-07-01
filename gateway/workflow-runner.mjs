@@ -7,7 +7,7 @@ import {createHash} from 'node:crypto'
 import {readdirSync, readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, rmSync} from 'node:fs'
 import {execSync} from 'node:child_process'
 import {join} from 'node:path'
-import {homedir, cpus} from 'node:os'
+import {homedir, cpus, tmpdir} from 'node:os'
 import {createLogger} from './logger.mjs'
 
 const log = createLogger('workflow')
@@ -699,6 +699,12 @@ function createWorktree(projectDir, stepId, wfId) {
         }
     }
 
+    // 校验 projectDir 不含 shell 特殊字符（防命令注入），wtDir 由内部生成已消毒
+    const safeForShell = (s) => /^[a-zA-Z0-9_:\\/\-. 一-鿿]+$/.test(String(s))
+    if (!safeForShell(projectDir)) {
+        log.warn({projectDir}, 'projectDir 含非法字符，跳过 worktree 创建')
+        return {dir: mkdtempSync(join(tmpdir(), 'wf-')), isGit: false}
+    }
     let isGit = false
     try {
         execSync(`git -C "${projectDir}" rev-parse --git-dir`, {stdio: 'pipe', timeout: 5000})

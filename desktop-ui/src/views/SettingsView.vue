@@ -188,10 +188,12 @@ function applyTheme(t: string) {
 }
 
 // 主题/语言改为「保存配置」后才生效（不在选择时即时预览），故此处不再 watch settings.theme/language
+let _stvThemeHandler: (() => void) | null = null
 if (typeof window !== 'undefined') {
-  window.matchMedia?.('(prefers-color-scheme: dark)').addEventListener('change', () => {
+  _stvThemeHandler = () => {
     if (settings.value?.theme === 'system') document.documentElement.dataset.theme = detectSystemTheme()
-  })
+  }
+  window.matchMedia?.('(prefers-color-scheme: dark)').addEventListener('change', _stvThemeHandler)
 }
 
 // ── Token 值格式化: 1000000 → "1M", 200000 → "200K" ──
@@ -243,9 +245,19 @@ async function loadSettings() {
           env: {...DEFAULT_SETTINGS.env, ...(raw.env || {})},
         }
         const url = settings.value.env?.ANTHROPIC_BASE_URL || ''
-        if (url.includes('deepseek')) providerId.value = 'deepseek'
-        else if (url.includes('anthropic')) providerId.value = 'anthropic'
-        else if (url.includes('openai')) providerId.value = 'codex'
+        // 供应商推断：按 baseUrl 特征匹配，与 WorkspaceView loadProviderModels 保持一致
+        const urlL = url.toLowerCase()
+        if (urlL.includes('deepseek')) providerId.value = 'deepseek'
+        else if (urlL.includes('anthropic')) providerId.value = 'anthropic'
+        else if (urlL.includes('openai') || urlL.includes('codex')) providerId.value = 'codex'
+        else if (urlL.includes('bigmodel')) providerId.value = 'zhipu'
+        else if (urlL.includes('moonshot') || urlL.includes('kimi')) providerId.value = 'moonshot'
+        else if (urlL.includes('aliyun')) providerId.value = 'qwen'
+        else if (urlL.includes('openrouter')) providerId.value = 'openrouter'
+        else if (urlL.includes('ollama')) providerId.value = 'ollama'
+        else if (urlL.includes('volces') || urlL.includes('volcengine')) providerId.value = 'volcengine'
+        else if (urlL.includes('googleapi')) providerId.value = 'gemini'
+        else if (url) providerId.value = 'custom'  // 非预设 URL → 自定义
         manualBaseUrl.value = url
         tokenInput.value = formatTokens(settings.value.maxContextTokens)
       } else {
@@ -287,6 +299,7 @@ async function loadProviders() {
       providers.value = data.providers || []
     }
   } catch {
+    // Gateway 未就绪时保留默认 providers 列表，不阻塞 UI
   }
   // 叠加：用 supportedModels() 动态模型覆盖当前供应商的预设列表（拿不到则保留预设）
   await overlayDynamicModels()
@@ -311,7 +324,11 @@ async function testConnection() {
     return
   }
   try {
-    const r = await fetch(`${GW}/api/config/test-model?baseUrl=${encodeURIComponent(baseUrl)}&apiKey=${encodeURIComponent(apiKey)}`)
+    const r = await fetch(`${GW}/api/config/test-model`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({baseUrl, apiKey}),
+    })
     const d = await r.json()
     if (d.ok) {
       testState.value = 'ok';
@@ -336,17 +353,20 @@ async function testConnection() {
 async function overlayDynamicModels() {
   const pid = providerId.value
   const endpoint = pid === 'anthropic' ? '/api/config/models' : '/api/config/live-models'
+  const isAnthropic = pid === 'anthropic'
   // 把当前供应商的 baseUrl 和 apiKey 传给 gateway，否则 gateway 只用全局 env 永远拉同一家的模型
   const p = providers.value.find(pp => pp.id === pid)
-  const params = new URLSearchParams()
   // 优先用户表单的实际 baseUrl（与 testConnection 一致），预设兜底
   const baseUrl = settings.value?.env?.ANTHROPIC_BASE_URL || p?.baseUrl || ''
-  if (baseUrl) params.set('baseUrl', baseUrl)
-  const ak = settings.value?.env?.ANTHROPIC_AUTH_TOKEN
-  if (ak) params.set('apiKey', ak)
-  const qs = params.toString() ? `?${params.toString()}` : ''
+  if (!baseUrl) { modelsLive.value = false; return }  // 自定义无 URL → 不请求，等用户手动填写
+  const ak = settings.value?.env?.ANTHROPIC_AUTH_TOKEN || settings.value?.env?.ANTHROPIC_API_KEY
   try {
-    const r = await fetch(`${GW}${endpoint}${qs}`)
+    const fetchOpts: any = isAnthropic ? {} : {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({baseUrl, apiKey: ak || ''}),
+    }
+    const r = await fetch(`${GW}${endpoint}`, fetchOpts)
     if (!r.ok) {
       modelsLive.value = false;
       return
@@ -378,11 +398,11 @@ function selectProvider(id: string) {
   testMsg.value = ''
   const p = providers.value.find(pp => pp.id === id)
   if (p && settings.value) {
-    settings.value.env.ANTHROPIC_BASE_URL = p.baseUrl
+    settings.value.env.ANTHROPIC_BASE_URL = p.baseUrl  // 预设 baseUrl 写入，自定义为空则清空
     if (p.models && p.models.length > 0) settings.value.model = p.models[0].id
+    else settings.value.model = ''
   }
-  // 自定义供应商不拉动态模型（无预设 baseUrl）
-  if (id !== 'custom') overlayDynamicModels()
+  overlayDynamicModels()
 }
 
 // ── 保存设置 (PUT /api/config/settings) ──
@@ -718,6 +738,7 @@ async function installFromMarket(item: any) {
 
 // ── 待删除的 skill（二次确认）──
 const pendingDeleteSkill = ref<string | null>(null)
+let pendingDeleteSkillTimer: ReturnType<typeof setTimeout> | null = null
 
 async function deleteSkill(name: string) {
   if (pendingDeleteSkill.value === name) {
@@ -735,7 +756,8 @@ async function deleteSkill(name: string) {
     } catch (e: any) { showAlert('删除失败: ' + (e.message || '')) }
   } else {
     pendingDeleteSkill.value = name
-    setTimeout(() => { if (pendingDeleteSkill.value === name) pendingDeleteSkill.value = null }, 4000)
+    if (pendingDeleteSkillTimer) clearTimeout(pendingDeleteSkillTimer)
+    pendingDeleteSkillTimer = setTimeout(() => { if (pendingDeleteSkill.value === name) pendingDeleteSkill.value = null }, 4000)
   }
 }
 
@@ -1113,6 +1135,7 @@ const activeRuleCategory = ref('')
 // ── Rules 来源筛选 ──
 const activeRuleSource = ref('')
 const pendingDeleteRule = ref<string | null>(null)
+let pendingDeleteRuleTimer: ReturnType<typeof setTimeout> | null = null
 const ruleSearch = ref('')
 const rulesSourceCounts = computed(() => {
   const builtin = rules.value.filter(r => r.source === 'builtin').length
@@ -1232,7 +1255,8 @@ async function deleteRule(filename: string) {
     } catch (e: any) { showAlert('删除失败: ' + (e.message || '')) }
   } else {
     pendingDeleteRule.value = filename
-    setTimeout(() => { if (pendingDeleteRule.value === filename) pendingDeleteRule.value = null }, 4000)
+    if (pendingDeleteRuleTimer) clearTimeout(pendingDeleteRuleTimer)
+    pendingDeleteRuleTimer = setTimeout(() => { if (pendingDeleteRule.value === filename) pendingDeleteRule.value = null }, 4000)
   }
 }
 
@@ -1940,6 +1964,7 @@ const retryCount = ref<Record<string, number>>({})
 const MAX_RETRIES = 3
 // 自动重试定时器
 let retryTimer: ReturnType<typeof setInterval> | null = null
+let petPollTimer: ReturnType<typeof setInterval> | null = null
 
 // 并行加载所有模块数据
 async function loadAllModules() {
@@ -2012,18 +2037,19 @@ function loadPetOptions() {
       petType.value = petOptions.value[0].id
     }
   } else {
-    const iv = setInterval(() => {
+    petPollTimer = setInterval(() => {
       const p = (window as any).__petInfo
       if (p) {
         petOptions.value = p.getPets()
         petOptionsLoaded.value = true
-        clearInterval(iv)
+        clearInterval(petPollTimer!)
+        petPollTimer = null
         if (!petType.value && petOptions.value.length > 0) {
           petType.value = petOptions.value[0].id
         }
       }
     }, 300)
-    setTimeout(() => { if (!petOptionsLoaded.value) { clearInterval(iv); petOptionsLoaded.value = true } }, 5000)
+    setTimeout(() => { if (!petOptionsLoaded.value && petPollTimer) { clearInterval(petPollTimer); petPollTimer = null; petOptionsLoaded.value = true } }, 5000)
   }
 }
 
@@ -2036,6 +2062,10 @@ onMounted(() => {
 
 onUnmounted(() => {
   if (retryTimer) clearInterval(retryTimer)
+  if (petPollTimer) clearInterval(petPollTimer)
+  if (pendingDeleteSkillTimer) clearTimeout(pendingDeleteSkillTimer)
+  if (pendingDeleteRuleTimer) clearTimeout(pendingDeleteRuleTimer)
+  if (_stvThemeHandler) window.matchMedia?.('(prefers-color-scheme: dark)').removeEventListener('change', _stvThemeHandler)
 })
 </script>
 

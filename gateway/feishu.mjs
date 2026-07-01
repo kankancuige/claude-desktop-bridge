@@ -85,7 +85,12 @@ export function startFeishuAdapter() {
 
     // ── 配对码生成 ──
     const pairCode = String(Math.floor(100000 + Math.random() * 900000))
-    log.info({pairCode}, '配对码已生成')
+    log.info({pairCodeMasked: pairCode.slice(0, 2) + '****'}, '配对码已生成')
+
+    // ── 配对暴力破解防护 ──
+    const pairFailCount = new Map()
+    const PAIR_MAX_FAIL = 5
+    const PAIR_COOLDOWN_MS = 10 * 60 * 1000
 
     // ── pendingConfirm 挂起确认表 ──
     // 功能说明: 记录等待用户回复确认的请求，key 为飞书用户 open_id
@@ -165,12 +170,29 @@ export function startFeishuAdapter() {
 
         // ── 第1层: 配对鉴权 ──
         if (!pairedUsers.has(uid)) {
+            const fc = pairFailCount.get(uid)
+            if (fc && fc.count >= PAIR_MAX_FAIL && Date.now() < fc.cooldownUntil) {
+                const remainMin = Math.ceil((fc.cooldownUntil - Date.now()) / 60000)
+                await sendMsg(uid, `尝试次数过多，请 ${remainMin} 分钟后再试`)
+                return
+            }
             if (text.trim() === pairCode) {
                 pairedUsers.add(uid)
+                pairFailCount.delete(uid)
                 writeFileSync(pairedFile, JSON.stringify({users: [...pairedUsers]}))  // SIDE_EFFECT: 持久化白名单
                 await sendMsg(uid, '配对成功！现在可以开始对话了。')
             } else {
-                await sendMsg(uid, `请先发送配对码进行授权。你的配对码是: ${pairCode}`)
+                const cur = pairFailCount.get(uid) || {count: 0, cooldownUntil: 0}
+                cur.count++
+                if (cur.count >= PAIR_MAX_FAIL) {
+                    cur.cooldownUntil = Date.now() + PAIR_COOLDOWN_MS
+                    log.warn({userId: uid?.slice(0, 8), failCount: cur.count}, '配对码暴力破解触发冷却')
+                }
+                pairFailCount.set(uid, cur)
+                const left = PAIR_MAX_FAIL - cur.count
+                await sendMsg(uid, left > 0
+                    ? `配对码错误，还剩 ${left} 次机会`
+                    : `尝试次数过多，已锁定 ${PAIR_COOLDOWN_MS / 60000} 分钟`)
             }
             return
         }
@@ -194,7 +216,7 @@ export function startFeishuAdapter() {
                 if (r.ok) await sendMsg(uid, '已提交')
                 else await sendMsg(uid, '该请求已处理')
             } catch (e) {
-                await sendMsg(uid, '提交失败: ' + e.message)
+                await sendMsg(uid, '提交失败，请稍后重试')
             }
             pendingConfirm.delete(uid)  // 无论成功与否都清除挂起状态
             return
@@ -233,7 +255,7 @@ export function startFeishuAdapter() {
         } catch (e) {
             log.error({err: e, userId: uid?.slice(0, 8)}, '处理失败')
             try {
-                await sendMsg(uid, '处理失败: ' + e.message)
+                await sendMsg(uid, '处理失败，请稍后重试')
             } catch {
             }
         }
@@ -250,10 +272,16 @@ export function startFeishuAdapter() {
     // 关键数据流: user_message → WS 事件流 → replyText 累积 → finish() → sendMsg 飞书用户
     async function injectAndWait(sessionId, userId, text) {
         return new Promise(async (resolve) => {
-            const mirrorOn = await shouldSkipReply(sessionId)
-            log.info({sessionId: sessionId?.slice(0, 8), mirror: mirrorOn}, 'inject 开始')
-            const ws2 = new WebSocket(`ws://127.0.0.1:3456/ws/${sessionId}?source=feishu`)
+            let ws2
+            try {
+                ws2 = new WebSocket(`ws://127.0.0.1:3456/ws/${sessionId}?source=feishu`)
+            } catch (e) {
+                resolve()
+                return
+            }
             let toolCount = 0, done = false, replyText = ''
+            let mirrorOn = false
+            let timeoutId = null
 
             // ── finish ──
             // 功能说明: 标记完成并发送回复(reason 参数用于日志诊断结束原因)
@@ -261,6 +289,7 @@ export function startFeishuAdapter() {
             const finish = async (reason) => {
                 if (done) return;
                 done = true;
+                if (timeoutId) clearTimeout(timeoutId)
                 log.info({
                     sessionId: sessionId?.slice(0, 8),
                     reason,
@@ -283,22 +312,22 @@ export function startFeishuAdapter() {
                 resolve()
             }
 
-            // ── WS 连接建立 → 发送用户消息 ──
+            // ── WS 事件处理（必须在任何 await 之前注册，防止事件竞态丢失）──
+            ws2.onerror = () => finish('ws_error')
+            ws2.onclose = () => finish('ws_close')
+            timeoutId = setTimeout(() => finish('timeout'), 5 * 60 * 1000 + 30000)
+
             ws2.onopen = () => {
                 ws2.send(JSON.stringify({type: 'user_message', content: text}));
                 log.info({sessionId: sessionId?.slice(0, 8), text: text.slice(0, 50)}, '→session')
             }
 
-            // ── WS 消息事件处理 ──
-            // 事件类型: assistant_message / text_delta / tool_use_start / permission_request / choice_request / result
             ws2.onmessage = (e) => {
                 try {
                     const msg = JSON.parse(e.data)
                     if (msg.type === 'text_delta' && msg.text) {
-                        // 增量文本流片段拼接
                         replyText += msg.text
                     } else if (msg.type === 'assistant_message') {
-                        // 完整 assistant 消息中的 text blocks 收集
                         const parts = [];
                         for (const b of (msg.message?.content || [])) {
                             if (b.type === 'text' && b.text) parts.push(b.text)
@@ -308,7 +337,6 @@ export function startFeishuAdapter() {
                         toolCount++
                         if (!mirrorOn) sendMsg(userId, `⏳ [${toolCount}] ${msg.tool_name || '工具'}...`)
                     } else if (msg.type === 'permission_request') {
-                        // mirror 开启时通过钩子下发，不走内联路径避免重复
                         if (!mirrorOn) {
                             pendingConfirm.set(userId, {sessionId, requestId: msg.requestId, type: 'permission'})
                             sendMsg(userId, `需要授权\n工具: ${msg.toolName}\n\n回复 y/确认 允许，n/拒绝 拒绝`)
@@ -329,7 +357,6 @@ export function startFeishuAdapter() {
                             sendMsg(userId, `请选择\n${lines.join('\n')}\n\n回复选项编号`)
                         }
                     } else if (msg.type === 'result') {
-                        // Claude 回复完成
                         if (toolCount > 0 && !mirrorOn) sendMsg(userId, `共执行 ${toolCount} 个工具`)
                         setTimeout(finish, 500, 'result')
                     }
@@ -337,11 +364,8 @@ export function startFeishuAdapter() {
                 }
             }
 
-            // ── WS 异常/关闭 → 直接完成 ──
-            ws2.onerror = () => finish('ws_error')
-            ws2.onclose = () => finish('ws_close')
-            // 含权限确认时 query 可能阻塞超过 5 分钟
-            setTimeout(() => finish('timeout'), 5 * 60 * 1000 + 30000)
+            // 事件处理器全部就位后才做 async 操作
+            mirrorOn = await shouldSkipReply(sessionId)
         })
     }
 

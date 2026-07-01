@@ -377,8 +377,8 @@ export function useWorkflow() {
 
         const esc = (s: string) => s.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n')
         const agentOpts = (n: typeof nodes.value[0]) => {
-            const parts = [`agentType: '${n.agent}'`]
-            if (n.model && n.model !== 'inherit') parts.push(`model: '${n.model}'`)
+            const parts = [`agentType: '${esc(n.agent)}'`]
+            if (n.model && n.model !== 'inherit') parts.push(`model: '${esc(n.model)}'`)
             if (n.maxTurns !== 15) parts.push(`maxTurns: ${n.maxTurns}`)
             return parts.join(', ')
         }

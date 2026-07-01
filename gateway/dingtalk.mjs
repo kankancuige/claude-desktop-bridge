@@ -107,9 +107,11 @@ export function startDingTalkAdapter() {
     }
 
     // 每 100 分钟清除 token 缓存(钉钉 token 有效期 2 小时，提前 20 分钟刷新)
-    setInterval(() => {
+    const tokenRefreshTimer = setInterval(() => {
         accessToken = null
     }, 100 * 60 * 1000)
+    // 确保定时器不会阻止进程退出
+    if (tokenRefreshTimer && typeof tokenRefreshTimer.unref === 'function') tokenRefreshTimer.unref()
 
     // ── sendMsg ── 发送消息到钉钉用户(通过 HTTP API)
     // 功能说明: 通过钉钉机器人单聊消息 API 发送文本到指定用户
@@ -151,7 +153,12 @@ export function startDingTalkAdapter() {
 
     // ── 配对码生成 ──
     const pairCode = String(Math.floor(100000 + Math.random() * 900000))
-    log.info({pairCode}, '配对码已生成')
+    log.info({pairCodeMasked: pairCode.slice(0, 2) + '****'}, '配对码已生成')
+
+    // ── 配对暴力破解防护 ──
+    const pairFailCount = new Map()  // userId → {count, cooldownUntil}
+    const PAIR_MAX_FAIL = 5           // 连续失败上限
+    const PAIR_COOLDOWN_MS = 10 * 60 * 1000  // 冷却时间 10 分钟
 
     // ── pendingConfirm 挂起确认表 ──
     const pendingConfirm = new Map()
@@ -184,12 +191,30 @@ export function startDingTalkAdapter() {
 
         // ── 第1层: 配对鉴权 ──
         if (!pairedUsers.has(uid)) {
+            // 暴力破解防护：检查冷却期
+            const fc = pairFailCount.get(uid)
+            if (fc && fc.count >= PAIR_MAX_FAIL && Date.now() < fc.cooldownUntil) {
+                const remainMin = Math.ceil((fc.cooldownUntil - Date.now()) / 60000)
+                await sendMsg(uid, `尝试次数过多，请 ${remainMin} 分钟后再试`)
+                return
+            }
             if (text.trim() === pairCode) {
                 pairedUsers.add(uid)
+                pairFailCount.delete(uid)
                 writeFileSync(pairedFile, JSON.stringify({users: [...pairedUsers]}))  // SIDE_EFFECT: 持久化白名单
                 await sendMsg(uid, '配对成功！现在可以开始对话了。')
             } else {
-                await sendMsg(uid, `请先发送配对码进行授权。你的配对码是: ${pairCode}`)
+                const cur = pairFailCount.get(uid) || {count: 0, cooldownUntil: 0}
+                cur.count++
+                if (cur.count >= PAIR_MAX_FAIL) {
+                    cur.cooldownUntil = Date.now() + PAIR_COOLDOWN_MS
+                    log.warn({userId: uid?.slice(0, 8), failCount: cur.count}, '配对码暴力破解触发冷却')
+                }
+                pairFailCount.set(uid, cur)
+                const left = PAIR_MAX_FAIL - cur.count
+                await sendMsg(uid, left > 0
+                    ? `配对码错误，还剩 ${left} 次机会`
+                    : `尝试次数过多，已锁定 ${PAIR_COOLDOWN_MS / 60000} 分钟`)
             }
             return
         }
@@ -212,7 +237,7 @@ export function startDingTalkAdapter() {
                 if (r.ok) await sendMsg(uid, '已提交')
                 else await sendMsg(uid, '该请求已处理')
             } catch (e) {
-                await sendMsg(uid, '提交失败: ' + e.message)
+                await sendMsg(uid, '提交失败，请稍后重试')
             }
             pendingConfirm.delete(uid)
             return
@@ -250,7 +275,7 @@ export function startDingTalkAdapter() {
         } catch (e) {
             log.error({err: e, userId: uid?.slice(0, 8)}, '处理失败')
             try {
-                await sendMsg(uid, '处理失败: ' + e.message)
+                await sendMsg(uid, '处理失败，请稍后重试')
             } catch {
             }
         }
@@ -267,16 +292,22 @@ export function startDingTalkAdapter() {
     // 关键数据流: user_message → WS 事件流 → replyText 累积 → finish() → sendMsg 钉钉用户
     async function injectAndWait(sessionId, userId, text) {
         return new Promise(async (resolve) => {
-            const mirrorOn = await shouldSkipReply(sessionId)
-            log.info({sessionId: sessionId?.slice(0, 8), mirror: mirrorOn}, 'inject 开始')
-            const ws2 = new WebSocket(`ws://127.0.0.1:3456/ws/${sessionId}?source=dingtalk`)
+            let ws2
+            try {
+                ws2 = new WebSocket(`ws://127.0.0.1:3456/ws/${sessionId}?source=dingtalk`)
+            } catch (e) {
+                resolve()  // WebSocket 构造失败直接结束
+                return
+            }
             let toolCount = 0, done = false, replyText = ''
+            let mirrorOn = false
+            let timeoutId = null
 
             // ── finish ──
-            // 功能说明: 标记完成并发送回复，防重入确保只执行一次
             const finish = async (reason) => {
                 if (done) return;
                 done = true;
+                if (timeoutId) clearTimeout(timeoutId)
                 log.info({
                     sessionId: sessionId?.slice(0, 8),
                     reason,
@@ -299,22 +330,22 @@ export function startDingTalkAdapter() {
                 resolve()
             }
 
-            // ── WS 连接建立 → 发送用户消息 ──
+            // ── WS 事件处理（必须在任何 await 之前注册，防止事件竞态丢失）──
+            ws2.onerror = () => finish('ws_error')
+            ws2.onclose = () => finish('ws_close')
+            timeoutId = setTimeout(() => finish('timeout'), 5 * 60 * 1000 + 30000)
+
             ws2.onopen = () => {
                 ws2.send(JSON.stringify({type: 'user_message', content: text}));
                 log.info({sessionId: sessionId?.slice(0, 8), text: text.slice(0, 50)}, '→session')
             }
 
-            // ── WS 消息事件处理 ──
-            // 事件类型: assistant_message / text_delta / tool_use_start / permission_request / choice_request / result
             ws2.onmessage = (e) => {
                 try {
                     const msg = JSON.parse(e.data)
                     if (msg.type === 'text_delta' && msg.text) {
-                        // 增量文本流片段拼接
                         replyText += msg.text
                     } else if (msg.type === 'assistant_message') {
-                        // 完整 assistant 消息中的 text blocks 收集
                         const parts = [];
                         for (const b of (msg.message?.content || [])) {
                             if (b.type === 'text' && b.text) parts.push(b.text)
@@ -344,7 +375,6 @@ export function startDingTalkAdapter() {
                             sendMsg(userId, `请选择\n${lines.join('\n')}\n\n回复选项编号`)
                         }
                     } else if (msg.type === 'result') {
-                        // Claude 回复完成，延时 500ms 确保最后一条进度消息已发出
                         if (toolCount > 0 && !mirrorOn) sendMsg(userId, `共执行 ${toolCount} 个工具`)
                         setTimeout(finish, 500, 'result')
                     }
@@ -352,11 +382,8 @@ export function startDingTalkAdapter() {
                 }
             }
 
-            // ── WS 异常/关闭 → 直接完成 ──
-            ws2.onerror = () => finish('ws_error')
-            ws2.onclose = () => finish('ws_close')
-            // 含权限确认时可能阻塞超过 5 分钟
-            setTimeout(() => finish('timeout'), 5 * 60 * 1000 + 30000)
+            // 事件处理器全部就位后才做 async 操作
+            mirrorOn = await shouldSkipReply(sessionId)
         })
     }
 
@@ -498,7 +525,11 @@ export function startDingTalkAdapter() {
             const uid = body.senderId || body.senderStaffId || body.sender_id
             const text = extractDingText(body)
 
-            if (!uid || !text) return
+            if (!uid || !text) {
+              // 消息为空或发送者未知，仍需响应 SUCCESS 避免 SDK 重推
+              dwClient.socketCallBackResponse(message.headers.messageId, {status: 'SUCCESS'})
+              return
+            }
             log.info({userId: uid?.slice(0, 8), text: text.slice(0, 50)}, '← 消息')
             await handleMessage(uid, text)
 

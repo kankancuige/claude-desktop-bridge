@@ -70,7 +70,8 @@ function buildStreams(name) {
                 },
             }),
         })
-    } catch {
+    } catch (e) {
+        console.warn('[logger] pino-roll 全量日志流创建失败，文件日志将不可用:', e.message || e)
     }
 
     // 错误文件 — error 级别单独分包
@@ -90,7 +91,8 @@ function buildStreams(name) {
                 },
             }),
         })
-    } catch {
+    } catch (e) {
+        console.warn('[logger] pino-roll 错误日志流创建失败:', e.message || e)
     }
 
     return streams

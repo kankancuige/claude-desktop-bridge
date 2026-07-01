@@ -43,6 +43,11 @@ function applyTheme(t: string) {
  * 注意: 非 ref，因为 theme 变化通过 data-theme 属性驱动 CSS，不需要 Vue 响应式追踪
  */
 let currentTheme = 'system'
+let _themeChangeHandler: (() => void) | null = null
+
+function onThemeChange() {
+  if (currentTheme === 'system') applyTheme('system')
+}
 
 /**
  * ── applyInitialTheme ──
@@ -213,9 +218,8 @@ onMounted(() => {
   // ── 监听系统主题变化 ──
   // 当用户选择了 system 模式时，OS 主题切换后自动更新 data-theme
   // 如果用户手动选择了 dark/light，则不响应系统变化（currentTheme !== 'system'）
-  window.matchMedia?.('(prefers-color-scheme: dark)').addEventListener('change', () => {
-    if (currentTheme === 'system') applyTheme('system')
-  })
+  _themeChangeHandler = onThemeChange
+  window.matchMedia?.('(prefers-color-scheme: dark)').addEventListener('change', _themeChangeHandler)
 
   // ── Claude Code 延迟检测 ──
   // 延迟 2 秒等待 gateway 启动完成后再检测，避免 gateway 未就绪导致误报
@@ -246,6 +250,7 @@ onBeforeUnmount(() => {
   _cleanupUpdateProg?.()
   _cleanupUpdateDone?.()
   _cleanupUpdateErr?.()
+  if (_themeChangeHandler) window.matchMedia?.('(prefers-color-scheme: dark)').removeEventListener('change', _themeChangeHandler)
 })
 
 // ═══════════════════════════════════════════

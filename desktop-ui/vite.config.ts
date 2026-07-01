@@ -18,7 +18,7 @@ function petScanner(): Plugin {
       if (id === '\0' + VIRTUAL_ID) {
         const mediaDir = resolve(__dirname, 'public/media')
         let files: string[] = []
-        try { files = readdirSync(mediaDir).filter(f => f.endsWith('.png')) } catch { /* dir not found */ }
+        try { files = readdirSync(mediaDir).filter(f => f.endsWith('.png')) } catch { console.warn('[petScanner] public/media/ 目录未找到，宠物列表为空') }
         const pets = files.map(f => {
           const id = f.replace(/\.png$/i, '').replace(/[^a-zA-Z0-9_-]/g, '_').toLowerCase()
           return { id, label: f, src: `media/${f}` }

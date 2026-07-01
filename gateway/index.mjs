@@ -760,6 +760,8 @@ async function downloadAndReplaceRtk(targetVersion) {
     const asset = (release.assets || []).find(a => a.name && a.name.includes(binName.replace('.exe', '')))
     if (!asset) throw new Error(`未找到 ${binName} 的下载链接`)
     const downloadUrl = asset.browser_download_url
+    // 校验下载 URL 必须是 GitHub 域名（防止 GitHub API 响应被污染时 SSRF）
+    if (!/^https?:\/\/[^/]*\.?github\.com\//i.test(downloadUrl)) throw new Error('RTK 下载链接域名不合法')
 
     // 2. 下载到临时文件
     log.info({version: targetVersion, url: downloadUrl}, 'RTK 开始下载')
@@ -964,12 +966,16 @@ function readBody(req) {
         let d = '';
         req.on('data', c => {
             d += c
+            if (d.length > 10_000_000) {  // 10MB 上限，防止 OOM
+                req.destroy()
+                r({_bodyTooLarge: true})
+            }
         });
         req.on('end', () => {
             try {
                 r(JSON.parse(d || '{}'))
             } catch {
-                r({})
+                r({_parseError: true})
             }
         })
     })
@@ -1060,22 +1066,30 @@ function mapThinkingLevel(lv) {
 function convertSdkToWs(sdkMsg, sessionId) {
     switch (sdkMsg.type) {
         case 'system':
-            if (sdkMsg.subtype === 'init') return {
-                type: 'system_init',
-                cwd: sdkMsg.cwd,
-                model: sdkMsg.model,
-                tools: sdkMsg.tools,
-                sessionId,
-                permissionMode: sdkMsg.permissionMode,
-                skills: sdkMsg.skills
-            };
+            if (sdkMsg.subtype === 'init') {
+                const info = lookupModelInfo(sdkMsg.model);
+                // PROVIDERS 查不到时，用 session 存储的前端传入 modelMeta 作为回退
+                const s = sessions.get(sessionId);
+                const mm = s?.modelMeta;
+                return {
+                    type: 'system_init',
+                    cwd: sdkMsg.cwd,
+                    model: sdkMsg.model,
+                    tools: sdkMsg.tools,
+                    sessionId,
+                    permissionMode: sdkMsg.permissionMode,
+                    skills: sdkMsg.skills,
+                    contextWindow: info.contextWindow !== 1000000 ? info.contextWindow : (mm?.contextWindow || info.contextWindow),
+                    pricing: info.pricing || mm?.pricing || null
+                };
+            }
             return null
         case 'stream_event':
             return mapStreamEvent(sdkMsg.event)
         case 'assistant':
             return {type: 'assistant_message', message: sdkMsg.message, error: sdkMsg.error}
         case 'user':
-            return {type: 'user_message_echo', message: sdkMsg.message}
+            return {type: 'user_message_echo', message: sdkMsg.message, timestamp: sdkMsg.timestamp}
         case 'result':
             return {
                 type: 'result',
@@ -1245,8 +1259,9 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
 async function startStreamPump(sessionId) {
     const s = sessions.get(sessionId);
     if (!s) return
+    const myQuery = s.query  // 记录此 pump 持有的 query 对象引用
     try {
-        for await (const sdkMsg of s.query) {
+        for await (const sdkMsg of myQuery) {
             if (sdkMsg.type === 'system' && sdkMsg.subtype === 'init') {
                 if (sdkMsg.session_id) s.lastSessionId = sdkMsg.session_id
                 // 顺手把 init 暴露的命令/agent 名单缓存下来，供设置页冷启动读取
@@ -1274,7 +1289,7 @@ async function startStreamPump(sessionId) {
             if (sdkMsg.type === 'assistant') {
                 for (const b of (sdkMsg.message?.content || [])) {
                     if (b.type === 'text' && b.text) {
-                        s.turnText = (s.turnText || '') + b.text;
+                        s.turnText = ((s.turnText || '') + b.text).slice(-100000)  // 上限 100KB，防长轮内存膨胀
                         // 检测 [WF:run 脚本名 {args}] 指令（仅当全局开关 enabled 时）
                         if (!loadWfConfig().enabled) continue;
                         const wfMatch = b.text.match(/\[WF:run\s+([\w.-]+?)\s+(\{[\s\S]*?\})\]/);
@@ -1339,7 +1354,8 @@ async function startStreamPump(sessionId) {
         if (e.message !== 'cancelled') broadcast(sessionId, {type: 'error', message: e.message, code: 'stream_error'})
     } finally {
         const s2 = sessions.get(sessionId);
-        if (s2) s2.query = null
+        // 仅当 query 未被重建替换时才置空，避免覆盖新 pump 持有的 query
+        if (s2 && s2.query === myQuery) s2.query = null
     }
 }
 
@@ -1638,8 +1654,12 @@ async function executeScheduledTask(id) {
 function resumeScheduledTasks() {
     for (const [id, task] of Object.entries(scheduledTasks)) {
         if (!task.enabled) continue
+        if (!task.cron) {
+            log.warn({taskId: id}, '定时任务缺少 cron 表达式，已跳过')
+            continue
+        }
         try {
-            const job = cron.schedule(task.cron || '* * * * *', () => {
+            const job = cron.schedule(task.cron, () => {
                 executeScheduledTask(id).catch(e => {
                     log.error({err: e, taskId: id}, '定时任务执行失败')
                 })
@@ -1770,6 +1790,185 @@ async function autoTriggerWorkflow(sessionId, msgContent) {
     })
 }
 
+// ── 供应商预设常量（模块级，供 /api/config/providers 和 lookupModelInfo 共用）──
+const PROVIDERS = [
+    {
+        id: 'deepseek', name: 'DeepSeek', icon: 'D',
+        baseUrl: 'https://api.deepseek.com/anthropic',
+        officialUrl: 'https://platform.deepseek.com',
+        docsUrl: 'https://api-docs.deepseek.com',
+        models: [
+            {id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', contextWindow: '1M'},
+            {id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', contextWindow: '256K'},
+            {id: 'deepseek-chat', name: 'DeepSeek Chat', contextWindow: '128K'},
+            {id: 'deepseek-reasoner', name: 'DeepSeek Reasoner', contextWindow: '128K'},
+        ],
+        pricing: {input: '4 CNY/1M tokens', output: '16 CNY/1M tokens'},
+    },
+    {
+        id: 'zhipu', name: '智谱AI', icon: 'Z',
+        baseUrl: 'https://open.bigmodel.cn/api/anthropic',
+        officialUrl: 'https://open.bigmodel.cn',
+        docsUrl: 'https://docs.bigmodel.cn',
+        models: [
+            {id: 'glm-5.2', name: 'GLM-5.2', contextWindow: '128K'},
+            {id: 'glm-5.1', name: 'GLM-5.1', contextWindow: '128K'},
+            {id: 'glm-5', name: 'GLM-5', contextWindow: '128K'},
+            {id: 'glm-4.7', name: 'GLM-4.7', contextWindow: '128K'},
+            {id: 'glm-4.6', name: 'GLM-4.6', contextWindow: '128K'},
+            {id: 'glm-4.5', name: 'GLM-4.5', contextWindow: '128K'},
+            {id: 'glm-4-flash', name: 'GLM-4-Flash', contextWindow: '128K'},
+        ],
+        pricing: {input: '1 CNY/1M tokens', output: '4 CNY/1M tokens'},
+    },
+    {
+        id: 'moonshot', name: 'Kimi 月之暗面', icon: 'K',
+        baseUrl: 'https://api.moonshot.ai/anthropic',
+        officialUrl: 'https://platform.kimi.ai',
+        docsUrl: 'https://platform.kimi.ai/docs',
+        models: [
+            {id: 'kimi-k2.6', name: 'Kimi K2.6', contextWindow: '256K'},
+            {id: 'kimi-k2.5', name: 'Kimi K2.5', contextWindow: '256K'},
+            {id: 'kimi-k2.7-code', name: 'Kimi K2.7 Code', contextWindow: '256K'},
+        ],
+        pricing: {input: '0.95 USD/1M tokens', output: '4 USD/1M tokens'},
+    },
+    {
+        id: 'anthropic', name: 'Anthropic', icon: 'A',
+        baseUrl: 'https://api.anthropic.com',
+        officialUrl: 'https://console.anthropic.com',
+        docsUrl: 'https://docs.anthropic.com/en/api',
+        models: [
+            {id: 'claude-opus-4-5', name: 'Claude Opus 4.5', contextWindow: '200K'},
+            {id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', contextWindow: '200K'},
+            {id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5', contextWindow: '200K'},
+        ],
+        pricing: {input: '15 USD/1M tokens', output: '75 USD/1M tokens'},
+    },
+    {
+        id: 'qwen', name: '千问', icon: 'Q',
+        baseUrl: 'https://dashscope.aliyuncs.com/apps/anthropic',
+        officialUrl: 'https://bailian.console.aliyun.com',
+        docsUrl: 'https://help.aliyun.com/zh/model-studio',
+        models: [
+            {id: 'qwen3-max', name: 'Qwen3 Max', contextWindow: '128K'},
+            {id: 'qwen3.5-plus', name: 'Qwen3.5 Plus', contextWindow: '128K'},
+            {id: 'qwen3.5-flash', name: 'Qwen3.5 Flash', contextWindow: '128K'},
+            {id: 'qwen3-coder-plus', name: 'Qwen3 Coder Plus', contextWindow: '128K'},
+        ],
+        pricing: {input: '0.5 CNY/1M tokens', output: '2 CNY/1M tokens'},
+    },
+    {
+        id: 'openrouter', name: 'OpenRouter', icon: 'R',
+        baseUrl: 'https://openrouter.ai/api/v1',
+        officialUrl: 'https://openrouter.ai',
+        docsUrl: 'https://openrouter.ai/docs',
+        models: [
+            {id: 'anthropic/claude-sonnet-4', name: 'Claude Sonnet 4', contextWindow: '200K'},
+            {id: 'anthropic/claude-opus-4', name: 'Claude Opus 4', contextWindow: '200K'},
+            {id: 'google/gemini-2.5-pro', name: 'Gemini 2.5 Pro', contextWindow: '1M'},
+            {id: 'openai/gpt-5', name: 'GPT-5', contextWindow: '128K'},
+            {id: 'deepseek/deepseek-chat', name: 'DeepSeek Chat', contextWindow: '128K'},
+        ],
+        pricing: {input: '按模型不同', output: '聚合定价'},
+    },
+    {
+        id: 'ollama', name: 'Ollama (本地)', icon: 'O',
+        baseUrl: 'http://localhost:11434/v1',
+        officialUrl: 'https://ollama.com',
+        docsUrl: 'https://ollama.com/docs',
+        models: [
+            {id: 'qwen3', name: 'Qwen 3', contextWindow: '32K'},
+            {id: 'llama4', name: 'Llama 4', contextWindow: '128K'},
+            {id: 'deepseek-r1', name: 'DeepSeek R1', contextWindow: '128K'},
+            {id: 'codestral', name: 'Codestral', contextWindow: '256K'},
+        ],
+        pricing: {input: '本地免费', output: '不限量'},
+    },
+    {
+        id: 'volcengine', name: '火山引擎', icon: 'V',
+        baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
+        officialUrl: 'https://console.volcengine.com/ark',
+        docsUrl: 'https://www.volcengine.com/docs/82379',
+        models: [
+            {id: 'doubao-seed-1.6', name: '豆包 Seed 1.6', contextWindow: '128K'},
+            {id: 'doubao-seed-1.6-flash', name: '豆包 Flash 1.6', contextWindow: '128K'},
+            {id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', contextWindow: '1M'},
+            {id: 'deepseek-r1-0528', name: 'DeepSeek R1', contextWindow: '128K'},
+        ],
+        pricing: {input: '0.8 CNY/1M tokens', output: '2 CNY/1M tokens'},
+    },
+    {
+        id: 'gemini', name: 'Gemini', icon: 'G',
+        baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+        officialUrl: 'https://ai.google.dev',
+        docsUrl: 'https://ai.google.dev/gemini-api/docs',
+        models: [
+            {id: 'gemini-3-pro', name: 'Gemini 3 Pro', contextWindow: '1M'},
+            {id: 'gemini-3-flash', name: 'Gemini 3 Flash', contextWindow: '1M'},
+            {id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', contextWindow: '1M'},
+            {id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash', contextWindow: '1M'},
+        ],
+        pricing: {input: '0.15 USD/1M tokens', output: '0.60 USD/1M tokens'},
+    },
+    {
+        id: 'codex', name: 'Codex', icon: 'X',
+        baseUrl: 'https://api.openai.com/v1',
+        officialUrl: 'https://github.com/openai/codex',
+        docsUrl: 'https://github.com/openai/codex',
+        models: [
+            {id: 'gpt-5.2-codex', name: 'GPT-5.2 Codex', contextWindow: '200K'},
+            {id: 'gpt-5.1-codex', name: 'GPT-5.1 Codex', contextWindow: '200K'},
+            {id: 'gpt-5.1-codex-mini', name: 'GPT-5.1 Codex Mini', contextWindow: '200K'},
+        ],
+        pricing: {input: '3 USD/1M tokens', output: '15 USD/1M tokens'},
+    },
+    {
+        id: 'custom', name: '自定义', icon: '···',
+        baseUrl: '',
+        officialUrl: '',
+        docsUrl: '',
+        models: [],
+        pricing: {input: '', output: ''},
+    },
+];
+
+/** 解析 contextWindow 字符串为 token 数（如 '1M' → 1000000, '128K' → 128000） */
+function parseContextWindow(cw) {
+    if (!cw) return 1000000;
+    const m = /^(\d+(?:\.\d+)?)\s*(M|K)$/i.exec(String(cw));
+    if (!m) return 1000000;
+    const n = parseFloat(m[1]);
+    return m[2].toUpperCase() === 'M' ? Math.round(n * 1e6) : Math.round(n * 1000);
+}
+
+/** 解析 pricing 字符串提取价格数字和货币 */
+function parsePricingPrice(s) {
+    if (!s) return null;
+    const m = /^([\d.]+)\s*(CNY|USD|EUR|GBP|JPY)/i.exec(String(s));
+    if (!m) return null;
+    return {price: parseFloat(m[1]), currency: m[2].toUpperCase()};
+}
+
+/** 根据模型 ID 查找 contextWindow 和定价 */
+function lookupModelInfo(modelId) {
+    const fallback = {contextWindow: 1000000, pricing: null};
+    for (const p of PROVIDERS) {
+        for (const m of p.models) {
+            if (m.id === modelId) {
+                const cw = parseContextWindow(m.contextWindow);
+                const inp = parsePricingPrice(p.pricing?.input);
+                const out = parsePricingPrice(p.pricing?.output);
+                return {
+                    contextWindow: cw,
+                    pricing: (inp && out) ? {inputPrice: inp.price, outputPrice: out.price, currency: inp.currency} : null,
+                };
+            }
+        }
+    }
+    return fallback;
+}
+
 // ---- HTTP server ----
 // ── HTTP REST API 服务器 ──
 // 功能说明: 统一 HTTP 入口，处理所有前端 REST API 请求（会话管理/配置CRUD/微信发送/确认响应/项目扫描/文件Diff等）
@@ -1851,7 +2050,8 @@ const httpServer = createServer(async (req, res) => {
                 agentName: body._agentName || 'main',
                 taskId: null,
                 children: new Set(),
-                depth: body._depth || 0
+                depth: body._depth || 0,
+                modelMeta: body.modelMeta || null  // 前端传入的 model contextWindow/pricing，供 lookupModelInfo 回退
             })
             // 文件 diff 基线：优先载入已持久化的基线（重启/resume 后仍显示累计改动）；没有才新拍并落盘
             try {
@@ -2115,7 +2315,12 @@ const httpServer = createServer(async (req, res) => {
 
             const uploadDir = join(s.workDir, '.bridge-uploads')
             mkdirSync(uploadDir, {recursive: true})
-            const ext = pathExtname(file.filename || '') || '.png'
+            // 消毒文件名：取 basename 防路径穿越，去除非安全字符，限扩展名白名单
+            const rawName = basename(file.filename || '')
+            const safeName = rawName.replace(/[^a-zA-Z0-9._-]/g, '_')
+            const ext = /\.(png|jpe?g|gif|webp|svg|bmp|pdf|txt|zip)$/i.test(safeName)
+                ? pathExtname(safeName).toLowerCase()
+                : '.png'
             const destName = `upload-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`
             const destPath = join(uploadDir, destName)
             writeFileSync(destPath, file.data)
@@ -2602,6 +2807,11 @@ const httpServer = createServer(async (req, res) => {
         if (req.method === 'PUT') {
             try {
                 const b = await readBody(req);
+                if (b._parseError || b._bodyTooLarge) {
+                    res.writeHead(b._bodyTooLarge ? 413 : 400);
+                    res.end(JSON.stringify({error: b._bodyTooLarge ? 'payload too large' : 'invalid JSON'}));
+                    return
+                }
                 backupFile(sp);
                 writeJSON(sp, b);
                 res.writeHead(200);
@@ -3003,9 +3213,12 @@ const httpServer = createServer(async (req, res) => {
                 }
             }
 
-            // ── 情况 4: 其他直链 URL ──
+            // ── 情况 4: 其他直链 URL（仅允许已知代码托管平台，防止 SSRF）──
             if (!resp) {
-                try { resp = await fetch(rawUrl, {signal: AbortSignal.timeout(30000)}) } catch {}
+                const allowedHosts = /^https?:\/\/([^/]+\.)?(github\.com|githubusercontent\.com|gitlab\.com|bitbucket\.org|jsdelivr\.net|ghproxy\.com|gitee\.com)(\/|$)/i
+                if (allowedHosts.test(rawUrl)) {
+                    try { resp = await fetch(rawUrl, {signal: AbortSignal.timeout(30000)}) } catch {}
+                }
             }
 
             if (!resp || !resp.ok) { res.writeHead(502); res.end(JSON.stringify({error: `下载失败 ${resp?.status || '网络不可达'}`})); return }
@@ -3460,8 +3673,10 @@ const httpServer = createServer(async (req, res) => {
                 return
             }
             // 默认 frontmatter 模板：tools 留空表示继承全部工具
+            // 字段值去除换行防止 YAML 注入；name 已在上方 sanitize 为 [a-z0-9-]
             const lang = b.language || ''
-            const tpl = b.content || `---\nname: ${n}\ntype: ${b.type || ''}\nlanguage: ${lang}\ndescription: ${b.description || ''}\ntools: ${b.tools || ''}\nmodel: ${b.model || 'inherit'}\n---\n\n`
+            const safe = (v) => String(v || '').replace(/[\r\n]/g, ' ')
+            const tpl = b.content || `---\nname: ${n}\ntype: ${safe(b.type)}\nlanguage: ${lang}\ndescription: ${safe(b.description)}\ntools: ${safe(b.tools)}\nmodel: ${safe(b.model) || 'inherit'}\n---\n\n`
             writeFileSync(fp, tpl, 'utf8')
             res.writeHead(201);
             res.end(JSON.stringify({ok: true, name: n}));
@@ -3499,17 +3714,17 @@ const httpServer = createServer(async (req, res) => {
         return
     }
     // OpenAI 兼容供应商(DeepSeek/OpenAI)的真实模型列表：用配置的 key 调其 /models 接口
-    // ── GET /api/config/live-models —— OpenAI 兼容供应商真实模型列表 ──
-    // 功能说明: 用配置的 baseUrl+apiKey 调供应商的 /models 接口获取真实可用的模型 ID 列表
-    //   支持 ?baseUrl=&apiKey= 查询参数覆盖全局配置（切换供应商时前端传对应凭据）
+    // ── POST /api/config/live-models —— OpenAI 兼容供应商真实模型列表 ──
+    // 功能说明: 用请求体中的 baseUrl+apiKey 调供应商的 /models 接口获取真实可用的模型 ID 列表
     // 实现方式: 不同供应商 models 端点位置不同，按 baseUrl 特征判断
     //   8 秒超时保护；失败返回 {models:[], error:...}
-    // 关键数据流: GET ?baseUrl=X&apiKey=Y → 判断供应商 → fetch models 端点 → 解析 data[] → 200 {models, source}
-    if (req.method === 'GET' && url.pathname === '/api/config/live-models') {
+    // 关键数据流: POST {baseUrl, apiKey} → 判断供应商 → fetch models 端点 → 解析 data[] → 200 {models, source}
+    if (req.method === 'POST' && url.pathname === '/api/config/live-models') {
         try {
             const cliS = loadCliSettings()
-            const qBaseUrl = url.searchParams.get('baseUrl') || ''
-            const qApiKey = url.searchParams.get('apiKey') || ''
+            const b = await readBody(req)
+            const qBaseUrl = b.baseUrl || ''
+            const qApiKey = b.apiKey || ''
             const baseUrl = qBaseUrl || process.env.ANTHROPIC_BASE_URL || cliS.env?.ANTHROPIC_BASE_URL || ''
             const key = qApiKey || process.env.ANTHROPIC_API_KEY || cliS.env?.ANTHROPIC_AUTH_TOKEN || ''
             if (!baseUrl || !key) {
@@ -3546,15 +3761,16 @@ const httpServer = createServer(async (req, res) => {
             return
         }
     }
-    // 供应商连接测试：用前端传的 baseUrl+apiKey 调 /models 验证连通性
-    // ── GET /api/config/test-model —— 供应商连接测试 ──
-    // 功能说明: 用前端传的 baseUrl+apiKey 调供应商 /models 接口验证连通性
+    // 供应商连接测试：用请求体中的 baseUrl+apiKey 调 /models 验证连通性
+    // ── POST /api/config/test-model —— 供应商连接测试 ──
+    // 功能说明: 用请求体中的 baseUrl+apiKey 调供应商 /models 接口验证连通性
     //   返回 ok 状态 + 可选的前 10 个模型 ID 列表，失败时返回 HTTP 状态码和响应摘要
-    // 关键数据流: GET ?baseUrl=X&apiKey=Y → fetch {origin}/models → 200 {ok:true, count, list} 或 {ok:false, error}
-    if (req.method === 'GET' && url.pathname === '/api/config/test-model') {
+    // 关键数据流: POST {baseUrl, apiKey} → fetch {origin}/models → 200 {ok:true, count, list} 或 {ok:false, error}
+    if (req.method === 'POST' && url.pathname === '/api/config/test-model') {
         try {
-            const qBaseUrl = url.searchParams.get('baseUrl') || ''
-            const qApiKey = url.searchParams.get('apiKey') || ''
+            const b = await readBody(req)
+            const qBaseUrl = b.baseUrl || ''
+            const qApiKey = b.apiKey || ''
             if (!qBaseUrl || !qApiKey) {
                 res.writeHead(200);
                 res.end(JSON.stringify({ok: false, error: 'missing baseUrl or apiKey'}));
@@ -3641,157 +3857,14 @@ const httpServer = createServer(async (req, res) => {
         }
     }
 
+
     // ── GET /api/config/providers —— AI 供应商预设列表 ──
-    // 功能说明: 返回内置的 AI 供应商预设（DeepSeek/Anthropic/OpenAI），含 baseUrl、模型列表、定价信息
-    //   前端设置页的供应商选择器依赖此接口
-    // 关键数据流: GET → 硬编码预设 → 200 {providers: [{id, name, baseUrl, models, pricing}]}
     if (req.method === 'GET' && url.pathname === '/api/config/providers') {
         res.writeHead(200);
-        res.end(JSON.stringify({
-            providers: [
-                {
-                    id: 'deepseek', name: 'DeepSeek', icon: 'D',
-                    baseUrl: 'https://api.deepseek.com/anthropic',
-                    officialUrl: 'https://platform.deepseek.com',
-                    docsUrl: 'https://api-docs.deepseek.com',
-                    models: [
-                        {id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', contextWindow: '1M'},
-                        {id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', contextWindow: '256K'},
-                        {id: 'deepseek-chat', name: 'DeepSeek Chat', contextWindow: '128K'},
-                        {id: 'deepseek-reasoner', name: 'DeepSeek Reasoner', contextWindow: '128K'},
-                    ],
-                    pricing: {input: '4 CNY/1M tokens', output: '16 CNY/1M tokens'},
-                },
-                {
-                    id: 'zhipu', name: '智谱AI', icon: 'Z',
-                    baseUrl: 'https://open.bigmodel.cn/api/anthropic',
-                    officialUrl: 'https://open.bigmodel.cn',
-                    docsUrl: 'https://docs.bigmodel.cn',
-                    models: [
-                        {id: 'glm-5.2', name: 'GLM-5.2', contextWindow: '128K'},
-                        {id: 'glm-5.1', name: 'GLM-5.1', contextWindow: '128K'},
-                        {id: 'glm-5', name: 'GLM-5', contextWindow: '128K'},
-                        {id: 'glm-4.7', name: 'GLM-4.7', contextWindow: '128K'},
-                        {id: 'glm-4.6', name: 'GLM-4.6', contextWindow: '128K'},
-                        {id: 'glm-4.5', name: 'GLM-4.5', contextWindow: '128K'},
-                        {id: 'glm-4-flash', name: 'GLM-4-Flash', contextWindow: '128K'},
-                    ],
-                    pricing: {input: '1 CNY/1M tokens', output: '4 CNY/1M tokens'},
-                },
-                {
-                    id: 'moonshot', name: 'Kimi 月之暗面', icon: 'K',
-                    baseUrl: 'https://api.moonshot.ai/anthropic',
-                    officialUrl: 'https://platform.kimi.ai',
-                    docsUrl: 'https://platform.kimi.ai/docs',
-                    models: [
-                        {id: 'kimi-k2.6', name: 'Kimi K2.6', contextWindow: '256K'},
-                        {id: 'kimi-k2.5', name: 'Kimi K2.5', contextWindow: '256K'},
-                        {id: 'kimi-k2.7-code', name: 'Kimi K2.7 Code', contextWindow: '256K'},
-                    ],
-                    pricing: {input: '0.95 USD/1M tokens', output: '4 USD/1M tokens'},
-                },
-                {
-                    id: 'anthropic', name: 'Anthropic', icon: 'A',
-                    baseUrl: 'https://api.anthropic.com',
-                    officialUrl: 'https://console.anthropic.com',
-                    docsUrl: 'https://docs.anthropic.com/en/api',
-                    models: [
-                        {id: 'claude-opus-4-5', name: 'Claude Opus 4.5', contextWindow: '200K'},
-                        {id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', contextWindow: '200K'},
-                        {id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5', contextWindow: '200K'},
-                    ],
-                    pricing: {input: '15 USD/1M tokens', output: '75 USD/1M tokens'},
-                },
-                {
-                    id: 'qwen', name: '千问', icon: 'Q',
-                    baseUrl: 'https://dashscope.aliyuncs.com/apps/anthropic',
-                    officialUrl: 'https://bailian.console.aliyun.com',
-                    docsUrl: 'https://help.aliyun.com/zh/model-studio',
-                    models: [
-                        {id: 'qwen3-max', name: 'Qwen3 Max', contextWindow: '128K'},
-                        {id: 'qwen3.5-plus', name: 'Qwen3.5 Plus', contextWindow: '128K'},
-                        {id: 'qwen3.5-flash', name: 'Qwen3.5 Flash', contextWindow: '128K'},
-                        {id: 'qwen3-coder-plus', name: 'Qwen3 Coder Plus', contextWindow: '128K'},
-                    ],
-                    pricing: {input: '0.5 CNY/1M tokens', output: '2 CNY/1M tokens'},
-                },
-                {
-                    id: 'openrouter', name: 'OpenRouter', icon: 'R',
-                    baseUrl: 'https://openrouter.ai/api/v1',
-                    officialUrl: 'https://openrouter.ai',
-                    docsUrl: 'https://openrouter.ai/docs',
-                    models: [
-                        {id: 'anthropic/claude-sonnet-4', name: 'Claude Sonnet 4', contextWindow: '200K'},
-                        {id: 'anthropic/claude-opus-4', name: 'Claude Opus 4', contextWindow: '200K'},
-                        {id: 'google/gemini-2.5-pro', name: 'Gemini 2.5 Pro', contextWindow: '1M'},
-                        {id: 'openai/gpt-5', name: 'GPT-5', contextWindow: '128K'},
-                        {id: 'deepseek/deepseek-chat', name: 'DeepSeek Chat', contextWindow: '128K'},
-                    ],
-                    pricing: {input: '按模型不同', output: '聚合定价'},
-                },
-                {
-                    id: 'ollama', name: 'Ollama (本地)', icon: 'O',
-                    baseUrl: 'http://localhost:11434/v1',
-                    officialUrl: 'https://ollama.com',
-                    docsUrl: 'https://ollama.com/docs',
-                    models: [
-                        {id: 'qwen3', name: 'Qwen 3', contextWindow: '32K'},
-                        {id: 'llama4', name: 'Llama 4', contextWindow: '128K'},
-                        {id: 'deepseek-r1', name: 'DeepSeek R1', contextWindow: '128K'},
-                        {id: 'codestral', name: 'Codestral', contextWindow: '256K'},
-                    ],
-                    pricing: {input: '本地免费', output: '不限量'},
-                },
-                {
-                    id: 'volcengine', name: '火山引擎', icon: 'V',
-                    baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
-                    officialUrl: 'https://console.volcengine.com/ark',
-                    docsUrl: 'https://www.volcengine.com/docs/82379',
-                    models: [
-                        {id: 'doubao-seed-1.6', name: '豆包 Seed 1.6', contextWindow: '128K'},
-                        {id: 'doubao-seed-1.6-flash', name: '豆包 Flash 1.6', contextWindow: '128K'},
-                        {id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', contextWindow: '1M'},
-                        {id: 'deepseek-r1-0528', name: 'DeepSeek R1', contextWindow: '128K'},
-                    ],
-                    pricing: {input: '0.8 CNY/1M tokens', output: '2 CNY/1M tokens'},
-                },
-                {
-                    id: 'gemini', name: 'Gemini', icon: 'G',
-                    baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
-                    officialUrl: 'https://ai.google.dev',
-                    docsUrl: 'https://ai.google.dev/gemini-api/docs',
-                    models: [
-                        {id: 'gemini-3-pro', name: 'Gemini 3 Pro', contextWindow: '1M'},
-                        {id: 'gemini-3-flash', name: 'Gemini 3 Flash', contextWindow: '1M'},
-                        {id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', contextWindow: '1M'},
-                        {id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash', contextWindow: '1M'},
-                    ],
-                    pricing: {input: '0.15 USD/1M tokens', output: '0.60 USD/1M tokens'},
-                },
-                {
-                    id: 'codex', name: 'Codex', icon: 'X',
-                    baseUrl: 'https://api.openai.com/v1',
-                    officialUrl: 'https://github.com/openai/codex',
-                    docsUrl: 'https://github.com/openai/codex',
-                    models: [
-                        {id: 'gpt-5.2-codex', name: 'GPT-5.2 Codex', contextWindow: '200K'},
-                        {id: 'gpt-5.1-codex', name: 'GPT-5.1 Codex', contextWindow: '200K'},
-                        {id: 'gpt-5.1-codex-mini', name: 'GPT-5.1 Codex Mini', contextWindow: '200K'},
-                    ],
-                    pricing: {input: '3 USD/1M tokens', output: '15 USD/1M tokens'},
-                },
-                {
-                    id: 'custom', name: '自定义', icon: '···',
-                    baseUrl: '',
-                    officialUrl: '',
-                    docsUrl: '',
-                    models: [],
-                    pricing: {input: '', output: ''},
-                },
-            ]
-        }));
+        res.end(JSON.stringify({providers: PROVIDERS}));
         return;
     }
+
     // ── HTTP: 定时任务 ──
 
     // GET /api/config/scheduled-tasks
@@ -3954,7 +4027,7 @@ const httpServer = createServer(async (req, res) => {
         const pid = url.pathname.split('/')[4];
         if (pid !== 'wechat') {
             res.writeHead(400);
-            res.end();
+            res.end(JSON.stringify({error: 'platform not supported'}));
             return
         }
         ;
@@ -3969,7 +4042,7 @@ const httpServer = createServer(async (req, res) => {
             const q = await r.json();
             if (!q.qrcode) {
                 res.writeHead(500);
-                res.end();
+                res.end(JSON.stringify({error: 'qrcode not found'}));
                 return
             }
             ;pendingQRCodes.set(pid, {qrcode: q.qrcode, expires: Date.now() + 300000});
@@ -3981,7 +4054,7 @@ const httpServer = createServer(async (req, res) => {
             }))
         } catch (e) {
             res.writeHead(500);
-            res.end()
+            res.end(JSON.stringify({error: e.message}))
         }
         ;
         return
@@ -3996,7 +4069,7 @@ const httpServer = createServer(async (req, res) => {
         const p = pendingQRCodes.get(pid);
         if (!p) {
             res.writeHead(400);
-            res.end();
+            res.end(JSON.stringify({error: 'no pending qrcode'}));
             return
         }
         ;
@@ -4063,7 +4136,7 @@ const httpServer = createServer(async (req, res) => {
                 appSecret: b.appSecret
             }; else {
                 res.writeHead(400);
-                res.end();
+                res.end(JSON.stringify({error: 'unsupported platform'}));
                 return
             }
             ;writeJSON(join(CLAUDE_HOME, 'adapters.json'), a);
@@ -4071,7 +4144,7 @@ const httpServer = createServer(async (req, res) => {
             res.end(JSON.stringify({ok: true}))
         } catch (e) {
             res.writeHead(500);
-            res.end()
+            res.end(JSON.stringify({error: e.message}))
         }
         ;
         return
@@ -4232,7 +4305,7 @@ const httpServer = createServer(async (req, res) => {
             const {userId, text} = await readBody(req);
             if (!userId || !text) {
                 res.writeHead(400);
-                res.end();
+                res.end(JSON.stringify({error: 'userId and text required'}));
                 return
             }
             ;let t, u;
@@ -4254,7 +4327,7 @@ const httpServer = createServer(async (req, res) => {
             ;
             if (!t) {
                 res.writeHead(500);
-                res.end();
+                res.end(JSON.stringify({error: 'wechat bot token not configured'}));
                 return
             }
             ;const bn = u.replace(/\/+$/, '') + '/';
@@ -4263,7 +4336,7 @@ const httpServer = createServer(async (req, res) => {
             res.end(JSON.stringify({sent: r.sent, parts: r.parts}))
         } catch (e) {
             res.writeHead(500);
-            res.end()
+            res.end(JSON.stringify({error: e.message}))
         }
         ;
         return
@@ -4299,7 +4372,7 @@ const httpServer = createServer(async (req, res) => {
             ;
             if (!t) {
                 res.writeHead(500);
-                res.end();
+                res.end(JSON.stringify({error: 'wechat bot token not configured'}));
                 return
             }
             ;const bn = u.replace(/\/+$/, '') + '/';
@@ -4308,7 +4381,7 @@ const httpServer = createServer(async (req, res) => {
             res.end(JSON.stringify({sent: r.sent, parts: r.parts, length: replyText.length}))
         } catch (e) {
             res.writeHead(500);
-            res.end()
+            res.end(JSON.stringify({error: e.message}))
         }
         ;
         return
@@ -4385,7 +4458,7 @@ const httpServer = createServer(async (req, res) => {
             const k = process.env.ANTHROPIC_API_KEY || cliS.env?.ANTHROPIC_AUTH_TOKEN;
             if (!k) {
                 res.writeHead(502);
-                res.end();
+                res.end(JSON.stringify({error: 'API key not configured'}));
                 return
             }
             ;const r = await fetch('https://api.deepseek.com/user/balance', {
@@ -4394,7 +4467,7 @@ const httpServer = createServer(async (req, res) => {
             });
             if (!r.ok) {
                 res.writeHead(502);
-                res.end();
+                res.end(JSON.stringify({error: 'balance API returned ' + r.status}));
                 return
             }
             ;const d = await r.json();
@@ -4403,7 +4476,7 @@ const httpServer = createServer(async (req, res) => {
             res.end(JSON.stringify({balance: parseFloat(i.total_balance || '0'), currency: i.currency || 'CNY'}))
         } catch {
             res.writeHead(502);
-            res.end()
+            res.end(JSON.stringify({error: 'balance API unreachable'}))
         }
         ;
         return
@@ -4660,7 +4733,7 @@ const httpServer = createServer(async (req, res) => {
 // 控制通道客户端池：独立于 session，用于接收 nudge 等全局事件
 const controlClients = new Set()
 
-const wss = new WebSocketServer({server: httpServer})
+const wss = new WebSocketServer({server: httpServer, maxPayload: 1048576})
 wss.on('connection', (ws, req) => {
     const urlStr = req.url || '';
     const qi = urlStr.indexOf('?')
@@ -4752,12 +4825,15 @@ wss.on('connection', (ws, req) => {
             // 回合开始：拍「修改前」快照，本轮 result 时结算为记录点
             const srcLabel = imSources.includes(ws._source) ? `[${ws._source}] ` : ''
             beginTurn(sessionId, srcLabel + msg.content)
-            // 检测权限/思考设置是否变更，若变更则更新 session 并重建 query
+            // 检测权限/思考/模型设置是否变更，若变更则更新 session 并重建 query
             const newPerm = msg.permissionMode
             const newThink = msg.thinkingLevel
+            const newModel = msg.model
+            const newMM = msg.modelMeta
             const permChanged = newPerm && newPerm !== s.permissionMode
             const thinkChanged = newThink && newThink !== s.thinkingLevel
-            if (permChanged || thinkChanged) {
+            const modelChanged = newModel && newModel !== s.queryOpts?.model
+            if (permChanged || thinkChanged || modelChanged) {
                 if (permChanged) {
                     s.permissionMode = newPerm;
                     log.info({sessionId: sessionId?.slice(0, 8), permissionMode: newPerm}, 'permissionMode 变更')
@@ -4765,6 +4841,11 @@ wss.on('connection', (ws, req) => {
                 if (thinkChanged) {
                     s.thinkingLevel = newThink;
                     log.info({sessionId: sessionId?.slice(0, 8), thinkingLevel: newThink}, 'thinkingLevel 变更')
+                }
+                if (modelChanged) {
+                    s.queryOpts.model = newModel;
+                    if (newMM) s.modelMeta = newMM;
+                    log.info({sessionId: sessionId?.slice(0, 8), model: newModel}, 'model 变更')
                 }
                 try {
                     s.pushStream.close();
@@ -4777,27 +4858,62 @@ wss.on('connection', (ws, req) => {
             }
             // query 为 null（被中止过或设置变更重建）→ 懒重建，resume 续接原会话
             if (!s.query) {
-                const cliS = loadCliSettings()
-                s.pushStream = new PushStream()
-                const opts = await makeQueryOptions({
-                    resume: s.lastSessionId || sessionId,
-                    permissionMode: s.permissionMode,
-                    thinkingLevel: s.thinkingLevel
-                }, s.workDir, cliS, {}, sessionId)
-                s.query = query({prompt: s.pushStream, options: opts})
-                startStreamPump(sessionId)
-            }
-            s.pushStream.push({
-                type: 'user',
-                session_id: sessionId,
-                message: {role: 'user', content: [{type: 'text', text: msg.content}]},
-                parent_tool_use_id: null
-            })
-            // 异步 AI 分类 + 启动 workflow（不阻塞用户消息，仅当无 _noWorkflow 标记时）
-            if (!msg._noWorkflow) {
-                autoTriggerWorkflow(sessionId, msg.content).catch(e => {
+                // 防并发重建：不同 WS 连接可能同时进入此处，用 _rebuildPromise 互斥
+                if (s._rebuildPromise) {
+                    if (!s._pendingMessages) s._pendingMessages = []
+                    s._pendingMessages.push(msg.content)
+                    if (!msg._noWorkflow) autoTriggerWorkflow(sessionId, msg.content).catch(e => {
+                        log.warn({err: e, sessionId: sessionId?.slice(0, 8)}, 'autoTriggerWorkflow 异常')
+                    })
+                    return
+                }
+                s._pendingMessages = [msg.content]
+                s._rebuildPromise = (async () => {
+                    try {
+                        const cliS = loadCliSettings()
+                        s.pushStream = new PushStream()
+                        const opts = await makeQueryOptions({
+                            resume: s.lastSessionId || sessionId,
+                            model: s.queryOpts?.model,
+                            permissionMode: s.permissionMode,
+                            thinkingLevel: s.thinkingLevel
+                        }, s.workDir, cliS, {}, sessionId)
+                        s.query = query({prompt: s.pushStream, options: opts})
+                        startStreamPump(sessionId)
+                    } finally {
+                        const pending = s._pendingMessages || []
+                        s._pendingMessages = null
+                        s._rebuildPromise = null
+                        if (s.query) {
+                            for (const content of pending) {
+                                s.pushStream.push({
+                                    type: 'user', session_id: sessionId,
+                                    message: {role: 'user', content: [{type: 'text', text: content}]},
+                                    parent_tool_use_id: null
+                                })
+                            }
+                        }
+                    }
+                })().catch(e => {
+                    log.error({err: e, sessionId: sessionId?.slice(0, 8)}, 'rebuild 失败')
+                    s._rebuildPromise = null
+                    s._pendingMessages = null
+                })
+                if (!msg._noWorkflow) autoTriggerWorkflow(sessionId, msg.content).catch(e => {
                     log.warn({err: e, sessionId: sessionId?.slice(0, 8)}, 'autoTriggerWorkflow 异常')
                 })
+            } else {
+                s.pushStream.push({
+                    type: 'user',
+                    session_id: sessionId,
+                    message: {role: 'user', content: [{type: 'text', text: msg.content}]},
+                    parent_tool_use_id: null
+                })
+                if (!msg._noWorkflow) {
+                    autoTriggerWorkflow(sessionId, msg.content).catch(e => {
+                        log.warn({err: e, sessionId: sessionId?.slice(0, 8)}, 'autoTriggerWorkflow 异常')
+                    })
+                }
             }
         }
     })
@@ -4818,8 +4934,11 @@ process.on('unhandledRejection', (reason) => {
 
 // 启动前杀死占用端口的旧进程（上次非正常退出残留）
 try {
-    if (process.platform === 'win32') {
-        const o = execSync(`netstat -ano | findstr :${PORT}`, {encoding: 'utf8', timeout: 3000})
+    const portNum = parseInt(PORT, 10)
+    if (isNaN(portNum) || portNum < 1 || portNum > 65535) {
+        log.warn({PORT}, '端口号非法，跳过旧进程清理')
+    } else if (process.platform === 'win32') {
+        const o = execSync(`netstat -ano | findstr :${portNum}`, {encoding: 'utf8', timeout: 3000})
         const seen = new Set()
         for (const m of o.matchAll(/\d+\s*$/gm)) {
             const pid = m[0].trim()
@@ -4833,12 +4952,12 @@ try {
     } else if (process.platform === 'darwin') {
         // macOS 没有 fuser，用 lsof 查找占用端口的进程
         try {
-            execSync(`lsof -ti :${PORT} | xargs kill -9`, {timeout: 3000})
+            execSync(`lsof -ti :${portNum} | xargs kill -9`, {timeout: 3000})
         } catch {
         }
     } else {
         try {
-            execSync(`fuser -k ${PORT}/tcp`, {timeout: 3000})
+            execSync(`fuser -k ${portNum}/tcp`, {timeout: 3000})
         } catch {
         }
     }
@@ -5008,9 +5127,11 @@ async function loadMessages(ed, sessionId) {
                     }
                 }
             } catch {
+                // JSONL 行 JSON 解析失败（可能为写入中间态），跳过错行
             }
         }
-    } catch {
+    } catch (e) {
+        log.warn({err: e, sessionId}, '读取会话历史失败')
         return m
     }
     return m.slice(-30)
@@ -5056,6 +5177,16 @@ function resolveSafe(workDir, relPath) {
     const wdNorm = normPath(workDir).replace(/\/$/, '')
     const absNorm = normPath(abs)
     if (absNorm !== wdNorm && !absNorm.startsWith(wdNorm + '/')) return null
+    // 三次校验：解析符号链接后再验证，防止 symlink 绕过目录穿越防护
+    try {
+        if (existsSync(abs)) {
+            const realAbs = realpathSync(abs)
+            const realWk = realpathSync(workDir)
+            if (realAbs !== realWk && !realAbs.startsWith(realWk + sep)) return null
+        }
+    } catch {
+        // realpathSync 失败（文件不存在 / 权限不足等），保持原路径的校验结果
+    }
     return abs
 }
 

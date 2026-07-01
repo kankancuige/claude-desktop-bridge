@@ -84,7 +84,12 @@ export function startWeChatAdapter() {
     // 功能说明: 每次适配器启动生成一个 6 位随机配对码，用户发送该码给 bot 完成配对
     // 实现方式: Math.random 生成 100000-999999 范围内数字字符串
     const pairCode = String(Math.floor(100000 + Math.random() * 900000))
-    log.info({pairCode}, '配对码已生成')
+    log.info({pairCodeMasked: pairCode.slice(0, 2) + '****'}, '配对码已生成')
+
+    // ── 配对暴力破解防护 ──
+    const pairFailCount = new Map()
+    const PAIR_MAX_FAIL = 5
+    const PAIR_COOLDOWN_MS = 10 * 60 * 1000
     log.info('已加载凭据, 开始轮询')
 
     let buf = ''  // 长轮询游标缓存：服务端增量更新的 offset，避免重复拉取
@@ -195,12 +200,29 @@ export function startWeChatAdapter() {
         // ── 第1层: 配对鉴权 ──
         // 未配对用户需发送配对码，否则提示并拒绝后续处理
         if (!pairedUsers.has(uid)) {
+            const fc = pairFailCount.get(uid)
+            if (fc && fc.count >= PAIR_MAX_FAIL && Date.now() < fc.cooldownUntil) {
+                const remainMin = Math.ceil((fc.cooldownUntil - Date.now()) / 60000)
+                await sendMsg(uid, ctx, `尝试次数过多，请 ${remainMin} 分钟后再试`)
+                return
+            }
             if (text.trim() === pairCode) {
                 pairedUsers.add(uid)
+                pairFailCount.delete(uid)
                 writeFileSync(pairedFile, JSON.stringify({users: [...pairedUsers]}))  // SIDE_EFFECT: 持久化白名单
-                await sendMsg(uid, ctx, '✅ 配对成功！现在可以开始对话了。')
+                await sendMsg(uid, ctx, '配对成功！现在可以开始对话了。')
             } else {
-                await sendMsg(uid, ctx, `请先发送配对码进行授权。你的配对码是: ${pairCode}`)
+                const cur = pairFailCount.get(uid) || {count: 0, cooldownUntil: 0}
+                cur.count++
+                if (cur.count >= PAIR_MAX_FAIL) {
+                    cur.cooldownUntil = Date.now() + PAIR_COOLDOWN_MS
+                    log.warn({userId: uid?.slice(0, 8), failCount: cur.count}, '配对码暴力破解触发冷却')
+                }
+                pairFailCount.set(uid, cur)
+                const left = PAIR_MAX_FAIL - cur.count
+                await sendMsg(uid, ctx, left > 0
+                    ? `配对码错误，还剩 ${left} 次机会`
+                    : `尝试次数过多，已锁定 ${PAIR_COOLDOWN_MS / 60000} 分钟`)
             }
             return
         }
@@ -225,7 +247,7 @@ export function startWeChatAdapter() {
                 if (d.ok) await sendMsg(uid, ctx, '✅ 已提交，继续处理中...')
                 else await sendMsg(uid, ctx, '该请求已处理（可能桌面端已操作或已超时）')
             } catch (e) {
-                await sendMsg(uid, ctx, '提交失败: ' + e.message)
+                await sendMsg(uid, ctx, '提交失败，请稍后重试')
             }
             pendingConfirm.delete(uid)  // 无论成功与否都清除挂起状态，避免死锁
             return
@@ -264,7 +286,7 @@ export function startWeChatAdapter() {
         } catch (e) {
             log.error({err: e, userId: uid?.slice(0, 8)}, '处理失败')
             try {
-                await sendMsg(uid, ctx, '处理失败: ' + e.message)
+                await sendMsg(uid, ctx, '处理失败，请稍后重试')
             } catch {
             }
         }
@@ -283,14 +305,22 @@ export function startWeChatAdapter() {
     // 关键数据流: user_message → WS 事件流 → replyText 累积 → /api/wechat/reply → 微信用户
     async function injectAndWait(sessionId, userId, ctx, text) {
         return new Promise(async (resolve) => {
-            const ws = new WebSocket(`ws://127.0.0.1:3456/ws/${sessionId}?source=wechat`)
+            let ws
+            try {
+                ws = new WebSocket(`ws://127.0.0.1:3456/ws/${sessionId}?source=wechat`)
+            } catch (e) {
+                resolve()
+                return
+            }
             let toolCount = 0, done = false, replyText = ''
             let mirrorOn = false
+            let timeoutId = null
 
             // ── finish ── 必须在所有事件处理器之前定义
             const finish = async (reason) => {
                 if (done) return;
                 done = true;
+                if (timeoutId) clearTimeout(timeoutId)
                 try { ws.close() } catch {}
                 if (await shouldSkipReply(sessionId)) {
                     log.info({sessionId: sessionId?.slice(0, 8)}, 'mirror 已开启，跳过独立回复');
@@ -316,7 +346,7 @@ export function startWeChatAdapter() {
             // 所有事件处理器必须在任何 await 之前注册，防止事件竞态丢失
             ws.onerror = () => finish('ws_error')
             ws.onclose = () => finish('ws_close')
-            setTimeout(() => finish('timeout'), 5 * 60 * 1000 + 30000)
+            timeoutId = setTimeout(() => finish('timeout'), 5 * 60 * 1000 + 30000)
 
             ws.onopen = () => {
                 ws.send(JSON.stringify({type: 'user_message', content: text}));
