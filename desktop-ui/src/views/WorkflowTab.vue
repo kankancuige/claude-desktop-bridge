@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // WorkflowTab.vue —— Claude Code 原生 Workflow DAG 编辑器
-import {ref, onMounted, nextTick} from 'vue'
+import {ref, onMounted, onBeforeUnmount, nextTick} from 'vue'
 import {useWorkflow} from '../composables/useWorkflow'
 
 const GW = 'http://127.0.0.1:3456'
@@ -119,6 +119,7 @@ function onKey(e: KeyboardEvent) {
 }
 
 onMounted(() => window.addEventListener('keydown', onKey))
+onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 
 // 坐标转换
 const svgW = 2000;
@@ -234,7 +235,7 @@ function autoLayout() {
     recalcGroup(lay[li][ni].id)
   }
   phases.value = []
-  if (lay.length > 1) for (let li = 1; li < lay.length; li++) addPhase(`Phase ${li + 1}`, 40 + li * 100 - 50)
+  for (let li = 0; li < lay.length; li++) addPhase(`Phase ${li + 1}`, 40 + li * 100 - 50)
 }
 
 // 多选 → parallel 组

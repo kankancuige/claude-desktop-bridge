@@ -55,9 +55,8 @@ const LANG_CONFIG = {
     '.kts':  {lang: 'kotlin',  tsPackage: '@tree-sitter-grammars/tree-sitter-kotlin'},
     '.swift':{lang: 'swift',   tsPackage: 'tree-sitter-swift'},
 }
-// tree-sitter 多语言解析器注册表（惰性加载，共享单个 Parser 实例）
+// tree-sitter 多语言解析器注册表（惰性加载，每语言独立 Parser 实例防止并发 setLanguage 冲突）
 const _parserRegistry = new Map()   // lang → {parser, language} | false
-let _universalParser = null
 
 // ── 各语言源文件扩展名（供 resolveImportPath 解析相对导入）──
 const LANG_SOURCE_EXTS = {
@@ -472,15 +471,14 @@ async function ensureParserForLang(langConfig) {
     try {
         require.resolve('tree-sitter')
         require.resolve(tsPackage)
-        if (!_universalParser) {
+        if (!_parserRegistry.has(lang)) {
             const Parser = (await import('tree-sitter')).default
-            _universalParser = new Parser()
+            const LangModule = (await import(tsPackage)).default
+            const parser = new Parser()
+            parser.setLanguage(LangModule)
+            _parserRegistry.set(lang, {parser, language: LangModule})
         }
-        const LangModule = (await import(tsPackage)).default
-        const entry = {parser: _universalParser, language: LangModule}
-        _universalParser.setLanguage(LangModule)
-        _parserRegistry.set(lang, entry)
-        return entry
+        return _parserRegistry.get(lang)
     } catch (e) {
         _parserRegistry.set(lang, false)
         return null
@@ -704,7 +702,8 @@ function parseImportsTreeSitterMulti(source, ext, langConfig) {
     const entry = _parserRegistry.get(langConfig.lang)
     if (!entry || entry === false) return null
     const {parser, language} = entry
-    parser.setLanguage(language)
+
+    // 每语言独立 Parser 实例，无需 setLanguage（已在 ensureParserForLang 中设置）
     const tree = parser.parse(source)
     const root = tree.rootNode
 

@@ -471,7 +471,7 @@ function persistPetSettings() {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(settings.value),
       })
-    } catch {}
+    } catch (e) { console.error(e) }
   }, 300)
 }
 
@@ -552,7 +552,7 @@ async function loadCavemanConfig() {
         cavemanUpdateVersion.value = data.cavemanUpdate?.latest || data.cavemanCurrent || ''
       }
     }
-  } catch {}
+  } catch (e) { console.error(e) }
 }
 
 async function saveCavemanConfig() {
@@ -562,7 +562,7 @@ async function saveCavemanConfig() {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({enabled: cavemanConfig.value.enabled, level: cavemanConfig.value.level}),
     })
-  } catch {}
+  } catch (e) { console.error(e) }
 }
 
 async function updateCaveman() {
@@ -605,7 +605,7 @@ async function loadRtkConfig() {
         rtkUpdateVersion.value = data.rtkUpdate?.latest || data.rtkCurrent || ''
       }
     }
-  } catch {}
+  } catch (e) { console.error(e) }
 }
 
 async function saveRtkConfig() {
@@ -615,7 +615,7 @@ async function saveRtkConfig() {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({enabled: rtkConfig.value.enabled}),
     })
-  } catch {}
+  } catch (e) { console.error(e) }
 }
 
 async function updateRtk() {
@@ -679,7 +679,7 @@ async function loadDisabledSkills() {
       const d = await res.json()
       disabledSkills.value = d.disabled || []
     }
-  } catch {}
+  } catch (e) { console.error(e) }
 }
 async function toggleSkillEnabled(skill: any) {
   const name = skill.name
@@ -693,7 +693,7 @@ async function toggleSkillEnabled(skill: any) {
       if (disabled) disabledSkills.value.push(name)
       else disabledSkills.value = disabledSkills.value.filter(n => n !== name)
     }
-  } catch {}
+  } catch (e) { console.error(e) }
 }
 
 // ── Skills 搜索（同时用于本地过滤 + 市场搜索）──
@@ -1465,7 +1465,7 @@ async function loadDisabledMcpPlugins() {
       const d = await res.json()
       disabledMcpPlugins.value = d.disabled || []
     }
-  } catch {}
+  } catch (e) { console.error(e) }
 }
 
 // ── 切换 MCP 插件启用/禁用 ──
@@ -1481,7 +1481,7 @@ async function toggleMcpPlugin(plugin: any) {
       if (disabled) disabledMcpPlugins.value.push(name)
       else disabledMcpPlugins.value = disabledMcpPlugins.value.filter(n => n !== name)
     }
-  } catch {}
+  } catch (e) { console.error(e) }
 }
 
 // ── 切换 MCP 服务器启用/禁用 ──
@@ -1496,7 +1496,7 @@ async function toggleMcpServer(srv: any) {
     if (res.ok && d.ok) {
       srv.enabled = enabled
     }
-  } catch {}
+  } catch (e) { console.error(e) }
 }
 
 // ── 加载 MCP 服务器列表 ──
@@ -1509,7 +1509,7 @@ async function loadMcpServers() {
       const data = await res.json()
       mcpServers.value = data.servers || []
     }
-  } catch {}
+  } catch (e) { console.error(e) }
   mcpServersLoading.value = false
 }
 
@@ -1671,7 +1671,7 @@ async function loadScheduledTasks() {
   try {
     const r = await fetch(`${GW}/api/config/scheduled-tasks`)
     if (r.ok) { const d = await r.json(); scheduledTasks.value = d.tasks || [] }
-  } catch {}
+  } catch (e) { console.error(e) }
   schedLoading.value = false
 }
 function openNewSched() {
@@ -1716,7 +1716,7 @@ async function toggleSched(t: any) {
       body: JSON.stringify({enabled: !t.enabled}),
     })
     await loadScheduledTasks()
-  } catch {}
+  } catch (e) { console.error(e) }
 }
 async function runSchedNow(t: any) {
   try {
@@ -1731,7 +1731,7 @@ async function deleteSched(id: string) {
     try {
       await fetch(`${GW}/api/config/scheduled-tasks/${id}`, {method: 'DELETE'})
       await loadScheduledTasks()
-    } catch {}
+    } catch (e) { console.error(e) }
   })
 }
 

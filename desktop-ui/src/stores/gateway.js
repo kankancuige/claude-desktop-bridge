@@ -14,6 +14,7 @@
 
 import {defineStore} from 'pinia'
 import {ref} from 'vue'
+import {apiFetch, wsUrl} from '../api'
 
 // ── gateway 后端地址常量 ──
 // gateway 始终运行在 localhost:3456，不对外暴露
@@ -84,7 +85,7 @@ export const useGatewayStore = defineStore('gateway', () => {
      * @throws {Error} 创建失败时抛出错误
      */
     async function createSession(workDir) {
-        const res = await fetch(`${GW}/api/sessions`, {
+        const res = await apiFetch(`${GW}/api/sessions`, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({workDir}),
@@ -108,9 +109,10 @@ export const useGatewayStore = defineStore('gateway', () => {
      * @param {string} sid - 会话 ID
      * SIDE_EFFECT: 替换全局 ws 变量；注册事件监听器
      */
-    function connect(sid) {
-        if (ws) ws.close()                            // 关闭旧连接，防止泄露
-        ws = new WebSocket(`ws://127.0.0.1:3456/ws/${sid}`)
+    async function connect(sid) {
+        if (ws) ws.close()
+        const url = await wsUrl(`/ws/${sid}`)
+        ws = new WebSocket(url)
 
         // ── 连接成功 ──
         ws.onopen = () => {
@@ -125,8 +127,12 @@ export const useGatewayStore = defineStore('gateway', () => {
         // ── 接收消息 ──
         // 所有来自 gateway 的消息都通过 handleMessage 统一分发
         ws.onmessage = (e) => {
-            const msg = JSON.parse(e.data)
-            handleMessage(msg)
+            try {
+                const msg = JSON.parse(e.data)
+                handleMessage(msg)
+            } catch (err) {
+                console.error('[gateway] WebSocket 消息解析失败:', err)
+            }
         }
 
         // ── 连接关闭 ──

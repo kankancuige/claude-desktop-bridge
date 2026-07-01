@@ -93,12 +93,24 @@ export function startWeChatAdapter() {
     log.info('已加载凭据, 开始轮询')
 
     let buf = ''  // 长轮询游标缓存：服务端增量更新的 offset，避免重复拉取
+    let _pollBackoff = 5000  // 指数退避延迟（5s 起始，上限 120s）
 
     // ── pendingConfirm 挂起确认表 ──
     // 功能说明: 记录等待用户回复确认的请求，key 为 userId，value 包含 sessionId/requestId/type
     // 实现方式: Map 结构，用户下一条非确认回复消息会被拦截并当作确认结果提交到 /api/confirm
     // 关键数据流: permission_request/choice_request 写入 → 用户回复解析 → /api/confirm POST → 删除
     const pendingConfirm = new Map()
+    // pendingConfirm TTL 清理：5 分钟超时自动清除，防止异常路径下残留
+    const _confirmCleanup = setInterval(() => {
+      const cutoff = Date.now() - 5 * 60 * 1000
+      for (const [uid, pc] of pendingConfirm) {
+        if ((pc._at || 0) < cutoff) pendingConfirm.delete(uid)
+      }
+    }, 5 * 60 * 1000)
+    if (_confirmCleanup.unref) _confirmCleanup.unref()
+    // 包装 set 自动注入 _at 时间戳，供 TTL 清理使用
+    const _pcSet = pendingConfirm.set.bind(pendingConfirm)
+    pendingConfirm.set = (k, v) => _pcSet(k, {...v, _at: Date.now()})
 
     // ── parseConfirmReply ──
     // 功能说明: 解析用户的确认回复文本，支持二选一(allow/deny)和多选项(choice)两种模式
@@ -167,8 +179,14 @@ export function startWeChatAdapter() {
                 }
             } catch (e) {
                 // AbortError 是正常超时，静默进入下一轮长轮询
-                if (e.name !== 'AbortError') log.error({err: e}, '轮询异常');
-                await sleep(5000)
+                if (e.name !== 'AbortError') {
+                    log.error({err: e}, '轮询异常')
+                    _pollBackoff = Math.min((_pollBackoff || 5000) * 2, 120000)
+                    await sleep(_pollBackoff)
+                } else {
+                    _pollBackoff = 5000  // 正常超时重置退避
+                    await sleep(5000)
+                }
             }
         }
     }

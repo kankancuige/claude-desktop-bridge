@@ -31,9 +31,11 @@ let isQuitting = false          // 真退出标记，区分"关闭窗口"和"退
  */
 let _logQueue = []
 let _logDraining = false
+const MAX_LOG_QUEUE = 2000  // 日志队列上限，防止异常刷屏时内存无限增长
 function logToFile(msg) {
   if (!GATEWAY_LOG) return
   const line = `[${new Date().toISOString()}] ${msg}\n`
+  if (_logQueue.length >= MAX_LOG_QUEUE) _logQueue.shift()  // 丢弃最旧日志
   _logQueue.push(line)
   if (!_logDraining) drainLogQueue()
 }
@@ -233,6 +235,16 @@ function createWindow() {
 
   // ── IPC: 获取 gateway 日志路径（双向通信，返回字符串） ──
   ipcMain.handle('getGatewayLogPath', () => GATEWAY_LOG)
+
+  // ── IPC: 获取 Bridge Token（本地 API 认证） ──
+  const os = require('os')
+  ipcMain.handle('getBridgeToken', () => {
+    try {
+      const tokenPath = path.join(os.homedir(), '.claude', 'bridge-token')
+      if (fs.existsSync(tokenPath)) return fs.readFileSync(tokenPath, 'utf8').trim()
+    } catch {}
+    return null
+  })
 
   // ── IPC: 选择文件夹（双向通信，返回路径或 null） ──
   // 功能说明: 打开系统原生文件夹选择对话框，用于新增项目时选择工作目录

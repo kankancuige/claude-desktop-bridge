@@ -27,6 +27,8 @@ import {ref, shallowRef, nextTick, onMounted, onActivated, onBeforeUnmount, comp
 import * as monaco from 'monaco-editor'
 import {useRouter} from 'vue-router'
 import {t, setLocale} from '../i18n'
+import {apiFetch, wsUrl} from '../api'
+import DOMPurify from 'dompurify'
 const PhaserPet = defineAsyncComponent(() => import('./PhaserPet.vue'))
 const GlobalToast = defineAsyncComponent(() => import('../components/GlobalToast.vue'))
 const SidebarLeft = defineAsyncComponent(() => import('../components/SidebarLeft.vue'))
@@ -191,7 +193,7 @@ function toggleShowAll(workDir: string) {
 
 /** 持久化 hiddenProjects 到 localStorage */
 function persistHidden() {
-  try { localStorage.setItem(STORAGE_KEY_HIDDEN, JSON.stringify([...hiddenProjects.value])) } catch {}
+  try { localStorage.setItem(STORAGE_KEY_HIDDEN, JSON.stringify([...hiddenProjects.value])) } catch (e) { console.error(e) }
 }
 
 /** 隐藏项目：加入 hiddenProjects，如果是当前活跃项目则清理状态 */
@@ -236,19 +238,19 @@ async function confirmDelete() {
   const {sid} = pendingDelete.value
   pendingDelete.value = null
   try {
-    const res = await fetch(`${GW}/api/sessions/${sid}?deleteFiles=1`, {method: 'DELETE'})
+    const res = await apiFetch(`${GW}/api/sessions/${sid}?deleteFiles=1`, {method: 'DELETE'})
     if (!res.ok) {
       showToast(t('ws.deleteFailed'))
       return
     }
     // 清理 localStorage 缓存的 token/费用记忆
-    try { localStorage.removeItem(usageKey(sid)) } catch {}
+    try { localStorage.removeItem(usageKey(sid)) } catch (e) { console.error(e) }
     // 如果删除的是当前前台活跃 session，清理 UI 状态
     const tab = tabSessions.value.find(t => t.state.sessionId === sid)
     if (tab) tabSessions.value = tabSessions.value.filter(t => t.id !== tab.id)
     if (sessionId.value === sid) {
       if (ws && ws.readyState === WebSocket.OPEN) {
-        try { ws.close() } catch {}
+        try { ws.close() } catch (e) { console.error(e) }
       }
       ws = null
       sessionId.value = null
@@ -447,9 +449,10 @@ function switchToTab(tabId: string) {
   restoreTabState(tab.state)
   activeProject.value = tab.projectPath
   ws = tab.websocket
+  nextTick(() => scrollDown())
   // 通知 Gateway 切换 IM 消息注入目标 + 同步镜像开关
   if (tab.state.sessionId) {
-    fetch(`${GW}/api/sessions/${tab.state.sessionId}/focus`, {method: 'POST'}).catch(() => {})
+    apiFetch(`${GW}/api/sessions/${tab.state.sessionId}/focus`, {method: 'POST'}).catch(() => {})
     loadSessionMirrors()
   }
   // MRU 排序: 将当前 tab 移到数组末尾
@@ -482,7 +485,7 @@ function doCloseTab(tabId: string) {
   if (tab?.websocket) {
     tab.websocket.onclose = null   // 阻止异步 onclose 污染其他 tab 的全局状态
     tab.websocket.onerror = null
-    try { tab.websocket.close() } catch {}
+    try { tab.websocket.close() } catch (e) { console.error(e) }
   }
   tabSessions.value = tabSessions.value.filter(t => t.id !== tabId)
   if (activeTabId.value === tabId) {
@@ -505,7 +508,7 @@ function persistPetToGateway() {
     .then(s => {
       s.petEnabled = petEnabledGlob.value
       s.pet = petId.value
-      return fetch(`${GW}/api/config/settings`, {
+      return apiFetch(`${GW}/api/config/settings`, {
         method: 'PUT',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(s),
@@ -551,6 +554,8 @@ let petBubbleTimer: ReturnType<typeof setTimeout> | null = null
 let petTimer: ReturnType<typeof setTimeout> | null = null
 /** 后台 tab 数组交换期间置 true，阻止 watch 回调触发 pet 污染 */
 let _swappingTab = false
+/** WS handler 序列号: 防止多个连接的后台 tab 处理程序并发修改全局状态 */
+let _handlerSeq = 0
 function syncPetState(state: string, extra?: Record<string, any>) {
   petState.value = state
   petMessage.value = extra?.message || ''
@@ -743,7 +748,7 @@ async function uploadAttachment(att: PendingAttachment, sessionId: string) {
   try {
     const form = new FormData()
     form.append('file', att.file)
-    const res = await fetch(`${GW}/api/sessions/${sessionId}/upload`, {
+    const res = await apiFetch(`${GW}/api/sessions/${sessionId}/upload`, {
       method: 'POST',
       body: form,
     })
@@ -753,7 +758,7 @@ async function uploadAttachment(att: PendingAttachment, sessionId: string) {
       if (d.ocrText) (att as any).ocrText = d.ocrText
       if (d.multimodal) (att as any).multimodal = true
     }
-  } catch {}
+  } catch (e) { console.error(e) }
   att.uploading = false
 }
 /** 正在创建新会话中（防止重复点击） */
@@ -1163,7 +1168,7 @@ onMounted(async () => {
   } catch {
   }
   // 获取 Gateway 版本号
-  try { const vr = await fetch(`${GW}/api/version`); if (vr.ok) gatewayVersion.value = (await vr.json()).version } catch {}
+  try { const vr = await fetch(`${GW}/api/version`); if (vr.ok) gatewayVersion.value = (await vr.json()).version } catch (e) { console.error(e) }
   await Promise.all([loadProjects(), loadBalance(), loadProviderModels(), loadSlashCommands(), loadIMStatus()])
   // Esc 关闭 diff/文件 modal
   window.addEventListener('keydown', onGlobalKeydown)
@@ -1348,7 +1353,7 @@ async function handleNewSession(workDir: string, encodedDir?: string, histSessio
     }
     if (encodedDir && histSessionId) body.resume = histSessionId
 
-    const res = await fetch(`${GW}/api/sessions`, {
+    const res = await apiFetch(`${GW}/api/sessions`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(body),
@@ -1362,7 +1367,7 @@ async function handleNewSession(workDir: string, encodedDir?: string, histSessio
     connectWS(data.sessionId)
     syncCurrentTabState()  // 将会话 ID + WebSocket 写回 tab
     // 通知 Gateway 聚焦当前会话（IM 消息注入目标）
-    fetch(`${GW}/api/sessions/${data.sessionId}/focus`, {method: 'POST'}).catch(() => {})
+    apiFetch(`${GW}/api/sessions/${data.sessionId}/focus`, {method: 'POST'}).catch(() => {})
     loadSessionMirrors()
     setTimeout(loadSlashCommands, 1500)  // 会话起来后拉一次实时命令列表
     loadMentionFiles()                   // 预加载文件列表供 # 引用
@@ -1533,7 +1538,7 @@ async function handleNudge(msg: any) {
         const { platform, enabled } = args
         if (platform && typeof enabled === 'boolean') {
           mirrorState.value[platform] = enabled
-          try { localStorage.setItem(`bridge-mirror-${platform}`, enabled ? '1' : '0') } catch {}
+          try { localStorage.setItem(`bridge-mirror-${platform}`, enabled ? '1' : '0') } catch (e) { console.error(e) }
           showToast(enabled ? t('ws.mirrorOnToast') : t('ws.mirrorOffToast'))
         }
         break
@@ -1566,16 +1571,27 @@ async function loadHistory(encodedDir: string, sId: string) {
 
 /** 控制通道 WebSocket：不绑定 session，启动即连，接收 IM nudge 事件 */
 let controlWS: WebSocket | null = null
-function connectControlWS() {
+let _ctrlReconnectDelay = 5000
+let _controlWSStopped = false
+
+async function connectControlWS() {
+  if (_controlWSStopped) return
   if (controlWS && controlWS.readyState === WebSocket.OPEN) return
-  controlWS = new WebSocket('ws://127.0.0.1:3456/ws/control')
+  const ctrlUrl = await wsUrl('/ws/control')
+  controlWS = new WebSocket(ctrlUrl)
   controlWS.onmessage = (e) => {
     try {
       const msg = JSON.parse(e.data)
       if (msg.type === 'nudge') handleNudge(msg)
-    } catch {}
+    } catch (e) { console.error(e) }
   }
-  controlWS.onclose = () => { controlWS = null; setTimeout(connectControlWS, 5000) }
+  controlWS.onopen = () => { _ctrlReconnectDelay = 5000 }
+  controlWS.onclose = () => {
+    controlWS = null
+    setTimeout(connectControlWS, _ctrlReconnectDelay)
+    // 指数退避: 5s → 10s → 20s → ... → 上限 60s
+    _ctrlReconnectDelay = Math.min(_ctrlReconnectDelay * 2, 60000)
+  }
   controlWS.onerror = () => { controlWS?.close() }
 }
 
@@ -1585,9 +1601,10 @@ function connectControlWS() {
  * WebSocket 生命周期：onopen 标记 connected，onmessage 分发到各 type 处理分支，onclose/onerror 重置状态。
  * 注意：ws 是模块级非响应式变量（let），避免 Vue Proxy 干扰 WebSocket 原生事件。
  */
-function connectWS(sid: string, resumed = false) {
+async function connectWS(sid: string, resumed = false) {
   if (ws) ws.close()
-  ws = new WebSocket(`ws://127.0.0.1:3456/ws/${sid}`)
+  const wsConnectUrl = await wsUrl(`/ws/${sid}`)
+  ws = new WebSocket(wsConnectUrl)
 
   // 闭包捕获: 此 WS 所属的 tab 标识，防止异步回调污染其他 tab
   const mySid = sid
@@ -1618,12 +1635,18 @@ function connectWS(sid: string, resumed = false) {
       if (!tab) return  // 标签页已关闭
 
       const fg = isFg()
+      // 获取 handler 序列号，防止并发后台 handler 交叉修改全局状态
+      const mySeq = ++_handlerSeq
 
       // 后台标签页: 保存当前前台状态 → 将全局 ref 指向 tab 快照 → 处理完后恢复
       if (!fg) {
         _saved = snapshotTabState()
-        restoreTabState(tab.state)
         _swappingTab = true
+        try { restoreTabState(tab.state) } catch (e) {
+          console.error(e)
+          _swappingTab = false
+          return
+        }
       }
 
       let msg
@@ -1631,7 +1654,7 @@ function connectWS(sid: string, resumed = false) {
         msg = JSON.parse(e.data)
       } catch {
         // 无法解析的消息静默丢弃；若已交换后台 tab 状态则先恢复前台
-        if (_saved) restoreTabState(_saved!)
+        if (_saved) { try { restoreTabState(_saved!) } catch {} }
         return
       }
       switch (msg.type) {
@@ -1717,9 +1740,21 @@ function connectWS(sid: string, resumed = false) {
       }
 
       case 'content_block_stop': {
-        // 工具执行完成：更新最终耗时
-        const t = pendingTools.value.find(x => x.tool_use_id === msg.index)
-        if (t) t.elapsed = msg.elapsed?.elapsed_time_seconds || t.elapsed
+        // 区分工具块与思考块: SDK 对 tool_use 和 thinking 都发此事件，通过 index 前缀区分
+        if (typeof msg.index === 'string' && msg.index.startsWith('thought_')) {
+          // 思考块结束：计算 token/费用，改标签为"思考完成"
+          const tmm = [...messages.value].reverse().find(m => m.role === 'thinking' && m.thinkingId === msg.index)
+          if (tmm) {
+            const tk = estimateTokens(tmm.thinkingContent || '')
+            tmm.tokens = tk
+            tmm.cost = estCost(tk)
+            tmm.text = t('ws.thinkDone')
+          }
+        } else {
+          // 工具执行完成：更新最终耗时
+          const t = pendingTools.value.find(x => x.tool_use_id === msg.index)
+          if (t) t.elapsed = msg.elapsed?.elapsed_time_seconds || t.elapsed
+        }
         break
       }
 
@@ -1752,18 +1787,6 @@ function connectWS(sid: string, resumed = false) {
         // 思考增量：追加到对应 thinkingId 的消息 thinkingContent 末尾
         const tm = [...messages.value].reverse().find(m => m.role === 'thinking' && m.thinkingId === msg.index)
         if (tm) tm.thinkingContent = (tm.thinkingContent || '') + (msg.thinking || '')
-        break
-      }
-
-      case 'content_block_stop': {
-        // 思考块结束：计算 token/费用，改标签为"思考完成"
-        const tmm = [...messages.value].reverse().find(m => m.role === 'thinking' && m.thinkingId === msg.index)
-        if (tmm) {
-          const tk = estimateTokens(tmm.thinkingContent || '')
-          tmm.tokens = tk
-          tmm.cost = estCost(tk)
-          tmm.text = t('ws.thinkDone')
-        }
         break
       }
 
@@ -2016,8 +2039,11 @@ function connectWS(sid: string, resumed = false) {
 
     if (!fg) {
       // 后台标签页: 写回 tab 快照 → 恢复前台全局状态
-      tab.state = snapshotTabState()
-      restoreTabState(_saved!)
+      // 序列号检查: 若已有更新的 handler 启动，放弃写回以避免状态交叉污染
+      if (mySeq === _handlerSeq) {
+        tab.state = snapshotTabState()
+        try { restoreTabState(_saved!) } catch {}
+      }
     } else {
       nextTick(() => scrollDown())
     }
@@ -2136,25 +2162,25 @@ async function loadSessionMirrors() {
         }
       }
     }
-  } catch {}
+  } catch (e) { console.error(e) }
 }
 
 /** 通知 Gateway 设置指定平台的镜像开关（session 级标志） */
 async function setMirror(platform: string, enabled: boolean) {
   if (!sessionId.value) return
   try {
-    await fetch(`${GW}/api/sessions/${sessionId.value}/mirror`, {
+    await apiFetch(`${GW}/api/sessions/${sessionId.value}/mirror`, {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({platform, enabled}),
     })
-  } catch {}
+  } catch (e) { console.error(e) }
 }
 
 /** 切换镜像开关：更新本地状态 → Gateway → toast 提示 */
 function toggleMirror(platform: string) {
   if (!imBound.value[platform]) return
   mirrorState.value[platform] = !mirrorState.value[platform]
-  try { localStorage.setItem(`bridge-mirror-${platform}`, mirrorState.value[platform] ? '1' : '0') } catch {}
+  try { localStorage.setItem(`bridge-mirror-${platform}`, mirrorState.value[platform] ? '1' : '0') } catch (e) { console.error(e) }
   setMirror(platform, mirrorState.value[platform])
   showToast(mirrorState.value[platform] ? t('ws.mirrorOnToast') : t('ws.mirrorOffToast'))
 }
@@ -2953,9 +2979,9 @@ function doCloseModal() {
     if (diffOriginalModel) { diffOriginalModel.dispose(); diffOriginalModel = null }
     if (diffModifiedModel) { diffModifiedModel.dispose(); diffModifiedModel = null }
     monacoDiffEditor.value?.dispose()
-  } catch {}
+  } catch (e) { console.error(e) }
   monacoDiffEditor.value = null
-  try { monacoEditor.value?.dispose() } catch {}
+  try { monacoEditor.value?.dispose() } catch (e) { console.error(e) }
   monacoEditor.value = null
   cachedEditorContent = ''
   modalMode.value = null
@@ -3015,9 +3041,9 @@ watch([modalMode, modalLoading], async ([mode, loading]) => {
 
   if (mode === 'file' && modalFileContent.value && !modalMarkdown.value) {
     // 先清旧实例：DOM 存活时 dispose 安全，不会触发 0x0 ResizeObserver
-    try { monacoDiffEditor.value?.dispose() } catch {}
+    try { monacoDiffEditor.value?.dispose() } catch (e) { console.error(e) }
     monacoDiffEditor.value = null
-    try { monacoEditor.value?.dispose() } catch {}
+    try { monacoEditor.value?.dispose() } catch (e) { console.error(e) }
     monacoEditor.value = null
 
     const editor = monaco.editor.create(container, {
@@ -3039,20 +3065,20 @@ watch([modalMode, modalLoading], async ([mode, loading]) => {
     if (model) {
       model.onDidChangeContent(() => {
         modalDirty.value = true
-        try { cachedEditorContent = model.getValue() } catch {}
+        try { cachedEditorContent = model.getValue() } catch (e) { console.error(e) }
       })
     }
     monacoEditor.value = editor
   } else if (mode === 'diff' && modalDiff.value?.lines?.length) {
     // 先清旧实例：DOM 存活时 dispose 安全
-    try { monacoEditor.value?.dispose() } catch {}
+    try { monacoEditor.value?.dispose() } catch (e) { console.error(e) }
     monacoEditor.value = null
     try {
       // diffEditor.dispose 不会清理外部 createModel 的 model，手动清理
       if (diffOriginalModel) { diffOriginalModel.dispose(); diffOriginalModel = null }
       if (diffModifiedModel) { diffModifiedModel.dispose(); diffModifiedModel = null }
       monacoDiffEditor.value?.dispose()
-    } catch {}
+    } catch (e) { console.error(e) }
     monacoDiffEditor.value = null
 
     const {oldText, newText} = reconstructDiffTexts(modalDiff.value.lines)
@@ -3082,7 +3108,7 @@ function doSave() {
   const path = modalPath.value
   if (!sid || modalMode.value !== 'file' || !path) return
   const content = cachedEditorContent
-  fetch(`${GW}/api/sessions/${sid}/save-and-snapshot`, {
+  apiFetch(`${GW}/api/sessions/${sid}/save-and-snapshot`, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({path, content}),
@@ -3139,9 +3165,10 @@ onBeforeUnmount(() => {
     if (diffOriginalModel) { diffOriginalModel.dispose(); diffOriginalModel = null }
     if (diffModifiedModel) { diffModifiedModel.dispose(); diffModifiedModel = null }
     monacoDiffEditor.value?.dispose()
-  } catch {}
-  try { monacoEditor.value?.dispose() } catch {}
+  } catch (e) { console.error(e) }
+  try { monacoEditor.value?.dispose() } catch (e) { console.error(e) }
   // 控制通道 WebSocket 清理（防止卸载后自动重连泄漏）
+  _controlWSStopped = true
   if (controlWS) {
     controlWS.onclose = null
     controlWS.onerror = null
@@ -3191,7 +3218,7 @@ async function confirmRewind() {
   if (!cp || !sessionId.value) return
   rewinding.value = true
   try {
-    const res = await fetch(`${GW}/api/sessions/${sessionId.value}/rewind`, {
+    const res = await apiFetch(`${GW}/api/sessions/${sessionId.value}/rewind`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({checkpointId: cp.id}),
@@ -3251,7 +3278,7 @@ async function confirmCommit() {
   }
   committing.value = true
   try {
-    const res = await fetch(`${GW}/api/sessions/${sessionId.value}/commit`, {method: 'POST'})
+    const res = await apiFetch(`${GW}/api/sessions/${sessionId.value}/commit`, {method: 'POST'})
     const d = await res.json()
     if (res.ok && d.ok) {
       messages.value.push({role: 'system', text: t('sys.committed', {n: d.fileCount}), time: Date.now()})
@@ -3682,7 +3709,11 @@ function renderMarkdown(raw: string): string {
     return `<div class="md-table-wrap"><table class="md-table"><thead>${thead}</thead><tbody>${tbody}</tbody></table></div>`
   })
 
-  return html
+  // 防御纵深: 最终过一遍 DOMPurify，拦截基础转义可能遗漏的 XSS（如 javascript: 链接、event handler 属性）
+  return DOMPurify.sanitize(html, {ALLOWED_TAGS: [
+    'pre','code','span','blockquote','ol','ul','li','h2','h3','h4','h5',
+    'strong','em','del','a','hr','div','table','thead','tbody','tr','th','td','br','p','img'
+  ], ALLOWED_ATTR: ['class','href','src','alt']})
 }
 
 /** 检查累计费用是否达到余额阈值，达到则静默 toast 提醒一次 */

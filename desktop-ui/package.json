@@ -14,6 +14,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "dompurify": "^3.4.11",
     "electron-updater": "^6.8.9",
     "monaco-editor": "^0.55.1",
     "phaser": "^4.2.0",
@@ -22,6 +23,7 @@
     "vue-router": "^4.6.4"
   },
   "devDependencies": {
+    "@types/dompurify": "^3.2.0",
     "@types/node": "^24.12.3",
     "@vitejs/plugin-vue": "^6.0.6",
     "@vue/tsconfig": "^0.9.1",
@@ -72,16 +74,25 @@
     },
     "icon": "public/logo.png",
     "win": {
-      "target": ["nsis", "zip"],
+      "target": [
+        "nsis",
+        "zip"
+      ],
       "icon": "public/logo.png"
     },
     "mac": {
-      "target": ["dmg", "zip"],
+      "target": [
+        "dmg",
+        "zip"
+      ],
       "icon": "public/logo.png",
       "category": "public.app-category.developer-tools"
     },
     "linux": {
-      "target": ["AppImage", "zip"],
+      "target": [
+        "AppImage",
+        "zip"
+      ],
       "icon": "public/logo.png",
       "category": "Development"
     }

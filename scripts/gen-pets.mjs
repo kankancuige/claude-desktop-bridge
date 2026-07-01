@@ -14,6 +14,15 @@
  * ── 用法 ──
  * node scripts/gen-pets.mjs
  */
+import { readFileSync, writeFileSync, readdirSync } from 'node:fs'
+import { resolve, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
+const mediaDir = resolve(__dirname, '../desktop-ui/public/media')
+const vueFile = resolve(__dirname, '../desktop-ui/src/views/PhaserPet.vue')
+
+const files = readdirSync(mediaDir).filter(f => /\.png$/i.test(f))
 
 const entries = files.map(f => {
   const id = f.replace(/\.png$/i, '').replace(/[^a-zA-Z0-9_-]/g, '_').toLowerCase()

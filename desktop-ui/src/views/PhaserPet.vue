@@ -274,7 +274,7 @@ class PetScene extends Phaser.Scene {
       else if (s === 'connected') { this.switchState('greet'); this.time.delayedCall(2000, () => { this.switchState('stand'); this.game.registry.set('petState', 'idle') }) }
       else if (s === 'tool_use') this.switchState('greet')
       else if (s === 'building') { this.switchState('climb'); this.pet.body!.setVelocityY(-FRAME_RATE * 8); this.pet.body!.setAllowGravity(false) }
-      else if (s === 'success') { this.switchState('jump'); this.pet.body!.setVelocityY(-250); this.time.delayedCall(500, () => { if (this.currentState === 'jump') this.switchState('jump'); this.pet.body!.setVelocityY(-200); this.time.delayedCall(500, () => this.switchState('stand')) }) }
+      else if (s === 'success') { this.switchState('jump'); this.pet.body!.setVelocityY(-250); this.time.delayedCall(700, () => this.switchState('stand')) }
       else if (s === 'error') { this.switchState('jump'); this.pet.body!.setVelocityY(-350); this.time.delayedCall(1200, () => this.switchState('sit')) }
       else if (s === 'disconnected') this.switchState('sit')
       else if (s === 'thinking') this.switchState('stand')

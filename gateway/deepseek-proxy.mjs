@@ -23,13 +23,24 @@ let proxyServer = null
 // ── thinking 块缓存 (fingerprint → [{index, thinking, signature}]) ──
 const thinkingCache = new Map()
 const MAX_CACHE_PER_SESSION = 50
-/** 全局 TTL: 30 分钟清理一次过期 session，防止长时间运行内存膨胀 */
+/** 全局 session 数量上限，超限时淘汰最旧条目，防止长时间运行 OOM */
+const MAX_CACHE_SESSIONS = 500
 const CACHE_TTL_MS = 30 * 60 * 1000
 let _cacheCleanupTimer = setInterval(() => {
     const cutoff = Date.now() - CACHE_TTL_MS
     for (const [k, v] of thinkingCache) {
         const lastCached = v[v.length - 1]?.cachedAt || 0
         if (lastCached < cutoff) thinkingCache.delete(k)
+    }
+    // 超 session 上限时按最后活跃时间淘汰最旧的
+    while (thinkingCache.size > MAX_CACHE_SESSIONS) {
+        let oldest = null
+        for (const [k, v] of thinkingCache) {
+            const ts = v[v.length - 1]?.cachedAt || 0
+            if (!oldest || ts < oldest.ts) oldest = {key: k, ts}
+        }
+        if (oldest) thinkingCache.delete(oldest.key)
+        else break
     }
 }, CACHE_TTL_MS)
 if (_cacheCleanupTimer.unref) _cacheCleanupTimer.unref()
@@ -87,6 +98,7 @@ export function startDeepSeekProxy(upstream) {
                 })
             } else {
                 log.error({err: e}, '代理服务异常')
+                reject(e)
             }
         })
         proxyServer.listen(TRY_PORT, '127.0.0.1', () => {
@@ -109,8 +121,12 @@ export function isProxyRunning() {
     return proxyServer !== null && proxyServer.listening
 }
 
-/** 停止代理 (进程退出时调用) */
+/** 停止代理 (进程退出时调用)，同时清理缓存定时器 */
 export function stopDeepSeekProxy() {
+    if (_cacheCleanupTimer) {
+        clearInterval(_cacheCleanupTimer)
+        _cacheCleanupTimer = null
+    }
     if (proxyServer) {
         try {
             // 强制关闭所有活跃连接，防止 keep-alive 导致 server.close() hang

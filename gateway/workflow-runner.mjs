@@ -6,7 +6,7 @@ import {createContext, runInContext} from 'node:vm'
 import {createHash} from 'node:crypto'
 import {readdirSync, readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, rmSync} from 'node:fs'
 import {execSync} from 'node:child_process'
-import {join} from 'node:path'
+import {join, extname} from 'node:path'
 import {homedir, cpus, tmpdir} from 'node:os'
 import {createLogger} from './logger.mjs'
 
@@ -92,7 +92,7 @@ function detectProjectLanguage(workDir) {
         const fs = {
             readdirSync, statSync: (p) => {
                 try {
-                    return require('fs').statSync(p)
+                    return statSync(p)
                 } catch {
                     return null
                 }
@@ -110,7 +110,7 @@ function detectProjectLanguage(workDir) {
                     if (st.isDirectory()) {
                         walk(p, depth + 1)
                     } else {
-                        const ext = require('path').extname(e)
+                        const ext = extname(e)
                         if (ext) exts[ext] = (exts[ext] || 0) + 1
                     }
                 }
@@ -1303,6 +1303,11 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
     }
 
     // ── 构建 VM 沙箱 ──
+    // 重要安全说明: node:vm 不是安全沙箱！官方文档明确警告:
+    // "The vm module is not a security mechanism. Do not use it to run untrusted code."
+    // 沙箱中的代码可通过 this.constructor.constructor('return process')() 逃逸。
+    // 本系统假定所有 workflow 脚本来自可信用户（存储在 ~/.claude/workflows/）。
+    // 如需运行不可信代码，应改用 child_process.fork() 或 OS 级沙箱隔离。
     const sandbox = {
         agent, parallel, pipeline, phase, log, budget, args, meta,
         console: {

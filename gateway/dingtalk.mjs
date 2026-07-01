@@ -162,6 +162,17 @@ export function startDingTalkAdapter() {
 
     // ── pendingConfirm 挂起确认表 ──
     const pendingConfirm = new Map()
+    // pendingConfirm TTL 清理：5 分钟超时自动清除，防止异常路径下残留
+    const _confirmCleanup = setInterval(() => {
+      const cutoff = Date.now() - 5 * 60 * 1000
+      for (const [uid, pc] of pendingConfirm) {
+        if ((pc._at || 0) < cutoff) pendingConfirm.delete(uid)
+      }
+    }, 5 * 60 * 1000)
+    if (_confirmCleanup.unref) _confirmCleanup.unref()
+    // 包装 set 自动注入 _at 时间戳，供 TTL 清理使用
+    const _pcSet = pendingConfirm.set.bind(pendingConfirm)
+    pendingConfirm.set = (k, v) => _pcSet(k, {...v, _at: Date.now()})
 
     // ── parseConfirmReply ──
     // 功能说明: 解析用户的确认回复文本

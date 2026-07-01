@@ -6,9 +6,9 @@
 
 import {createServer} from 'node:http'
 import {readdirSync, statSync, readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, rmdirSync, openSync, readSync, closeSync} from 'node:fs'
-import {execSync, spawn} from 'node:child_process'
+import {execSync, spawn, spawnSync} from 'node:child_process'
 import {homedir} from 'node:os'
-import {join, dirname, basename, relative, resolve, extname as pathExtname} from 'node:path'
+import {join, dirname, basename, relative, resolve, sep, extname as pathExtname} from 'node:path'
 import {fileURLToPath} from 'node:url'
 import {WebSocketServer} from 'ws'
 import {config as loadEnv} from 'dotenv'
@@ -40,6 +40,7 @@ import {
     cacheFilePath
 } from './project-cache.mjs'
 import {startDeepSeekProxy, getProxyUrl, stopDeepSeekProxy, isProxyRunning} from './deepseek-proxy.mjs'
+let _proxyStarting = null
 import cron from 'node-cron'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -189,6 +190,11 @@ function mapModel(name) {
 }
 
 const CLAUDE_HOME = join(homedir(), '.claude')
+const BRIDGE_TOKEN_PATH = join(CLAUDE_HOME, 'bridge-token')
+// 本地 API 认证 token: 启动时生成随机 token，写入文件供桌面端读取
+// 所有 POST/PUT/DELETE 请求须携带 x-bridge-token header 与此匹配
+const BRIDGE_TOKEN = crypto.randomUUID()
+try { writeFileSync(BRIDGE_TOKEN_PATH, BRIDGE_TOKEN, 'utf8') } catch {}
 
 // ---- 动态模型/命令缓存 ----
 // supportedModels()/supportedCommands() 是控制请求，需活跃 query；冷启动设置页读这里的缓存
@@ -778,7 +784,11 @@ async function downloadAndReplaceRtk(targetVersion) {
             const extractDir = join(rtkDir, '_rtk_extract')
             if (existsSync(extractDir)) rmdirSync(extractDir, {recursive: true})
             mkdirSync(extractDir, {recursive: true})
-            execSync(`powershell -Command "Expand-Archive -Path '${tmpFile}' -DestinationPath '${extractDir}' -Force"`, {timeout: 30000, windowsHide: true})
+            const psResult = spawnSync('powershell.exe', [
+                '-NoProfile', '-NonInteractive', '-Command',
+                'Expand-Archive', '-LiteralPath', tmpFile, '-DestinationPath', extractDir, '-Force'
+            ], {timeout: 30000, windowsHide: true})
+            if (psResult.error) throw new Error(`解压失败: ${psResult.error.message}`)
             const extracted = join(extractDir, 'rtk.exe')
             if (existsSync(extracted)) {
                 const dest = join(rtkDir, binName)
@@ -789,9 +799,10 @@ async function downloadAndReplaceRtk(targetVersion) {
             }
             rmdirSync(extractDir, {recursive: true})
         } else {
-            execSync(`tar -xzf "${tmpFile}" -C "${rtkDir}"`, {timeout: 30000})
+            const tarResult = spawnSync('tar', ['-xzf', tmpFile, '-C', rtkDir], {timeout: 30000})
+            if (tarResult.error) throw new Error(`解压失败: ${tarResult.error.message}`)
             const dest = join(rtkDir, binName)
-            try { execSync(`chmod +x "${dest}"`) } catch {}
+            try { spawnSync('chmod', ['+x', dest]) } catch {}
         }
     } finally {
         if (existsSync(tmpFile)) unlinkSync(tmpFile)
@@ -1163,8 +1174,12 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
 
     // DeepSeek 兼容代理: 自动路由请求通过本地代理修复参数冲突
     if (baseUrl && baseUrl.includes('deepseek') && !isProxyRunning()) {
+        // 防并发启动：同一时刻多个 session 创建只触发一次启动
+        if (!_proxyStarting) {
+            _proxyStarting = startDeepSeekProxy(baseUrl).finally(() => { _proxyStarting = null })
+        }
         try {
-            await startDeepSeekProxy(baseUrl)
+            await _proxyStarting
         } catch (e) {
             log.error({err: e}, 'DeepSeek proxy 启动失败')
         }
@@ -1993,8 +2008,24 @@ const httpServer = createServer(async (req, res) => {
         res.end();
         return
     }
+    // 本地 API 认证: POST/PUT/DELETE 须携带有效 bridge-token
+    if (req.method === 'POST' || req.method === 'PUT' || req.method === 'DELETE') {
+        const token = req.headers['x-bridge-token']
+        if (token !== BRIDGE_TOKEN) {
+            res.writeHead(403)
+            res.end(JSON.stringify({error: 'forbidden: missing or invalid bridge token'}))
+            return
+        }
+    }
     res.setHeader('Content-Type', 'application/json')
     const url = new URL(req.url, `http://127.0.0.1:${PORT}`)
+
+    // GET /api/bridge-token —— 非 Electron 环境(dev/browser)读取本地认证 token
+    if (url.pathname === '/api/bridge-token' && req.method === 'GET') {
+        res.writeHead(200);
+        res.end(JSON.stringify({token: BRIDGE_TOKEN}));
+        return
+    }
 
     // GET /debug-log —— 前端诊断用，msg 参数写入终端日志
     if (url.pathname === '/debug-log' && req.method === 'GET') {
@@ -3477,9 +3508,13 @@ const httpServer = createServer(async (req, res) => {
     const ruleM = url.pathname.match(/^\/api\/config\/rules\/(.+)$/);
     if (ruleM) {
         let fn = decodeURIComponent(ruleM[1]);
-        // 防止路径穿越
-        if (fn.includes('..')) { res.writeHead(400); res.end(JSON.stringify({error: 'invalid filename'})); return }
-        const fp = join(CLAUDE_HOME, 'rules', fn);
+        // 路径穿越白名单防护: resolve 后检查结果必须在 CLAUDE_HOME/rules 目录下
+        const rulesDir = join(CLAUDE_HOME, 'rules')
+        const resolved = resolve(rulesDir, fn)
+        if (!resolved.startsWith(rulesDir + sep) && resolved !== rulesDir) {
+            res.writeHead(400); res.end(JSON.stringify({error: 'invalid filename'})); return
+        }
+        const fp = resolved
         if (req.method === 'GET') {
             try {
                 const c = readFileSync(fp, 'utf8');
@@ -4735,6 +4770,21 @@ const controlClients = new Set()
 
 const wss = new WebSocketServer({server: httpServer, maxPayload: 1048576})
 wss.on('connection', (ws, req) => {
+    // WebSocket 认证: 检查 upgrade 请求中的 bridge-token（兼容 header 和 query param）
+    const wsToken = req.headers['x-bridge-token'] || (() => {
+        const qm = (req.url || '').indexOf('?')
+        if (qm < 0) return null
+        const q = (req.url || '').slice(qm + 1)
+        for (const p of q.split('&')) {
+            const [k, v] = p.split('=')
+            if (k === 'token') return decodeURIComponent(v || '')
+        }
+        return null
+    })()
+    if (wsToken !== BRIDGE_TOKEN) {
+        ws.close(4003, JSON.stringify({error: 'forbidden: missing or invalid bridge token'}))
+        return
+    }
     const urlStr = req.url || '';
     const qi = urlStr.indexOf('?')
     const pathPart = qi >= 0 ? urlStr.slice(0, qi) : urlStr;
@@ -4884,7 +4934,8 @@ wss.on('connection', (ws, req) => {
                         const pending = s._pendingMessages || []
                         s._pendingMessages = null
                         s._rebuildPromise = null
-                        if (s.query) {
+                        // 重建完成后处理积压消息：先置 null 再消费，避免新消息写入旧数组
+                        if (s.query && pending.length) {
                             for (const content of pending) {
                                 s.pushStream.push({
                                     type: 'user', session_id: sessionId,

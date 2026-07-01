@@ -162,12 +162,15 @@ onBeforeUnmount(() => {
   document.removeEventListener('keydown', onKeydown)
 })
 
-// mode 变化时注册/注销键盘监听
+// mode 变化时注册/注销键盘监听（用闭包状态防止双重注册）
+let _keydownRegistered = false
 watch(() => props.mode, (m) => {
-  if (m) {
+  if (m && !_keydownRegistered) {
     document.addEventListener('keydown', onKeydown)
-  } else {
+    _keydownRegistered = true
+  } else if (!m && _keydownRegistered) {
     document.removeEventListener('keydown', onKeydown)
+    _keydownRegistered = false
   }
 }, { immediate: true })
 

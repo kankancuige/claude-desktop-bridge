@@ -26,6 +26,7 @@ console.log(
 import { createApp } from 'vue'
 import { createPinia } from 'pinia'
 import router from './router'
+import './api'                                   // 全局 fetch 拦截器（bridge-token 认证），须在其他 import 前加载
 import App from './App.vue'
 import './style.css'                               // 全局样式（CSS 变量、主题色、基础重置）
 

@@ -95,6 +95,17 @@ export function startFeishuAdapter() {
     // ── pendingConfirm 挂起确认表 ──
     // 功能说明: 记录等待用户回复确认的请求，key 为飞书用户 open_id
     const pendingConfirm = new Map()
+    // pendingConfirm TTL 清理：5 分钟超时自动清除，防止异常路径下残留
+    const _confirmCleanup = setInterval(() => {
+      const cutoff = Date.now() - 5 * 60 * 1000
+      for (const [uid, pc] of pendingConfirm) {
+        if ((pc._at || 0) < cutoff) pendingConfirm.delete(uid)
+      }
+    }, 5 * 60 * 1000)
+    if (_confirmCleanup.unref) _confirmCleanup.unref()
+    // 包装 set 自动注入 _at 时间戳，供 TTL 清理使用
+    const _pcSet = pendingConfirm.set.bind(pendingConfirm)
+    pendingConfirm.set = (k, v) => _pcSet(k, {...v, _at: Date.now()})
 
     // ── 飞书 API 客户端 (发消息用) ──
     // 功能说明: 用于通过 HTTP API 发送消息到飞书用户

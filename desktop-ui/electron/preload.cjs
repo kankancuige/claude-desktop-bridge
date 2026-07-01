@@ -25,6 +25,9 @@ const { contextBridge, ipcRenderer } = require('electron')
  * 注意: 不要在此处添加任意 IPC 通道，每个新增 API 都应有明确的安全理由
  */
 contextBridge.exposeInMainWorld('electronAPI', {
+  // ── Bridge Token（本地 API 认证）──
+  getBridgeToken: () => ipcRenderer.invoke('getBridgeToken'),
+
   // ── 平台标识 ──
   // 渲染进程可据此判断当前操作系统（win32/darwin/linux），用于条件渲染
   platform: process.platform,
