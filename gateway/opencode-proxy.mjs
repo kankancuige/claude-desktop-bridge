@@ -93,10 +93,16 @@ async function handleRequest(clientReq, clientRes) {
         const respText = await r.text()
         let data
         try { data = JSON.parse(respText) } catch { data = null }
-        log.info({status: r.status, hasChoices: !!data?.choices, firstChoice: data?.choices?.[0]?.message?.content?.slice(0,100), error: !!data?.error}, 'upstream ok')
+        // 流式响应（SSE）落到此分支：JSON.parse 必失败 → data=null → 走错误分支快速返回，避免挂起
         if (!data || data.error) {
+            // 检测上游是否为 SSE 流式响应（translateBody 透传 stream:true 时可能发生）
+            const isSSE = respText.includes('data:') && (clientReq.headers['accept'] || '').includes('text/event-stream')
+            const msg = isSSE
+                ? 'OpenCode 代理暂不支持流式响应(SSE→Anthropic 翻译未实现),请用非流式模型或等待流式翻译补全'
+                : (data?.error?.message || `Bad response: ${respText.slice(0,200)}`)
+            log.warn({status: r.status, isSSE, body: respText.slice(0, 200)}, 'upstream 非 JSON 或错误')
             clientRes.writeHead(r.status||502, {'Content-Type':'application/json'})
-            clientRes.end(JSON.stringify({type:'error',error:{type:'api_error',message:data?.error?.message||`Bad response: ${respText.slice(0,200)}`}}))
+            clientRes.end(JSON.stringify({type:'error',error:{type:'api_error',message:msg}}))
             return
         }
         clientRes.writeHead(200, {'Content-Type':'application/json'})
@@ -110,7 +116,10 @@ async function handleRequest(clientReq, clientRes) {
 
 // ── 翻译入口 ──
 function translateBody(body) {
-    const o = { model: body.model, max_tokens: body.max_tokens || 32000, stream: false }
+    // stream 跟随客户端请求；客户端发 stream:true 时该函数不强制改 false
+    // 注意：若 SDK 发 stream:true，上游返回 SSE，但下方 handleRequest 仅支持非流式（await r.text() 一次性读取）
+    //   流式情况会卡到上游超时或返回完整响应。流式 Anthropic↔OpenAI 翻译待实现，实战前需补。
+    const o = { model: body.model, max_tokens: body.max_tokens || 32000, stream: body.stream === true }
     const msgs = []
     if (body.system) {
         const s = Array.isArray(body.system) ? body.system.filter(b=>b.type==='text').map(b=>b.text).join('') : String(body.system)
