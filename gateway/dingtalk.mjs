@@ -575,7 +575,8 @@ export function startDingTalkAdapter(token) {
                 return body.content
             }
         }
-        return body.content || ''
+        // content 非 string（object/null/undefined）→ 统一返回空串，避免下游 JSON.stringify 把 object 包裹成 "{}"
+        return ''
     }
 
     // ── 连接 Stream → 启动成功 ──

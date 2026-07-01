@@ -158,7 +158,12 @@ export function startWeChatAdapter(token) {
                 if (!res.ok) {
                     log.error({status: res.status}, 'getupdates HTTP 错误')
                     if (res.status === 404 || res.status === 401) {
-                        if (!reloadToken()) return
+                        // reloadToken 失败不退出循环：token 暂时不可用，长退避后重试，避免适配器静默死亡
+                        if (!reloadToken()) {
+                            log.error('token 重新加载失败，60s 后重试')
+                            await sleep(60000)
+                            continue
+                        }
                     }
                     await sleep(5000);
                     continue

@@ -131,12 +131,12 @@ export function stopDeepSeekProxy() {
         clearInterval(_cacheCleanupTimer)
         _cacheCleanupTimer = null
     }
+    // 重置 _startPromise：否则 stop 后再 start 会返回旧的 resolved promise（指向已 close 的 server），代理无法重启
+    _startPromise = null
     if (proxyServer) {
         try {
-            // 强制关闭所有活跃连接，防止 keep-alive 导致 server.close() hang
             proxyServer.closeAllConnections?.()
             proxyServer.close()
-            // 兜底：2 秒后 unref，进程可以退出
             setTimeout(() => { proxyServer?.unref() }, 2000)
         } catch {
         }

@@ -41,6 +41,8 @@ export function startOpenCodeProxy() {
 export function getOpenCodeProxyUrl() { return `http://127.0.0.1:${proxyPort}` }
 export function isOpenCodeProxyRunning() { return proxyServer !== null && proxyServer.listening }
 export function stopOpenCodeProxy() {
+    // 重置 _startPromise：与 deepseek-proxy 一致，否则 stop→start 返回旧 resolved promise
+    _startPromise = null
     if (proxyServer) { try { proxyServer.closeAllConnections?.(); proxyServer.close() } catch {}; proxyServer = null; proxyPort = 0 }
 }
 
@@ -141,15 +143,16 @@ function transUser(m) {
 }
 function transAssistant(m) {
     if (typeof m.content === 'string') return {role:'assistant',content:m.content}
-    if (!Array.isArray(m.content)) return {role:'assistant',content:null}
+    if (!Array.isArray(m.content)) return {role:'assistant',content:''}
     const texts=[], tcs=[]
     for (const b of m.content) {
         if (b.type==='text') texts.push(b.text)
         else if (b.type==='tool_use') tcs.push({id:b.id,type:'function',function:{name:b.name,arguments:typeof b.input==='string'?b.input:JSON.stringify(b.input)}})
     }
     const r = {role:'assistant'}
+    // OpenAI 规范要求 assistant.content 为 string（含 tool_calls 时也用空串），不接 null
     if (texts.length) r.content = texts.join('')
-    else if (!tcs.length) r.content = null
+    else r.content = ''
     if (tcs.length) r.tool_calls = tcs
     return r
 }

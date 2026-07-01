@@ -2070,6 +2070,8 @@ onMounted(() => {
 onUnmounted(() => {
   if (retryTimer) clearInterval(retryTimer)
   if (petPollTimer) clearInterval(petPollTimer)
+  if (qrPollTimer) { clearInterval(qrPollTimer); qrPollTimer = null }  // QR 轮询可能正在进行，离开页面必须停
+  if (_petPersistTimer) { clearTimeout(_petPersistTimer); _petPersistTimer = null }  // persist 300ms 可能未执行
   if (pendingDeleteSkillTimer) clearTimeout(pendingDeleteSkillTimer)
   if (pendingDeleteRuleTimer) clearTimeout(pendingDeleteRuleTimer)
   if (_stvThemeHandler) window.matchMedia?.('(prefers-color-scheme: dark)').removeEventListener('change', _stvThemeHandler)

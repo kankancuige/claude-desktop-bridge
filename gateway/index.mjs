@@ -5167,8 +5167,9 @@ wss.on('connection', (ws, req) => {
             s.pushStream = null;
             s.pendingTurn = null  // 清理未完成的回合快照，防止内存泄漏 + finalizeCheckpoint 误判
             // 清理并发 rebuild 状态: 防止 rebuild finally 块把刚清掉的 pushStream 重新写入
+            // 注意: 不清 _pendingMessages —— rebuild finally 依赖它取回积压消息，
+            //   若此刻清空会丢失 rebuild 期间排队进入的用户消息（无任何提示）
             s._rebuildPromise = null
-            s._pendingMessages = null
             s.lastSessionId = s.lastSessionId || sessionId
             ws.send(JSON.stringify({type: 'generation_stopped'}))
             return

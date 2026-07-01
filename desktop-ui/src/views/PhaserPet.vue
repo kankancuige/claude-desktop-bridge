@@ -362,7 +362,9 @@ function onVisibility() {
   }
 }
 
+let _firstMounted = false
 onMounted(() => {
+  _firstMounted = true
   nextTick(() => initPhaser())
   document.addEventListener('mousemove', onDocMouseMove)
   document.addEventListener('mouseup', onDocMouseUp)
@@ -370,6 +372,8 @@ onMounted(() => {
   document.addEventListener('visibilitychange', onVisibility)
 })
 onActivated(() => {
+  // 首次挂载 onMounted 已 initPhaser，跳过避免 create→destroy→create 闪烁
+  if (_firstMounted) { _firstMounted = false; return }
   destroyGame()
   nextTick(() => initPhaser())
 })
