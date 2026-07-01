@@ -1352,8 +1352,9 @@ function mapStreamEvent(event) {
 //   3. 非 bypass 模式注册 canUseTool 回调；bypass 下 SDK 不触发回调所以不注册
 // 关键数据流: body + env + cliS → merge → {model, executable, cwd, permissionMode, thinking, maxTurns, mcpServers, env, canUseTool?}
 async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = null) {
-    const apiKey = body.apiKey || process.env.ANTHROPIC_API_KEY || cliS.env?.ANTHROPIC_AUTH_TOKEN
-    let baseUrl = body.baseUrl || process.env.ANTHROPIC_BASE_URL || cliS.env?.ANTHROPIC_BASE_URL
+    // 三源合并: body(前端临时切换) > cliS.env(settings) ; 不读 process.env 避免父进程 env 与 settings 不一致
+    const apiKey = body.apiKey || cliS.env?.ANTHROPIC_AUTH_TOKEN || cliS.env?.ANTHROPIC_API_KEY
+    let baseUrl = body.baseUrl || cliS.env?.ANTHROPIC_BASE_URL
     const exe = body.claudeExe || process.env.CLAUDE_EXE || cliS.claudeExe || getClaudeExe()
     const permissionMode = body.permissionMode || 'default'
     const agents = body._agents || loadAgentDefinitions()  // sub-session 可覆盖为单个 agent
@@ -1443,6 +1444,13 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
                 matcher: '', timeout: 10, hooks: [rtkPostToolUseHandler]
             }],
         }
+    }
+    // 暴露本次生效的 env 给同进程 fetch 路径（classifyWorkflowViaAI 等），替代写 process.env 全局
+    opts.runtimeEnv = {
+        ANTHROPIC_BASE_URL: effectiveBaseUrl,
+        ANTHROPIC_API_KEY: apiKey,
+        ANTHROPIC_AUTH_TOKEN: apiKey,
+        ANTHROPIC_MODEL: mapModel(body.model) || cliS.model || MODEL,
     }
     return opts
 }
@@ -1848,6 +1856,7 @@ async function executeScheduledTask(id) {
         thinkingLevel: task.thinkingLevel || 'auto',
         mirrors: {wechat: false, feishu: false, dingtalk: false},
         queryOpts: opts,
+        runtimeEnv: opts.runtimeEnv,  // 供 classifyWorkflowViaAI 同进程 fetch，不污染 process.env
         parentSessionId: null, agentName: 'scheduler',
         taskId: null, children: new Set(), depth: 0,
         turnText: '', turnToolCount: 0
@@ -1895,10 +1904,15 @@ function resumeScheduledTasks() {
 // 关键数据流: 用户消息 → classifyWorkflowViaAI → 命中→start workflow / 失败→关键词降级 / 都不中→跳过
 const WF_VALID_NAMES = ['code-review', 'bug-hunter', 'audit-sweep', 'deep-research', 'judge-panel', 'generate-critic-fix', 'default']
 
-async function classifyWorkflowViaAI(text) {
+async function classifyWorkflowViaAI(text, sessionId) {
     const cliS = loadCliSettings()
-    const apiKey = process.env.ANTHROPIC_API_KEY || cliS.env?.ANTHROPIC_AUTH_TOKEN
-    const baseUrl = process.env.ANTHROPIC_BASE_URL || cliS.env?.ANTHROPIC_BASE_URL
+    // 优先从当前 session 的 runtimeEnv 取（感知临时切换的 provider），fallback 到 settings
+    // 不再读 process.env，避免被其他 session 的 makeQueryOptions 互相覆盖
+    const s = sessionId ? sessions.get(sessionId) : null
+    const re = s?.runtimeEnv || {}
+    const apiKey = re.ANTHROPIC_API_KEY || re.ANTHROPIC_AUTH_TOKEN || cliS.env?.ANTHROPIC_AUTH_TOKEN
+    const baseUrl = re.ANTHROPIC_BASE_URL || cliS.env?.ANTHROPIC_BASE_URL
+    const model = re.ANTHROPIC_MODEL || cliS.model || 'deepseek-v4-pro'
     if (!apiKey || !baseUrl) return null
 
     const apiUrl = baseUrl.endsWith('/v1/messages') ? baseUrl : baseUrl.replace(/\/+$/, '') + '/v1/messages'
@@ -1927,7 +1941,7 @@ async function classifyWorkflowViaAI(text) {
                 'anthropic-version': '2023-06-01',
             },
             body: JSON.stringify({
-                model: process.env.ANTHROPIC_MODEL || 'deepseek-v4-pro',
+                model,
                 max_tokens: 10,
                 temperature: 0,
                 system: '你是工作流路由器。根据用户意图输出一个词。不要解释。',
@@ -1980,7 +1994,7 @@ async function autoTriggerWorkflow(sessionId, msgContent) {
 
     // AI 分类优先；失败/超时/不可用 → 降级到关键词
     try {
-        matchedWf = await classifyWorkflowViaAI(msgContent)
+        matchedWf = await classifyWorkflowViaAI(msgContent, sessionId)
     } catch {
         matchedWf = null
     }
@@ -2308,6 +2322,7 @@ const httpServer = createServer(async (req, res) => {
                 thinkingLevel: body.thinkingLevel || 'auto',
                 mirrors: {wechat: false, feishu: false, dingtalk: false},
                 queryOpts: opts,
+                runtimeEnv: opts.runtimeEnv,  // 供 classifyWorkflowViaAI 同进程 fetch，不污染 process.env
                 parentSessionId: null,
                 agentName: body._agentName || 'main',
                 taskId: null,
@@ -3991,8 +4006,9 @@ const httpServer = createServer(async (req, res) => {
             const b = await readBody(req)
             const qBaseUrl = b.baseUrl || ''
             const qApiKey = b.apiKey || ''
-            const baseUrl = qBaseUrl || process.env.ANTHROPIC_BASE_URL || cliS.env?.ANTHROPIC_BASE_URL || ''
-            const key = qApiKey || process.env.ANTHROPIC_API_KEY || cliS.env?.ANTHROPIC_AUTH_TOKEN || ''
+            // 不再读 process.env：该端点面向 settings 配置查询，cliS.env 已覆盖；临时切换 provider 不经此路径
+            const baseUrl = qBaseUrl || cliS.env?.ANTHROPIC_BASE_URL || ''
+            const key = qApiKey || cliS.env?.ANTHROPIC_AUTH_TOKEN || cliS.env?.ANTHROPIC_API_KEY || ''
             if (!baseUrl || !key) {
                 res.writeHead(200);
                 res.end(JSON.stringify({models: [], error: 'no_creds'}));
@@ -4773,7 +4789,7 @@ const httpServer = createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/api/balance') {
         try {
             const cliS = loadCliSettings();
-            const k = process.env.ANTHROPIC_API_KEY || cliS.env?.ANTHROPIC_AUTH_TOKEN;
+            const k = cliS.env?.ANTHROPIC_AUTH_TOKEN || cliS.env?.ANTHROPIC_API_KEY;
             if (!k) {
                 res.writeHead(502);
                 res.end(JSON.stringify({error: 'API key not configured'}));
@@ -5244,6 +5260,7 @@ wss.on('connection', (ws, req) => {
                             thinkingLevel: s.thinkingLevel
                         }, s.workDir, cliS, {}, sessionId)
                         s.query = query({prompt: s.pushStream, options: opts})
+                        s.runtimeEnv = opts.runtimeEnv  // 模型变更重建后刷新 runtimeEnv
                         startStreamPump(sessionId)
                     } finally {
                         const pending = s._pendingMessages || []
