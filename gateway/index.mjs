@@ -5633,28 +5633,34 @@ function scanWorkdirFiles(workDir) {
                     break
                 }
                 let size = 0
+                let mtimeMs = 0
                 try {
-                    size = statSync(full).size
+                    const s = statSync(full)
+                    size = s.size
+                    mtimeMs = s.mtimeMs
                 } catch {
                 }
                 // relative() 规范化两边，兼容 workDir 里的 // 双斜杠
                 const rel = relative(workDir, full).replace(/\\/g, '/')
-                files.push({path: rel, size, binary: isBinaryPath(rel)})
+                files.push({path: rel, size, mtimeMs, binary: isBinaryPath(rel)})
             }
         }
     }
     return {files, truncated, missing: false}
 }
 
-// ── buildFileSnapshot — 工作目录文件快照构建 ──
+// ── buildFileSnapshot — 工作目录文件快照构建（支持增量优化）──
 // 功能说明: 为工作目录创建完整文件内容快照，用作每个 session 的 diff 基线
 //   文本文件存储完整内容 + sha256 hash；二进制文件仅存元信息(size, lastModified)；超大文件跳过内容
 // 实现方式: scanWorkdirFiles → 逐文件读内容 → sha256 hash → 构建 {path→{content,hash,size}} Map
+//   增量模式(传 baseline): baseline 有该文件且 size+mtimeMs 都未变 → 沿用 content 不重读
+//   mtimeMs 缺失或 baseline 无该文件 → 重读，安全降级到全量
 // SIDE_EFFECT: 无（只读文件系统）；返回对象会挂到 session.snapshot
 // 关键数据流: scanWorkdirFiles() → 读文件+hash → snapshot{files:{path,content?,hash?,size?,binary?,mtime?},fileMap{}}
-function buildFileSnapshot(workDir) {
+function buildFileSnapshot(workDir, baseline) {
     const {files, truncated} = scanWorkdirFiles(workDir)
     const map = new Map()
+    const baseFiles = baseline?.files  // 上次快照的 Map(含 content)，未变动文件直接复用避免重读
     for (const f of files) {
         if (f.binary) {
             map.set(f.path, {binary: true, size: f.size});
@@ -5664,16 +5670,27 @@ function buildFileSnapshot(workDir) {
             map.set(f.path, {binary: false, tooLarge: true, size: f.size});
             continue
         }
+        // ── 增量: baseline 有且 size+mtimeMs 都未变且 content 有效 → 直接复用，跳过 readFileSync ──
+        // 这是 beginTurn 每条用户消息前的性能关键路径，重读未变动文件会阻塞事件循环
+        const prev = baseFiles?.get(f.path)
+        if (prev && !prev.readError && !prev.tooLarge
+            && prev.size === f.size
+            && prev.mtimeMs === f.mtimeMs
+            && typeof prev.content === 'string') {
+            map.set(f.path, prev)  // 复用 baseline 对象(含 content)
+            continue
+        }
         try {
             const content = readFileSync(join(workDir, f.path), 'utf8')
             map.set(f.path, {
                 binary: false,
                 content,
                 size: f.size,
+                mtimeMs: f.mtimeMs,
                 lines: content.length ? content.split('\n').length : 0
             })
         } catch {
-            map.set(f.path, {binary: false, readError: true, size: f.size})
+            map.set(f.path, {binary: false, readError: true, size: f.size, mtimeMs: f.mtimeMs})
         }
     }
     return {takenAt: Date.now(), files: map, truncated}
@@ -5887,7 +5904,9 @@ function beginTurn(sessionId, prompt) {
     try {
         s.pendingTurn = {
             prompt: String(prompt || '').slice(0, 500),
-            preSnapshot: buildFileSnapshot(s.workDir),
+            // 增量快照: 以会话基线 s.snapshot 作 baseline，只重读 mtime/size 变动的文件
+            // 避免每条消息前全量 readFileSync 阻塞事件循环（大项目卡顿）
+            preSnapshot: buildFileSnapshot(s.workDir, s.snapshot),
             time: Date.now()
         }
     } catch (e) {
