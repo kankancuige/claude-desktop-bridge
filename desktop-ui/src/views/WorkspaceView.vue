@@ -250,6 +250,7 @@ async function confirmDelete() {
     if (tab) tabSessions.value = tabSessions.value.filter(t => t.id !== tab.id)
     if (sessionId.value === sid) {
       if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.onclose = null; ws.onerror = null  // 先解除回调再关闭，防止异步 onclose 污染状态
         try { ws.close() } catch (e) { console.error(e) }
       }
       ws = null
@@ -501,20 +502,28 @@ function doCloseTab(tabId: string) {
 // ── 宠物状态（Gateway settings.json 为数据源，localStorage 为快速缓存）──
 const petEnabledGlob = ref(localStorage.getItem('claude-bridge-pet-enabled') !== 'false')
 const petId = ref(localStorage.getItem('claude-bridge-pet') || '')
+let _petPersistTimer: ReturnType<typeof setTimeout> | null = null
+let _petPersistSeq = 0
 function persistPetToGateway() {
   // SIDE_EFFECT: 异步写 Gateway settings.json，不阻塞 UI
-  fetch(`${GW}/api/config/settings`)
-    .then(r => r.ok ? r.json() : {})
-    .then(s => {
-      s.petEnabled = petEnabledGlob.value
-      s.pet = petId.value
-      return apiFetch(`${GW}/api/config/settings`, {
-        method: 'PUT',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(s),
+  // 防抖 300ms + 序列号避免 GET/PUT 竞态（快速切换时 last-write-wins 问题）
+  if (_petPersistTimer) clearTimeout(_petPersistTimer)
+  _petPersistTimer = setTimeout(() => {
+    const seq = ++_petPersistSeq
+    fetch(`${GW}/api/config/settings`)
+      .then(r => r.ok ? r.json() : {})
+      .then(s => {
+        if (seq !== _petPersistSeq) return  // 已有更新的 persist 请求，丢弃本次
+        s.petEnabled = petEnabledGlob.value
+        s.pet = petId.value
+        return apiFetch(`${GW}/api/config/settings`, {
+          method: 'PUT',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(s),
+        })
       })
-    })
-    .catch(() => {})
+      .catch(() => {})
+  }, 300)
 }
 // 右键切换或设置页改了 pet → 本地更新 + 持久化
 function onSwitchPet(id: string) {
@@ -1572,11 +1581,17 @@ async function loadHistory(encodedDir: string, sId: string) {
 /** 控制通道 WebSocket：不绑定 session，启动即连，接收 IM nudge 事件 */
 let controlWS: WebSocket | null = null
 let _ctrlReconnectDelay = 5000
+const _CTRL_MAX_RETRIES = 10
+let _ctrlRetryCount = 0
 let _controlWSStopped = false
 
 async function connectControlWS() {
   if (_controlWSStopped) return
   if (controlWS && controlWS.readyState === WebSocket.OPEN) return
+  if (_ctrlRetryCount >= _CTRL_MAX_RETRIES) {
+    console.warn('[controlWS] 已达最大重试次数，停止重连')
+    return
+  }
   const ctrlUrl = await wsUrl('/ws/control')
   controlWS = new WebSocket(ctrlUrl)
   controlWS.onmessage = (e) => {
@@ -1585,9 +1600,10 @@ async function connectControlWS() {
       if (msg.type === 'nudge') handleNudge(msg)
     } catch (e) { console.error(e) }
   }
-  controlWS.onopen = () => { _ctrlReconnectDelay = 5000 }
+  controlWS.onopen = () => { _ctrlReconnectDelay = 5000; _ctrlRetryCount = 0 }
   controlWS.onclose = () => {
     controlWS = null
+    _ctrlRetryCount++
     setTimeout(connectControlWS, _ctrlReconnectDelay)
     // 指数退避: 5s → 10s → 20s → ... → 上限 60s
     _ctrlReconnectDelay = Math.min(_ctrlReconnectDelay * 2, 60000)
@@ -1871,6 +1887,7 @@ async function connectWS(sid: string, resumed = false) {
           checkCostLimit()  // 费用达余额阈值时提醒一次
         }
         status.value = 'idle'
+        flushMsgQueue()
         if (fg) {
           syncPetState('success', { message: 'Done!', bubble: petPick(BUBBLE_SUCCESS, myProject) })
           setTimeout(() => { syncPetState('idle'); petBubble.value = '' }, 3000)
@@ -1886,6 +1903,7 @@ async function connectWS(sid: string, resumed = false) {
         pendingTools.value = []
         messages.value.push({role: 'error', text: msg.message, time: Date.now()})
         status.value = 'idle'
+        flushMsgQueue()
         if (fg) {
           syncPetState('error', { message: msg.message?.slice(0, 40), bubble: petPick(BUBBLE_ERROR_SDK, myProject) + (msg.message?.slice(0, 50) || '') })
           setTimeout(() => { syncPetState('idle'); petBubble.value = '' }, 3000)
@@ -2355,6 +2373,8 @@ async function dispatch(text: string) {
  * wire 为注入引用文件内容后的版本，若未提供则直接用原文。
  */
 function doSend(text: string, wire?: string) {
+  // buildWireText 等异步操作期间 WS 可能已断开，再次检查防止 ! 崩溃
+  if (!ws || ws.readyState !== 1) return
   status.value = 'thinking'
   lastUserMessage = text
   turnThinkingText = ''  // 新一轮开始: 清空本轮思考文本累计，result 时重新估算
@@ -2362,7 +2382,7 @@ function doSend(text: string, wire?: string) {
   // resume 走 SDK，claude.exe 自带完整历史，无需前端手动注入 <context>
   messages.value.push({role: 'user', text, time: Date.now()})  // 界面显示用户原文
   const curModelMeta = models.value.find(m => m.id === model.value)
-  ws!.send(JSON.stringify({
+  ws.send(JSON.stringify({
     type: 'user_message',
     content: wire ?? text,
     permissionMode: permissionMode.value,
@@ -2432,12 +2452,23 @@ function respondChoice(optionIndex: number) {
 /** 发送排队消息：从队列移除后正常 dispatch（此时 status 已变为 idle） */
 function sendQueued(item: QItem) {
   msgQueue.value = msgQueue.value.filter(q => q.id !== item.id)
+  if (!ws || ws.readyState !== 1) return
   dispatch(item.text)
 }
 
 /** 从队列中移除某条消息（用户主动取消） */
 function removeQueued(item: QItem) {
   msgQueue.value = msgQueue.value.filter(q => q.id !== item.id)
+}
+
+/** thinking 结束后自动发送所有排队消息，逐条 dispatch 避免并发乱序 */
+async function flushMsgQueue() {
+  const items = [...msgQueue.value]
+  msgQueue.value = []
+  for (const item of items) {
+    if (!ws || ws.readyState !== 1) break
+    await dispatch(item.text)
+  }
 }
 
 /**
