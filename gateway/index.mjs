@@ -7,6 +7,7 @@
 import {createServer} from 'node:http'
 import {readdirSync, statSync, readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, rmdirSync, openSync, readSync, closeSync} from 'node:fs'
 import {execSync, spawn, spawnSync} from 'node:child_process'
+import crypto from 'node:crypto'
 import {homedir} from 'node:os'
 import {join, dirname, basename, relative, resolve, sep, extname as pathExtname} from 'node:path'
 import {fileURLToPath} from 'node:url'
