@@ -5,7 +5,7 @@
  */
 
 import {createServer} from 'node:http'
-import {readdirSync, statSync, readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, rmdirSync, openSync, readSync, closeSync} from 'node:fs'
+import {readdirSync, statSync, readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, rmdirSync, renameSync, openSync, readSync, closeSync} from 'node:fs'
 import {execSync, spawn, spawnSync} from 'node:child_process'
 import crypto from 'node:crypto'
 import {homedir} from 'node:os'
@@ -209,11 +209,17 @@ try {
 } catch {
 }
 
+let _persistDynamicTimer = null
 function persistDynamicCache() {
-    try {
-        writeFileSync(DYNAMIC_CACHE_FILE, JSON.stringify(dynamicCache), 'utf8')
-    } catch {
-    }
+    // 防抖 500ms: system_init 可能并发触发多次，避免重复写盘
+    if (_persistDynamicTimer) clearTimeout(_persistDynamicTimer)
+    _persistDynamicTimer = setTimeout(() => {
+        _persistDynamicTimer = null
+        try {
+            writeFileSync(DYNAMIC_CACHE_FILE, JSON.stringify(dynamicCache), 'utf8')
+        } catch {
+        }
+    }, 500)
 }
 
 // 取一个「已初始化」的活跃 query，用于发控制请求；没有则返回 null
@@ -320,8 +326,11 @@ function broadcast(sid, msg) {
     const s = sessions.get(sid);
     if (s) {
         const raw = JSON.stringify(msg);
-        for (const w of s.clients) {
-            if (w.readyState === 1) w.send(raw)
+        // 防御性拷贝: onclose 回调可能删除 s.clients 成员，遍历 Set 时并发修改会漏发
+        for (const w of [...s.clients]) {
+            if (w.readyState === 1) {
+                try { w.send(raw) } catch {}
+            }
         }
     }
 }
@@ -495,11 +504,17 @@ function readJSON(p) {
     }
 }
 
-// 功能说明: 写入 JSON 文件（格式化缩进 2 空格）
-// 实现方式: JSON.stringify(d, null, 2) + writeFileSync
-// 关键数据流: 对象 → JSON.stringify → writeFileSync(p)
+// 功能说明: 写入 JSON 文件（格式化缩进 2 空格，原子写入防崩溃损坏）
+// 实现方式: JSON.stringify → writeFileSync(tmp) → rename(tmp, p)，避免中途崩溃导致文件损坏
+// 关键数据流: 对象 → JSON.stringify → 临时文件 → rename → 目标文件
 function writeJSON(p, d) {
-    writeFileSync(p, JSON.stringify(d, null, 2), 'utf8')
+    const tmp = p + '.tmp'
+    writeFileSync(tmp, JSON.stringify(d, null, 2), 'utf8')
+    try { renameSync(tmp, p) } catch {
+        // Windows 下 rename 有时因文件锁/权限失败，回退到直接覆盖写
+        try { writeFileSync(p, JSON.stringify(d, null, 2), 'utf8') } catch {}
+        try { unlinkSync(tmp) } catch {}
+    }
 }
 
 // 功能说明: 写入前备份原文件到 .bak 后缀
@@ -4841,6 +4856,7 @@ wss.on('connection', (ws, req) => {
             }
             s.query = null;
             s.pushStream = null;
+            s.pendingTurn = null  // 清理未完成的回合快照，防止内存泄漏 + finalizeCheckpoint 误判
             s.lastSessionId = s.lastSessionId || sessionId
             ws.send(JSON.stringify({type: 'generation_stopped'}))
             return

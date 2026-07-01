@@ -59,6 +59,7 @@ const walkOffset = ref(0)
 
 let behaviorTimer: ReturnType<typeof setTimeout> | null = null
 let walkTimer: ReturnType<typeof setTimeout> | null = null
+let _mounted = false
 
 function clearTimers() {
   if (behaviorTimer) { clearTimeout(behaviorTimer); behaviorTimer = null }
@@ -66,9 +67,11 @@ function clearTimers() {
 }
 
 function scheduleBehavior() {
+  if (!_mounted) return
   if (props.state === 'disconnected' || props.state === 'thinking') return
   const delay = 3000 + Math.random() * 5000
   behaviorTimer = setTimeout(() => {
+    if (!_mounted) return
     if (props.state === 'disconnected' || props.state === 'thinking') { scheduleBehavior(); return }
     const r = Math.random()
     if (r < 0.4) doBlink()
@@ -79,22 +82,27 @@ function scheduleBehavior() {
 }
 
 function doBlink() {
+  if (!_mounted) return
   behavior.value = 'blinking'
-  setTimeout(() => { behavior.value = 'idle'; scheduleBehavior() }, 200)
+  setTimeout(() => { if (!_mounted) return; behavior.value = 'idle'; scheduleBehavior() }, 200)
 }
 function doTailWag() {
+  if (!_mounted) return
   behavior.value = 'tail_wagging'
-  setTimeout(() => { behavior.value = 'idle'; scheduleBehavior() }, 1500)
+  setTimeout(() => { if (!_mounted) return; behavior.value = 'idle'; scheduleBehavior() }, 1500)
 }
 function doEarTwitch() {
+  if (!_mounted) return
   behavior.value = 'ear_twitch'
-  setTimeout(() => { behavior.value = 'idle'; scheduleBehavior() }, 400)
+  setTimeout(() => { if (!_mounted) return; behavior.value = 'idle'; scheduleBehavior() }, 400)
 }
 function doWalk() {
+  if (!_mounted) return
   behavior.value = 'walking'
   walkDir.value = walkDir.value === 'right' ? 'left' : 'right'
   walkOffset.value = walkDir.value === 'right' ? 35 : -35
   walkTimer = setTimeout(() => {
+    if (!_mounted) return
     behavior.value = 'idle'
     walkOffset.value = 0
     scheduleBehavior()
@@ -111,6 +119,7 @@ watch(() => props.isThinking, (v) => {
     walkDir.value = 'left'
     walkOffset.value = -35
     walkTimer = setInterval(() => {
+      if (!_mounted) { clearTimers(); return }
       flip = !flip
       walkDir.value = flip ? 'right' : 'left'
       walkOffset.value = flip ? 35 : -35
@@ -141,8 +150,8 @@ const svgStyle = computed(() => ({
   transition: 'transform 0.3s ease-in-out',
 }))
 
-onMounted(() => scheduleBehavior())
-onBeforeUnmount(() => { clearTimers(); clearTimeout(t0); clearTimeout(t1) })
+onMounted(() => { _mounted = true; scheduleBehavior() })
+onBeforeUnmount(() => { _mounted = false; clearTimers(); clearTimeout(t0); clearTimeout(t1) })
 </script>
 
 <template>
