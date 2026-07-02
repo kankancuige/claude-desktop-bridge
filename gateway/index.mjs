@@ -5171,7 +5171,7 @@ wss.on('connection', (ws, req) => {
             }, 'stopped')
             // 懒重建: 只中止当前 query，下条消息来了再 spawn 新进程（避免 abort signal 冲突导致 ENOENT）
             try {
-                s.pushStream.close();
+                s.pushStream?.close();
                 s.query?.return?.()
             } catch {
             }
@@ -5242,12 +5242,16 @@ wss.on('connection', (ws, req) => {
                     log.info({sessionId: sessionId?.slice(0, 8), model: newModel}, 'model 变更')
                 }
                 try {
-                    s.pushStream.close();
+                    s.pushStream?.close();
                     s.query?.return?.()
                 } catch {
                 }
                 s.query = null;
                 s.pushStream = null;
+                // 失效重建状态: 若 _rebuildPromise 残留，后续消息进 if(s._rebuildPromise)
+                //   会把消息追加到旧 pending 却无人消费。设置变更应触发新重建，清旧状态。
+                s._rebuildPromise = null
+                s._rebuildId = null
                 // 仅当有实际 conversation 时才记 lastSessionId 用于 resume
                 // 模型首次变更时 SDK 还没创建 conversation，设了会导致 resume 到不存在的会话
                 if (s._hasConversation) s.lastSessionId = s.lastSessionId || sessionId

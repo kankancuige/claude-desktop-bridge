@@ -43,6 +43,10 @@ const emit = defineEmits<{
 const monacoContainer = shallowRef<HTMLDivElement | null>(null)
 const monacoEditor = shallowRef<monaco.editor.IStandaloneCodeEditor | null>(null)
 const monacoDiffEditor = shallowRef<monaco.editor.IStandaloneDiffEditor | null>(null)
+// diff 模式下 setModel 传入 createModel 创建的外部 model，diffEditor.dispose() 不自动回收
+// 需要在 disposeEditors 中单独 dispose，避免反复切换文件时 model 累积泄漏
+let diffOriginalModel: monaco.editor.ITextModel | null = null
+let diffModifiedModel: monaco.editor.ITextModel | null = null
 
 /** Monaco 主题 */
 function monacoTheme(): 'vs' | 'vs-dark' {
@@ -69,6 +73,11 @@ function disposeEditors() {
   monacoDiffEditor.value = null
   try { monacoEditor.value?.dispose() } catch {}
   monacoEditor.value = null
+  // diff 模式下 createModel 创建的 model 需单独 dispose，monacoDiffEditor.dispose() 不回收它们
+  try { diffOriginalModel?.dispose() } catch {}
+  diffOriginalModel = null
+  try { diffModifiedModel?.dispose() } catch {}
+  diffModifiedModel = null
 }
 
 // ═══════════════════════════════════════════
@@ -126,8 +135,8 @@ watch([() => props.mode, () => props.loading], async ([mode, loading]) => {
       scrollBeyondLastLine: false,
     })
     diffEditor.setModel({
-      original: monaco.editor.createModel(oldText, lang),
-      modified: monaco.editor.createModel(newText, lang),
+      original: (diffOriginalModel = monaco.editor.createModel(oldText, lang)),
+      modified: (diffModifiedModel = monaco.editor.createModel(newText, lang)),
     })
     monacoDiffEditor.value = diffEditor
   }

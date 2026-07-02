@@ -288,6 +288,9 @@ async function handleProxyRequest(clientReq, clientRes, upstreamUrl) {
             })
         })
 
+        proxyReq.setTimeout(120000, () => {
+            proxyReq.destroy(new Error('代理请求超时'))
+        })
         proxyReq.on('error', (e) => {
             log.error({err: e}, '上游请求失败')
             if (!clientRes.headersSent) {
