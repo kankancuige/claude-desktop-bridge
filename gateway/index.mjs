@@ -1054,10 +1054,28 @@ function spawnRtk(rtkPath, cmd, _text) {
     return new Promise((resolve, reject) => {
         const args = cmd ? parseShellArgs(cmd) : []
         if (args.length === 0) { resolve(''); return }
+        // Windows 上 rtk 子进程需要 Unix 命令（如 ls）→ 合并 Git Bash 的 bin 目录到 PATH
+        const env = {...process.env}
+        if (process.platform === 'win32') {
+            const gitBashDirs = [
+                'C:\\Program Files\\Git\\usr\\bin',
+                'C:\\Program Files\\Git\\bin',
+                'C:\\Program Files (x86)\\Git\\usr\\bin',
+                'C:\\Program Files (x86)\\Git\\bin',
+                join(homedir(), 'scoop\\apps\\git\\current\\usr\\bin'),
+            ]
+            const existing = (env.PATH || '').split(';')
+            for (const d of gitBashDirs) {
+                // 目录存在且未在 PATH 中则追加
+                try { if (statSync(d).isDirectory() && !existing.includes(d)) existing.push(d) } catch {}
+            }
+            env.PATH = existing.join(';')
+        }
         const child = spawn(rtkPath, args, {
             stdio: ['pipe', 'pipe', 'pipe'],
             timeout: RTK_TIMEOUT,
             windowsHide: true,
+            env,
         })
         let stdout = ''
         let stderr = ''
