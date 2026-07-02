@@ -1,6 +1,6 @@
 {
   "name": "claude-desktop-bridge-gateway",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "https://github.com/kankancuige/claude-desktop-bridge",
   "private": true,
   "type": "module",

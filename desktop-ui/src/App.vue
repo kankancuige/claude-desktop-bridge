@@ -240,7 +240,10 @@ onMounted(() => {
     })
     _cleanupUpdateErr = api.onUpdateError?.((err: any) => {
       updateDownloading.value = false
-      updateError.value = err.message || '更新失败'
+      const raw = err.message || ''
+      // electron-updater HttpError 会把完整 URL + headers 塞进 message，截断保留可读部分
+      const idx = raw.indexOf('\n\n')
+      updateError.value = idx > 0 ? raw.slice(0, idx) : raw
     })
   }
 })
@@ -553,14 +556,16 @@ function closeWindow() { api?.close?.() }
   border: 1px solid var(--border);
   border-radius: 12px;
   padding: 12px 16px;
-  display: flex; align-items: center; gap: 12px;
+  display: flex; align-items: flex-start; gap: 12px;
   font-size: 14px;
   max-width: 420px;
+  overflow: hidden;
   box-shadow: 0 4px 16px rgba(0,0,0,0.25);
 }
 .update-banner-left {
   display: flex; align-items: center; gap: 8px;
   color: var(--text-secondary); flex: 1;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .update-banner-right {
   display: flex; align-items: center; gap: 8px;
