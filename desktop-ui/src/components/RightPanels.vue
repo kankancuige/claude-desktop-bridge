@@ -4,7 +4,7 @@
  * 360px 固定宽度，由父组件控制显示/隐藏。
  * 文件树渲染、目录展开/折叠、文件点击预览/diff 均通过 emits 上报父组件。
  */
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { t } from '../i18n'
 import type { TreeNode, FlatFile, AgentRun } from './types'
 
@@ -61,7 +61,12 @@ const emit = defineEmits<{
   (e: 'loadFileTree'): void
   (e: 'openCommitFiles'): void
   (e: 'setFileFilter', filter: 'all' | 'changed'): void
+  (e: 'stopWf', mode: 'pause' | 'commit'): void
+  (e: 'resumeWf', budgetMax?: number): void
 }>()
+
+// resume 时的新预算值
+const newBudget = ref(0)
 
 // ═══════════════════════════════════════════
 // ── 工具函数 ──
@@ -222,6 +227,25 @@ function fmtTime(ts: number) {
       <template v-else>
         <div class="fp-header">
           <span class="fp-title"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:4px"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg> Workflow {{ wfRunState.name }}</span>
+          <div class="fp-header-actions">
+            <template v-if="wfRunState.status === 'running'">
+              <button class="fp-icon-btn" title="暂停" @click="emit('stopWf', 'pause')">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+              </button>
+              <button class="fp-icon-btn commit-btn" title="提交当前结果" @click="emit('stopWf', 'commit')">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+              </button>
+            </template>
+            <template v-else-if="wfRunState.status === 'paused'">
+              <button class="fp-icon-btn" title="恢复" @click="emit('resumeWf', newBudget)">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              </button>
+              <input v-model.number="newBudget" type="number" min="0" placeholder="预算" style="width:60px;font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:4px;background:var(--bg-raised);color:var(--text-primary)"/>
+              <button class="fp-icon-btn commit-btn" title="提交当前结果" @click="emit('stopWf', 'commit')">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+              </button>
+            </template>
+          </div>
           <button class="fp-icon-btn" :title="t('ws.close')" @click="emit('closeWfPanel')">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
           </button>
@@ -247,6 +271,8 @@ function fmtTime(ts: number) {
           </div>
         </div>
         <div v-if="wfRunState.status === 'done'" style="padding:8px 12px;font-size:11px;color:var(--success);border-top:1px solid var(--border)">完成 · {{ wfRunState.tokenSpent.toLocaleString() }} tokens</div>
+        <div v-else-if="wfRunState.status === 'paused'" style="padding:8px 12px;font-size:11px;color:var(--warning);border-top:1px solid var(--border)">已暂停 · {{ wfRunState.tokenSpent?.toLocaleString?.() || '0' }} tokens</div>
+        <div v-else-if="wfRunState.status === 'running'" style="padding:8px 12px;font-size:11px;color:var(--text-muted);border-top:1px solid var(--border)">运行中 · {{ wfRunState.tokenSpent?.toLocaleString?.() || '0' }} tokens</div>
       </template>
     </div>
   </div>

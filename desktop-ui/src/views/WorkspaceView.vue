@@ -149,6 +149,8 @@ interface Checkpoint {
 
 /** 项目列表：从 Gateway 扫描的工作目录集合 */
 const projects = ref<Project[]>([])
+/** 项目列表 epoch：本地修改（删除/新增）时递增，loadProjects 结果若 epoch 落后则丢弃 */
+let _projectsEpoch = 0
 /** 侧栏中已展开的项目集合（workDir → 是否展开），点击项目卡片切换 */
 const expandedProjects = ref<Set<string>>(new Set())
 /** 已"显示全部"会话的项目集合，用于分页展开/收起 */
@@ -245,9 +247,22 @@ async function confirmDelete() {
     }
     // 清理 localStorage 缓存的 token/费用记忆
     try { localStorage.removeItem(usageKey(sid)) } catch (e) { console.error(e) }
-    // 如果删除的是当前前台活跃 session，清理 UI 状态
-    const tab = tabSessions.value.find(t => t.state.sessionId === sid)
-    if (tab) tabSessions.value = tabSessions.value.filter(t => t.id !== tab.id)
+    // 清理所有引用此会话的 tab（多 tab 打开同一会话时每个都得清理，否则
+    // 残留 tab 切过去会 resume 已删除的会话，导致"删了又回来"）
+    const deadTabs = tabSessions.value.filter(t => t.state.sessionId === sid)
+    for (const dt of deadTabs) {
+      if (dt.websocket) {
+        dt.websocket.onclose = null; dt.websocket.onerror = null
+        try { dt.websocket.close() } catch (e) { console.error(e) }
+      }
+    }
+    if (deadTabs.length) tabSessions.value = tabSessions.value.filter(t => t.state.sessionId !== sid)
+    // 若当前活跃 tab 被清掉了，切到最后一个剩余 tab
+    if (!tabSessions.value.find(t => t.id === activeTabId.value)) {
+      const next = tabSessions.value[tabSessions.value.length - 1]
+      if (next) switchToTab(next.id)
+      else activeTabId.value = null
+    }
     if (sessionId.value === sid) {
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.onclose = null; ws.onerror = null  // 先解除回调再关闭，防止异步 onclose 污染状态
@@ -260,7 +275,16 @@ async function confirmDelete() {
       messages.value = []
       activeProject.value = ''
     }
-    await loadProjects()
+    // 本地更新项目列表：移除已删除的会话，避免全量 loadProjects() 刷新
+    _projectsEpoch++
+    for (const p of projects.value) {
+      const idx = p.sessions.findIndex(s => s.id === sid)
+      if (idx !== -1) {
+        p.sessions.splice(idx, 1)
+        p.sessionCount = p.sessions.length
+        break
+      }
+    }
   } catch {
     showToast(t('ws.deleteFailed'))
   }
@@ -982,6 +1006,7 @@ interface WfRunState {
 
 const wfRunState = ref<WfRunState | null>(null)
 const showWfPanel = ref(false)
+const wfNewBudget = ref(0)
 
 // 从 workflow_log 消息中提取 agent 状态
 function parseWfAgentLog(msg: string): WfAgentInfo | null {
@@ -1091,6 +1116,7 @@ async function loadProviderModels() {
     if (!provider) provider = plist?.find((p: any) => {
       if (p.id === 'deepseek' && baseUrl.includes('deepseek')) return true;
       if (p.id === 'opencode' && baseUrl.includes('opencode')) return true;
+      if (p.id === 'minimax' && baseUrl.includes('minimax')) return true;
       if (p.id === 'anthropic' && baseUrl.includes('anthropic')) return true;
       if (p.id === 'codex' && (baseUrl.includes('openai') || baseUrl.includes('codex'))) return true;
       if (p.id === 'openrouter' && baseUrl.includes('openrouter')) return true;
@@ -1254,11 +1280,14 @@ async function loadBalance() {
  */
 async function loadProjects(reorder = false) {
   try {
+    const myEpoch = _projectsEpoch  // 快照：await 期间若本地有编辑则 epoch 会递增
     const res = await fetch(`${GW}/api/projects`)
     const data = await res.json()
+    if (!reorder && _projectsEpoch !== myEpoch) return  // 本地已有编辑，丢弃服务端数据
     const incoming: Project[] = data.projects || []
     if (reorder || projects.value.length === 0) {
       projects.value = incoming.sort((a, b) => (b.lastActive || 0) - (a.lastActive || 0))
+      if (reorder) _projectsEpoch = 0  // 显式刷新，重置 epoch
       return
     }
     // 保序合并：已有项目原位更新数据；本地新增的空项目(gateway 暂无)保留；新出现的项目追加到末尾
@@ -1310,6 +1339,7 @@ async function addProject() {
     showToast(t('ws.projAdded'), 3000);
     return
   }
+  _projectsEpoch++
   projects.value.unshift({
     workDir: wd,
     encodedDir: encodeProjectName(wd),
@@ -2114,6 +2144,29 @@ async function connectWS(sid: string, resumed = false) {
       setTimeout(() => syncPetState('disconnected'), 3000)
     }
   }
+}
+
+// ── Workflow 停止/恢复/提交 ──
+async function stopWf(mode: 'pause' | 'commit') {
+  const name = wfRunState.value?.name
+  if (!name) return
+  await apiFetch(`${GW}/api/workflows/${encodeURIComponent(name)}/stop`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({mode}),
+  })
+}
+
+async function resumeWf() {
+  const name = wfRunState.value?.name
+  if (!name) return
+  const body: any = {sessionId: activeSessionId.value}
+  if (wfNewBudget.value > 0) body.budgetMax = wfNewBudget.value
+  await apiFetch(`${GW}/api/workflows/${encodeURIComponent(name)}/resume`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  })
 }
 
 // ── 消息气泡操作：复制 / 回填到输入框 ──
@@ -4088,28 +4141,30 @@ const tokenTooltip = computed(() => {
                   <!-- 气泡标签：You / AI -->
                   <div class="bubble-label">{{ msg.role === 'user' ? 'You' : 'AI' }}</div>
                   <div class="bubble-text" v-html="renderMarkdown(msg.text)"></div>
-                  <div class="bubble-actions">
-                    <button class="bubble-act-btn" :title="copiedIndex === i ? t('ws.copied') : t('ws.copy')"
-                            @click="copyBubble(msg.text, i)">
-                      <svg v-if="copiedIndex === i" width="14" height="14" viewBox="0 0 24 24" fill="none"
-                           stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-                        <polyline points="20 6 9 17 4 12"/>
-                      </svg>
-                      <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                           stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
-                        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
-                      </svg>
-                    </button>
-                    <button class="bubble-act-btn" :title="t('ws.refill')" @click="refillBubble(msg.text)">
-                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-                           stroke-linecap="round" stroke-linejoin="round">
-                        <polyline points="9 10 4 15 9 20"/>
-                        <path d="M20 4v7a4 4 0 0 1-4 4H4"/>
-                      </svg>
-                    </button>
+                  <div class="bubble-footer">
+                    <div v-if="msg.role === 'assistant' && msg.tokens" class="bubble-tokens">~{{ fmtTok(msg.tokens) }} tokens · ¥{{ msg.cost!.toFixed(4) }}</div>
+                    <div class="bubble-actions">
+                      <button class="bubble-act-btn" :title="copiedIndex === i ? t('ws.copied') : t('ws.copy')"
+                              @click="copyBubble(msg.text, i)">
+                        <svg v-if="copiedIndex === i" width="14" height="14" viewBox="0 0 24 24" fill="none"
+                             stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+                          <polyline points="20 6 9 17 4 12"/>
+                        </svg>
+                        <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                          <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                          <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                        </svg>
+                      </button>
+                      <button class="bubble-act-btn" :title="t('ws.refill')" @click="refillBubble(msg.text)">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                             stroke-linecap="round" stroke-linejoin="round">
+                          <polyline points="9 10 4 15 9 20"/>
+                          <path d="M20 4v7a4 4 0 0 1-4 4H4"/>
+                        </svg>
+                      </button>
+                    </div>
                   </div>
-                  <div v-if="msg.role === 'assistant' && msg.tokens" class="bubble-tokens">~{{ fmtTok(msg.tokens) }} tokens · ¥{{ msg.cost!.toFixed(4) }}</div>
                 </div>
                 <!-- 工具调用记录：仅 assistant 消息且有工具调用时显示 -->
                 <div v-if="msg.role === 'assistant' && msg.tools?.length" class="tools-box">
@@ -4775,6 +4830,25 @@ const tokenTooltip = computed(() => {
                                         stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
                                         style="vertical-align:middle;margin-right:4px"><polyline
                 points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg> Workflow {{ wfRunState.name }}</span>
+            <div class="fp-header-actions">
+              <template v-if="wfRunState.status === 'running'">
+                <button class="fp-icon-btn" title="暂停" @click="stopWf('pause')">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+                </button>
+                <button class="fp-icon-btn commit-btn" title="提交当前结果" @click="stopWf('commit')">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+                </button>
+              </template>
+              <template v-else-if="wfRunState.status === 'paused'">
+                <button class="fp-icon-btn" title="恢复" @click="resumeWf()">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                </button>
+                <input v-model.number="wfNewBudget" type="number" min="0" placeholder="新预算(token)" style="width:90px;font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:4px;background:var(--bg-raised);color:var(--text-primary)"/>
+                <button class="fp-icon-btn commit-btn" title="提交当前结果" @click="stopWf('commit')">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+                </button>
+              </template>
+            </div>
             <button class="fp-icon-btn" :title="t('ws.close')" @click="showWfPanel = false">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <line x1="18" y1="6" x2="6" y2="18"/>
@@ -4816,6 +4890,14 @@ const tokenTooltip = computed(() => {
           <div v-if="wfRunState.status === 'done'"
                style="padding:8px 12px;font-size:11px;color:var(--success);border-top:1px solid var(--border)">
             完成 · {{ wfRunState.tokenSpent.toLocaleString() }} tokens
+          </div>
+          <div v-else-if="wfRunState.status === 'paused'"
+               style="padding:8px 12px;font-size:11px;color:var(--warning);border-top:1px solid var(--border)">
+            已暂停 · {{ (wfRunState.tokenSpent || 0).toLocaleString() }} tokens
+          </div>
+          <div v-else-if="wfRunState.status === 'running'"
+               style="padding:8px 12px;font-size:11px;color:var(--text-muted);border-top:1px solid var(--border)">
+            运行中 · {{ (wfRunState.tokenSpent || 0).toLocaleString() }} tokens
           </div>
         </template>
       </div>
@@ -6480,13 +6562,19 @@ const tokenTooltip = computed(() => {
   animation: fadeInUp 0.3s var(--ease-out);
 }
 
+/* 气泡底部栏: token 计数 + 复制/回填按钮，flex 布局不重叠 */
+.bubble-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 8px;
+  min-height: 24px;
+}
+
 /* 气泡操作图标：复制 / 回填，悬停显示 */
 .bubble-actions {
   display: flex;
   gap: 4px;
-  position: absolute;
-  bottom: 6px;
-  right: 8px;
   opacity: 0;
   transition: opacity var(--transition-fast);
 }
@@ -6500,7 +6588,6 @@ const tokenTooltip = computed(() => {
   font-size: 11px;
   color: var(--text-muted);
   opacity: 0.5;
-  padding: 2px 0 0 2px;
 }
 
 .bubble-act-btn {

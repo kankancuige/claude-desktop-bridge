@@ -366,11 +366,8 @@ export function startWeChatAdapter(token) {
                 }).catch(e => log.error({err: e, sessionId: sessionId?.slice(0, 8)}, 'reply 失败')).finally(resolve)
             }
 
-            // mirrorOn 须在事件处理器注册前获取，防止 mirror 开启时事件回调内 mirrorOn 仍为 false
-            // WebSocket 构造函数同步返回，实际连接异步，此 await 不会导致事件丢失
-            mirrorOn = await shouldSkipReply(sessionId)
-
-            // 所有事件处理器必须在任何 await 之前注册，防止事件竞态丢失
+            // 事件处理器必须在 await 前注册: await 会让出事件循环，localhost WS 握手极快，
+            //   若 await 期间 WS 已 OPEN 则 onopen 永远不触发 → user_message 丢失 → 超时
             ws.onerror = () => finish('ws_error')
             ws.onclose = () => finish('ws_close')
             timeoutId = setTimeout(() => finish('timeout'), 5 * 60 * 1000 + 30000)
@@ -379,6 +376,9 @@ export function startWeChatAdapter(token) {
                 ws.send(JSON.stringify({type: 'user_message', content: text}));
                 log.info({sessionId: sessionId?.slice(0, 8), text: text.slice(0, 50)}, '→session')
             }
+
+            // mirrorOn 获取可后置: onmessage 内用到 mirrorOn 时已赋值
+            mirrorOn = await shouldSkipReply(sessionId)
 
             ws.onmessage = (e) => {
                 try {

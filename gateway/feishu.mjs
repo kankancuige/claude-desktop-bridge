@@ -323,10 +323,8 @@ export function startFeishuAdapter(token) {
                 resolve()
             }
 
-            // mirrorOn 须在事件处理器注册前获取，防止 mirror 开启时事件回调内 mirrorOn 仍为 false
-            mirrorOn = await shouldSkipReply(sessionId)
-
-            // ── WS 事件处理（必须在任何 await 之前注册，防止事件竞态丢失）──
+            // 事件处理器必须在 await 前注册: await 会让出事件循环，localhost WS 握手极快，
+            //   若 await 期间 WS 已 OPEN 则 onopen 永远不触发 → user_message 丢失 → 超时
             ws2.onerror = () => finish('ws_error')
             ws2.onclose = () => finish('ws_close')
             timeoutId = setTimeout(() => finish('timeout'), 5 * 60 * 1000 + 30000)
@@ -335,6 +333,8 @@ export function startFeishuAdapter(token) {
                 ws2.send(JSON.stringify({type: 'user_message', content: text}));
                 log.info({sessionId: sessionId?.slice(0, 8), text: text.slice(0, 50)}, '→session')
             }
+
+            mirrorOn = await shouldSkipReply(sessionId)
 
             ws2.onmessage = (e) => {
                 try {

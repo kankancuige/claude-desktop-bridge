@@ -328,7 +328,9 @@ export function useWorkflow() {
     /**
      * dtoWorkflowScript — 将画布 DAG 转换为 Workflow 引擎可执行的 JS 脚本
      * 功能说明: 通过拓扑分层 BFS 将节点按依赖关系分层，
-     *          每层内并行组用 parallel() 包裹，串行节点用 pipeline 链连接，
+     *          每层内并行组用 parallel() 包裹，串行节点顺序执行，
+     *          层间天然形成 barrier（每层 await 完成后才执行下一层），
+     *          等价于 staged() 阶段性管道语义。
      *          生成完整的 export const meta + phase() + agent()/parallel() 代码
      * 实现方式:
      *   1. 构建邻接表 + 入度表
@@ -428,7 +430,7 @@ export function useWorkflow() {
                 lines.push(`])`)
             }
 
-            // 串行节点（pipeline 链）
+            // 串行节点：同层独立节点按序执行，层间有隐式 barrier（下一个 phase() 前必须全部完成）
             for (const n of solo) {
                 lines.push(`const ${n.id} = await agent('${esc(n.prompt || '未设置提示词')}', { ${agentOpts(n)}, label: '${n.id}' })`)
             }

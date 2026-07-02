@@ -29,7 +29,9 @@ import {
     getRunState,
     presetRunState,
     stopWorkflow,
-    resumeWorkflow
+    resumeWorkflow,
+    commitWorkflow,
+    queryHistory,
 } from './workflow-runner.mjs'
 import {
     buildProjectCache,
@@ -356,7 +358,7 @@ function broadcast(sid, msg) {
 }
 
 // 注入依赖到 workflow-runner（供 VM 沙箱内 agent() 调用）
-setDeps({query, makeQueryOptions, loadCliSettings, PushStream, broadcast, sessions})
+setDeps({query, makeQueryOptions, loadCliSettings, loadWfConfig, PushStream, broadcast, sessions})
 
 // 收口：任一通道响应或超时都走这里，幂等（已 settled 则忽略）
 // ── 确认请求收口（settlePending）──
@@ -615,7 +617,9 @@ function validateHooks() {
 const WF_CONFIG_FILE = join(CLAUDE_HOME, 'bridge-workflow.json')
 
 function loadWfConfig() {
-    return readJSON(WF_CONFIG_FILE) || {enabled: false}
+    return {enabled: false, journalCacheTTL: 30,
+        modelTiers: {power: null, balanced: null, light: null},
+        ...(readJSON(WF_CONFIG_FILE) || {})}
 }
 
 function saveWfConfig(c) {
@@ -1390,15 +1394,29 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
         mcpServers: cliS.mcpServers || undefined,
         stderr: (msg) => process.stderr.write(`[claude.exe stderr] ${msg}`),
         env: (() => {
+            const modelName = mapModel(body.model) || cliS.model || MODEL
             const e = {
                 ...process.env,
                 CLAUDE_CODE_ENTRYPOINT: 'claude',
                 ANTHROPIC_API_KEY: apiKey,
                 ANTHROPIC_AUTH_TOKEN: apiKey,
                 ANTHROPIC_BASE_URL: effectiveBaseUrl,
-                ANTHROPIC_MODEL: mapModel(body.model) || cliS.model || MODEL, ...extraEnv
+                ANTHROPIC_MODEL: modelName, ...extraEnv
             };
             delete e.ELECTRON_RUN_AS_NODE;
+            // 子 agent 默认用 claude-* 模型名发给第三方供应商会 403，统一映射到当前模型
+            // 须在 ANTHROPIC_API_KEY 之后再设 DEFAULT，防止 process.env 中的旧值残留
+            if (effectiveBaseUrl && (effectiveBaseUrl.includes('minimax') || effectiveBaseUrl.includes('deepseek') || effectiveBaseUrl.includes('moonshot') || effectiveBaseUrl.includes('opencode') || effectiveBaseUrl.includes('bigmodel') || effectiveBaseUrl.includes('aliyun') || effectiveBaseUrl.includes('volces'))) {
+                e.ANTHROPIC_DEFAULT_OPUS_MODEL = modelName
+                e.ANTHROPIC_DEFAULT_SONNET_MODEL = modelName
+                e.ANTHROPIC_DEFAULT_HAIKU_MODEL = modelName
+                e.ANTHROPIC_SMALL_FAST_MODEL = modelName
+            }
+            // MiniMax Coding Plan: 需要长超时 + 禁用非必要流量
+            if (effectiveBaseUrl && effectiveBaseUrl.includes('minimax')) {
+                e.API_TIMEOUT_MS = '600000'
+                e.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'
+            }
             return e
         })(),
     }
@@ -1446,11 +1464,36 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
         }
     }
     // 暴露本次生效的 env 给同进程 fetch 路径（classifyWorkflowViaAI 等），替代写 process.env 全局
+    const rtModel = mapModel(body.model) || cliS.model || MODEL
     opts.runtimeEnv = {
         ANTHROPIC_BASE_URL: effectiveBaseUrl,
         ANTHROPIC_API_KEY: apiKey,
         ANTHROPIC_AUTH_TOKEN: apiKey,
-        ANTHROPIC_MODEL: mapModel(body.model) || cliS.model || MODEL,
+        ANTHROPIC_MODEL: rtModel,
+    }
+    if (effectiveBaseUrl && (effectiveBaseUrl.includes('minimax') || effectiveBaseUrl.includes('deepseek') || effectiveBaseUrl.includes('moonshot') || effectiveBaseUrl.includes('opencode') || effectiveBaseUrl.includes('bigmodel') || effectiveBaseUrl.includes('aliyun') || effectiveBaseUrl.includes('volces'))) {
+        opts.runtimeEnv.ANTHROPIC_DEFAULT_OPUS_MODEL = rtModel
+        opts.runtimeEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = rtModel
+        opts.runtimeEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL = rtModel
+        opts.runtimeEnv.ANTHROPIC_SMALL_FAST_MODEL = rtModel
+    }
+    if (effectiveBaseUrl && effectiveBaseUrl.includes('minimax')) {
+        opts.runtimeEnv.API_TIMEOUT_MS = '600000'
+        opts.runtimeEnv.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'
+    }
+    // SDK 的 Anthropic client 读 process.env(不读 opts.env)，直接设 process.env
+    // 不再 restore: 多个 session 共享 process.env，restore 会导致 A 恢复 B 的值
+    process.env.ANTHROPIC_BASE_URL = effectiveBaseUrl
+    process.env.ANTHROPIC_API_KEY = apiKey
+    process.env.ANTHROPIC_AUTH_TOKEN = apiKey
+    process.env.ANTHROPIC_MODEL = rtModel
+    if (effectiveBaseUrl && effectiveBaseUrl.includes('minimax')) {
+        process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = rtModel
+        process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = rtModel
+        process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL = rtModel
+        process.env.ANTHROPIC_SMALL_FAST_MODEL = rtModel
+        process.env.API_TIMEOUT_MS = '600000'
+        process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'
     }
     return opts
 }
@@ -1505,7 +1548,7 @@ async function startStreamPump(sessionId) {
                         s.turnText = ((s.turnText || '') + b.text).slice(-100000)  // 上限 100KB，防长轮内存膨胀
                         // 检测 [WF:run 脚本名 {args}] 指令（仅当全局开关 enabled 时）
                         if (!loadWfConfig().enabled) continue;
-                        const wfMatch = b.text.match(/\[WF:run\s+([\w.-]+?)\s+(\{[\s\S]*?\})\]/);
+                        const wfMatch = s.turnText.match(/\[WF:run\s+([\w.-]+?)\s+(\{[\s\S]*?\})\]/);
                         if (wfMatch && !s._wfRan) {
                             const wfName = wfMatch[1];
                             let wfArgs = {};
@@ -1904,15 +1947,33 @@ function resumeScheduledTasks() {
 // 关键数据流: 用户消息 → classifyWorkflowViaAI → 命中→start workflow / 失败→关键词降级 / 都不中→跳过
 const WF_VALID_NAMES = ['code-review', 'bug-hunter', 'audit-sweep', 'deep-research', 'judge-panel', 'generate-critic-fix', 'default']
 
+// 任务类型 → 模型等级映射 (power=最强, balanced=均衡, light=轻量)
+const WF_TIER_MAP = {
+    'code-review': 'balanced',
+    'bug-hunter': 'balanced',
+    'audit-sweep': 'balanced',
+    'deep-research': 'power',
+    'judge-panel': 'power',
+    'generate-critic-fix': 'balanced',
+    'default': 'balanced',
+}
+
+// 根据 workflow 名称和 modelTiers 配置解析实际模型 ID
+function resolveTierModel(wfName, wfCfg) {
+    const tier = WF_TIER_MAP[wfName] || 'balanced'
+    return wfCfg?.modelTiers?.[tier] || null
+}
+
 async function classifyWorkflowViaAI(text, sessionId) {
     const cliS = loadCliSettings()
     // 优先从当前 session 的 runtimeEnv 取（感知临时切换的 provider），fallback 到 settings
-    // 不再读 process.env，避免被其他 session 的 makeQueryOptions 互相覆盖
     const s = sessionId ? sessions.get(sessionId) : null
     const re = s?.runtimeEnv || {}
     const apiKey = re.ANTHROPIC_API_KEY || re.ANTHROPIC_AUTH_TOKEN || cliS.env?.ANTHROPIC_AUTH_TOKEN
     const baseUrl = re.ANTHROPIC_BASE_URL || cliS.env?.ANTHROPIC_BASE_URL
-    const model = re.ANTHROPIC_MODEL || cliS.model || 'deepseek-v4-pro'
+    // 分类模型: 优先用 bridge-workflow.json modelTiers.light，未配则用 session 模型
+    const wfCfg = loadWfConfig()
+    const model = wfCfg.modelTiers?.light || re.ANTHROPIC_MODEL || cliS.model || 'deepseek-v4-pro'
     if (!apiKey || !baseUrl) return null
 
     const apiUrl = baseUrl.endsWith('/v1/messages') ? baseUrl : baseUrl.replace(/\/+$/, '') + '/v1/messages'
@@ -1961,12 +2022,12 @@ async function classifyWorkflowViaAI(text, sessionId) {
 }
 
 const WORKFLOW_TRIGGERS = [
-    {name: 'code-review', kw: ['审查', 'review', '检查代码', 'code review', '看下代码', '审阅', 'cr', '优化', '性能', '太慢', 'optimize', 'performance']},
+    {name: 'code-review', kw: ['审查', 'review', '检查代码', 'code review', '审阅', 'cr', '帮我review', 'codereview']},
     {name: 'bug-hunter', kw: ['找bug', 'bug', '缺陷', 'debug', 'exception', 'stack trace', '空指针', '死锁', '竞态', 'race condition', '内存泄漏', 'null pointer']},
     {name: 'audit-sweep', kw: ['审计', 'audit', '全面检查', 'sweep', '扫描漏洞', '安全审计', '安全审查']},
-    {name: 'deep-research', kw: ['调研', 'research', '技术选型', '竞品', '对比一下市面', '深入分析']},
-    {name: 'judge-panel', kw: ['方案', '对比', '选哪个', '比较优劣', '哪个好', '怎么选', '权衡', '架构决策']},
-    {name: 'generate-critic-fix', kw: ['fix', '补丁', 'patch', '修正一下']},
+    {name: 'deep-research', kw: ['调研', 'research', '竞品分析', '对比一下市面', '深入分析']},
+    {name: 'judge-panel', kw: ['方案对比', '选哪个', '比较优劣', '哪个好', '怎么选', '权衡利弊', '架构决策', '技术对比']},
+    {name: 'generate-critic-fix', kw: ['fix这个', '补丁', 'patch', '修正一下', '修这个bug', '改这个bug']},
 ]
 
 function analyzeMessageForWorkflow(text) {
@@ -1977,8 +2038,8 @@ function analyzeMessageForWorkflow(text) {
             if (lower.includes(k.toLowerCase())) return wf.name
         }
     }
-    // 高复杂度信号: >200字 或 含代码块 → 兜底
-    if (text.length > 200 || text.includes('```')) return 'default'
+    // 高复杂度信号: 含代码块 + >100 字 → 兜底触发 default；纯长文本不自动触发
+    if (text.length > 100 && text.includes('```')) return 'default'
     // 明确不需要 workflow 的问句: 简单问答、解释、闲聊
     if (/^(什么是|怎么|如何|为什么|what|how|why|帮我解释|hello|hi|你好)/i.test(text) && text.length < 50) return '__skip__'
     return null
@@ -2014,7 +2075,8 @@ async function autoTriggerWorkflow(sessionId, msgContent) {
         task: msgContent.slice(0, 100),
         ts: Date.now(),
     })
-    runWfScript(matchedWf, sessionId, {task: msgContent}).catch(e => {
+    const tierModel = resolveTierModel(matchedWf, wfCfg)
+    runWfScript(matchedWf, sessionId, {task: msgContent, _tierModel: tierModel}).catch(e => {
         log.error({err: e, sessionId: sessionId?.slice(0, 8), workflow: matchedWf}, '自动 workflow 失败')
     })
 }
@@ -2164,6 +2226,20 @@ const PROVIDERS = [
         pricing: {input: '0.15 USD/1M tokens', output: '0.60 USD/1M tokens'},
     },
     {
+        id: 'minimax', name: 'MiniMax', icon: 'M',
+        baseUrl: 'https://api.minimaxi.com/anthropic',
+        officialUrl: 'https://platform.minimaxi.com',
+        docsUrl: 'https://platform.minimax.io/docs/api',
+        models: [
+            {id: 'MiniMax-M3', name: 'MiniMax M3', contextWindow: '512K'},
+            {id: 'MiniMax-M2.7', name: 'MiniMax M2.7', contextWindow: '205K'},
+            {id: 'MiniMax-M2.5', name: 'MiniMax M2.5', contextWindow: '205K'},
+            {id: 'MiniMax-M2.1', name: 'MiniMax M2.1', contextWindow: '1M'},
+            {id: 'MiniMax-M2.1-Lightning', name: 'MiniMax M2.1 Lightning', contextWindow: '1M'},
+        ],
+        pricing: {input: '0.30 USD/1M tokens', output: '1.20 USD/1M tokens'},
+    },
+    {
         id: 'codex', name: 'Codex', icon: 'X',
         baseUrl: 'https://api.openai.com/v1',
         officialUrl: 'https://github.com/openai/codex',
@@ -2255,11 +2331,15 @@ const httpServer = createServer(async (req, res) => {
     }
     // URL 解析需提前到认证之前（认证白名单依赖 pathname）
     const url = new URL(req.url, `http://127.0.0.1:${PORT}`)
-    // 本地 API 认证: 所有方法都校 token，仅白名单端点豁免
-    // 白名单 /api/bridge-token 仅 GET: dev/浏览器环境首次取 token 用（本机同源，跨域恶意网页被 CORS 挡）
-    // 限制为 GET 避免其他方法绕过认证白名单（虽然无 POST handler 返 token，但收紧认证面）
+    // 本地 API 认证: 仅浏览器请求（有 Origin 头）需校 token
+    // 浏览器跨域请求必带 Origin 头（含 Electron file://→Origin:null）；Node.js fetch() 不带
+    // IM 适配器/内部进程用 Node.js fetch → 无 Origin → 免 token
+    // 跨域恶意网页有 Origin 但无 token → 403
+    // 桌面端有 Origin 但有 token（api.ts 拦截器自动注）→ 放行
+    // 白名单 /api/bridge-token 仅 GET: dev/浏览器首次取 token 用，token 注入前无 token
     const isTokenEndpoint = req.method === 'GET' && url.pathname === '/api/bridge-token'
-    if (!isTokenEndpoint) {
+    const isBrowserRequest = !!req.headers.origin
+    if (!isTokenEndpoint && isBrowserRequest) {
         const token = req.headers['x-bridge-token']
         if (token !== BRIDGE_TOKEN) {
             res.writeHead(403)
@@ -2506,26 +2586,24 @@ const httpServer = createServer(async (req, res) => {
             try {
                 s.pushStream?.close();
                 s.query?.return?.()
-            } catch {
+            } catch (e) {
+                log.error({module: 'gateway'}, `关闭 SDK 资源失败 session=${id} — ${e.message}`)
             }
+            // 断开引用让 GC 回收，帮助 SDK 底层释放文件句柄
+            s.query = null
+            s.pushStream = null
             // 关闭所有 WS 客户端连接，触发桌面端 onclose 清理 UI 状态
             for (const ws of [...s.clients]) {
                 try { ws.close(4001, JSON.stringify({error: 'session deleted'})) } catch {}
             }
-            ;sessions.delete(id); invalidateProjectsCache()
         }
+        // 先删磁盘文件再清内存缓存: 文件删除失败时 sessions Map 仍保留原会话，
+        // 避免 scanProjects 从 .jsonl 扫回已删除的会话
         if (url.searchParams.get('deleteFiles') === '1') {
-            try {
-                for (const e of readdirSync(join(CLAUDE_HOME, 'projects'))) {
-                    const c = join(CLAUDE_HOME, 'projects', e, id + '.jsonl');
-                    if (existsSync(c)) {
-                        unlinkSync(c);
-                        break
-                    }
-                }
-            } catch {
-            }
+            await deleteSessionFiles(id)
         }
+        markSessionDeleted(id)  // 内存层标记：2 分钟内 scanProjects 跳过此会话
+        if (s) { sessions.delete(id); invalidateProjectsCache() }
         if (focusedSessionId === id) focusedSessionId = null;
         res.writeHead(200);
         res.end(JSON.stringify({ok: true}));
@@ -3100,6 +3178,17 @@ const httpServer = createServer(async (req, res) => {
                     res.writeHead(b._bodyTooLarge ? 413 : 400);
                     res.end(JSON.stringify({error: b._bodyTooLarge ? 'payload too large' : 'invalid JSON'}));
                     return
+                }
+                // 清理 env 段中与当前供应商不匹配的残留字段，防止 claude.exe 读到旧模型名发给第三方 API 导致 403
+                if (b.env) {
+                    b.env.ANTHROPIC_MODEL = b.model || ''
+                    // 移除 ANTHROPIC_DEFAULT_* 和 cc-switch 非标准后缀字段
+                    // makeQueryOptions 运行时会根据当前模型动态设置这些值
+                    delete b.env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME
+                    delete b.env.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME
+                    delete b.env.ANTHROPIC_DEFAULT_OPUS_MODEL
+                    delete b.env.ANTHROPIC_DEFAULT_SONNET_MODEL
+                    delete b.env.ANTHROPIC_DEFAULT_HAIKU_MODEL
                 }
                 backupFile(sp);
                 writeJSON(sp, b);
@@ -4034,6 +4123,9 @@ const httpServer = createServer(async (req, res) => {
                 modelsUrl = baseUrl.replace(/\/v1\/messages\/?$/, '/v1/models')
             } else if (baseUrl && baseUrl.includes('opencode')) {
                 modelsUrl = baseUrl.replace(/\/+$/, '').replace(/\/zen\/v\d+/, '/zen/go/v1') + '/models'
+            } else if (baseUrl && baseUrl.includes('minimax')) {
+                // MiniMax /anthropic 是 Anthropic 兼容端点，/models 在 OpenAI 兼容路径下
+                modelsUrl = baseUrl.replace(/\/anthropic\/?$/, '').replace(/\/+$/, '') + '/v1/models'
             } else {
                 modelsUrl = baseUrl.replace(/\/anthropic\/?$/, '').replace(/\/+$/, '') + '/models'
             }
@@ -4041,8 +4133,8 @@ const httpServer = createServer(async (req, res) => {
                 headers: {Authorization: `Bearer ${key}`},
                 signal: AbortSignal.timeout(8000)
             })
-            // 404 回退：部分供应商 models 不在根路径（如 OpenCode Zen /zen/v1/models）
-            if (!r.ok && r.status === 404) {
+            // 404/403 回退：部分供应商 models 不在根路径
+            if (!r.ok && (r.status === 404 || r.status === 403)) {
                 try {
                     const u = new URL(baseUrl)
                     const origin = u.origin
@@ -4103,6 +4195,8 @@ const httpServer = createServer(async (req, res) => {
                 modelsUrl = qBaseUrl.replace(/\/v1\/messages\/?$/, '/v1/models')
             } else if (qBaseUrl && qBaseUrl.includes('opencode')) {
                 modelsUrl = qBaseUrl.replace(/\/+$/, '').replace(/\/zen\/v\d+/, '/zen/go/v1') + '/models'
+            } else if (qBaseUrl && qBaseUrl.includes('minimax')) {
+                modelsUrl = qBaseUrl.replace(/\/anthropic\/?$/, '').replace(/\/+$/, '') + '/v1/models'
             } else {
                 modelsUrl = qBaseUrl.replace(/\/anthropic\/?$/, '').replace(/\/+$/, '') + '/models'
             }
@@ -4110,8 +4204,8 @@ const httpServer = createServer(async (req, res) => {
                 headers: {Authorization: `Bearer ${qApiKey}`},
                 signal: AbortSignal.timeout(10000)
             })
-            // 404 回退：部分供应商 models 不在根路径（如 OpenCode Zen /zen/v1/models）
-            if (!r.ok && r.status === 404) {
+            // 404/403 回退：部分供应商 models 不在根路径
+            if (!r.ok && (r.status === 404 || r.status === 403)) {
                 try {
                     const u = new URL(qBaseUrl)
                     const origin = u.origin
@@ -4196,7 +4290,7 @@ const httpServer = createServer(async (req, res) => {
         }
         if (req.method === 'PUT') {
             const b = await readBody(req);
-            saveWfConfig({enabled: !!b.enabled});
+            saveWfConfig({...loadWfConfig(), ...b});
             res.writeHead(200);
             res.end(JSON.stringify({ok: true}));
             return
@@ -4927,6 +5021,14 @@ const httpServer = createServer(async (req, res) => {
     // PUT  /api/workflows/:name    → 保存脚本
     // DELETE /api/workflows/:name → 删除脚本
     // POST /api/workflows/:name/run → 执行脚本
+    // GET  /api/workflows/history → 查询执行历史
+    if (url.pathname === '/api/workflows/history' && req.method === 'GET') {
+        const limit = Math.min(parseInt(url.searchParams.get('limit') || '50'), 200)
+        const history = queryHistory(limit)
+        res.writeHead(200)
+        res.end(JSON.stringify({history}))
+        return
+    }
     // GET  /api/workflows/:name/state → 查询运行状态
     if (url.pathname === '/api/workflows' && req.method === 'GET') {
         const list = listWorkflows();
@@ -4974,6 +5076,18 @@ const httpServer = createServer(async (req, res) => {
     const wfStopM = url.pathname.match(/^\/api\/workflows\/([^/]+)\/stop$/)
     if (req.method === 'POST' && wfStopM) {
         const name = decodeURIComponent(wfStopM[1])
+        const body = await readBody(req).catch(() => ({}))
+        if (body.mode === 'commit') {
+            try {
+                const r = await commitWorkflow(name)
+                res.writeHead(200)
+                res.end(JSON.stringify({ok: true, name, ...r}))
+            } catch (e) {
+                res.writeHead(400)
+                res.end(JSON.stringify({error: e.message}))
+            }
+            return
+        }
         const ok = stopWorkflow(name)
         res.writeHead(ok ? 200 : 404);
         res.end(JSON.stringify(ok ? {ok: true, name, status: 'paused'} : {error: 'not running'}))
@@ -4998,7 +5112,9 @@ const httpServer = createServer(async (req, res) => {
                 return
             }
             presetRunState(name)
-            resumeWorkflow(name, sid).catch(e => {
+            const override = {}
+            if (body.budgetMax != null) override.budgetMax = Number(body.budgetMax)
+            resumeWorkflow(name, sid, override).catch(e => {
                 broadcast(sid, {type: 'workflow_error', workflowName: name, error: e.message})
             })
             res.writeHead(202);
@@ -5200,6 +5316,28 @@ wss.on('connection', (ws, req) => {
             return
         }
         if (msg.type === 'user_message' && msg.content) {
+            // 每轮消息前从 settings.json 刷新 process.env，确保设置页切换厂商后即时生效
+            // 不需要新建 session，也不需要依赖前端传 baseUrl/apiKey
+            (() => {
+                const fresh = loadCliSettings()
+                const key = fresh.env?.ANTHROPIC_AUTH_TOKEN || fresh.env?.ANTHROPIC_API_KEY || ''
+                const url = fresh.env?.ANTHROPIC_BASE_URL || ''
+                const mdl = fresh.model || ''
+                if (key) { process.env.ANTHROPIC_API_KEY = key; process.env.ANTHROPIC_AUTH_TOKEN = key }
+                if (url) process.env.ANTHROPIC_BASE_URL = url
+                if (mdl) process.env.ANTHROPIC_MODEL = mdl
+                // provider 变更检测: 比较当前 session runtimeEnv 与最新 settings
+                const prevUrl = s.runtimeEnv?.ANTHROPIC_BASE_URL || ''
+                const prevKey = s.runtimeEnv?.ANTHROPIC_AUTH_TOKEN || ''
+                if ((url && url !== prevUrl) || (key && key !== prevKey)) {
+                    // 厂商/API Key 变了，使 modelChanged 路径触发 query 重建
+                    if (s.queryOpts) s.queryOpts.model = null
+                    s.runtimeEnv = s.runtimeEnv || {}
+                    s.runtimeEnv.ANTHROPIC_BASE_URL = url
+                    s.runtimeEnv.ANTHROPIC_AUTH_TOKEN = key
+                    log.info({sessionId: sessionId?.slice(0,8), baseUrl: url?.slice(0,40)}, '厂商配置变更，将重建 query')
+                }
+            })()
             log.info({
                 sessionId: sessionId?.slice(0, 8),
                 source: ws._source,
@@ -5276,12 +5414,16 @@ wss.on('connection', (ws, req) => {
                     try {
                         const cliS = loadCliSettings()
                         s.pushStream = new PushStream()
-                        const opts = await makeQueryOptions({
+                        const bodyOverride = {
                             resume: s.lastSessionId || undefined,
                             model: s.queryOpts?.model,
                             permissionMode: s.permissionMode,
                             thinkingLevel: s.thinkingLevel
-                        }, s.workDir, cliS, {}, sessionId)
+                        }
+                        // 厂商变更检测: session runtimeEnv 已刷新，携带最新 baseUrl/apiKey 避免回退到 cliS.env
+                        if (s.runtimeEnv?.ANTHROPIC_BASE_URL) bodyOverride.baseUrl = s.runtimeEnv.ANTHROPIC_BASE_URL
+                        if (s.runtimeEnv?.ANTHROPIC_AUTH_TOKEN) bodyOverride.apiKey = s.runtimeEnv.ANTHROPIC_AUTH_TOKEN
+                        const opts = await makeQueryOptions(bodyOverride, s.workDir, cliS, {}, sessionId)
                         s.query = query({prompt: s.pushStream, options: opts})
                         s.runtimeEnv = opts.runtimeEnv  // 模型变更重建后刷新 runtimeEnv
                         startStreamPump(sessionId)
@@ -5425,11 +5567,41 @@ let _projectsCache = null, _projectsCacheTs = 0
 const PROJECTS_CACHE_TTL = 10_000  // 10s 内复用缓存，避免每次 /p 命令触发全量扫描
 // 互斥锁: 并发调用共享同一个扫描 Promise，避免重复 IO
 let _scanningProjects = null
+// 已删除会话 ID → 过期时间戳，scanProjects 返回结果时过滤，防御三重竞态：
+// 1) deleteSessionFiles rename 后 SDK 进程残留重建了 JSONL
+// 2) 扫描与 DELETE 并发：扫描完成写回缓存时 DELETE 还未执行到 invalidate
+// 3) 缓存命中：返回缓存结果时其中包含已删除的会话（缓存 10s 内的旧快照）
+const _deletedSessionIds = new Map()  // sessionId → expiresAt
+
+function markSessionDeleted(sessionId) {
+    _deletedSessionIds.set(sessionId, Date.now() + 120_000)  // 2 分钟窗口
+    if (_deletedSessionIds.size > 500) {  // 惰性清理，防内存泄漏
+        const now = Date.now()
+        for (const [k, v] of _deletedSessionIds) { if (v < now) _deletedSessionIds.delete(k) }
+    }
+}
+
+function filterDeletedSessions(projects) {
+    let dirty = false
+    const now = Date.now()
+    for (const [k, v] of _deletedSessionIds) { if (v < now) { _deletedSessionIds.delete(k); dirty = true } }
+    if (_deletedSessionIds.size === 0 && !dirty) return projects
+    for (const p of projects) {
+        const before = p.sessions.length
+        p.sessions = p.sessions.filter(s => !_deletedSessionIds.has(s.id))
+        if (p.sessions.length !== before) {
+            p.sessionCount = p.sessions.length
+            // fire-and-forget 重试清理残留文件（SDK 进程此时可能已退出，句柄已释放）
+            deleteSessionFiles(s.id).catch(() => {})
+        }
+    }
+    return projects.filter(p => p.sessionCount > 0)
+}
 
 async function scanProjects() {
     const now = Date.now()
-    if (_projectsCache && (now - _projectsCacheTs) < PROJECTS_CACHE_TTL) return _projectsCache
-    if (_scanningProjects) return _scanningProjects
+    if (_projectsCache && (now - _projectsCacheTs) < PROJECTS_CACHE_TTL) return filterDeletedSessions(_projectsCache)
+    if (_scanningProjects) return _scanningProjects.then(filterDeletedSessions)
     _scanningProjects = (async () => {
 
     const base = join(CLAUDE_HOME, 'projects');
@@ -5438,18 +5610,32 @@ async function scanProjects() {
         for (const name of readdirSync(base)) {
             const full = join(base, name);
             if (!statSync(full).isDirectory()) continue
-            const files = readdirSync(full).filter(f => f.endsWith('.jsonl'))
+            const files = readdirSync(full).filter(f => {
+                if (!f.endsWith('.jsonl')) return false
+                if (f.startsWith('.trash-')) return false
+                // 已标记删除的会话：尝试再次清理残留文件，跳过展示
+                const sid = f.replace('.jsonl', '')
+                if (_deletedSessionIds.has(sid)) {
+                    const trashPath = join(full, `.trash-${Date.now()}-${sid}.jsonl`)
+                    try { renameSync(join(full, f), trashPath) } catch {}
+                    return false
+                }
+                return true
+            })
                 .map(f => ({name: f, mtime: statSync(join(full, f)).mtimeMs}))
                 .sort((a, b) => b.mtime - a.mtime)
                 .map(f => f.name);
             if (!files.length) continue
+            // 遍历所有 jsonl 找 cwd，不只看最新的（删除后最新文件可能缺 cwd）
             let wd = null
-            try {
-                const head = readFileHeadLines(join(full, files[0]), 4096);
-                const c = head.join('\n');
-                const m = c.match(/"cwd":\s*"([^"]+)"/);
-                if (m) wd = m[1].replace(/\\/g, '/')
-            } catch {
+            for (const fn of files) {
+                try {
+                    const head = readFileHeadLines(join(full, fn), 4096);
+                    const c = head.join('\n');
+                    const m = c.match(/"cwd":\s*"([^"]+)"/);
+                    if (m) { wd = m[1].replace(/\\/g, '/'); break }
+                } catch {
+                }
             }
             if (!wd) {
                 wd = decodeProjectName(name) || name
@@ -5495,10 +5681,50 @@ async function scanProjects() {
     } catch {
     }
         ;results.sort((a, b) => (b.lastActive || 0) - (a.lastActive || 0));
-        _projectsCache = results; _projectsCacheTs = Date.now()
-        return results
+        const filtered = filterDeletedSessions(results)
+        _projectsCache = filtered; _projectsCacheTs = Date.now()
+        return filtered
     })().finally(() => { _scanningProjects = null })
     return _scanningProjects
+}
+/**
+ * 删除会话对应的 .jsonl 文件。
+ * Windows 下 Claude CLI 子进程退出可能滞后于 query.return()，文件句柄未释放
+ * 导致 unlinkSync 报 EBUSY。策略：先重试 unlinkSync（指数退避），仍失败则 rename
+ * 为 .trash- 前缀让 scanProjects 自动跳过，后台残留进程最终退出后文件自然清理。
+ */
+async function deleteSessionFiles(sessionId) {
+    const projectsDir = join(CLAUDE_HOME, 'projects')
+    let entries
+    try { entries = readdirSync(projectsDir) } catch { return }
+    const targets = []
+    for (const e of entries) {
+        const p = join(projectsDir, e, sessionId + '.jsonl')
+        if (existsSync(p)) targets.push(p)
+    }
+    for (const p of targets) {
+        // 先尝试直接删除，指数退避重试
+        for (let attempt = 0, delay = 200; attempt < 8; attempt++) {
+            try {
+                unlinkSync(p)
+                break
+            } catch (e) {
+                if (attempt === 7) {
+                    // 最终回退: rename 为 .trash- 标记，scanProjects 会跳过
+                    try {
+                        const trash = join(dirname(p), `.trash-${Date.now()}-${sessionId}.jsonl`)
+                        renameSync(p, trash)
+                        log.warn({module: 'gateway'}, `无法删除会话文件，已标记为 trash session=${sessionId} path=${basename(p)}`)
+                    } catch (e2) {
+                        log.error({module: 'gateway'}, `删除/重命名会话文件均失败 session=${sessionId} — ${e2.message}`)
+                    }
+                    return
+                }
+                await new Promise(r => setTimeout(r, delay))
+                delay = Math.min(delay * 2, 2000)
+            }
+        }
+    }
 }
 function invalidateProjectsCache() { _projectsCache = null }
 
@@ -5506,7 +5732,7 @@ async function listProjectSessions(ed) {
     const base = join(CLAUDE_HOME, 'projects', ed);
     const r = []
     try {
-        for (const f of readdirSync(base).filter(x => x.endsWith('.jsonl'))) {
+        for (const f of readdirSync(base).filter(x => x.endsWith('.jsonl') && !x.startsWith('.trash-'))) {
             const id = f.replace('.jsonl', '');
             const st = statSync(join(base, f));
             let t = id.slice(0, 8);
@@ -5543,12 +5769,12 @@ async function loadMessages(ed, sessionId) {
                 const e = JSON.parse(l);
                 if (e.type === 'user' && e.message?.content) {
                     const t = typeof e.message.content === 'string' ? e.message.content : e.message.content.map(b => b.type === 'text' ? b.text : '').join(' ').trim();
-                    if (t) m.push({role: 'user', text: t.slice(0, 500), time: e.timestamp})
+                    if (t) m.push({role: 'user', text: t, time: e.timestamp})
                 } else if (e.type === 'assistant' && e.message?.content) {
                     for (const b of Array.isArray(e.message.content) ? e.message.content : [e.message.content]) {
                         if (b?.type === 'text' && b.text) m.push({
                             role: 'assistant',
-                            text: b.text.slice(0, 500),
+                            text: b.text,
                             time: e.timestamp
                         })
                     }
@@ -5561,7 +5787,7 @@ async function loadMessages(ed, sessionId) {
         log.warn({err: e, sessionId}, '读取会话历史失败')
         return m
     }
-    return m.slice(-30)
+    return m
 }
 
 async function getLastModified(dir, files) {

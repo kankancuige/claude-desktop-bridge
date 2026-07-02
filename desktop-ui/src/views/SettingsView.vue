@@ -235,6 +235,35 @@ const currentProvider = computed(() => providers.value.find(p => p.id === provid
 // 功能说明: 从当前供应商取 models 数组（可能是预设列表，也可能被动态模型覆盖）
 const currentModels = computed(() => currentProvider.value?.models || [])
 
+// ── Workflow 模型等级: 将供应商模型映射到能力等级 ──
+const MODEL_TIERS = [
+  {key: 'power', label: '强 (Power)', desc: '最强模型 — 深度调研、方案对比、架构分析'},
+  {key: 'balanced', label: '均衡 (Balanced)', desc: '日常主力 — 代码审查、Bug 排查、代码生成'},
+  {key: 'light', label: '轻量 (Light)', desc: '快速便宜 — 意图分类、简单问答、路由转发'},
+]
+const modelTiers = ref<Record<string, string>>({})
+
+async function loadModelTiers() {
+  try {
+    const r = await fetch(`${GW}/api/config/workflow-settings`)
+    if (r.ok) {
+      const d = await r.json()
+      modelTiers.value = d.modelTiers || {}
+    }
+  } catch {}
+}
+
+async function saveModelTier(tier: string, modelId: string) {
+  const r = await fetch(`${GW}/api/config/workflow-settings`)
+  const cfg = r.ok ? await r.json() : {}
+  cfg.modelTiers = {...(cfg.modelTiers || {}), [tier]: modelId || null}
+  await fetch(`${GW}/api/config/workflow-settings`, {
+    method: 'PUT',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(cfg),
+  })
+}
+
 // ── loadSettings: GET /api/config/settings → merge defaults → 推断供应商 → 应用主题 ──
 async function loadSettings() {
   settingsLoading.value = true
@@ -254,6 +283,7 @@ async function loadSettings() {
         const urlL = url.toLowerCase()
         if (urlL.includes('deepseek')) providerId.value = 'deepseek'
         else if (urlL.includes('opencode')) providerId.value = 'opencode'
+        else if (urlL.includes('minimax')) providerId.value = 'minimax'
         else if (urlL.includes('anthropic')) providerId.value = 'anthropic'
         else if (urlL.includes('openai') || urlL.includes('codex')) providerId.value = 'codex'
         else if (urlL.includes('bigmodel')) providerId.value = 'zhipu'
@@ -263,6 +293,7 @@ async function loadSettings() {
         else if (urlL.includes('ollama')) providerId.value = 'ollama'
         else if (urlL.includes('volces') || urlL.includes('volcengine')) providerId.value = 'volcengine'
         else if (urlL.includes('googleapi')) providerId.value = 'gemini'
+        else if (urlL.includes('minimax')) providerId.value = 'minimax'
         else if (url) providerId.value = 'custom'  // 非预设 URL → 自定义
         manualBaseUrl.value = url
         tokenInput.value = formatTokens(settings.value.maxContextTokens)
@@ -405,8 +436,10 @@ function selectProvider(id: string) {
   const p = providers.value.find(pp => pp.id === id)
   if (p && settings.value) {
     settings.value.env.ANTHROPIC_BASE_URL = p.baseUrl  // 预设 baseUrl 写入，自定义为空则清空
-    if (p.models && p.models.length > 0) settings.value.model = p.models[0].id
-    else settings.value.model = ''
+    const modelId = (p.models && p.models.length > 0) ? p.models[0].id : ''
+    settings.value.model = modelId
+    // 同步 env.ANTHROPIC_MODEL，防止 PUT 时残留旧模型名导致 claude.exe 子 agent 403
+    if (settings.value.env) settings.value.env.ANTHROPIC_MODEL = modelId
   }
   overlayDynamicModels()
 }
@@ -1987,6 +2020,7 @@ async function loadAllModules() {
     {key: 'disabledMcpPlugins', fn: loadDisabledMcpPlugins},
     {key: 'mcpServers', fn: loadMcpServers},
     {key: 'im', fn: loadIM},
+    {key: 'modelTiers', fn: loadModelTiers},
     {key: 'scheduler', fn: loadScheduledTasks},
   ]
   await Promise.all(modules.map(m =>
@@ -2265,6 +2299,23 @@ onUnmounted(() => {
               <div class="field" style="margin-top:16px">
                 <label>{{ t('gen.customModelId') }}</label>
                 <input v-model="settings.model" class="field-input mono"/>
+              </div>
+            </section>
+
+            <!-- 模型等级配置: 将供应商模型映射到能力等级，Workflow 按任务难度自动选择 -->
+            <section class="section-block">
+              <h2 class="section-title">Workflow 模型等级</h2>
+              <div class="settings-grid">
+                <div v-for="tier in MODEL_TIERS" :key="tier.key" class="field">
+                  <label>{{ tier.label }}</label>
+                  <select :value="modelTiers[tier.key] || ''"
+                          @change="saveModelTier(tier.key, ($event.target as HTMLSelectElement).value)"
+                          class="field-input">
+                    <option value="">跟随默认模型</option>
+                    <option v-for="m in currentModels" :key="m.id" :value="m.id">{{ m.name || m.id }}</option>
+                  </select>
+                  <span class="field-hint">{{ tier.desc }}</span>
+                </div>
               </div>
             </section>
 
@@ -5469,5 +5520,10 @@ input[type="time"].field-input::-webkit-calendar-picker-indicator {
 .oss-repo .repo-link {
   font-size: 14px;
 }
+.tiers-grid { display:flex; flex-direction:column; gap:6px }
+.tier-row { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:6px 10px; background:var(--bg-raised); border-radius:6px; border:1px solid var(--border) }
+.tier-info { display:flex; flex-direction:column; gap:1px; min-width:0 }
+.tier-label { font-size:12px; font-weight:600; color:var(--text-primary) }
+.tier-desc { font-size:10px; color:var(--text-muted) }
 
 </style>
