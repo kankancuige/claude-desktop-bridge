@@ -480,12 +480,6 @@ function switchToTab(tabId: string) {
     apiFetch(`${GW}/api/sessions/${tab.state.sessionId}/focus`, {method: 'POST'}).catch(() => {})
     loadSessionMirrors()
   }
-  // MRU 排序: 将当前 tab 移到数组末尾
-  const idx = tabSessions.value.findIndex(t => t.id === tabId)
-  if (idx >= 0 && idx < tabSessions.value.length - 1) {
-    const [moved] = tabSessions.value.splice(idx, 1)
-    tabSessions.value.push(moved)
-  }
 }
 
 function syncCurrentTabState() {
@@ -1428,7 +1422,9 @@ async function handleNewSession(workDir: string, encodedDir?: string, histSessio
     loadMentionFiles()                   // 预加载文件列表供 # 引用
     loadMentionAgents()                  // 预加载 agent 列表供 @ 引用
     loadCheckpoints()                    // 预加载记录点，count badge 初始就能显示
-    await loadProjects()
+    // 仅新建会话时刷新项目列表（新 .jsonl 需要出现在侧栏）；resume 已有会话时不刷，
+    // 否则 scanProjects 按 mtime 重排会导致被点击的 session 跳到第一位
+    if (!histSessionId) await loadProjects()
   } catch (e: any) {
     const msg = e.message || String(e)
     if (msg === 'Failed to fetch') {

@@ -701,7 +701,7 @@ async function checkCavemanUpdate() {
         }
         persistDynamicCache()
     } catch (e) {
-        log.warn({err: e}, 'Caveman releases 网络异常')
+        log.info({err: e}, 'Caveman 版本检查网络异常（非关键）')
     }
 }
 
@@ -832,7 +832,7 @@ async function checkRtkUpdate() {
         }
         persistDynamicCache()
     } catch (e) {
-        log.warn({err: e}, 'RTK releases 网络异常')
+        log.info({err: e}, 'RTK 版本检查网络异常（非关键）')
     }
 }
 
@@ -1537,7 +1537,11 @@ async function startStreamPump(sessionId) {
     try {
         for await (const sdkMsg of myQuery) {
             if (sdkMsg.type === 'system' && sdkMsg.subtype === 'init') {
-                if (sdkMsg.session_id) { s.lastSessionId = sdkMsg.session_id; s._hasConversation = true }
+                if (sdkMsg.session_id) {
+                    s.lastSessionId = sdkMsg.session_id; s._hasConversation = true
+                    // 持久化 gateway sessionId → SDK conversationId 映射，供重启 resume 使用
+                    persistSdkSessionId(s.workDir, sessionId, sdkMsg.session_id)
+                }
                 // 顺手把 init 暴露的命令/agent 名单缓存下来，供设置页冷启动读取
                 if (Array.isArray(sdkMsg.slash_commands)) {
                     dynamicCache.commands = sdkMsg.slash_commands.map(n => ({
@@ -1591,6 +1595,13 @@ async function startStreamPump(sessionId) {
             }
             // result 标志一个回合结束 → 结算记录点 + 镜像到所有已开启的 IM 平台
             if (sdkMsg.type === 'result') {
+                // maybeUpdateProjectCache 必须在 finalizeCheckpoint 之前调用：
+                // finalizeCheckpoint 会清 s.pendingTurn，而 maybeUpdateProjectCache 依赖它拿 preSnapshot
+                try {
+                    maybeUpdateProjectCache(sessionId, s)
+                } catch (e) {
+                    log.warn({err: e, sessionId: sessionId?.slice(0, 8)}, 'project-cache 更新失败')
+                }
                 try {
                     finalizeCheckpoint(sessionId)
                 } catch (e) {
@@ -1600,11 +1611,6 @@ async function startStreamPump(sessionId) {
                     maybeMirror(sessionId)
                 } catch (e) {
                     log.warn({err: e, sessionId: sessionId?.slice(0, 8)}, 'mirror 失败')
-                }
-                try {
-                    maybeUpdateProjectCache(sessionId, s)
-                } catch (e) {
-                    log.warn({err: e, sessionId: sessionId?.slice(0, 8)}, 'project-cache 更新失败')
                 }
                 s.turnText = ''
             }
@@ -2404,17 +2410,45 @@ const httpServer = createServer(async (req, res) => {
             res.end(JSON.stringify({error: 'workDir required'}));
             return
         }
-        const sessionId = body.resume || crypto.randomUUID()
+        let sessionId = body.resume || crypto.randomUUID()
+        let resumeSid = null  // 传给 SDK 的 conversation ID，null = 不 resume
+        if (body.resume) {
+            // 先查正向映射: gateway UUID → SDK ID
+            const sdkSid = lookupSdkSessionId(workDir, body.resume)
+            if (sdkSid) {
+                resumeSid = sdkSid
+            } else {
+                // 反查: body.resume 可能是 SDK ID（侧栏点 session）→ 找回 gateway UUID
+                const gwSid = lookupGatewaySessionId(workDir, body.resume)
+                if (gwSid) {
+                    sessionId = gwSid
+                    resumeSid = body.resume  // body.resume 本身就是 SDK ID
+                } else {
+                    // 都查不到：检查 body.resume 是否对应存在的 .jsonl
+                    const jsonlPath = join(CLAUDE_HOME, 'projects', encodeProjectName(workDir), body.resume + '.jsonl')
+                    if (existsSync(jsonlPath)) {
+                        resumeSid = body.resume  // 就是 SDK conversation ID
+                    }
+                    // else: gateway UUID 无映射也无 .jsonl → resumeSid=null，从零开始
+                }
+            }
+        }
         try {
             const cliS = loadCliSettings();
             const pushStream = new PushStream()
             const opts = await makeQueryOptions(body, workDir, cliS, {}, sessionId)
-            if (body.resume) {
-                opts.resume = body.resume
+            if (resumeSid) opts.resume = resumeSid
+            // 若 sessionId 已有活跃会话（query 仍在运行、仍有客户端连接），
+            // 直接复用，不销毁重建——否则会中断正在进行的对话 + 导致重复 session
+            const oldSess = sessions.get(sessionId)
+            if (oldSess?.query && oldSess?.pushStream && oldSess.clients?.size > 0) {
+                focusedSessionId = sessionId
+                res.writeHead(200);
+                res.end(JSON.stringify({sessionId, workDir, resumed: true}));
+                return
             }
             const q = query({prompt: pushStream, options: opts})
-            // 若 sessionId 已存在（resume/reconnect），先清理旧资源
-            const oldSess = sessions.get(sessionId)
+            // 清理已死的旧会话资源
             if (oldSess) {
                 try { oldSess.pushStream?.close() } catch {}
                 try { oldSess.query?.return?.() } catch {}
@@ -2448,7 +2482,11 @@ const httpServer = createServer(async (req, res) => {
                     if (persisted) ss.snapshot = persisted
                     else {
                         ss.snapshot = buildFileSnapshot(workDir);
-                        saveSnapshot(ss, sessionId)
+                        // 异步落盘：2MB+ JSON 同步写会阻塞 session 创建响应，推迟到下一 tick
+                        const snapSession = ss
+                        setImmediate(() => {
+                            try { saveSnapshot(snapSession, sessionId) } catch {}
+                        })
                     }
                 }
             } catch (e) {
@@ -6103,6 +6141,49 @@ function diffSnapshotVsCurrent(snapshot, currentFiles, workDir) {
 // ════════════════════════ 记录点（Checkpoint）持久化 + 回退 ════════════════════════
 // 每轮用户消息 = 一个记录点，只存改动文件的「修改前内容」增量，落盘项目存储跨重启存活。
 
+// ── Gateway Session → SDK Conversation ID 映射持久化 ──
+// gateway sessionId (crypto.randomUUID) ≠ SDK conversation id (system_init.session_id)
+// 重启/resume 时必须用 SDK 的真 conversation ID 调用 opts.resume，否则 SDK 不识别
+//   会创建新 .jsonl → scanProjects 看到两个文件 → "一个会话变两个"
+// SIDE_EFFECT: 读写 bridge-session-map.json
+function sessionMapPath(workDir) {
+    return join(CLAUDE_HOME, 'projects', encodeProjectName(workDir), 'bridge-session-map.json')
+}
+
+function loadSessionMap(workDir) {
+    return readJSON(sessionMapPath(workDir)) || {}
+}
+
+function saveSessionMap(workDir, map) {
+    try {
+        const fp = sessionMapPath(workDir)
+        if (!existsSync(dirname(fp))) mkdirSync(dirname(fp), {recursive: true})
+        writeFileSync(fp, JSON.stringify(map), 'utf8')
+    } catch (e) {
+        log.warn({err: e}, 'session-map 保存失败')
+    }
+}
+
+function persistSdkSessionId(workDir, gatewaySessionId, sdkSessionId) {
+    const map = loadSessionMap(workDir)
+    map[gatewaySessionId] = sdkSessionId
+    // 反向映射: SDK conversation ID → gateway sessionId
+    // 侧栏点 session 传的是 .jsonl 文件名(=SDK ID)，需要反查找到正确的 gateway 会话键
+    map['@rev:' + sdkSessionId] = gatewaySessionId
+    saveSessionMap(workDir, map)
+}
+
+function lookupSdkSessionId(workDir, gatewaySessionId) {
+    const map = loadSessionMap(workDir)
+    return map[gatewaySessionId] || null
+}
+
+// 通过 SDK conversation ID 反向查找 gateway sessionId（侧栏 resume 用）
+function lookupGatewaySessionId(workDir, sdkSessionId) {
+    const map = loadSessionMap(workDir)
+    return map['@rev:' + sdkSessionId] || null
+}
+
 // ── 基线快照持久化（让文件面板「仅改动」在重启/resume 后仍以会话起始为基线）──
 // SIDE_EFFECT: 读写 bridge-snapshot/<sessionId>.json
 function snapshotStorePath(workDir, sessionId) {
@@ -6155,27 +6236,41 @@ function saveCheckpoints(s, sessionId) {
     }
 }
 
-// ── beginTurn — 回合开始：记录修改前状态 ──
-// 功能说明: 在 Claude 每轮开始处理用户消息前，拍下「修改前」快照并记录 prompt，
+// ── beginTurn — 回合开始：记录修改前状态（异步快照，不阻塞消息入队）──
+// 功能说明: 在 Claude 每轮开始处理用户消息前，异步拍下「修改前」快照并记录 prompt，
 //   供 finalizeCheckpoint 在回合结束时对比 diff，生成记录点
-// 实现方式: buildFileSnapshot(workDir) → 写 pendingTurn{preSnapshot, prompt, time}
+// 实现方式: 先占位 pendingTurn（含 prompt + time）→ 消息立即入队 SDK →
+//   setImmediate 异步构建 buildFileSnapshot → 填入 preSnapshot
 //   构建失败时 pendingTurn=null，后续 finalizeCheckpoint 会跳过
-// SIDE_EFFECT: mutates session.pendingTurn
+// 关键设计: preSnapshot 只在 result 事件时需要（通常几秒后），
+//   没必要在消息处理路径上同步阻塞事件循环（大项目 buildFileSnapshot 可达数百 ms）
+// SIDE_EFFECT: mutates session.pendingTurn（分两次：同步写 prompt/time，异步写 preSnapshot）
 function beginTurn(sessionId, prompt) {
     const s = sessions.get(sessionId);
     if (!s) return
-    try {
-        s.pendingTurn = {
-            prompt: String(prompt || '').slice(0, 500),
-            // 增量快照: 以会话基线 s.snapshot 作 baseline，只重读 mtime/size 变动的文件
-            // 避免每条消息前全量 readFileSync 阻塞事件循环（大项目卡顿）
-            preSnapshot: buildFileSnapshot(s.workDir, s.snapshot),
-            time: Date.now()
-        }
-    } catch (e) {
-        log.warn({err: e}, 'beginTurn snapshot 失败');
-        s.pendingTurn = null
+    // 同步占位：prompt + time + _turnId 先落盘，消息立即入队 SDK 不受阻
+    const turnId = Symbol('turn')
+    s.pendingTurn = {
+        prompt: String(prompt || '').slice(0, 500),
+        preSnapshot: null,
+        time: Date.now(),
+        _turnId: turnId
     }
+    // 异步构建快照：增量以 s.snapshot 为 baseline，只重读 mtime/size 变动的文件
+    // 用 setImmediate 推迟到当前事件循环 tick 结束后执行，保证消息先入队
+    // CAS 守护 _turnId: stop 后立即新消息时，旧 setImmediate 看到 _turnId 不匹配则跳过
+    const snapSession = s
+    setImmediate(() => {
+        try {
+            if (!snapSession.pendingTurn || snapSession.pendingTurn._turnId !== turnId) return
+            snapSession.pendingTurn.preSnapshot = buildFileSnapshot(snapSession.workDir, snapSession.snapshot)
+        } catch (e) {
+            log.warn({err: e}, 'beginTurn snapshot 失败');
+            if (snapSession.pendingTurn && snapSession.pendingTurn._turnId === turnId) {
+                snapSession.pendingTurn = null
+            }
+        }
+    })
 }
 
 // ── finalizeCheckpoint — 回合结束：对比修改前后的文件差异，生成记录点 ──
@@ -6192,6 +6287,17 @@ function beginTurn(sessionId, prompt) {
 function finalizeCheckpoint(sessionId) {
     const s = sessions.get(sessionId);
     if (!s || !s.pendingTurn) return
+    // 异步快照通常已就绪（beginTurn setImmediate 远早于 result 事件），
+    // 极端情况（result 在 setImmediate 之前到达）降级为同步构建
+    if (!s.pendingTurn.preSnapshot) {
+        try {
+            s.pendingTurn.preSnapshot = buildFileSnapshot(s.workDir, s.snapshot)
+        } catch (e) {
+            log.warn({err: e}, 'finalizeCheckpoint snapshot 降级构建失败');
+            s.pendingTurn = null
+            return
+        }
+    }
     const pre = s.pendingTurn.preSnapshot;
     const prompt = s.pendingTurn.prompt;
     const time = s.pendingTurn.time
@@ -6224,7 +6330,11 @@ function finalizeCheckpoint(sessionId) {
     s.checkpoints.push({id: `cp-${s.checkpointSeq}`, prompt, time, files, revertible})
     // 裁剪上限，防止长会话无界增长
     if (s.checkpoints.length > 50) s.checkpoints.splice(0, s.checkpoints.length - 50)
-    saveCheckpoints(s, sessionId)
+    // 异步落盘：in-memory checkpoints 已更新，API 立即可见；磁盘 I/O 不阻塞 result 广播
+    const cpSession = s
+    setImmediate(() => {
+        try { saveCheckpoints(cpSession, sessionId) } catch {}
+    })
     // 注意：不要在这里重置 session.snapshot —— 文件面板「仅改动」依赖会话起始基线，
     // 重置会让累计改动清零导致「仅改动」空白。记录点用自己的 per-turn preSnapshot，互不影响。
 }
