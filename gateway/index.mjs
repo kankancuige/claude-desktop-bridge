@@ -1400,8 +1400,11 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
         : (baseUrl && baseUrl.includes('opencode') && isOpenCodeProxyRunning()) ? getOpenCodeProxyUrl()
         : baseUrl
 
+    // 模型选择: 用户显式选 → body.model; 未选 → 按消息复杂度自动匹配 modelTiers; 都没有 → settings.model
+    const autoModel = (!body.model && body.text) ? pickTierModelByContent(body.text, loadWfConfig()) : null
+    const resolvedModel = mapModel(body.model) || autoModel || cliS.model || MODEL
     const opts = {
-        model: mapModel(body.model) || cliS.model || MODEL,
+        model: resolvedModel,
         executable: 'node',
         cwd: workDir,
         permissionMode,
@@ -1412,7 +1415,7 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
         mcpServers: cliS.mcpServers || undefined,
         stderr: (msg) => process.stderr.write(`[claude.exe stderr] ${msg}`),
         env: (() => {
-            const modelName = mapModel(body.model) || cliS.model || MODEL
+            const modelName = resolvedModel
             const e = {
                 ...process.env,
                 CLAUDE_CODE_ENTRYPOINT: 'claude',
@@ -1482,18 +1485,17 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
         }
     }
     // 暴露本次生效的 env 给同进程 fetch 路径（classifyWorkflowViaAI 等），替代写 process.env 全局
-    const rtModel = mapModel(body.model) || cliS.model || MODEL
     opts.runtimeEnv = {
         ANTHROPIC_BASE_URL: effectiveBaseUrl,
         ANTHROPIC_API_KEY: apiKey,
         ANTHROPIC_AUTH_TOKEN: apiKey,
-        ANTHROPIC_MODEL: rtModel,
+        ANTHROPIC_MODEL: resolvedModel,
     }
     if (effectiveBaseUrl && (effectiveBaseUrl.includes('minimax') || effectiveBaseUrl.includes('deepseek') || effectiveBaseUrl.includes('moonshot') || effectiveBaseUrl.includes('opencode') || effectiveBaseUrl.includes('bigmodel') || effectiveBaseUrl.includes('aliyun') || effectiveBaseUrl.includes('volces'))) {
-        opts.runtimeEnv.ANTHROPIC_DEFAULT_OPUS_MODEL = rtModel
-        opts.runtimeEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = rtModel
-        opts.runtimeEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL = rtModel
-        opts.runtimeEnv.ANTHROPIC_SMALL_FAST_MODEL = rtModel
+        opts.runtimeEnv.ANTHROPIC_DEFAULT_OPUS_MODEL = resolvedModel
+        opts.runtimeEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = resolvedModel
+        opts.runtimeEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL = resolvedModel
+        opts.runtimeEnv.ANTHROPIC_SMALL_FAST_MODEL = resolvedModel
     }
     if (effectiveBaseUrl && effectiveBaseUrl.includes('minimax')) {
         opts.runtimeEnv.API_TIMEOUT_MS = '600000'
@@ -1504,12 +1506,12 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
     process.env.ANTHROPIC_BASE_URL = effectiveBaseUrl
     process.env.ANTHROPIC_API_KEY = apiKey
     process.env.ANTHROPIC_AUTH_TOKEN = apiKey
-    process.env.ANTHROPIC_MODEL = rtModel
+    process.env.ANTHROPIC_MODEL = resolvedModel
     if (effectiveBaseUrl && effectiveBaseUrl.includes('minimax')) {
-        process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = rtModel
-        process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = rtModel
-        process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL = rtModel
-        process.env.ANTHROPIC_SMALL_FAST_MODEL = rtModel
+        process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = resolvedModel
+        process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = resolvedModel
+        process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL = resolvedModel
+        process.env.ANTHROPIC_SMALL_FAST_MODEL = resolvedModel
         process.env.API_TIMEOUT_MS = '600000'
         process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'
     }
@@ -1986,6 +1988,21 @@ const WF_TIER_MAP = {
 function resolveTierModel(wfName, wfCfg) {
     const tier = WF_TIER_MAP[wfName] || 'balanced'
     return wfCfg?.modelTiers?.[tier] || null
+}
+
+// 根据消息内容复杂度自动选择模型等级（用户未显式选模型时生效）
+function pickTierModelByContent(text, wfCfg) {
+    if (!text || !wfCfg?.modelTiers) return null
+    // 简单问答 — 短消息 + 问候/询问模式 → light
+    if (text.length < 60 && /^(你好|hi|hello|什么是|怎么|如何|为什么|怎么用|帮我解释|帮助|help|what|how|why)/i.test(text.trim())) {
+        return wfCfg.modelTiers.light || null
+    }
+    // 复杂任务 — 长消息 或 包含代码块 → power
+    if (text.length > 500 || (text.match(/```/g) || []).length >= 2) {
+        return wfCfg.modelTiers.power || null
+    }
+    // 默认 → balanced
+    return wfCfg.modelTiers.balanced || null
 }
 
 async function classifyWorkflowViaAI(text, sessionId) {
