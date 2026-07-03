@@ -151,12 +151,18 @@ function getClaudeExe() {
     } catch {
     }
 
-    // ── 5. nvm 版本目录 ──
+    // ── 5. nvm/fnm/Volta 版本目录 ──
     const nvmHomes = [
         process.env.NVM_HOME, process.env.NVM_DIR,
         join(homedir(), 'AppData', 'Roaming', 'nvm'),
         join(homedir(), '.nvm'),
         join(homedir(), '.nvm', 'versions', 'node'),
+        // fnm (Fast Node Manager)
+        join(homedir(), 'AppData', 'Local', 'fnm'),
+        join(homedir(), 'AppData', 'Local', 'fnm-node-versions'),
+        join(homedir(), '.local', 'share', 'fnm'),
+        // Volta
+        join(homedir(), '.volta', 'tools', 'image', 'node'),
     ].filter(Boolean)
     for (const nvmHome of nvmHomes) {
         if (!existsSync(nvmHome)) continue
@@ -180,7 +186,6 @@ function getClaudeExe() {
         process.env.NVM_SYMLINK ? join(process.env.NVM_SYMLINK, 'node_modules') : null,
         process.env.APPDATA ? join(process.env.APPDATA, 'npm', 'node_modules') : null,
         process.env.ProgramFiles ? join(process.env.ProgramFiles, 'nodejs', 'node_modules') : null,
-        'C:\\Program Files\\nodejs\\node_modules',
         process.env.PREFIX ? join(process.env.PREFIX, 'node_modules') : null,
     ].filter(Boolean)
     for (const root of npmGlobalRoots) {
@@ -1021,17 +1026,26 @@ function parseShellArgs(cmd) {
 }
 
 // ── RTK 安全: 只读命令白名单，防止重执行时产生副作用 ──
-const RTK_READONLY_PREFIXES = [
-    'wc', 'grep', 'rg', 'ls', 'dir', 'find', 'cat', 'head', 'tail', 'sort',
-    'uniq', 'cut', 'tr', 'awk', 'sed', 'echo', 'printf', 'date', 'env',
-    'printenv', 'pwd', 'whoami', 'uname', 'hostname', 'which', 'type',
+// 按平台拆分：Windows 仅包含原生支持 + 跨平台工具，Unix 额外包含 Unix-only 命令
+const RTK_READONLY_CROSS = [
+    'echo', 'dir', 'tree', 'hostname', 'whoami',
     'git log', 'git diff', 'git show', 'git status', 'git branch', 'git tag',
-    'git stash list', 'git remote', 'git config', 'file', 'stat', 'du', 'df',
-    'tree', 'read', 'node -e', 'node -p', 'python -c',
+    'git stash list', 'git remote', 'git config',
+    'node -e', 'node -p', 'python -c',
     'npm view', 'npm list', 'npm ls', 'npm outdated',
     'dotnet --list', 'dotnet --info', 'cargo search', 'cargo tree',
-    'npx --help', 'npx -v',
+    'npx --help', 'npx -v', 'rg',
 ]
+const RTK_READONLY_UNIX = [
+    'wc', 'grep', 'ls', 'cat', 'head', 'tail', 'uniq', 'cut', 'tr',
+    'awk', 'sed', 'printf', 'env', 'printenv', 'pwd', 'uname', 'which',
+    'file', 'stat', 'du', 'df', 'read', 'type', 'find', 'sort', 'date',
+]
+// Windows: 仅跨平台；Unix: 跨平台 + Unix-only
+const RTK_READONLY_PREFIXES = process.platform === 'win32'
+    ? RTK_READONLY_CROSS
+    : [...RTK_READONLY_CROSS, ...RTK_READONLY_UNIX]
+
 function isReadOnlyCommand(cmd) {
     if (!cmd || typeof cmd !== 'string') return false
     const lower = cmd.trim().toLowerCase()
@@ -1039,6 +1053,43 @@ function isReadOnlyCommand(cmd) {
         if (lower.startsWith(prefix)) return true
     }
     return false
+}
+
+// ── findGitBashDirs — 动态探测 Windows 上 Git Bash 的 bin 目录 ──
+// 用 where.exe git 定位 git.exe，反向推导 /usr/bin；失败则回退常见路径
+function findGitBashDirs() {
+    const dirs = []
+    try {
+        const result = spawnSync('where', ['git'], {timeout: 3000, encoding: 'utf8', windowsHide: true})
+        if (result.status === 0 && result.stdout) {
+            const seen = new Set()
+            for (const line of result.stdout.trim().split('\n')) {
+                const gitExe = line.trim()
+                if (!gitExe || seen.has(gitExe)) continue
+                seen.add(gitExe)
+                // Git for Windows 标准布局: <GitRoot>/cmd/git.exe → ../usr/bin
+                const usrBin = resolve(dirname(gitExe), '..', 'usr', 'bin')
+                try { if (statSync(usrBin).isDirectory()) dirs.push(usrBin) } catch {}
+                // 也加入 git.exe 自身目录（部分命令如 git 本身在此）
+                const binDir = dirname(gitExe)
+                try { if (statSync(binDir).isDirectory() && !dirs.includes(binDir)) dirs.push(binDir) } catch {}
+            }
+        }
+    } catch {}
+    // 动态探测失败 → 回退常见路径兜底
+    if (dirs.length === 0) {
+        const fallbacks = [
+            'C:\\Program Files\\Git\\usr\\bin',
+            'C:\\Program Files\\Git\\bin',
+            'C:\\Program Files (x86)\\Git\\usr\\bin',
+            'C:\\Program Files (x86)\\Git\\bin',
+            join(homedir(), 'scoop', 'apps', 'git', 'current', 'usr', 'bin'),
+        ]
+        for (const d of fallbacks) {
+            try { if (statSync(d).isDirectory()) dirs.push(d) } catch {}
+        }
+    }
+    return dirs
 }
 
 // ── spawnRtk — 启动 RTK 子进程处理文本压缩 ──
@@ -1054,19 +1105,12 @@ function spawnRtk(rtkPath, cmd, _text) {
     return new Promise((resolve, reject) => {
         const args = cmd ? parseShellArgs(cmd) : []
         if (args.length === 0) { resolve(''); return }
-        // Windows 上 rtk 子进程需要 Unix 命令（如 ls）→ 合并 Git Bash 的 bin 目录到 PATH
+        // Windows 上 rtk 子进程需要 Unix 命令 → 动态探测 Git Bash 的 bin 目录合并到 PATH
         const env = {...process.env}
         if (process.platform === 'win32') {
-            const gitBashDirs = [
-                'C:\\Program Files\\Git\\usr\\bin',
-                'C:\\Program Files\\Git\\bin',
-                'C:\\Program Files (x86)\\Git\\usr\\bin',
-                'C:\\Program Files (x86)\\Git\\bin',
-                join(homedir(), 'scoop\\apps\\git\\current\\usr\\bin'),
-            ]
+            const gitBashDirs = findGitBashDirs()
             const existing = (env.PATH || '').split(';')
             for (const d of gitBashDirs) {
-                // 目录存在且未在 PATH 中则追加
                 try { if (statSync(d).isDirectory() && !existing.includes(d)) existing.push(d) } catch {}
             }
             env.PATH = existing.join(';')
@@ -1565,13 +1609,17 @@ async function startStreamPump(sessionId) {
                 } : n)
                 builtinCache.updatedAt = Date.now()
             }
-            // 累积本轮 assistant 文本 + 监听 [WF:run ...] 指令
+            // 累积本轮文本（assistant 消息为权威完整版，用于 IM 镜像同步）
+            // assistant 覆盖 text_delta 的增量累积，保证 mirror 拿到 SDK 提供的完整文本
             if (sdkMsg.type === 'assistant') {
+                let completeText = ''
                 for (const b of (sdkMsg.message?.content || [])) {
-                    if (b.type === 'text' && b.text) {
-                        s.turnText = ((s.turnText || '') + b.text).slice(-100000)  // 上限 100KB，防长轮内存膨胀
-                        // 检测 [WF:run 脚本名 {args}] 指令（仅当全局开关 enabled 时）
-                        if (!loadWfConfig().enabled) continue;
+                    if (b.type === 'text' && b.text) completeText += b.text
+                }
+                if (completeText) {
+                    s.turnText = completeText.slice(-100000)  // 上限 100KB，防长轮内存膨胀
+                    // 检测 [WF:run 脚本名 {args}] 指令（仅当全局开关 enabled 时）
+                    if (loadWfConfig().enabled) {
                         const wfMatch = s.turnText.match(/\[WF:run\s+([\w.-]+?)\s+(\{[\s\S]*?\})\]/);
                         if (wfMatch && !s._wfRan) {
                             const wfName = wfMatch[1];
@@ -1580,17 +1628,16 @@ async function startStreamPump(sessionId) {
                                 wfArgs = JSON.parse(wfMatch[2]);
                             } catch {
                             }
-                            // 验证脚本名必须在可用列表中，防止 DeepSeek 把占位符当真实名称
                             const valid = getWorkflow(wfName + '.mjs') || getWorkflow(wfName);
                             if (!valid) {
                                 log.warn({sessionId: sessionId?.slice(0, 8), wfName}, '[WF:run] 脚本名无效，已忽略');
-                                continue;
+                            } else {
+                                s._wfRan = true;
+                                log.info({sessionId: sessionId?.slice(0, 8), wfName, wfArgs}, '[WF:run] 已触发');
+                                runWfScript(wfName, sessionId, wfArgs).catch(function (e) {
+                                    log.error({err: e, sessionId: sessionId?.slice(0, 8), wfName}, 'Workflow 引擎错误');
+                                });
                             }
-                            s._wfRan = true;
-                            log.info({sessionId: sessionId?.slice(0, 8), wfName, wfArgs}, '[WF:run] 已触发');
-                            runWfScript(wfName, sessionId, wfArgs).catch(function (e) {
-                                log.error({err: e, sessionId: sessionId?.slice(0, 8), wfName}, 'Workflow 引擎错误');
-                            });
                         }
                     }
                 }
@@ -1618,6 +1665,10 @@ async function startStreamPump(sessionId) {
             }
             const wsMsg = convertSdkToWs(sdkMsg, sessionId)
             if (wsMsg) broadcast(sessionId, wsMsg)
+            // text_delta 兜底累积到 turnText，防止后续轮次 SDK 不发 assistant 消息导致 mirror 丢文本
+            if (wsMsg?.type === 'text_delta' && wsMsg.text) {
+                s.turnText = ((s.turnText || '') + wsMsg.text).slice(-100000)
+            }
             // 镜像工具进度到所有已开启 mirror 的 IM 平台
             if (wsMsg?.type === 'tool_use_start') {
                 try {
@@ -1678,6 +1729,8 @@ function splitByBytes(text, maxBytes) {
 async function sendWeChatChunks(bn, token, userId, contextToken, fullText) {
     const parts = splitByBytes(fullText, WX_MAX_BYTES - WX_MARKER_RESERVE)
     const total = parts.length
+    // contextToken 为空时用 message_state=1（推送消息），有值时用 message_state=2（回复消息）
+    const messageState = contextToken ? 2 : 1
     let sent = true
     for (let i = 0; i < total; i++) {
         const body = total > 1 ? `【${i + 1}/${total}】\n${parts[i]}` : parts[i]
@@ -1697,7 +1750,7 @@ async function sendWeChatChunks(bn, token, userId, contextToken, fullText) {
                         to_user_id: userId,
                         client_id: `gw-${Date.now()}-${i}`,
                         message_type: 2,
-                        message_state: 2,
+                        message_state: messageState,
                         context_token: contextToken || '',
                         item_list: [{type: 1, text_item: {text: body}}]
                     }, base_info: {channel_version: '0.1.0'}
@@ -5616,7 +5669,7 @@ checkRtkUpdate().catch(e => log.warn({err: e}, 'RTK 版本检查异常'))
 httpServer.listen(PORT, '127.0.0.1', () => {
     log.info({port: PORT}, `Gateway 已启动`)
     resumeScheduledTasks()
-    // 启动时预启动 DeepSeek 代理（固定端口 8787），供 settings.json ANTHROPIC_BASE_URL 引用
+    // 启动时预热 DeepSeek 代理端口，供 settings.json ANTHROPIC_BASE_URL 引用
     startDeepSeekProxy('https://api.deepseek.com/anthropic').catch(e => log.warn({err: e}, 'proxy boot 启动失败'))
     startOpenCodeProxy().catch(e => log.warn({err: e}, 'opencode proxy boot 启动失败'))
 })

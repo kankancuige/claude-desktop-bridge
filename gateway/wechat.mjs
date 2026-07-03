@@ -458,6 +458,8 @@ export function startWeChatAdapter(token) {
     // 关键数据流: 参数组装 → POST iLink API → 微信服务端 → 用户微信客户端
     async function sendMsg(userId, ctx, text) {
         const bn = baseUrl.endsWith('/') ? baseUrl : baseUrl + '/'
+        // ctx 为空时用 message_state=1（推送消息），有 ctx 时用 message_state=2（回复消息）
+        const messageState = ctx ? 2 : 1
         try {
             const clientId = `cc-bridge-${Math.random().toString(36).slice(2, 10)}`  // 随机 clientId 防重
             const res = await fetch(`${bn}ilink/bot/sendmessage`, {
@@ -468,7 +470,7 @@ export function startWeChatAdapter(token) {
                         to_user_id: userId,
                         client_id: clientId,
                         message_type: 2,
-                        message_state: 2,
+                        message_state: messageState,
                         context_token: ctx,
                         item_list: [{type: 1, text_item: {text}}]
                     },
