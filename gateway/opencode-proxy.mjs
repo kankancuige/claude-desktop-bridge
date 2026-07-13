@@ -17,6 +17,7 @@ let proxyServer = null
 let _startPromise = null
 
 const UPSTREAM = 'https://opencode.ai/zen/go/v1/chat/completions'
+const OC_PORT = parseInt(process.env.BRIDGE_OC_PORT, 10) || 8788
 
 export function startOpenCodeProxy() {
     if (_startPromise) return _startPromise
@@ -28,11 +29,11 @@ export function startOpenCodeProxy() {
                 // 固定端口被占 → 直接报错，不静默回退（与 deepseek-proxy 一致策略）
                 proxyServer = null
                 _startPromise = null
-                reject(new Error('端口 8788 被占用，OpenCode 代理无法启动。请关闭占用 8788 的进程后重启。'))
+                reject(new Error(`端口 ${OC_PORT} 被占用，OpenCode 代理无法启动。请关闭占用 ${OC_PORT} 的进程后重启。`))
             } else { proxyServer = null; _startPromise = null; reject(e) }
         })
-        proxyServer.listen(8788, '127.0.0.1', () => {
-            proxyPort = 8788; log.info({port: proxyPort}, 'OpenCode 代理已启动')
+        proxyServer.listen(OC_PORT, '127.0.0.1', () => {
+            proxyPort = OC_PORT; log.info({port: proxyPort}, 'OpenCode 代理已启动')
             resolve({server: proxyServer, port: proxyPort})
         })
     })

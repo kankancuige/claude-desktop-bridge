@@ -13,7 +13,7 @@ import {join, dirname, basename, relative, resolve, sep, extname as pathExtname}
 import {fileURLToPath} from 'node:url'
 import {WebSocketServer} from 'ws'
 import {config as loadEnv} from 'dotenv'
-import {query} from '@anthropic-ai/claude-agent-sdk'
+import {query, deleteSession} from '@anthropic-ai/claude-agent-sdk'
 import {createLogger, logHttpRequest} from './logger.mjs'
 import {startWeChatAdapter} from './wechat.mjs'
 import {startFeishuAdapter} from './feishu.mjs'
@@ -29,6 +29,8 @@ import {
     getRunState,
     presetRunState,
     stopWorkflow,
+    stopWorkflowAgent,
+    resumeWorkflowAgent,
     resumeWorkflow,
     commitWorkflow,
     queryHistory,
@@ -363,7 +365,7 @@ function broadcast(sid, msg) {
 }
 
 // 注入依赖到 workflow-runner（供 VM 沙箱内 agent() 调用）
-setDeps({query, makeQueryOptions, loadCliSettings, loadWfConfig, PushStream, broadcast, sessions})
+setDeps({query, makeQueryOptions, loadCliSettings, loadWfConfig, PushStream, broadcast, sessions, persistSdkSessionId})
 
 // 收口：任一通道响应或超时都走这里，幂等（已 settled 则忽略）
 // ── 确认请求收口（settlePending）──
@@ -424,6 +426,11 @@ function makeCanUseTool(sessionId) {
         const s = sessions.get(sessionId)
         if (!s) {
             resolve({behavior: 'deny', message: 'session 已关闭', interrupt: true});
+            return
+        }
+        // 动态权限: 切换 permissionMode 后下一个工具调用立即生效，无需重建 query
+        if (s.permissionMode === 'bypassPermissions') {
+            resolve({behavior: 'allow', updatedInput: input})
             return
         }
         const requestId = `req-${++reqCounter}`
@@ -496,9 +503,9 @@ function makeCanUseTool(sessionId) {
 // 实现方式: choice 类型解析 optionIndex/questionIndex 获取标签文本，引导喂回模型但不中断（interrupt:false）
 //   permission 类型: allow → 返回 updatedInput；否则 deny + interrupt:false
 // 关键数据流: 用户决策(allow/deny/选项索引) → PermissionResult {behavior, message, interrupt, updatedInput?}
-function decisionToResult(entry, decision, optionIndex, questionIndex) {
+function decisionToResult(entry, decision, optionIndex, questionIndex, customText) {
     if (entry.type === 'choice') {
-        const label = labelForChoice(entry, questionIndex ?? 0, optionIndex ?? 0)
+        const label = customText || labelForChoice(entry, questionIndex ?? 0, optionIndex ?? 0)
         // 把用户选择作为引导喂回模型，不中断（spike 后可能改为 allow+updatedInput）
         return {behavior: 'deny', message: `用户选择了: ${label}`, interrupt: false}
     }
@@ -1186,11 +1193,17 @@ function decodeProjectName(n) {
     return m[1] + ':/' + m[2].replace(/-/g, '/')
 }
 
+// 路径规范化：消除编码歧义，确保相同物理路径产生相同编码结果
+//   D:\a\b → D:/a/b，D://a//b → D:/a/b，D:/a/b/ → D:/a/b
+function normalizeWorkDir(wd) {
+    return wd.replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/+$/, '') || '/'
+}
+
 // 功能说明: 将工作目录路径编码为文件系统安全的目录名
 // 实现方式: 盘符 D:/path/to → "D--path-to"（: → --, / → -）
 // 关键数据流: "D:/path/to/project" → "D--path-to-project"
 function encodeProjectName(wd) {
-    const n = wd.replace(/\\/g, '/');
+    const n = normalizeWorkDir(wd);
     const dm = n.match(/^([a-zA-Z]):\/(.*)$/);
     if (!dm) return n.replace(/\//g, '-');
     return dm[1] + '--' + dm[2].replace(/\//g, '-')
@@ -1360,7 +1373,8 @@ function convertSdkToWs(sdkMsg, sessionId) {
                 duration_ms: sdkMsg.duration_ms,
                 is_error: sdkMsg.is_error,
                 num_turns: sdkMsg.num_turns,
-                result: sdkMsg.result,
+                // 0.3.x: SDKResultError 无 result 字段，改用 errors 数组
+                result: sdkMsg.result || sdkMsg.errors?.join('\n'),
                 usage: sdkMsg.usage
             }
         case 'tool_progress':
@@ -1455,7 +1469,6 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
         allowDangerouslySkipPermissions: permissionMode === 'bypassPermissions',
         thinking: mapThinkingLevel(body.thinkingLevel || 'auto'),
         maxTurns: body.maxTurns || cliS.maxTurns || 40,
-        resume: body.resume || undefined,
         mcpServers: cliS.mcpServers || undefined,
         stderr: (msg) => process.stderr.write(`[claude.exe stderr] ${msg}`),
         env: (() => {
@@ -1484,14 +1497,16 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
             }
             return e
         })(),
+        // 0.3.x 默认不发 stream_event，必须显式开启
+        includePartialMessages: true,
     }
     // Caveman: 会话级 systemPrompt.append 注入，仅对 bridge 会话生效，不污染任何 CLAUDE.md
     const cavemanPrompt = buildCavemanSystemPrompt(cliS.caveman)
     if (cavemanPrompt) opts.systemPrompt = {type: 'preset', preset: 'claude_code', append: cavemanPrompt}
     // 有 native binary 路径时才传，否则 SDK 自动走自带的 cli.js
     if (exe) opts.pathToClaudeCodeExecutable = exe
-    // 非 bypass 模式才注册 canUseTool（bypass 下 SDK 不触发回调）
-    if (sessionId && permissionMode !== 'bypassPermissions') opts.canUseTool = makeCanUseTool(sessionId)
+    // canUseTool 始终注册，动态检查 s.permissionMode 实现即时权限切换
+    if (sessionId) opts.canUseTool = makeCanUseTool(sessionId)
     // 注入 agent 定义（含内置+自定义），SDK 的 Task 工具用此列表找到子 agent
     if (Object.keys(agents).length) opts.agents = agents
     // 注册 Subagent 生命周期 hooks（SDK 子 agent 启动/停止时广播到前端）
@@ -1508,6 +1523,7 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
                         })
                     } catch {
                     }
+                    return {}
                 }]
             }],
             SubagentStop: [{
@@ -1521,6 +1537,7 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
                         })
                     } catch {
                     }
+                    return {}
                 }]
             }],
             PostToolUse: [{
@@ -1678,6 +1695,10 @@ async function startStreamPump(sessionId) {
                 ;
                 try {
                     maybeInjectProjectCache(sessionId, s, wsMsg)
+                } catch {
+                }
+                try {
+                    maybeInjectGitContext(sessionId, s)
                 } catch {
                 }
             }
@@ -1839,7 +1860,7 @@ function maybeInjectProjectCache(sessionId, s, wsMsg) {
 async function maybeUpdateProjectCache(sessionId, s) {
     if (!s.pendingTurn?.preSnapshot) return
     const cache = loadProjectCache(s.workDir)
-    const scan = scanWorkdirFiles(s.workDir)
+    const scan = currentFileScan(s.workDir, s.pendingTurn.preSnapshot)
     if (scan.missing) return
     const diffMap = diffSnapshotVsCurrent(s.pendingTurn.preSnapshot, scan.files, s.workDir)
     const changedCount = [...diffMap.values()].filter(d => d.status !== 'unchanged').length
@@ -1858,6 +1879,52 @@ async function maybeUpdateProjectCache(sessionId, s) {
             }, 'project-cache 已更新')
         }
     }
+}
+
+// ── Git 上下文注入（buildGitContext + maybeInjectGitContext）──
+// 复用 maybeInjectProjectCache 的模式：首次 tool_use_start 时注入伪用户消息
+function buildGitContext(workDir) {
+    try {
+        const branch = execSync('git rev-parse --abbrev-ref HEAD', {
+            cwd: workDir, encoding: 'utf8', timeout: 5000,
+            stdio: ['pipe', 'pipe', 'pipe']
+        }).trim()
+        const head = execSync('git rev-parse --short HEAD', {
+            cwd: workDir, encoding: 'utf8', timeout: 5000,
+            stdio: ['pipe', 'pipe', 'pipe']
+        }).trim()
+        const log = execSync('git log --oneline -10', {
+            cwd: workDir, encoding: 'utf8', timeout: 5000,
+            stdio: ['pipe', 'pipe', 'pipe']
+        }).trim()
+        const status = execSync('git status --short', {
+            cwd: workDir, encoding: 'utf8', timeout: 5000,
+            stdio: ['pipe', 'pipe', 'pipe']
+        }).trim()
+        return `[GitContext]
+Branch: ${branch}
+HEAD: ${head}
+
+最近 10 条提交:
+${log}
+
+工作区状态:
+${status || '(clean)'}`
+    } catch { return null }
+}
+
+function maybeInjectGitContext(sessionId, s) {
+    if (s._gitInjected) return
+    if (!s.pushStream) return
+    if (!s._gitContext) return
+    s._gitInjected = true
+    s.pushStream.push({
+        type: 'user',
+        session_id: sessionId,
+        message: {role: 'user', content: [{type: 'text', text: s._gitContext}]},
+        parent_tool_use_id: null,
+    })
+    log.info({sessionId: sessionId?.slice(0, 8)}, 'git-context 已注入')
 }
 
 // Claude Code 内置命令兜底列表（冷启动无活跃 query 时用，无需等 SDK 连接）
@@ -2474,7 +2541,8 @@ const httpServer = createServer(async (req, res) => {
     //   → snapshot + checkpoints 恢复 → startStreamPump() → 201 {sessionId, workDir, resumed}
     if (req.method === 'POST' && url.pathname === '/api/sessions') {
         const body = await readBody(req);
-        const workDir = body.workDir
+        // 规范化 workDir 消除编码歧义（双斜杠/反斜杠/末尾斜杠等）
+        const workDir = normalizeWorkDir(body.workDir || '')
         if (!workDir) {
             res.writeHead(400);
             res.end(JSON.stringify({error: 'workDir required'}));
@@ -2494,12 +2562,21 @@ const httpServer = createServer(async (req, res) => {
                     sessionId = gwSid
                     resumeSid = body.resume  // body.resume 本身就是 SDK ID
                 } else {
-                    // 都查不到：检查 body.resume 是否对应存在的 .jsonl
-                    const jsonlPath = join(CLAUDE_HOME, 'projects', encodeProjectName(workDir), body.resume + '.jsonl')
+                    // 都查不到：检查 body.resume 是否对应存在的 .jsonl（规范路径）
+                    const encDir = encodeProjectName(workDir)
+                    const jsonlPath = join(CLAUDE_HOME, 'projects', encDir, body.resume + '.jsonl')
                     if (existsSync(jsonlPath)) {
                         resumeSid = body.resume  // 就是 SDK conversation ID
+                    } else {
+                        // 兜底：path 编码可能因历史双斜杠不匹配，跨所有项目目录搜 .jsonl
+                        //   找到同名 .jsonl 且其 cwd 解码后与 workDir 同目录（忽略大小写），则复用
+                        const found = findSessionJsonl(body.resume, workDir)
+                        if (found) {
+                            // 修正：将 session-map 补写到规范编码目录，下次不再走兜底
+                            try { saveSessionMap(workDir, loadSessionMap(workDir)) } catch {}
+                            resumeSid = body.resume
+                        }
                     }
-                    // else: gateway UUID 无映射也无 .jsonl → resumeSid=null，从零开始
                 }
             }
         }
@@ -2507,14 +2584,27 @@ const httpServer = createServer(async (req, res) => {
             const cliS = loadCliSettings();
             const pushStream = new PushStream()
             const opts = await makeQueryOptions(body, workDir, cliS, {}, sessionId)
-            if (resumeSid) opts.resume = resumeSid
+            if (resumeSid) {
+                opts.resume = resumeSid
+            }
+            // 有 body.resume 但所有 lookup（含跨目录兜底）均失败:
+            //   放弃 resume，生成新 sessionId 避免 SDK 收到无效 ID 创建出新 conversation（"一变二"）
+            if (body.resume && !resumeSid) {
+                log.warn({
+                    resume: body.resume?.slice(0, 8),
+                    workDir: workDir,
+                    module: 'gateway'
+                }, 'session resume 映射丢失，创建新会话 — 旧 .jsonl 可能成为幽灵 session，请手动清理')
+                sessionId = crypto.randomUUID()
+            }
             // 若 sessionId 已有活跃会话（query 仍在运行、仍有客户端连接），
             // 直接复用，不销毁重建——否则会中断正在进行的对话 + 导致重复 session
             const oldSess = sessions.get(sessionId)
             if (oldSess?.query && oldSess?.pushStream && oldSess.clients?.size > 0) {
                 focusedSessionId = sessionId
                 res.writeHead(200);
-                res.end(JSON.stringify({sessionId, workDir, resumed: true}));
+                res.end(JSON.stringify({sessionId, workDir, resumed: true,
+                    gitInfo: sessions.get(sessionId)?.snapshot?.gitHead || null}));
                 return
             }
             const q = query({prompt: pushStream, options: opts})
@@ -2542,7 +2632,8 @@ const httpServer = createServer(async (req, res) => {
                 taskId: null,
                 children: new Set(),
                 depth: body._depth || 0,
-                modelMeta: body.modelMeta || null  // 前端传入的 model contextWindow/pricing，供 lookupModelInfo 回退
+                modelMeta: body.modelMeta || null,  // 前端传入的 model contextWindow/pricing，供 lookupModelInfo 回退
+                _gitContext: null  // git 仓库上下文，snapshot 构建后填充
             })
             // 文件 diff 基线：优先载入已持久化的基线（重启/resume 后仍显示累计改动）；没有才新拍并落盘
             try {
@@ -2562,6 +2653,12 @@ const httpServer = createServer(async (req, res) => {
             } catch (e) {
                 log.warn({err: e, sessionId: sessionId?.slice(0, 8)}, 'snapshot 失败')
             }
+            // 构建 git 上下文（仅 git 仓库有效，供 maybeInjectGitContext 注入）
+            try {
+                const sss = sessions.get(sessionId)
+                const ctx = buildGitContext(workDir)
+                if (ctx && sss) sss._gitContext = ctx
+            } catch {}
             // resume 续接：载入历史记录点 + 恢复递增序号
             try {
                 const ss = sessions.get(sessionId)
@@ -2582,7 +2679,8 @@ const httpServer = createServer(async (req, res) => {
             }
             invalidateProjectsCache()
             res.writeHead(201);
-            res.end(JSON.stringify({sessionId, workDir, resumed: !!body.resume}))
+            res.end(JSON.stringify({sessionId, workDir, resumed: !!body.resume,
+                gitInfo: sessions.get(sessionId)?.snapshot?.gitHead || null}))
         } catch (e) {
             log.error({err: e}, 'session 创建失败')
             if (!res.headersSent) {
@@ -2700,8 +2798,16 @@ const httpServer = createServer(async (req, res) => {
     //   4. 从 sessions Map 删除 + 如为 focusedSessionId 则置空
     // 关键数据流: DELETE /api/sessions/:id → settlePending(all) → close query → delete session → 200 {ok:true}
     if (req.method === 'DELETE' && delM) {
-        const id = delM[1];
-        const s = sessions.get(id)
+        const delParam = delM[1];
+        let id = delParam
+        let s = sessions.get(id)
+        // 侧栏删除传的是 .jsonl 文件名 (=SDK conversation ID)，sessions Map key 是 gatewayUUID，
+        // 需要反查找到真正的 gateway UUID 才能正确关闭 query/pushStream/clients
+        if (!s) {
+            for (const [key, sess] of sessions) {
+                if (sess.lastSessionId === delParam) { id = key; s = sess; break }
+            }
+        }
         // 先停 query（SDK 可能持有 .jsonl 文件句柄，Windows 下不先释放会导致 unlinkSync 失败）
         if (s) {
             for (const pid of [...(s.pending?.keys() || [])]) settlePending(id, pid, {
@@ -2723,16 +2829,72 @@ const httpServer = createServer(async (req, res) => {
                 try { ws.close(4001, JSON.stringify({error: 'session deleted'})) } catch {}
             }
         }
-        // 先删磁盘文件再清内存缓存: 文件删除失败时 sessions Map 仍保留原会话，
-        // 避免 scanProjects 从 .jsonl 扫回已删除的会话
-        if (url.searchParams.get('deleteFiles') === '1') {
-            await deleteSessionFiles(id)
-        }
-        markSessionDeleted(id)  // 内存层标记：2 分钟内 scanProjects 跳过此会话
+        // 先标记删除再清内存（_deletedSessionIds 已持久化，scanProjects 不会扫回）
+        markSessionDeleted(delParam)
         if (s) { sessions.delete(id); invalidateProjectsCache() }
         if (focusedSessionId === id) focusedSessionId = null;
         res.writeHead(200);
         res.end(JSON.stringify({ok: true}));
+        // 磁盘文件异步清理: SDK 进程退出滞后可能导致 deleteSessionFiles
+        // 指数退避长达 10s+，不阻塞 HTTP 响应
+        if (url.searchParams.get('deleteFiles') === '1') {
+            deleteSessionFiles(delParam).catch(() => {})
+        }
+        return
+    }
+
+    // ── Session 存在性检查（前端 switchToTab 恢复前校验）──
+    // GET /api/sessions/:id/exists —— 返回 200 或 404，支持 SDK ID 反查
+    const existsM = url.pathname.match(/^\/api\/sessions\/([^/]+)\/exists$/)
+    if (req.method === 'GET' && existsM) {
+        const eid = existsM[1]
+        let s = sessions.get(eid)
+        if (!s) {
+            for (const [key, sess] of sessions) {
+                if (sess.lastSessionId === eid) { s = sess; break }
+            }
+        }
+        res.writeHead(s ? 200 : 404)
+        res.end(JSON.stringify(s ? {exists: true} : {error: 'not found'}))
+        return
+    }
+
+    // ── 批量删除会话 ──
+    // POST /api/sessions/batch-delete  body: {ids: string[]}
+    // 批量标记删除 + 后台异步清理文件，避免逐个 DELETE 串行阻塞
+    if (req.method === 'POST' && url.pathname === '/api/sessions/batch-delete') {
+        const body = await readBody(req)
+        const ids = Array.isArray(body?.ids) ? body.ids : []
+        const deleteFiles = body.deleteFiles !== false
+        let deleted = 0
+        for (const rawId of ids) {
+            if (!rawId) continue
+            let id = rawId
+            let s = sessions.get(id)
+            if (!s) {
+                for (const [key, sess] of sessions) {
+                    if (sess.lastSessionId === rawId) { id = key; s = sess; break }
+                }
+            }
+            if (s) {
+                for (const pid of [...(s.pending?.keys() || [])]) settlePending(id, pid, {
+                    behavior: 'deny', message: '会话已删除', interrupt: true
+                }, 'deleted')
+                try { s.pushStream?.close(); s.query?.return?.() } catch {}
+                s.query = null; s.pushStream = null
+                for (const ws of [...s.clients]) {
+                    try { ws.close(4001, JSON.stringify({error: 'session deleted'})) } catch {}
+                }
+                sessions.delete(id)
+                if (focusedSessionId === id) focusedSessionId = null
+            }
+            markSessionDeleted(rawId)
+            if (deleteFiles) deleteSessionFiles(rawId).catch(() => {})
+            deleted++
+        }
+        invalidateProjectsCache()
+        res.writeHead(200)
+        res.end(JSON.stringify({ok: true, deleted}))
         return
     }
 
@@ -2746,12 +2908,13 @@ const httpServer = createServer(async (req, res) => {
             res.end(JSON.stringify({error: 'session not found'}));
             return
         }
-        const scan = scanWorkdirFiles(s.workDir)
+        const scan = currentFileScan(s.workDir, s.snapshot)
         if (scan.missing) {
             res.writeHead(200);
             res.end(JSON.stringify({
                 workDir: s.workDir,
                 hasSnapshot: !!s.snapshot,
+                gitInfo: s.snapshot?.gitHead || null,
                 missing: true,
                 files: [],
                 truncated: false
@@ -2787,6 +2950,7 @@ const httpServer = createServer(async (req, res) => {
             workDir: s.workDir,
             hasSnapshot: !!s.snapshot,
             snapshotAt: s.snapshot?.takenAt || null,
+            gitInfo: s.snapshot?.gitHead || null,
             truncated: scan.truncated,
             files
         }))
@@ -3176,6 +3340,12 @@ const httpServer = createServer(async (req, res) => {
                 s.snapshot = buildFileSnapshot(s.workDir)   // SIDE_EFFECT: 新基线=当前
             }
 
+            // ── Git 提交消息收集：在清空记录点前提取 prompt 和文件列表 ──
+            const originalCps = s.checkpoints ? [...s.checkpoints] : []
+            const committedCps = selectedFiles
+                ? originalCps.filter(cp => cp.files.some(f => selectedFiles.has(f.path)))
+                : originalCps
+
             // 记录点处理：选择性提交时只移除已提交文件，保留仍有未提交文件的记录点
             if (selectedFiles) {
                 const cps = s.checkpoints || []
@@ -3195,13 +3365,59 @@ const httpServer = createServer(async (req, res) => {
 
             saveSnapshot(s, commitM[1])
             saveCheckpoints(s, commitM[1])
-            // 提交不改磁盘文件，无需重建缓存（maybeUpdateProjectCache 已在回合结束时处理）
+
+            // ── Git 自动提交 ──
+            let gitCommit = null
+            try {
+                const gitDir = execSync('git rev-parse --git-dir', {
+                    cwd: s.workDir, encoding: 'utf8', timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
+                }).trim()
+                if (gitDir) {
+                    // 收集提交信息：记录点 prompt 作标题 + 变更文件清单
+                    const prompts = [...new Set(committedCps.map(cp => cp.prompt).filter(Boolean))]
+                    const subject = prompts[0] || 'checkpoint commit'
+
+                    const fileSet = new Map()
+                    for (const cp of committedCps) {
+                        for (const f of cp.files) {
+                            if (selectedFiles && !selectedFiles.has(f.path)) continue
+                            if (!fileSet.has(f.path)) fileSet.set(f.path, f.status)
+                        }
+                    }
+                    const fileLines = [...fileSet.entries()]
+                        .map(([p, st]) => {
+                            const prefix = st === 'added' ? 'A' : st === 'deleted' ? 'D' : 'M'
+                            return `${prefix} ${p}`
+                        })
+                        .join('\n')
+
+                    const bodyParts = [subject]
+                    if (prompts.length > 1) bodyParts.push('', ...prompts.slice(1).map(p => `- ${p}`))
+                    if (fileLines) bodyParts.push('', fileLines)
+
+                    execSync('git add -A', {cwd: s.workDir, encoding: 'utf8', timeout: 10000, stdio: ['pipe', 'pipe', 'pipe']})
+                    // 多行消息用多个 -m 参数，跨平台安全
+                    const msgArgs = bodyParts.map(part => `-m ${JSON.stringify(part)}`).join(' ')
+                    execSync(`git commit ${msgArgs} --allow-empty-message`, {
+                        cwd: s.workDir, encoding: 'utf8', timeout: 10000, stdio: ['pipe', 'pipe', 'pipe']
+                    })
+                    const hash = execSync('git rev-parse --short HEAD', {
+                        cwd: s.workDir, encoding: 'utf8', timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
+                    }).trim()
+                    gitCommit = {hash, subject}
+                    log.info({sessionId: commitM[1]?.slice(0, 8), hash, subject}, 'Git 自动提交')
+                }
+            } catch (_) {
+                // 非 git 仓库 / git 不可用 / 无改动可提交：静默跳过
+            }
+
             res.writeHead(200);
             res.end(JSON.stringify({
                 ok: true,
                 snapshotAt: s.snapshot.takenAt,
                 fileCount: selectedFiles ? selectedFiles.size : s.snapshot.files.size,
-                keptCheckpoints: selectedFiles ? (s.checkpoints || []).length : 0
+                keptCheckpoints: selectedFiles ? (s.checkpoints || []).length : 0,
+                gitCommit
             }))
         } catch (e) {
             res.writeHead(500);
@@ -4990,7 +5206,8 @@ const httpServer = createServer(async (req, res) => {
         try {
             for (const ed of readdirSync(bp)) {
                 // 跳过非项目目录（无 jsonl session 记录）
-                const jls = readdirSync(join(bp, ed)).filter(f => f.endsWith('.jsonl'));
+                // 过滤子 agent 转录文件，仅以主 session .jsonl 判断项目存在性
+                const jls = readdirSync(join(bp, ed)).filter(f => f.endsWith('.jsonl') && !f.startsWith('.trash-') && !f.startsWith('agent-') && !f.startsWith('wf-agent-'));
                 if (!jls.length) continue;
                 const md = join(bp, ed, 'memory');
                 const fl = existsSync(md) ? readdirSync(md).filter(f => f.endsWith('.md')) : [];
@@ -5251,6 +5468,31 @@ const httpServer = createServer(async (req, res) => {
         }
         return
     }
+    // POST /api/workflows/:name/agents/:label/stop → 单 agent 独立暂停
+    const wfAgentStopM = url.pathname.match(/^\/api\/workflows\/([^/]+)\/agents\/([^/]+)\/stop$/)
+    if (req.method === 'POST' && wfAgentStopM) {
+        const wfName = decodeURIComponent(wfAgentStopM[1])
+        const agentLabel = decodeURIComponent(wfAgentStopM[2])
+        const state = getRunState(wfName)
+        if (!state) { res.writeHead(404); res.end(JSON.stringify({error: 'workflow 未运行'})); return }
+        const wfId = state.wfId
+        const ok = stopWorkflowAgent(wfId, agentLabel)
+        res.writeHead(ok ? 200 : 404);
+        res.end(JSON.stringify({ok, agentLabel}))
+        return
+    }
+    // POST /api/workflows/:name/agents/:label/resume → 单 agent 独立恢复
+    const wfAgentResumeM = url.pathname.match(/^\/api\/workflows\/([^/]+)\/agents\/([^/]+)\/resume$/)
+    if (req.method === 'POST' && wfAgentResumeM) {
+        const wfName = decodeURIComponent(wfAgentResumeM[1])
+        const agentLabel = decodeURIComponent(wfAgentResumeM[2])
+        const state = getRunState(wfName)
+        if (!state) { res.writeHead(404); res.end(JSON.stringify({error: 'workflow 未运行'})); return }
+        const ok = resumeWorkflowAgent(state.wfId, agentLabel)
+        res.writeHead(ok ? 200 : 404)
+        res.end(JSON.stringify({ok, agentLabel}))
+        return
+    }
     const wfFileM = url.pathname.match(/^\/api\/workflows\/([^/]+)$/)
     if (wfFileM) {
         const name = decodeURIComponent(wfFileM[1])
@@ -5419,6 +5661,8 @@ wss.on('connection', (ws, req) => {
             }
             s.query = null;
             s.pushStream = null;
+            // 中止前结算记录点：preSnapshot 已就绪时立即 diff，不漏掉本轮已完成的文件修改
+            try { finalizeCheckpoint(sessionId) } catch {}
             s.pendingTurn = null  // 清理未完成的回合快照，防止内存泄漏 + finalizeCheckpoint 误判
             // 清理并发 rebuild 状态: 防止 rebuild finally 块把刚清掉的 pushStream 重新写入
             // 注: 清 _pendingMessages 符合 stop=取消 语义；同时失效 _rebuildId 让在途旧 rebuild
@@ -5430,6 +5674,22 @@ wss.on('connection', (ws, req) => {
             ws.send(JSON.stringify({type: 'generation_stopped'}))
             return
         }
+        // 即时权限切换: 更新 session 并自动通过所有 pending 权限请求
+        if (msg.type === 'setting_change') {
+            const newPerm = msg.permissionMode
+            if (newPerm && newPerm !== s.permissionMode) {
+                s.permissionMode = newPerm
+                log.info({sessionId: sessionId?.slice(0,8), permissionMode: newPerm}, 'permissionMode 变更 (即时)')
+                if (newPerm === 'bypassPermissions' && s.pending) {
+                    for (const [rid, entry] of s.pending) {
+                        if (entry.type === 'permission') {
+                            settlePending(sessionId, rid, {behavior: 'allow', updatedInput: entry.input}, 'auto')
+                        }
+                    }
+                }
+            }
+            return
+        }
         // 桌面端权限/方案选择响应
         if (msg.type === 'permission_response' && msg.requestId) {
             const entry = s.pending?.get(msg.requestId)
@@ -5438,7 +5698,7 @@ wss.on('connection', (ws, req) => {
         }
         if (msg.type === 'choice_response' && msg.requestId) {
             const entry = s.pending?.get(msg.requestId)
-            if (entry) settlePending(sessionId, msg.requestId, decisionToResult(entry, null, msg.optionIndex, msg.questionIndex), 'desktop')
+            if (entry) settlePending(sessionId, msg.requestId, decisionToResult(entry, null, msg.optionIndex, msg.questionIndex, msg.customText), 'desktop')
             return
         }
         if (msg.type === 'user_message' && msg.content) {
@@ -5550,6 +5810,7 @@ wss.on('connection', (ws, req) => {
                         if (s.runtimeEnv?.ANTHROPIC_BASE_URL) bodyOverride.baseUrl = s.runtimeEnv.ANTHROPIC_BASE_URL
                         if (s.runtimeEnv?.ANTHROPIC_AUTH_TOKEN) bodyOverride.apiKey = s.runtimeEnv.ANTHROPIC_AUTH_TOKEN
                         const opts = await makeQueryOptions(bodyOverride, s.workDir, cliS, {}, sessionId)
+                        if (bodyOverride.resume) opts.resume = bodyOverride.resume
                         s.query = query({prompt: s.pushStream, options: opts})
                         s.runtimeEnv = opts.runtimeEnv  // 模型变更重建后刷新 runtimeEnv
                         startStreamPump(sessionId)
@@ -5697,20 +5958,53 @@ let _scanningProjects = null
 // 1) deleteSessionFiles rename 后 SDK 进程残留重建了 JSONL
 // 2) 扫描与 DELETE 并发：扫描完成写回缓存时 DELETE 还未执行到 invalidate
 // 3) 缓存命中：返回缓存结果时其中包含已删除的会话（缓存 10s 内的旧快照）
-const _deletedSessionIds = new Map()  // sessionId → expiresAt
+// 持久化到 bridge-deleted-sessions.json，Gateway 重启不丢失删除标记
+const DELETED_SESSIONS_FILE = join(CLAUDE_HOME, 'bridge-deleted-sessions.json')
+const _deletedSessionIds = new Map()
+
+// 启动时从磁盘恢复删除标记
+try {
+    const saved = readJSON(DELETED_SESSIONS_FILE)
+    if (Array.isArray(saved)) {
+        const now = Date.now()
+        for (const [sid, expiresAt] of saved) {
+            if (expiresAt > now) _deletedSessionIds.set(sid, expiresAt)
+        }
+    }
+} catch {}
+
+let _deletedDirty = false
+let _deletedPersistScheduled = false
+function _schedulePersistDeleted() {
+    _deletedDirty = true
+    if (!_deletedPersistScheduled) {
+        _deletedPersistScheduled = true
+        setImmediate(() => {
+            _deletedPersistScheduled = false
+            if (_deletedDirty) {
+                _deletedDirty = false
+                try {
+                    writeFileSync(DELETED_SESSIONS_FILE, JSON.stringify([..._deletedSessionIds], null, 2))
+                } catch {}
+            }
+        })
+    }
+}
 
 function markSessionDeleted(sessionId) {
-    _deletedSessionIds.set(sessionId, Date.now() + 120_000)  // 2 分钟窗口
+    _deletedSessionIds.set(sessionId, Date.now() + 600_000)  // 10 分钟窗口，容忍 SDK 进程退出滞后
     if (_deletedSessionIds.size > 500) {  // 惰性清理，防内存泄漏
         const now = Date.now()
         for (const [k, v] of _deletedSessionIds) { if (v < now) _deletedSessionIds.delete(k) }
     }
+    _schedulePersistDeleted()
 }
 
 function filterDeletedSessions(projects) {
     let dirty = false
     const now = Date.now()
     for (const [k, v] of _deletedSessionIds) { if (v < now) { _deletedSessionIds.delete(k); dirty = true } }
+    if (dirty) _schedulePersistDeleted()
     if (_deletedSessionIds.size === 0 && !dirty) return projects
     for (const p of projects) {
         const before = p.sessions.length
@@ -5746,27 +6040,80 @@ async function scanProjects() {
                     try { renameSync(join(full, f), trashPath) } catch {}
                     return false
                 }
+                // 过滤子 agent 转录文件（SDK Task tool subagent → agent-*.jsonl；
+                // workflow agent → wf-agent-*.jsonl），避免被当作独立 session 展示
+                if (sid.startsWith('agent-') || sid.startsWith('wf-agent-')) return false
                 return true
             })
                 .map(f => ({name: f, mtime: statSync(join(full, f)).mtimeMs}))
                 .sort((a, b) => b.mtime - a.mtime)
                 .map(f => f.name);
-            if (!files.length) continue
+            // ── 二次过滤: 基于 session-map + content 排除 agent session ──
+            // SDK 的 query() 会为每个 conversation 创建 UUID.jsonl，
+            // workflow agent / SDK Task tool subagent 也会产生独立 jsonl 文件。
+            // 这里通过 bridge-session-map.json 白名单 + 内容标记双重过滤。
+            let _agentSdkIds, _mainSdkIds, _hasSm
+            try {
+                const smPath = join(full, 'bridge-session-map.json')
+                if (existsSync(smPath)) {
+                    const sm = JSON.parse(readFileSync(smPath, 'utf8'))
+                    _agentSdkIds = new Set(); _mainSdkIds = new Set(); _hasSm = true
+                    for (const [k, v] of Object.entries(sm)) {
+                        if (k.startsWith('@rev:')) continue
+                        if (k.startsWith('wf-agent-') || k.startsWith('agent-')) _agentSdkIds.add(v)
+                        else _mainSdkIds.add(v)
+                    }
+                }
+            } catch {}
+            function _isAgentSession(sid, filePath) {
+                // session-map 白名单: 已知主会话 → 放行；已知 agent → 拒绝
+                if (_hasSm) {
+                    if (_mainSdkIds.has(sid)) return false
+                    if (_agentSdkIds.has(sid)) return true
+                }
+                // 兜底: 内容检测 — 读第一行 JSON 查 SDK subagent 标记
+                try {
+                    const hd = readFileHeadLines(filePath, 2048)
+                    for (const line of hd) {
+                        if (!line.trim()) continue
+                        try {
+                            const obj = JSON.parse(line)
+                            if (obj.isSidechain === true) return true
+                            // agentId + parentUuid 是 SDK subagent 的特征字段组合
+                            if (obj.agentId && obj.parentUuid !== undefined) return true
+                        } catch {}
+                        break // 只检查第一条可解析的 JSON
+                    }
+                } catch {}
+                return false
+            }
+            const filteredFiles = []
+            for (const f of files) {
+                const sid = f.replace('.jsonl', '')
+                if (!_isAgentSession(sid, join(full, f))) filteredFiles.push(f)
+            }
+            const filesArr = filteredFiles
+            // 日志: 过滤掉了多少 agent session
+            if (filteredFiles.length < files.length) {
+                log.info({dir: name, total: files.length, kept: filteredFiles.length, filtered: files.length - filteredFiles.length}, 'scanProjects 过滤 agent session')
+            }
+            // ── 二次过滤结束，后续使用 filesArr ──
+            if (!filesArr.length) continue
             // 遍历所有 jsonl 找 cwd，不只看最新的（删除后最新文件可能缺 cwd）
             let wd = null
-            for (const fn of files) {
+            for (const fn of filesArr) {
                 try {
                     const head = readFileHeadLines(join(full, fn), 4096);
                     const c = head.join('\n');
                     const m = c.match(/"cwd":\s*"([^"]+)"/);
-                    if (m) { wd = m[1].replace(/\\/g, '/'); break }
+                    if (m) { wd = normalizeWorkDir(m[1]); break }
                 } catch {
                 }
             }
             if (!wd) {
                 wd = decodeProjectName(name) || name
             }
-            const sds = files.map(f => {
+            const sds = filesArr.map(f => {
                 const id = f.replace('.jsonl', '');
                 let t = id.slice(0, 8);
                 try {
@@ -5792,16 +6139,16 @@ async function scanProjects() {
                     if (!ex.sessions.find(es => es.id === s.id)) ex.sessions.push(s)
                 }
                 ;ex.sessionCount = ex.sessions.length;
-                const lm = await getLastModified(full, files);
+                const lm = await getLastModified(full, filesArr);
                 if (lm > (ex.lastActive || 0)) ex.lastActive = lm;
                 continue
             }
             results.push({
                 workDir: wd,
                 encodedDir: name,
-                sessionCount: files.length,
+                sessionCount: filesArr.length,
                 sessions: sds,
-                lastActive: await getLastModified(full, files)
+                lastActive: await getLastModified(full, filesArr)
             })
         }
     } catch {
@@ -5820,36 +6167,57 @@ async function scanProjects() {
  * 为 .trash- 前缀让 scanProjects 自动跳过，后台残留进程最终退出后文件自然清理。
  */
 async function deleteSessionFiles(sessionId) {
+    // 文件删除交给 SDK deleteSession，保证 .jsonl + subagents/ 子目录全清
     const projectsDir = join(CLAUDE_HOME, 'projects')
     let entries
     try { entries = readdirSync(projectsDir) } catch { return }
-    const targets = []
     for (const e of entries) {
-        const p = join(projectsDir, e, sessionId + '.jsonl')
-        if (existsSync(p)) targets.push(p)
+        try {
+            const wd = decodeProjectName(e)
+            if (!wd) continue
+            const sdkDir = join(projectsDir, e)
+            try { await deleteSession(sessionId, {dir: sdkDir}) } catch {}
+        } catch {}
     }
-    for (const p of targets) {
-        // 先尝试直接删除，指数退避重试
-        for (let attempt = 0, delay = 200; attempt < 8; attempt++) {
-            try {
-                unlinkSync(p)
-                break
-            } catch (e) {
-                if (attempt === 7) {
-                    // 最终回退: rename 为 .trash- 标记，scanProjects 会跳过
-                    try {
-                        const trash = join(dirname(p), `.trash-${Date.now()}-${sessionId}.jsonl`)
-                        renameSync(p, trash)
-                        log.warn({module: 'gateway'}, `无法删除会话文件，已标记为 trash session=${sessionId} path=${basename(p)}`)
-                    } catch (e2) {
-                        log.error({module: 'gateway'}, `删除/重命名会话文件均失败 session=${sessionId} — ${e2.message}`)
-                    }
-                    return
+    // 清理 bridge-session-map 中的映射条目，防止映射文件无限增长
+    for (const e of entries) {
+        try {
+            const wd = decodeProjectName(e)
+            if (!wd) continue
+            const map = loadSessionMap(wd)
+            let dirty = false
+            // 正向: gatewayUUID → sdkId
+            if (map[sessionId] !== undefined) { delete map[sessionId]; dirty = true }
+            // 反向: @rev:sdkId → gatewayUUID
+            const rk = '@rev:' + sessionId
+            if (map[rk] !== undefined) { delete map[rk]; dirty = true }
+            // sessionId 本身可能是 SDK ID，查找以它为 value 的正向条目
+            for (const [k, v] of Object.entries(map)) {
+                if (v === sessionId && !k.startsWith('@rev:')) {
+                    const revK = '@rev:' + v
+                    if (map[revK] !== undefined) { delete map[revK]; dirty = true }
+                    delete map[k]; dirty = true
                 }
-                await new Promise(r => setTimeout(r, delay))
-                delay = Math.min(delay * 2, 2000)
             }
-        }
+            if (dirty) saveSessionMap(wd, map)
+        } catch {}
+    }
+    // 清理基线快照 (bridge-snapshot/{gwSid}.json)
+    // 需要同时尝试 sessionId 本身和 session-map 反查到的 gatewayUUID
+    for (const e of entries) {
+        const sp1 = join(projectsDir, e, 'bridge-snapshot', sessionId + '.json')
+        try { if (existsSync(sp1)) unlinkSync(sp1) } catch {}
+        try {
+            const wd = decodeProjectName(e)
+            if (wd) {
+                const map = loadSessionMap(wd)
+                const gw = map['@rev:' + sessionId]
+                if (gw) {
+                    const sp2 = join(projectsDir, e, 'bridge-snapshot', gw + '.json')
+                    try { if (existsSync(sp2)) unlinkSync(sp2) } catch {}
+                }
+            }
+        } catch {}
     }
 }
 function invalidateProjectsCache() { _projectsCache = null }
@@ -5858,7 +6226,7 @@ async function listProjectSessions(ed) {
     const base = join(CLAUDE_HOME, 'projects', ed);
     const r = []
     try {
-        for (const f of readdirSync(base).filter(x => x.endsWith('.jsonl') && !x.startsWith('.trash-'))) {
+        for (const f of readdirSync(base).filter(x => x.endsWith('.jsonl') && !x.startsWith('.trash-') && !x.startsWith('agent-') && !x.startsWith('wf-agent-'))) {
             const id = f.replace('.jsonl', '');
             const st = statSync(join(base, f));
             let t = id.slice(0, 8);
@@ -6020,6 +6388,82 @@ function scanWorkdirFiles(workDir) {
     return {files, truncated, missing: false}
 }
 
+// ── getGitHead — 获取当前 HEAD 的 branch/hash/shortHash ──
+function getGitHead(workDir) {
+    try {
+        const branch = execSync('git rev-parse --abbrev-ref HEAD', {
+            cwd: workDir, encoding: 'utf8', timeout: 3000,
+            stdio: ['pipe', 'pipe', 'pipe']
+        }).trim()
+        const hash = execSync('git rev-parse HEAD', {
+            cwd: workDir, encoding: 'utf8', timeout: 3000,
+            stdio: ['pipe', 'pipe', 'pipe']
+        }).trim()
+        return {branch, hash, shortHash: hash.slice(0, 7)}
+    } catch { return null }
+}
+
+// ── scanGitFiles — git ls-files 获取文件列表，自动遵从 .gitignore ──
+// 返回格式与 scanWorkdirFiles 完全一致，失败返回 null
+function scanGitFiles(workDir) {
+    try {
+        const out = execSync(
+            'git ls-files --cached --others --exclude-standard --full-name -z',
+            {cwd: workDir, encoding: 'utf8', timeout: 10000,
+             maxBuffer: 10 * 1024 * 1024,
+             stdio: ['pipe', 'pipe', 'pipe']}
+        )
+        const files = []
+        for (const raw of out.split('\0')) {
+            if (files.length >= MAX_SNAP_FILES) break
+            const path = raw.trim()
+            if (!path) continue
+            const topDir = path.split('/')[0]
+            if (SNAP_EXCLUDE_DIRS.has(topDir)) continue
+            try {
+                const s = statSync(join(workDir, path))
+                if (!s.isFile()) continue
+                files.push({path: path.replace(/\\/g, '/'), size: s.size,
+                            mtimeMs: s.mtimeMs, binary: isBinaryPath(path)})
+            } catch { /* 已删除文件跳过 */ }
+        }
+        return {files, truncated: files.length >= MAX_SNAP_FILES, missing: false}
+    } catch { return null }
+}
+
+// ── buildGitSnapshot — git 仓库文件快照（内容走磁盘读，避免 CRLF/LF 误判）──
+// 与 buildFileSnapshot 的区别：文件列表来自 git ls-files（尊重 .gitignore），
+// 返回值多 gitHead 字段。内容读取完全一致（readFileSync）。
+// 任一步 git 命令失败 → 返回 null，由 buildFileSnapshot 回退磁盘扫描
+function buildGitSnapshot(workDir, baseline) {
+    const gitHead = getGitHead(workDir)
+    if (!gitHead) return null
+    const scan = scanGitFiles(workDir)
+    if (!scan) return null
+
+    const map = new Map()
+    const baseFiles = baseline?.files
+    for (const f of scan.files) {
+        if (f.binary) { map.set(f.path, {binary: true, size: f.size}); continue }
+        if (f.size > MAX_SNAP_FILE_BYTES) { map.set(f.path, {binary: false, tooLarge: true, size: f.size}); continue }
+
+        const prev = baseFiles?.get(f.path)
+        if (prev && !prev.readError && !prev.tooLarge
+            && prev.size === f.size && prev.mtimeMs === f.mtimeMs
+            && typeof prev.content === 'string') {
+            map.set(f.path, prev); continue
+        }
+        try {
+            const content = readFileSync(join(workDir, f.path), 'utf8')
+            map.set(f.path, {binary: false, content, size: f.size, mtimeMs: f.mtimeMs,
+                lines: content.length ? content.split('\n').length : 0})
+        } catch {
+            map.set(f.path, {binary: false, readError: true, size: f.size, mtimeMs: f.mtimeMs})
+        }
+    }
+    return {takenAt: Date.now(), files: map, truncated: scan.truncated, gitHead}
+}
+
 // ── buildFileSnapshot — 工作目录文件快照构建（支持增量优化）──
 // 功能说明: 为工作目录创建完整文件内容快照，用作每个 session 的 diff 基线
 //   文本文件存储完整内容 + sha256 hash；二进制文件仅存元信息(size, lastModified)；超大文件跳过内容
@@ -6027,8 +6471,22 @@ function scanWorkdirFiles(workDir) {
 //   增量模式(传 baseline): baseline 有该文件且 size+mtimeMs 都未变 → 沿用 content 不重读
 //   mtimeMs 缺失或 baseline 无该文件 → 重读，安全降级到全量
 // SIDE_EFFECT: 无（只读文件系统）；返回对象会挂到 session.snapshot
+// ── currentFileScan — 统一文件扫描入口，与 snapshot 来源对齐 ──
+// snapshot 是 git 构建的就用 git ls-files，否则磁盘扫描，保证 diff 时文件列表一致
+function currentFileScan(workDir, snapshot) {
+    if (snapshot?.gitHead) {
+        const scan = scanGitFiles(workDir)
+        if (scan) return scan
+    }
+    return scanWorkdirFiles(workDir)
+}
+
 // 关键数据流: scanWorkdirFiles() → 读文件+hash → snapshot{files:{path,content?,hash?,size?,binary?,mtime?},fileMap{}}
 function buildFileSnapshot(workDir, baseline) {
+    // 尝试 git 快照（原子操作：任一步失败则回退磁盘扫描）
+    const gitSnap = buildGitSnapshot(workDir, baseline)
+    if (gitSnap) return gitSnap
+
     const {files, truncated} = scanWorkdirFiles(workDir)
     const map = new Map()
     const baseFiles = baseline?.files  // 上次快照的 Map(含 content)，未变动文件直接复用避免重读
@@ -6254,6 +6712,32 @@ function lookupGatewaySessionId(workDir, sdkSessionId) {
     return map['@rev:' + sdkSessionId] || null
 }
 
+// 兜底搜索：path 编码不一致时，跨所有项目目录查找指定 .jsonl
+//   验证其 cwd 与给定 workDir 匹配（规范化后忽略大小写），返回 true 表示找到
+function findSessionJsonl(sessionId, workDir) {
+    const projectsDir = join(CLAUDE_HOME, 'projects')
+    const targetFile = sessionId + '.jsonl'
+    const normWd = normalizeWorkDir(workDir).toLowerCase()
+    try {
+        for (const entry of readdirSync(projectsDir)) {
+            const full = join(projectsDir, entry)
+            if (!statSync(full).isDirectory()) continue
+            const jlPath = join(full, targetFile)
+            if (!existsSync(jlPath)) continue
+            // 校验 cwd 匹配：从 .jsonl 读取 cwd 字段并规范化后比较
+            try {
+                const head = readFileHeadLines(jlPath, 4096).join('\n')
+                const m = head.match(/"cwd":\s*"([^"]+)"/)
+                if (m && normalizeWorkDir(m[1]).toLowerCase() === normWd) return true
+            } catch {}
+            // 兜底：decodeProjectName 从目录名还原比较
+            const decoded = decodeProjectName(entry)
+            if (decoded && normalizeWorkDir(decoded).toLowerCase() === normWd) return true
+        }
+    } catch {}
+    return false
+}
+
 // ── 基线快照持久化（让文件面板「仅改动」在重启/resume 后仍以会话起始为基线）──
 // SIDE_EFFECT: 读写 bridge-snapshot/<sessionId>.json
 function snapshotStorePath(workDir, sessionId) {
@@ -6269,6 +6753,7 @@ function saveSnapshot(s, sessionId) {
         const obj = {
             takenAt: s.snapshot.takenAt,
             truncated: s.snapshot.truncated,
+            gitHead: s.snapshot.gitHead || undefined,
             files: [...s.snapshot.files.entries()]
         }
         writeFileSync(fp, JSON.stringify(obj), 'utf8')
@@ -6280,7 +6765,7 @@ function saveSnapshot(s, sessionId) {
 function loadSnapshot(workDir, sessionId) {
     const d = readJSON(snapshotStorePath(workDir, sessionId))
     if (!d || !Array.isArray(d.files)) return null
-    return {takenAt: d.takenAt, truncated: !!d.truncated, files: new Map(d.files)}
+    return {takenAt: d.takenAt, truncated: !!d.truncated, gitHead: d.gitHead || undefined, files: new Map(d.files)}
 }
 
 // 记录点落盘路径：~/.claude/projects/<encoded>/bridge-checkpoints/<sessionId>.json
@@ -6334,6 +6819,7 @@ function beginTurn(sessionId, prompt) {
         try {
             if (!snapSession.pendingTurn || snapSession.pendingTurn._turnId !== turnId) return
             snapSession.pendingTurn.preSnapshot = buildFileSnapshot(snapSession.workDir, snapSession.snapshot)
+            log.info({sessionId: sessionId?.slice(0,8), gitHead: !!snapSession.pendingTurn.preSnapshot?.gitHead, fileCount: snapSession.pendingTurn.preSnapshot?.files?.size}, '[beginTurn] 快照已构建')
         } catch (e) {
             log.warn({err: e}, 'beginTurn snapshot 失败');
             if (snapSession.pendingTurn && snapSession.pendingTurn._turnId === turnId) {
@@ -6356,12 +6842,11 @@ function beginTurn(sessionId, prompt) {
 // SIDE_EFFECT: mutates session.checkpoints/snapshot/pendingTurn + 落盘 bridge-checkpoints/<sessionId>.json
 function finalizeCheckpoint(sessionId) {
     const s = sessions.get(sessionId);
-    if (!s || !s.pendingTurn) return
-    // 异步快照通常已就绪（beginTurn setImmediate 远早于 result 事件），
-    // 极端情况（result 在 setImmediate 之前到达）降级为同步构建
+    if (!s || !s.pendingTurn) { log.info({sessionId: sessionId?.slice(0,8), hasSession: !!s, hasPendingTurn: !!s?.pendingTurn}, '[ckpt] 跳过: 无会话或无 pendingTurn'); return }
     if (!s.pendingTurn.preSnapshot) {
         try {
             s.pendingTurn.preSnapshot = buildFileSnapshot(s.workDir, s.snapshot)
+            log.info({sessionId: sessionId?.slice(0,8), gitHead: !!s.pendingTurn.preSnapshot?.gitHead}, '[ckpt] 降级同步构建快照')
         } catch (e) {
             log.warn({err: e}, 'finalizeCheckpoint snapshot 降级构建失败');
             s.pendingTurn = null
@@ -6372,9 +6857,9 @@ function finalizeCheckpoint(sessionId) {
     const prompt = s.pendingTurn.prompt;
     const time = s.pendingTurn.time
     s.pendingTurn = null
-    if (!pre) return
-    const scan = scanWorkdirFiles(s.workDir)
-    if (scan.missing) return
+    if (!pre) { log.info({sessionId: sessionId?.slice(0,8)}, '[ckpt] 跳过: preSnapshot 为空'); return }
+    const scan = currentFileScan(s.workDir, pre)
+    if (scan.missing) { log.info({sessionId: sessionId?.slice(0,8)}, '[ckpt] 跳过: 工作目录不存在'); return }
     const diffMap = diffSnapshotVsCurrent(pre, scan.files, s.workDir)
     const files = []
     let revertible = true
@@ -6394,10 +6879,11 @@ function finalizeCheckpoint(sessionId) {
         }
         files.push({path, status: d.status, before, notRevertible, added: d.added, removed: d.removed})
     }
-    if (!files.length) return  // 本轮没动文件，不建记录点
+    if (!files.length) { log.info({sessionId: sessionId?.slice(0,8), totalDiff: diffMap.size, gitHead: !!pre?.gitHead}, '[ckpt] 跳过: 本轮未改动文件'); return }  // 本轮没动文件，不建记录点
     if (!s.checkpoints) s.checkpoints = []
     s.checkpointSeq = (s.checkpointSeq || 0) + 1
     s.checkpoints.push({id: `cp-${s.checkpointSeq}`, prompt, time, files, revertible})
+    log.info({sessionId: sessionId?.slice(0,8), cpId: `cp-${s.checkpointSeq}`, fileCount: files.length, gitHead: !!pre?.gitHead}, '[ckpt] 记录点已创建')
     // 裁剪上限，防止长会话无界增长
     if (s.checkpoints.length > 50) s.checkpoints.splice(0, s.checkpoints.length - 50)
     // 异步落盘：in-memory checkpoints 已更新，API 立即可见；磁盘 I/O 不阻塞 result 广播

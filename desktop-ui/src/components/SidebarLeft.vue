@@ -47,6 +47,10 @@ defineProps<{
   filteredHiddenProjects: Project[]
   /** 隐藏区是否展开 */
   showHiddenSection: boolean
+  /** 批量管理模式 */
+  batchMode: boolean
+  /** 已选中的 session ID 集合 */
+  selectedSessions: Set<string>
 }>()
 
 // ═══════════════════════════════════════════
@@ -65,6 +69,10 @@ const emit = defineEmits<{
   (e: 'toggleHiddenSection'): void
   (e: 'toggleShowAll', workDir: string): void
   (e: 'toggleShowAllProjects'): void
+  (e: 'toggleBatchMode'): void
+  (e: 'toggleSelect', sid: string): void
+  (e: 'toggleSelectAll', workDir: string, allIds: string[]): void
+  (e: 'batchDelete'): void
 }>()
 
 // ═══════════════════════════════════════════
@@ -99,7 +107,7 @@ function visibleSessions(p: Project, showAllSessions: Set<string>, pageSize: num
     侧栏 (Sidebar)：左侧 380px 固定宽度
     - 顶部：品牌 Logo + 设置按钮
     - 中部：搜索框 + 新增项目按钮 + 项目列表（含会话子列表）
-    - 底部：Gateway 连接状态指示器
+    - 底部：批量操作栏 / Agent 状态 / Gateway 连接状态指示器
   -->
   <aside class="sidebar">
     <!-- 顶部：品牌标识 + 设置入口 -->
@@ -138,10 +146,21 @@ function visibleSessions(p: Project, showAllSessions: Set<string>, pageSize: num
       </button>
     </div>
 
-    <!-- 项目列表区域 -->
-    <div class="project-list">
-      <div class="list-header">
-        <span>{{ t('ws.projects') }}</span>
+    <!-- 项目列表标题 + 批量管理入口 -->
+    <div class="list-header">
+      <span>{{ t('ws.projects') }}</span>
+      <div class="list-header-actions">
+        <button v-if="!batchMode" class="icon-btn-sm" :title="t('ws.batchMode')" @click="emit('toggleBatchMode')">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <path d="M9 11l3 3L22 4"/>
+            <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
+          </svg>
+        </button>
+        <button v-else class="icon-btn-sm exit-batch" :title="t('ws.exitBatchMode')" @click="emit('toggleBatchMode')">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
         <button class="icon-btn-sm" :title="t('ws.refreshReorder')" @click="emit('loadProjects', true)">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <polyline points="23 4 23 10 17 10"/>
@@ -149,6 +168,10 @@ function visibleSessions(p: Project, showAllSessions: Set<string>, pageSize: num
           </svg>
         </button>
       </div>
+    </div>
+
+    <!-- 项目列表区域 -->
+    <div class="project-list">
 
       <!-- 搜索无匹配 -->
       <div v-if="filteredProjects.length === 0 && searchText" class="empty-hint">{{ t('ws.noMatch') }}</div>
@@ -192,20 +215,33 @@ function visibleSessions(p: Project, showAllSessions: Set<string>, pageSize: num
           </button>
         </div>
 
+        <!-- 批量模式全选按钮 -->
+        <div v-if="batchMode && p.sessions.length > 0" class="batch-select-all-row">
+          <button class="batch-select-all-btn" @click.stop="emit('toggleSelectAll', p.workDir, p.sessions.map(s => s.id))">
+            {{ p.sessions.every(s => selectedSessions.has(s.id)) ? t('ws.deselectAll') : t('ws.selectAll') }}
+          </button>
+        </div>
+
         <!-- 会话子列表 -->
         <div v-if="expandedProjects.has(p.workDir)" class="session-sublist">
           <div v-for="s in visibleSessions(p, showAllSessions, sessionPageSize)" :key="s.id"
                class="session-item"
                :class="{ selected: $props.activeSessionId === s.id }"
-               @click.stop="emit('newSession', p.workDir, p.encodedDir, s.id)">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+               @click.stop="batchMode ? emit('toggleSelect', s.id) : emit('newSession', p.workDir, p.encodedDir, s.id)">
+            <!-- 批量模式：多选框；普通模式：对话气泡图标 -->
+            <label v-if="batchMode" class="batch-checkbox" @click.stop>
+              <input type="checkbox" :checked="selectedSessions.has(s.id)"
+                     @change="emit('toggleSelect', s.id)" />
+              <span class="checkmark"></span>
+            </label>
+            <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
               <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
             </svg>
             <div class="session-info">
               <div class="session-title">{{ s.title || s.id.slice(0, 8) }}</div>
               <div class="session-id-text">{{ s.id.slice(0, 12) }}</div>
             </div>
-            <button class="session-del" @click.stop="emit('deleteSession', s.id)" :title="t('common.delete')">
+            <button v-if="!batchMode" class="session-del" @click.stop="emit('deleteSession', s.id)" :title="t('common.delete')">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <polyline points="3 6 5 6 21 6"/>
                 <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
@@ -258,8 +294,20 @@ function visibleSessions(p: Project, showAllSessions: Set<string>, pageSize: num
       </div>
     </div>
 
-    <!-- 侧栏底部：Agent 状态 + Gateway 连接状态 -->
+    <!-- 侧栏底部：批量操作栏 / Agent 状态 + Gateway 连接状态 -->
     <div class="sidebar-bottom">
+      <!-- 批量操作栏 -->
+      <div v-if="batchMode" class="batch-bar">
+        <span class="batch-count">{{ selectedSessions.size }} 个已选</span>
+        <button class="batch-delete-btn" :disabled="selectedSessions.size === 0"
+                @click="emit('batchDelete')">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <polyline points="3 6 5 6 21 6"/>
+            <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+          </svg>
+          {{ t('common.delete') }}
+        </button>
+      </div>
       <div v-if="hasRunningAgent" class="subagent-panel-mini">
         <span class="subagent-panel-mini-dot"></span>
         <span>{{ runningAgentCount }} agent running</span>
@@ -278,14 +326,14 @@ function visibleSessions(p: Project, showAllSessions: Set<string>, pageSize: num
 <style scoped>
 /* ═══════════ 侧栏 Sidebar ═══════════ */
 .sidebar {
-  width: 380px; background: var(--bg-base);
+  width: 100%; background: var(--bg-base);
   border-right: 1px solid var(--border);
   display: flex; flex-direction: column; flex-shrink: 0;
 }
 
 .sidebar-top {
   display: flex; justify-content: space-between; align-items: center;
-  padding: 18px 18px 14px;
+  padding: 18px 40px 14px 18px;
 }
 
 .app-brand { display: flex; align-items: center; gap: 10px; }
@@ -303,6 +351,8 @@ function visibleSessions(p: Project, showAllSessions: Set<string>, pageSize: num
   display: flex; align-items: center; transition: all .15s;
 }
 .icon-btn:hover, .icon-btn-sm:hover { color: var(--text-primary); background: var(--bg-raised); }
+.exit-batch { color: var(--error); }
+.exit-batch:hover { color: #fff; background: var(--error); }
 
 .search-box {
   display: flex; align-items: center; gap: 8px;
@@ -330,9 +380,10 @@ function visibleSessions(p: Project, showAllSessions: Set<string>, pageSize: num
 
 .list-header {
   display: flex; justify-content: space-between; align-items: center;
-  padding: 4px 8px 8px; font-size: 12px; font-weight: 500;
+  padding: 4px 18px 8px 20px; font-size: 12px; font-weight: 500;
   color: var(--text-muted); text-transform: uppercase; letter-spacing: .5px;
 }
+.list-header-actions { display: flex; gap: 2px; }
 
 .empty-hint { text-align: center; padding: 16px; font-size: 13px; color: var(--text-muted); }
 .empty-state { text-align: center; padding: 40px 16px; color: var(--text-muted); }
@@ -379,6 +430,57 @@ function visibleSessions(p: Project, showAllSessions: Set<string>, pageSize: num
 .project-card:hover .project-hide { opacity: 1; }
 .project-hide:hover { color: var(--accent); background: var(--bg-deep); }
 
+/* ── 批量管理 ── */
+.batch-select-all-row {
+  padding-left: 28px; padding-bottom: 2px;
+}
+.batch-select-all-btn {
+  background: none; border: none; color: var(--accent-blue);
+  font-size: 11px; cursor: pointer; padding: 2px 4px; border-radius: 4px;
+}
+.batch-select-all-btn:hover { text-decoration: underline; }
+
+.batch-checkbox {
+  display: flex; align-items: center; cursor: pointer; flex-shrink: 0;
+}
+.batch-checkbox input { display: none; }
+.checkmark {
+  width: 16px; height: 16px; border-radius: 4px;
+  border: 2px solid var(--text-muted);
+  display: flex; align-items: center; justify-content: center;
+  transition: all .15s;
+  position: relative;
+}
+.batch-checkbox input:checked + .checkmark {
+  background: var(--accent-blue); border-color: var(--accent-blue);
+}
+.batch-checkbox input:checked + .checkmark::after {
+  content: ''; position: absolute; left: 4px; top: 2px;
+  width: 5px; height: 8px;
+  border: solid #fff; border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+
+.batch-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 6px 0; margin-bottom: 6px;
+  gap: 8px;
+}
+.batch-count {
+  font-size: 12px; color: var(--text-secondary);
+}
+.batch-delete-btn {
+  display: flex; align-items: center; gap: 4px;
+  background: var(--error); color: #fff; border: none;
+  padding: 6px 12px; border-radius: 6px; font-size: 12px;
+  cursor: pointer; transition: opacity .15s;
+}
+.batch-delete-btn:disabled {
+  opacity: 0.4; cursor: not-allowed;
+}
+.batch-delete-btn:not(:disabled):hover { opacity: 0.85; }
+
+/* ── 会话子列表 ── */
 .session-sublist {
   padding-left: 28px; padding-right: 4px; padding-bottom: 4px;
   display: flex; flex-direction: column; gap: 2px;

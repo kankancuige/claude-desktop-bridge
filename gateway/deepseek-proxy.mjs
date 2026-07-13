@@ -88,8 +88,8 @@ export function startDeepSeekProxy(upstream) {
             handleProxyRequest(req, res, upstreamUrl)
         })
 
-        // 固定端口 8787，供 Claude Desktop settings.json 配置引用
-        const TRY_PORT = 8787
+        // 固定端口 8787，供 Claude Desktop settings.json 配置引用；可通过 BRIDGE_DS_PORT 覆盖
+        const TRY_PORT = parseInt(process.env.BRIDGE_DS_PORT, 10) || 8787
         proxyServer.on('error', (e) => {
             if (e.code === 'EADDRINUSE') {
                 // 固定端口被占 → 直接报错，不静默回退随机端口

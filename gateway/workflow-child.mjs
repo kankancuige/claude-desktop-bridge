@@ -215,7 +215,7 @@ async function runScript(init) {
     try {
         const fn = new Function(
             'agent', 'parallel', 'pipeline', 'staged', 'phase', 'log', 'budget', 'args', 'meta',
-            'console', 'setTimeout', 'clearTimeout',
+            'console', 'setTimeout', 'clearTimeout', 'process',
             'Promise', 'JSON', 'Array', 'Object', 'String', 'Number', 'Boolean',
             'Math', 'Date', 'Error', 'RegExp', 'Map', 'Set',
             'parseInt', 'parseFloat', 'isNaN', 'isFinite',
@@ -231,6 +231,7 @@ async function runScript(init) {
                 warn: (...a) => sandboxLog('[Warn] ' + a.map(String).join(' ')),
             },
             safeSetTimeout, safeClearTimeout,
+            {cwd: () => process.cwd(), env: {}},
             Promise, JSON, Array, Object, String, Number, Boolean,
             Math, Date, Error, RegExp, Map, Set,
             parseInt, parseFloat, isNaN, isFinite,

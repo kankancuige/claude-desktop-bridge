@@ -27,6 +27,7 @@ import {ref, shallowRef, nextTick, onMounted, onActivated, onDeactivated, onBefo
 import * as monaco from 'monaco-editor'
 import {useRouter} from 'vue-router'
 import {t, setLocale} from '../i18n'
+import {useResizeHandle} from '../composables/useResizeHandle'
 import {apiFetch, wsUrl} from '../api'
 import DOMPurify from 'dompurify'
 const PhaserPet = defineAsyncComponent(() => import('./PhaserPet.vue'))
@@ -161,6 +162,111 @@ const sessionPageSize = 5
 const showAllProjects = ref(false)
 /** 侧栏项目列表分页大小 */
 const projectPageSize = 10
+/** 批量管理模式是否激活 */
+const batchMode = ref(false)
+/** 批量管理中已选中的 session ID 集合 */
+const selectedSessionIds = ref<Set<string>>(new Set())
+
+function toggleBatchMode() {
+  batchMode.value = !batchMode.value
+  if (!batchMode.value) selectedSessionIds.value = new Set()
+}
+
+function toggleSessionSelect(sid: string) {
+  const next = new Set(selectedSessionIds.value)
+  if (next.has(sid)) next.delete(sid)
+  else next.add(sid)
+  selectedSessionIds.value = next
+}
+
+function toggleSelectAll(workDir: string, allIds: string[]) {
+  const next = new Set(selectedSessionIds.value)
+  const allSelected = allIds.every(id => next.has(id))
+  if (allSelected) {
+    for (const id of allIds) next.delete(id)
+  } else {
+    for (const id of allIds) next.add(id)
+  }
+  selectedSessionIds.value = next
+}
+
+/** 批量删除选中会话，弹出确认弹窗 */
+function batchDeleteSessions() {
+  if (selectedSessionIds.value.size === 0) return
+  pendingBatchDelete.value = [...selectedSessionIds.value]
+}
+
+/** 确认执行批量删除 */
+async function confirmBatchDelete() {
+  if (!pendingBatchDelete.value) return
+  const ids = pendingBatchDelete.value
+  pendingBatchDelete.value = null
+  try {
+    const res = await apiFetch(`${GW}/api/sessions/batch-delete`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ids}),
+    })
+    if (!res.ok) { showToast(t('ws.deleteFailed')); return }
+    const data = await res.json()
+    // 清理 localStorage + 本地项目列表
+    for (const sid of ids) {
+      try { localStorage.removeItem(usageKey(sid)) } catch {}
+      if (sessionId.value && sessionId.value !== sid) {
+        try { localStorage.removeItem(usageKey(sessionId.value)) } catch {}
+      }
+    }
+    // 清理 activeSessionId
+    if (ids.includes(activeSessionId.value || '')) activeSessionId.value = null
+    // 清理引用被删 session 的 tab
+    const deadTabs = tabSessions.value.filter(t =>
+      ids.includes(t.state.sessionId || '') ||
+      (sessionId.value && ids.includes(sessionId.value) && t.state.sessionId === sessionId.value)
+    )
+    for (const dt of deadTabs) {
+      if (dt.websocket) {
+        dt.websocket.onclose = null; dt.websocket.onerror = null
+        try { dt.websocket.close() } catch {}
+      }
+    }
+    if (deadTabs.length) {
+      const deadIds = new Set(deadTabs.map(dt => dt.id))
+      tabSessions.value = tabSessions.value.filter(t => !deadIds.has(t.id))
+    }
+    if (!tabSessions.value.find(t => t.id === activeTabId.value)) {
+      const next = tabSessions.value[tabSessions.value.length - 1]
+      if (next) switchToTab(next.id)
+      else activeTabId.value = null
+    }
+    // 清理主 WS
+    if (sessionId.value && ids.includes(sessionId.value)) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.onclose = null; ws.onerror = null
+        try { ws.close() } catch {}
+      }
+      ws = null; sessionId.value = null
+      connected.value = false; status.value = 'idle'
+      messages.value = []; activeProject.value = null
+    }
+    // 本地更新项目列表
+    _projectsEpoch++
+    for (const p of projects.value) {
+      const before = p.sessions.length
+      p.sessions = p.sessions.filter(s => !ids.includes(s.id))
+      p.sessionCount = p.sessions.length
+    }
+    // 退出批量模式
+    batchMode.value = false
+    selectedSessionIds.value = new Set()
+    showToast(t('common.delete') + ` (${data.deleted})`)
+  } catch (e: any) {
+    console.error('batchDelete:', e)
+    showToast(t('ws.deleteFailed'))
+  }
+}
+
+/** 待确认的批量删除 ID 列表（null 表示无待确认项） */
+const pendingBatchDelete = ref<string[] | null>(null)
 /** 已隐藏的项目路径集合（持久化到 localStorage） */
 const STORAGE_KEY_HIDDEN = 'bridge-hidden-projects'
 function loadHiddenProjects(): Set<string> {
@@ -205,8 +311,8 @@ function hideProject(workDir: string) {
   hiddenProjects.value = s
   persistHidden()
   if (activeProject.value === workDir) {
-    activeProject.value = ''
-    sessionId.value = ''
+    activeProject.value = null
+    sessionId.value = null
   }
 }
 
@@ -237,7 +343,7 @@ function confirmCloseTab() {
 /** 确认删除会话：调用 Gateway DELETE API，清理 localStorage 缓存的 token/费用数据，并清理当前活跃 session 状态 */
 async function confirmDelete() {
   if (!pendingDelete.value) return
-  const {sid} = pendingDelete.value
+  const {sid} = pendingDelete.value  // SDK conversation ID（侧栏传入）
   pendingDelete.value = null
   try {
     const res = await apiFetch(`${GW}/api/sessions/${sid}?deleteFiles=1`, {method: 'DELETE'})
@@ -245,35 +351,49 @@ async function confirmDelete() {
       showToast(t('ws.deleteFailed'))
       return
     }
-    // 清理 localStorage 缓存的 token/费用记忆
-    try { localStorage.removeItem(usageKey(sid)) } catch (e) { console.error(e) }
-    // 清理所有引用此会话的 tab（多 tab 打开同一会话时每个都得清理，否则
-    // 残留 tab 切过去会 resume 已删除的会话，导致"删了又回来"）
-    const deadTabs = tabSessions.value.filter(t => t.state.sessionId === sid)
+    // 清理 localStorage（SDK ID + gateway UUID，两种都尝试）
+    try { localStorage.removeItem(usageKey(sid)) } catch {}
+    if (sessionId.value && sessionId.value !== sid) {
+      try { localStorage.removeItem(usageKey(sessionId.value)) } catch {}
+    }
+    // 清理 activeSessionId（侧栏高亮）
+    if (activeSessionId.value === sid) activeSessionId.value = null
+    // 清理所有引用此会话的 tab（双向 ID 匹配：侧栏 ID + gatewayUUID）
+    const deadTabs = tabSessions.value.filter(t =>
+      t.state.sessionId === sid ||
+      (sessionId.value && t.state.sessionId === sessionId.value)
+    )
     for (const dt of deadTabs) {
       if (dt.websocket) {
         dt.websocket.onclose = null; dt.websocket.onerror = null
-        try { dt.websocket.close() } catch (e) { console.error(e) }
+        try { dt.websocket.close() } catch {}
       }
     }
-    if (deadTabs.length) tabSessions.value = tabSessions.value.filter(t => t.state.sessionId !== sid)
+    if (deadTabs.length) {
+      const deadIds = new Set(deadTabs.map(dt => dt.id))
+      tabSessions.value = tabSessions.value.filter(t => !deadIds.has(t.id))
+    }
     // 若当前活跃 tab 被清掉了，切到最后一个剩余 tab
     if (!tabSessions.value.find(t => t.id === activeTabId.value)) {
       const next = tabSessions.value[tabSessions.value.length - 1]
       if (next) switchToTab(next.id)
       else activeTabId.value = null
     }
-    if (sessionId.value === sid) {
+    // 清理主 WS（当被删除的 session 恰好是当前活跃时）
+    if (sessionId.value && (
+      sessionId.value === sid ||
+      deadTabs.some(dt => dt.state.sessionId === sessionId.value)
+    )) {
       if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.onclose = null; ws.onerror = null  // 先解除回调再关闭，防止异步 onclose 污染状态
-        try { ws.close() } catch (e) { console.error(e) }
+        ws.onclose = null; ws.onerror = null
+        try { ws.close() } catch {}
       }
       ws = null
       sessionId.value = null
       connected.value = false
       status.value = 'idle'
       messages.value = []
-      activeProject.value = ''
+      activeProject.value = null
     }
     // 本地更新项目列表：移除已删除的会话，避免全量 loadProjects() 刷新
     _projectsEpoch++
@@ -285,7 +405,8 @@ async function confirmDelete() {
         break
       }
     }
-  } catch {
+  } catch (e: any) {
+    console.error('confirmDelete:', e)
     showToast(t('ws.deleteFailed'))
   }
 }
@@ -311,6 +432,24 @@ function startSessionDurationTimer() {
       sessionDurationMinutes.value = Math.floor((Date.now() - sessionStartTime.value) / 60000)
     }
   }, 10000) // 10 秒更新一次即可
+}
+/** 当前任务开始时间戳（每次 thinking 开始时重置） */
+const taskStartTime = ref<number>(0)
+/** 当前任务已持续分钟数 */
+const taskDurationMinutes = ref(0)
+let taskDurationTimer: ReturnType<typeof setInterval> | null = null
+function startTaskDurationTimer() {
+  if (taskDurationTimer) clearInterval(taskDurationTimer)
+  taskDurationMinutes.value = 0
+  taskStartTime.value = Date.now()
+  taskDurationTimer = setInterval(() => {
+    taskDurationMinutes.value = Math.floor((Date.now() - taskStartTime.value) / 60000)
+  }, 10000)
+}
+function stopTaskDurationTimer() {
+  if (taskDurationTimer) { clearInterval(taskDurationTimer); taskDurationTimer = null }
+  taskDurationMinutes.value = 0
+  taskStartTime.value = 0
 }
 /** 当前 Claude 状态：'idle' 空闲 / 'thinking' 思考中 */
 const status = ref('idle')
@@ -444,7 +583,7 @@ function createTabSession(workDir: string): TabSession {
   }
 }
 
-function switchToTab(tabId: string) {
+async function switchToTab(tabId: string) {
   if (activeTabId.value === tabId) return
   syncCurrentTabState()
   activeTabId.value = tabId
@@ -456,7 +595,16 @@ function switchToTab(tabId: string) {
     restoreTabState(tab.state)
     activeProject.value = tab.projectPath
     ws = null  // 切断旧 tab 的 ws 引用，防止 connectWS 误关
-    // handleNewSession 异步恢复会话，不阻塞 switchToTab 返回
+    // 校验 session 是否仍存在，避免用已删除的 gatewayUUID resume 导致"一变二"
+    try {
+      const check = await apiFetch(`${GW}/api/sessions/${tab.state.sessionId}/exists`)
+      if (!check.ok) throw new Error('gone')
+    } catch {
+      sessionId.value = null
+      connected.value = false; status.value = 'idle'
+      messages.value = []; inputText.value = ''
+      return
+    }
     handleNewSession(tab.projectPath, encodeProjectName(tab.projectPath), tab.state.sessionId)
     return
   }
@@ -599,7 +747,7 @@ function syncPetState(state: string, extra?: Record<string, any>) {
 // 宠物气泡：长任务提醒
 let longTaskBubbleShown = false
 let longTaskBubbleTimer: ReturnType<typeof setTimeout> | null = null
-watch(sessionDurationMinutes, (m) => {
+watch(taskDurationMinutes, (m) => {
   if (m >= 3 && !longTaskBubbleShown && status.value === 'thinking') {
     longTaskBubbleShown = true
     petBubble.value = BUBBLE_LONG_TASK[Math.floor(Math.random() * BUBBLE_LONG_TASK.length)].replace('{m}', String(m))
@@ -613,7 +761,7 @@ watch(status, (s) => {
   else if (s === 'idle' && connected.value) syncPetState('connected')
   else if (!connected.value) syncPetState('disconnected')
   else syncPetState('idle')
-  if (s !== 'thinking') { longTaskBubbleShown = false; if (longTaskBubbleTimer) clearTimeout(longTaskBubbleTimer) }
+  if (s !== 'thinking') { longTaskBubbleShown = false; if (longTaskBubbleTimer) clearTimeout(longTaskBubbleTimer); stopTaskDurationTimer() }
 })
 // ── 导出菜单状态 ──
 const showExportMenu = ref(false)
@@ -740,6 +888,29 @@ interface PendingAttachment {
 }
 const pendingAttachments = ref<PendingAttachment[]>([])
 let attachmentIdCounter = 0
+const fileInputRef = ref<HTMLInputElement | null>(null)
+
+/** 从 File 对象创建附件并加入待发送列表（粘贴和文件选择共用） */
+function addAttachment(file: File) {
+  const reader = new FileReader()
+  reader.onload = () => {
+    pendingAttachments.value.push({
+      id: ++attachmentIdCounter,
+      file,
+      dataUrl: file.type.startsWith('image/') ? reader.result as string : '',
+      uploading: false,
+    })
+  }
+  file.type.startsWith('image/') ? reader.readAsDataURL(file) : reader.onload!(new ProgressEvent('load'))
+}
+
+/** 文件选择按钮处理 */
+function onFileSelect(e: Event) {
+  const input = e.target as HTMLInputElement
+  if (!input.files) return
+  for (const f of input.files) addAttachment(f)
+  input.value = ''
+}
 
 /** 粘贴事件处理: 从剪贴板提取图片并加入待发送列表 */
 function onPaste(e: ClipboardEvent) {
@@ -749,17 +920,7 @@ function onPaste(e: ClipboardEvent) {
     if (item.type.startsWith('image/')) {
       e.preventDefault()
       const file = item.getAsFile()
-      if (!file) continue
-      const reader = new FileReader()
-      reader.onload = () => {
-        pendingAttachments.value.push({
-          id: ++attachmentIdCounter,
-          file,
-          dataUrl: reader.result as string,
-          uploading: false,
-        })
-      }
-      reader.readAsDataURL(file)
+      if (file) addAttachment(file)
     }
   }
 }
@@ -802,6 +963,19 @@ const activeSessionId = ref<string | null>(null)
 // ── 文件快照 Diff 面板状态 ──
 /** 右侧文件面板是否可见 */
 const showFilePanel = ref(false)
+const showSidebar = ref(true)
+function toggleSidebar() { showSidebar.value = !showSidebar.value }
+
+// ── 面板拖拽缩放 ──
+const sidebarWidth = ref(380)
+const rightPanelWidth = ref(360)
+
+const {dragging: leftDragging, onMouseDown: onLeftHandleDown} = useResizeHandle({
+  targetWidth: sidebarWidth, minWidth: 200, maxWidth: 600,
+})
+const {dragging: rightDragging, onMouseDown: onRightHandleDown} = useResizeHandle({
+  targetWidth: rightPanelWidth, minWidth: 250, maxWidth: 600, reverse: true,
+})
 /** 工作目录下的文件列表（扁平数组，含变更状态） */
 const fileList = ref<FlatFile[]>([])
 /** 文件树加载中 */
@@ -814,6 +988,8 @@ const snapshotAt = ref<number | null>(null)
 const fileTruncated = ref(false)
 /** 快照文件丢失（如工作目录被删除后残留引用） */
 const fileMissing = ref(false)
+/** git 仓库信息（分支 + commit hash） */
+const gitInfo = ref<{branch: string, hash: string, shortHash: string} | null>(null)
 /** 文件树中已展开的目录路径集合 */
 const expandedDirs = ref<Set<string>>(new Set())
 /** 文件过滤：'all' 全部文件 / 'changed' 仅变更文件 */
@@ -890,7 +1066,11 @@ interface PendingPermission {
 interface PendingChoice {
   requestId: string;
   question: string;
-  options: { label: string }[]
+  options: { label: string }[];
+  /** "其他"自定义输入是否激活 */
+  customInputActive: boolean;
+  /** "其他"自定义输入文本 */
+  customInputText: string
 }
 
 const pendingPermission = ref<PendingPermission | null>(null)
@@ -916,11 +1096,9 @@ interface AgentRun {
 
 /** 本轮对话中产生的所有 agent 运行记录（内联卡片数据源） */
 const agentRuns = ref<AgentRun[]>([])
-/** 当前正在运行的 agent 数量（native + workflow） */
+/** 当前正在运行的 agent 数量（native + workflow，workflow agent 已 mirror 到 agentRuns 不重复计数） */
 const runningAgentTotal = computed(() => {
-  let n = agentRuns.value.filter(a => a.status === 'running' || a.status === 'spawning').length
-  if (wfRunState.value) n += wfRunState.value.agents.filter((a: any) => a.status === 'running').length
-  return n
+  return agentRuns.value.filter(a => a.status === 'running' || a.status === 'spawning').length
 })
 /** Agent 按钮文字 */
 const agentBtnLabel = computed(() => {
@@ -976,7 +1154,7 @@ function agentColor(type: string): string {
 interface WfAgentInfo {
   id: string;
   label: string;
-  status: 'pending' | 'running' | 'done' | 'error';
+  status: 'pending' | 'running' | 'done' | 'error' | 'paused';
   prompt: string;
   output: string
 }
@@ -1002,26 +1180,32 @@ const wfRunState = ref<WfRunState | null>(null)
 const showWfPanel = ref(false)
 const wfNewBudget = ref(0)
 
-// 从 workflow_log 消息中提取 agent 状态
+// 从 workflow_log 消息中提取 agent 状态和任务描述
 function parseWfAgentLog(msg: string): WfAgentInfo | null {
-  const m = msg.message?.match(/\[Agent[:：]\s*([\w][\w:\-.\s一-鿿]*?)\]\s*(.+)/)
+  const m = msg.match(/\[Agent[:：]\s*([\w][\w:\-.\s一-鿿]*?)\]\s*(.+)/)
   if (!m) return null
   const [, label, action] = m
   const labelClean = label.trim()
+  // 提取任务描述: "启动 | 描述内容 (type=xxx)" → 取 "描述内容"
+  let desc = ''
+  const descMatch = action.match(/^启动\s*\|\s*(.+?)(?:\s*\(type=|$)/)
+  if (descMatch) desc = descMatch[1].trim()
   const status = /启动|Schema/.test(action) ? 'running'
       : /完成|Journal|恢复/.test(action) ? 'done'
-          : /错误|异常/.test(action) ? 'error' : 'running'
-  return {id: labelClean, label: labelClean, status, prompt: '', output: ''}
+      : /已暂停|等待恢复/.test(action) ? 'paused'
+      : /已恢复|重新执行/.test(action) ? 'running'
+      : /错误|异常/.test(action) ? 'error' : 'running'
+  return {id: labelClean, label: labelClean, status, prompt: desc, output: ''}
 }
 
 // 当有 agent 正在运行时，每秒刷新视图以更新耗时显示
 let agentRefreshTimer: ReturnType<typeof setInterval> | null = null
-watch(() => agentRuns.value.some(a => a.status === 'running'), (hasRunning) => {
-  if (hasRunning && !agentRefreshTimer) {
+watch(() => agentRuns.value.some(a => a.status === 'running' || a.status === 'paused'), (hasActive) => {
+  if (hasActive && !agentRefreshTimer) {
     agentRefreshTimer = setInterval(() => {
       agentRuns.value = [...agentRuns.value]
     }, 1000)
-  } else if (!hasRunning && agentRefreshTimer) {
+  } else if (!hasActive && agentRefreshTimer) {
     clearInterval(agentRefreshTimer);
     agentRefreshTimer = null
   }
@@ -1304,13 +1488,19 @@ async function loadProjects(reorder = false) {
 }
 
 /**
+ * 路径规范化：消除编码歧义，确保相同物理路径产生相同编码结果。
+ * D:\a\b → D:/a/b，D://a//b → D:/a/b，D:/a/b/ → D:/a/b
+ */
+function normW(d: string) { return d.replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/+$/, '') || '/' }
+
+/**
  * 复刻 Gateway 的项目名编码规则：
  * - 盘符路径 X:/a/b → X--a-b（冒号变双横线，剩余 / 变 -）
  * - 非盘符路径 / 全替为 -
  * 编码结果用作 API 路径参数（/api/projects/{encodedDir}/...）
  */
 function encodeProjectName(wd: string) {
-  const n = wd.replace(/\\/g, '/')
+  const n = normW(wd)
   const dm = n.match(/^([a-zA-Z]):\/(.*)$/)
   if (!dm) return n.replace(/\//g, '-')
   return dm[1] + '--' + dm[2].replace(/\//g, '-')
@@ -1326,8 +1516,8 @@ async function addProject() {
   if (api?.selectDirectory) dir = await api.selectDirectory()
   else dir = window.prompt(t('ws.promptDir')) // 无 Electron 时回退
   if (!dir) return
-  const wd = dir.replace(/\\/g, '/').replace(/\/+$/, '')
-  const norm = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+  const wd = normW(dir)
+  const norm = (p: string) => normW(p).toLowerCase()
   // 去重：与已有项目比对（忽略大小写与末尾斜杠）
   if (projects.value.some(p => norm(p.workDir) === norm(wd))) {
     showToast(t('ws.projAdded'), 3000);
@@ -1358,8 +1548,25 @@ async function addProject() {
  * - 恢复历史会话：额外传入 encodedDir + histSessionId，Gateway resume 复用原 sessionId
  * 创建前先重置所有对话状态（消息列表、token 计数、费用累计），
  * 然后调用 Gateway POST /api/sessions 创建/恢复，成功后建立 WebSocket 连接。
+ * 并发防护：同一 (workDir, histSessionId) 组合只允许一个进行中的创建，防止快速双击产生重复 session。
  */
+const _pendingCreates = new Map<string, Promise<void>>()
+
 async function handleNewSession(workDir: string, encodedDir?: string, histSessionId?: string) {
+  // 规范化 workDir 消除编码歧义，与 Gateway 保持一致
+  workDir = normW(workDir)
+  const key = (encodedDir || workDir) + '|' + (histSessionId || '__new__')
+  if (_pendingCreates.has(key)) return _pendingCreates.get(key)
+
+  const promise = _doHandleNewSession(workDir, encodedDir, histSessionId)
+  _pendingCreates.set(key, promise)
+  promise.finally(() => {
+    if (_pendingCreates.get(key) === promise) _pendingCreates.delete(key)
+  })
+  return promise
+}
+
+async function _doHandleNewSession(workDir: string, encodedDir?: string, histSessionId?: string) {
   syncCurrentTabState()
 
   let tab = tabSessions.value.find(t => t.projectPath === workDir)
@@ -1410,6 +1617,7 @@ async function handleNewSession(workDir: string, encodedDir?: string, histSessio
     const data = await res.json()
     if (!res.ok) throw new Error(data.error)
     sessionId.value = data.sessionId
+    gitInfo.value = data.gitInfo || null
     sessionStartTime.value = Date.now()
     startSessionDurationTimer()
     loadUsage(data.sessionId)  // resume 时恢复已记忆的 token/费用
@@ -1900,7 +2108,9 @@ async function connectWS(sid: string, resumed = false) {
         pendingChoice.value = {
           requestId: msg.requestId,
           question: q.question || t('ws.choose'),
-          options: q.options || []
+          options: q.options || [],
+          customInputActive: false,
+          customInputText: ''
         }
         break
       }
@@ -2025,10 +2235,28 @@ async function connectWS(sid: string, resumed = false) {
 
         // ── Workflow 事件 ──
       case 'workflow_started':
-      case 'workflow_resumed':
         wfRunState.value = {
           name: msg.name, status: 'running', phases: msg.phases || [], currentPhase: '',
           logs: [], agents: [], tokenSpent: 0, wfId: msg.workflowId,
+        }
+        showWfPanel.value = true
+        // 新 workflow 开始: 清理前一轮的 workflow agent 记录
+        agentRuns.value = agentRuns.value.filter(a => a.source !== 'workflow')
+        break
+
+      case 'workflow_resumed':
+        if (wfRunState.value) {
+          wfRunState.value.status = 'running'
+          // 恢复所有 paused 的 agent 为 running
+          for (const a of wfRunState.value.agents) {
+            if (a.status === 'paused') a.status = 'running'
+          }
+        }
+        // 恢复 agentRuns 中的所有 paused workflow agent
+        for (const ag of agentRuns.value) {
+          if (ag.source === 'workflow' && ag.status === 'paused') {
+            ag.status = 'running'
+          }
         }
         showWfPanel.value = true
         break
@@ -2057,19 +2285,28 @@ async function connectWS(sid: string, resumed = false) {
               wfRunState.value.agents.push(agInfo)
             }
             // Mirror 到内联 agentRuns（带进度文字）
+            const typeMatch = msg.message?.match(/\(type=([\w-]+)\)/)
+            const resolvedType = typeMatch ? typeMatch[1] : agInfo.label
+            const toolMatch = msg.message?.match(/工具:\s*(.+)/)
             const run = agentRuns.value.find(a => a.id === agInfo.id && a.source === 'workflow')
             if (run) {
               run.status = agInfo.status
               run.progress = msg.message
               if (agInfo.status === 'done') run.doneTime = Date.now()
               if (agInfo.status === 'running' && !run.startTime) run.startTime = Date.now()
+              if (toolMatch) {
+                run.currentTool = toolMatch[1].trim()
+                run.currentToolElapsed = 0
+              }
             } else {
               agentRuns.value.push({
-                id: agInfo.id, agentType: agInfo.label, description: '',
+                id: agInfo.id, agentType: resolvedType, description: agInfo.prompt || '',
                 status: agInfo.status, spawnTime: Date.now(),
                 startTime: agInfo.status === 'running' ? Date.now() : 0,
                 doneTime: agInfo.status === 'done' ? Date.now() : 0,
                 progress: msg.message, source: 'workflow',
+                currentTool: toolMatch ? toolMatch[1].trim() : '',
+                currentToolElapsed: 0,
               })
             }
           }
@@ -2080,10 +2317,14 @@ async function connectWS(sid: string, resumed = false) {
         if (wfRunState.value) {
           wfRunState.value.status = 'done'
           wfRunState.value.tokenSpent = msg.tokenSpent || 0
+          // 同步标记 wfRunState.agents 里所有 running/paused 条目为 done
+          for (const a of wfRunState.value.agents) {
+            if (a.status === 'running' || a.status === 'paused') a.status = 'done'
+          }
         }
-        // 标记所有 workflow source 的 running agent 为 done
+        // 标记所有 workflow source 的 running/paused agent 为 done
         for (const ag of agentRuns.value) {
-          if (ag.source === 'workflow' && ag.status === 'running') {
+          if (ag.source === 'workflow' && (ag.status === 'running' || ag.status === 'paused')) {
             ag.status = 'done';
             ag.doneTime = Date.now()
           }
@@ -2093,14 +2334,54 @@ async function connectWS(sid: string, resumed = false) {
       case 'workflow_paused':
         if (wfRunState.value) {
           wfRunState.value.status = 'paused'
+          // 同步标记 wfRunState.agents 中所有 running 条目为 paused
+          for (const a of wfRunState.value.agents) {
+            if (a.status === 'running') a.status = 'paused'
+          }
+        }
+        // 标记所有 workflow source 的 running agent 为 paused
+        for (const ag of agentRuns.value) {
+          if (ag.source === 'workflow' && ag.status === 'running') {
+            ag.status = 'paused'
+          }
         }
         break
 
       case 'workflow_error':
         if (wfRunState.value) {
           wfRunState.value.status = 'error'
+          // 同步标记所有 running/paused agent 为 error
+          for (const a of wfRunState.value.agents) {
+            if (a.status === 'running' || a.status === 'paused') a.status = 'error'
+          }
+        }
+        // 标记所有 workflow source 的 running/paused agent 为 error
+        for (const ag of agentRuns.value) {
+          if (ag.source === 'workflow' && (ag.status === 'running' || ag.status === 'paused')) {
+            ag.status = 'error';
+            ag.doneTime = Date.now()
+          }
         }
         break
+
+      case 'agent_paused': {
+        const pausedRun = agentRuns.value.find(a => a.id === msg.agentLabel && a.source === 'workflow')
+        if (pausedRun) pausedRun.status = 'paused'
+        if (wfRunState.value) {
+          const ag = wfRunState.value.agents.find(a => a.id === msg.agentLabel)
+          if (ag) ag.status = 'paused'
+        }
+        break
+      }
+      case 'agent_resumed': {
+        const resumedRun = agentRuns.value.find(a => a.id === msg.agentLabel && a.source === 'workflow')
+        if (resumedRun) { resumedRun.status = 'running'; resumedRun.startTime = Date.now() }
+        if (wfRunState.value) {
+          const ag = wfRunState.value.agents.find(a => a.id === msg.agentLabel)
+          if (ag) ag.status = 'running'
+        }
+        break
+      }
 
       case 'nudge':
         handleNudge(msg)
@@ -2162,6 +2443,22 @@ async function resumeWf() {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(body),
+  })
+}
+
+async function stopAgent(agentLabel: string) {
+  const name = wfRunState.value?.name
+  if (!name) return
+  await apiFetch(`${GW}/api/workflows/${encodeURIComponent(name)}/agents/${encodeURIComponent(agentLabel)}/stop`, {
+    method: 'POST',
+  })
+}
+
+async function resumeAgent(agentLabel: string) {
+  const name = wfRunState.value?.name
+  if (!name) return
+  await apiFetch(`${GW}/api/workflows/${encodeURIComponent(name)}/agents/${encodeURIComponent(agentLabel)}/resume`, {
+    method: 'POST',
   })
 }
 
@@ -2455,6 +2752,7 @@ function doSend(text: string, wire?: string) {
   // buildWireText 等异步操作期间 WS 可能已断开，再次检查防止 ! 崩溃
   if (!ws || ws.readyState !== 1) return
   status.value = 'thinking'
+  startTaskDurationTimer()
   lastUserMessage = text
   turnThinkingText = ''  // 新一轮开始: 清空本轮思考文本累计，result 时重新估算
   clearAgentRuns()       // 新一轮开始: 清空上一轮的 agent 运行卡片
@@ -2521,6 +2819,28 @@ function respondChoice(optionIndex: number) {
   messages.value.push({
     role: 'system',
     text: t('ws.chose', {label: c.options[optionIndex]?.label || optionIndex}),
+    time: Date.now()
+  })
+  pendingChoice.value = null
+  nextTick(() => scrollDown(true))
+}
+
+/** 用户通过"其他"输入自定义内容，回传文本给 Gateway */
+function respondChoiceCustom() {
+  const c = pendingChoice.value;
+  if (!c) return
+  const text = c.customInputText.trim()
+  if (!text) return
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({
+    type: 'choice_response',
+    requestId: c.requestId,
+    questionIndex: 0,
+    optionIndex: -1,
+    customText: text
+  }))
+  messages.value.push({
+    role: 'system',
+    text: t('ws.chose', {label: text}),
     time: Date.now()
   })
   pendingChoice.value = null
@@ -2882,6 +3202,7 @@ async function loadFileTree() {
       syncFileTree(d.files || [])
       hasSnapshot.value = !!d.hasSnapshot
       snapshotAt.value = d.snapshotAt || null
+      gitInfo.value = d.gitInfo || null
       fileTruncated.value = !!d.truncated
       fileMissing.value = !!d.missing
     }
@@ -3263,6 +3584,7 @@ function doSave() {
 // 子定时器启动/停止函数为外部闭包变量，此处直接引用。
 function resumeTimers() {
   if (!sessionDurationTimer && sessionStartTime.value) startSessionDurationTimer()
+  if (!taskDurationTimer && taskStartTime.value) startTaskDurationTimer()
   if (!tabAutoSyncTimer && activeTabId.value) tabAutoSyncTimer = setInterval(syncCurrentTabState, 5000)
   if (!agentRefreshTimer && agentRuns.value.some(a => a.status === 'running')) {
     agentRefreshTimer = setInterval(() => { agentRuns.value = [...agentRuns.value] }, 1000)
@@ -3270,6 +3592,7 @@ function resumeTimers() {
 }
 function pauseTimers() {
   if (sessionDurationTimer) { clearInterval(sessionDurationTimer); sessionDurationTimer = null }
+  if (taskDurationTimer) { clearInterval(taskDurationTimer); taskDurationTimer = null }
   if (tabAutoSyncTimer) { clearInterval(tabAutoSyncTimer); tabAutoSyncTimer = null }
   if (agentRefreshTimer) { clearInterval(agentRefreshTimer); agentRefreshTimer = null }
 }
@@ -3288,6 +3611,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('keydown', onGlobalKeydown)
   if (tabAutoSyncTimer) clearInterval(tabAutoSyncTimer)
   if (sessionDurationTimer) clearInterval(sessionDurationTimer)
+  if (taskDurationTimer) clearInterval(taskDurationTimer)
   if (agentRefreshTimer) clearInterval(agentRefreshTimer)
   if (petTimer) clearTimeout(petTimer)
   if (petBubbleTimer) clearTimeout(petBubbleTimer)
@@ -3427,7 +3751,9 @@ async function confirmCommit() {
     const res = await apiFetch(`${GW}/api/sessions/${sessionId.value}/commit`, {method: 'POST'})
     const d = await res.json()
     if (res.ok && d.ok) {
-      messages.value.push({role: 'system', text: t('sys.committed', {n: d.fileCount}), time: Date.now()})
+      const n = d.fileCount, hash = d.gitCommit?.hash, subject = d.gitCommit?.subject
+      const msg = hash ? t('sys.committedGit', {n, hash, subject}) : t('sys.committed', {n})
+      messages.value.push({role: 'system', text: msg, time: Date.now()})
       await Promise.all([loadCheckpoints(), loadFileTree()])
     } else {
       messages.value.push({role: 'error', text: t('err.commitFail', {msg: d.error || res.status}), time: Date.now()})
@@ -3493,10 +3819,10 @@ async function confirmCommitFiles() {
     })
     const d = await res.json()
     if (res.ok && d.ok) {
-      const kept = d.keptCheckpoints
+      const kept = d.keptCheckpoints, hash = d.gitCommit?.hash, subject = d.gitCommit?.subject
       const msg = kept != null
-          ? t('sys.committedSelective', {n: d.fileCount, kept})
-          : t('sys.committed', {n: d.fileCount})
+          ? (hash ? t('sys.committedSelectiveGit', {n: d.fileCount, kept, hash, subject}) : t('sys.committedSelective', {n: d.fileCount, kept}))
+          : (hash ? t('sys.committedGit', {n: d.fileCount, hash, subject}) : t('sys.committed', {n: d.fileCount}))
       messages.value.push({role: 'system', text: msg, time: Date.now()})
       await Promise.all([loadCheckpoints(), loadFileTree()])
     } else {
@@ -3574,6 +3900,14 @@ const thinkings = computed(() => [
   {value: 'xhigh', label: t('think.xhigh')},
   {value: 'max', label: t('think.max')},
 ])
+
+// 即时权限切换: mid-response 切换时通知后端立即生效，无需重建 query
+watch(permissionMode, (newVal, oldVal) => {
+  if (status.value !== 'thinking') return
+  if (!ws || ws.readyState !== 1) return
+  if (newVal === oldVal) return
+  ws.send(JSON.stringify({ type: 'setting_change', permissionMode: newVal }))
+})
 
 // ═══════════════════════════════════════════
 // ── Token 消耗与上下文统计 ──
@@ -3952,39 +4286,62 @@ const tokenTooltip = computed(() => {
 
 <template>
   <div class="app">
-    <!-- 侧栏：项目列表 + 会话管理 -->
-    <SidebarLeft
-      :search-text="projectSearch"
-      :filtered-projects="filteredProjects"
-      :visible-projects="visibleProjects"
-      :expanded-projects="expandedProjects"
-      :show-all-sessions="showAllSessions"
-      :show-all-projects="showAllProjects"
-      :active-project="activeProject"
-      :active-session-id="activeSessionId"
-      :connected="connected"
-      :connecting="connecting"
-      :gateway-version="gatewayVersion"
-      :has-running-agent="hasAgentRuns && agentRuns.some(a => a.status === 'running' || a.status === 'spawning')"
-      :running-agent-count="agentRuns.filter(a => a.status === 'running').length"
-      :project-page-size="projectPageSize"
-      :session-page-size="sessionPageSize"
-      :hidden-projects="hiddenProjects"
-      :filtered-hidden-projects="filteredHiddenProjects"
-      :show-hidden-section="showHiddenSection"
-      @go-settings="router.push('/settings')"
-      @search="projectSearch = $event"
-      @add-project="addProject"
-      @load-projects="loadProjects"
-      @toggle-project="toggleProject"
-      @new-session="(workDir: string, encodedDir: string, sid?: string) => handleNewSession(workDir, encodedDir, sid)"
-      @delete-session="deleteSession"
-      @hide-project="hideProject"
-      @show-project="showProject"
-      @toggle-hidden-section="showHiddenSection = !showHiddenSection"
-      @toggle-show-all="toggleShowAll"
-      @toggle-show-all-projects="showAllProjects = !showAllProjects"
-    />
+    <!-- 侧栏：展开时项目列表 + 会话管理，折叠后窄竖条 -->
+    <template v-if="showSidebar">
+      <div class="sidebar-wrapper" :style="{ width: sidebarWidth + 'px', transition: leftDragging ? 'none' : '' }">
+        <SidebarLeft
+        :search-text="projectSearch"
+        :filtered-projects="filteredProjects"
+        :visible-projects="visibleProjects"
+        :expanded-projects="expandedProjects"
+        :show-all-sessions="showAllSessions"
+        :show-all-projects="showAllProjects"
+        :active-project="activeProject"
+        :active-session-id="activeSessionId"
+        :connected="connected"
+        :connecting="connecting"
+        :gateway-version="gatewayVersion"
+        :has-running-agent="hasAgentRuns && agentRuns.some(a => a.status === 'running' || a.status === 'spawning')"
+        :running-agent-count="agentRuns.filter(a => a.status === 'running' || a.status === 'spawning').length"
+        :project-page-size="projectPageSize"
+        :session-page-size="sessionPageSize"
+        :hidden-projects="hiddenProjects"
+        :filtered-hidden-projects="filteredHiddenProjects"
+        :show-hidden-section="showHiddenSection"
+        :batch-mode="batchMode"
+        :selected-sessions="selectedSessionIds"
+        @go-settings="router.push('/settings')"
+        @search="projectSearch = $event"
+        @add-project="addProject"
+        @load-projects="loadProjects"
+        @toggle-project="toggleProject"
+        @new-session="(workDir: string, encodedDir: string, sid?: string) => handleNewSession(workDir, encodedDir, sid)"
+        @delete-session="deleteSession"
+        @hide-project="hideProject"
+        @show-project="showProject"
+        @toggle-hidden-section="showHiddenSection = !showHiddenSection"
+        @toggle-show-all="toggleShowAll"
+        @toggle-show-all-projects="showAllProjects = !showAllProjects"
+        @toggle-batch-mode="toggleBatchMode"
+        @toggle-select="toggleSessionSelect"
+        @toggle-select-all="(workDir: string, allIds: string[]) => toggleSelectAll(workDir, allIds)"
+        @batch-delete="batchDeleteSessions"
+      />
+        <button class="sidebar-toggle-btn" @click="toggleSidebar" :title="t('ws.hideSidebar')">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="18" height="18" rx="2"/>
+            <line x1="9" y1="3" x2="9" y2="21"/>
+          </svg>
+        </button>
+      </div>
+      <div class="resize-handle" :class="{ active: leftDragging }" @mousedown="onLeftHandleDown"></div>
+    </template>
+    <div v-else class="sidebar-collapsed-strip" @click="toggleSidebar" :title="t('ws.showSidebar')">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="3" width="18" height="18" rx="2"/>
+        <line x1="15" y1="3" x2="15" y2="21"/>
+      </svg>
+    </div>
 
     <!--
       主区域 (Main Area)：自适应宽度
@@ -4525,6 +4882,21 @@ const tokenTooltip = computed(() => {
               <button v-for="(o, i) in pendingChoice.options" :key="i" class="choice-opt-btn" @click="respondChoice(i)">
                 {{ i + 1 }}. {{ o.label }}
               </button>
+              <!-- "其他"按钮：点击后展开自定义输入框 -->
+              <button v-if="!pendingChoice.customInputActive" class="choice-opt-btn other" @click="pendingChoice.customInputActive = true">
+                {{ pendingChoice.options.length + 1 }}. {{ t('ws.other') }}
+              </button>
+              <!-- 自定义输入区域 -->
+              <div v-if="pendingChoice.customInputActive" class="choice-custom-row">
+                <input
+                  v-model="pendingChoice.customInputText"
+                  class="choice-custom-input"
+                  :placeholder="t('ws.customPlaceholder')"
+                  @keyup.enter="respondChoiceCustom()"
+                />
+                <button class="choice-opt-btn confirm" @click="respondChoiceCustom()">{{ t('ws.send') }}</button>
+                <button class="choice-opt-btn cancel" @click="pendingChoice.customInputActive = false; pendingChoice.customInputText = ''">{{ t('ws.cancel') }}</button>
+              </div>
             </div>
           </div>
 
@@ -4604,7 +4976,28 @@ const tokenTooltip = computed(() => {
                 <span>{{ tpl.label }}</span>
               </button>
             </div>
+            <!-- 待发送附件 chips -->
+            <div v-if="pendingAttachments.length" class="attach-chips">
+              <div v-for="a in pendingAttachments" :key="a.id" class="attach-chip">
+                <img v-if="a.dataUrl" :src="a.dataUrl" class="attach-thumb" />
+                <span v-else class="attach-icon">📄</span>
+                <span class="attach-name">{{ a.file.name }}</span>
+                <button class="attach-remove" @click="removeAttachment(a.id)" :title="t('ws.remove')">×</button>
+              </div>
+            </div>
             <div class="input-wrapper">
+              <input
+                  ref="fileInputRef"
+                  type="file"
+                  multiple
+                  hidden
+                  @change="onFileSelect"
+              />
+              <button class="attach-btn" @click="fileInputRef?.click()" :title="t('ws.attachFile')">
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                  <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                </svg>
+              </button>
               <!--
                 textarea 输入框：
                 - placeholder 随 status 变化（空闲 vs thinking 不同提示）
@@ -4655,7 +5048,8 @@ const tokenTooltip = computed(() => {
       - 过滤器：全部文件 / 仅变更文件
       - 文件树：嵌套目录结构，点击文件预览或 diff
     -->
-    <div v-if="showFilePanel || showWfPanel" class="right-panels">
+    <div v-show="showFilePanel || showWfPanel" class="resize-handle" :class="{ active: rightDragging }" @mousedown="onRightHandleDown"></div>
+    <div v-if="showFilePanel || showWfPanel" class="right-panels" :style="{ width: rightPanelWidth + 'px' }">
       <aside v-if="showFilePanel" class="file-panel" style="flex: 1; min-height: 0">
         <div class="fp-header">
           <span class="fp-title">{{ t('ws.fpTitle') }}</span>
@@ -4696,6 +5090,17 @@ const tokenTooltip = computed(() => {
           <span class="fp-snap-time warn" v-else>{{ t('ws.fpNoBaseline') }}</span>
         </div>
 
+        <div v-if="gitInfo" class="fp-git-info">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none"
+               stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="6" y1="3" x2="6" y2="15"/>
+            <circle cx="18" cy="6" r="3"/>
+            <path d="M18 9a9 9 0 0 1-9 9"/>
+          </svg>
+          <span class="fp-git-branch">{{ gitInfo.branch }}</span>
+          <span class="fp-git-hash">{{ gitInfo.shortHash }}</span>
+        </div>
+
         <div class="fp-tree">
           <div v-if="fileTreeLoading" class="fp-hint">{{ t('common.loading') }}</div>
           <div v-else-if="fileMissing" class="fp-hint">{{ t('ws.fpMissing') }}</div>
@@ -4708,7 +5113,7 @@ const tokenTooltip = computed(() => {
                 :key="row.node.path"
                 class="file-row"
                 :class="{ dir: row.node.isDir }"
-                :style="{ paddingLeft: (row.depth * 14 + 8) + 'px' }"
+                :style="{ paddingLeft: (Math.min(row.depth, 8) * 10 + 8) + 'px' }"
                 @click="row.node.isDir ? toggleDir(row.node.path) : openFileModal(row.node.file!)"
             >
               <!-- 目录 -->
@@ -4748,135 +5153,136 @@ const tokenTooltip = computed(() => {
       </aside>
       <!-- Workflow 多 Agent 详情面板 -->
       <div v-if="showWfPanel" class="wf-detail-panel" style="flex: 1; min-height: 0">
-        <!-- 原生 Agent 面板（无 Workflow 时） -->
-        <template v-if="!wfRunState">
-          <div class="fp-header">
-            <span class="fp-title">Agent 活动 ({{ agentRuns.length }})</span>
-            <button class="fp-icon-btn" :title="t('ws.close')" @click="showWfPanel = false">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <line x1="18" y1="6" x2="6" y2="18"/>
-                <line x1="6" y1="6" x2="18" y2="18"/>
-              </svg>
-            </button>
-          </div>
-          <div class="ag-panel-list">
-            <div v-if="agentRuns.length === 0" class="ag-panel-empty">暂无 Agent 活动</div>
-            <div v-for="ag in agentRuns" :key="(ag.spawnTime || 0) + '-' + ag.agentType" class="ag-panel-card" :class="ag.status">
-              <!-- 卡片头部：类型 + 状态 + 耗时 -->
-              <div class="ag-card-head">
-                <span class="ag-card-dot" :class="ag.status"
-                      :style="ag.status === 'running' ? { background: agentColor(ag.agentType), boxShadow: '0 0 8px ' + agentColor(ag.agentType) } : {}"></span>
-                <span class="ag-card-type"><span v-html="agentIcon(ag.agentType)"
-                                                 style="display:inline-flex;align-items:center"></span> {{
-                    ag.agentType
-                  }}</span>
-                <span class="ag-card-status" :class="ag.status">
-                <template v-if="ag.status === 'spawning'">启动中...</template>
-                <template v-else-if="ag.status === 'running'">执行中</template>
-                <template v-else-if="ag.status === 'done'">已完成</template>
-                <template v-else>错误</template>
-              </span>
-                <span v-if="ag.status === 'done' && ag.doneTime && ag.spawnTime"
-                      class="ag-card-time">{{ formatDuration(ag.doneTime - ag.spawnTime) }}</span>
-                <span v-else-if="ag.status === 'running' && ag.spawnTime"
-                      class="ag-card-time running">{{ formatDuration(Date.now() - ag.spawnTime) }}</span>
-              </div>
-              <!-- 任务描述 -->
-              <div v-if="ag.description" class="ag-card-desc" :title="ag.description">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-                     style="flex-shrink:0;margin-top:2px">
-                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                  <polyline points="14 2 14 8 20 8"/>
-                </svg>
-                <span>{{ ag.description }}</span>
-              </div>
-              <!-- 进度条 + 当前工具 -->
-              <div v-if="ag.status === 'running' || ag.status === 'done'" class="ag-card-progress">
-                <div v-if="ag.status === 'running'" class="ag-card-bar">
-                  <div class="ag-card-bar-indeterminate"></div>
-                </div>
-                <div v-else class="ag-card-bar">
-                  <div class="ag-card-bar-fill done"></div>
-                </div>
-                <div class="ag-card-tool-info">
-                  <span v-if="ag.currentTool" class="ag-card-tool-name">{{ ag.currentTool }}</span>
-                  <span v-if="ag.currentToolElapsed > 0" class="ag-card-tool-time">{{ ag.currentToolElapsed }}s</span>
-                  <span v-if="ag.status === 'running' && ag.spawnTime"
-                        class="ag-card-elapsed">总耗时 {{ formatDuration(Date.now() - ag.spawnTime) }}</span>
-                </div>
-              </div>
-              <!-- 时间线 -->
-              <div class="ag-card-timeline">
-                <div class="ag-card-step"><span class="ag-step-label">创建</span><span
-                    class="ag-step-time">{{ formatTime(ag.spawnTime) }}</span></div>
-                <div class="ag-card-step"><span class="ag-step-label">启动</span><span
-                    class="ag-step-time">{{ ag.startTime ? formatTime(ag.startTime) : '—' }}</span></div>
-                <div class="ag-card-step"><span class="ag-step-label">{{
-                    ag.status === 'error' ? '错误' : '完成'
-                  }}</span><span class="ag-step-time">{{ ag.doneTime ? formatTime(ag.doneTime) : '—' }}</span></div>
-              </div>
-              <div v-if="ag.transcriptPath" class="ag-card-record">记录已保存</div>
-            </div>
-          </div>
-        </template>
-        <!-- Workflow 面板 -->
-        <template v-else>
-          <div class="fp-header">
-            <span class="fp-title"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                                        stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
-                                        style="vertical-align:middle;margin-right:4px"><polyline
-                points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg> Workflow {{ wfRunState.name }}</span>
-            <div class="fp-header-actions">
-              <template v-if="wfRunState.status === 'running'">
-                <button class="fp-icon-btn" title="暂停" @click="stopWf('pause')">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
-                </button>
-                <button class="fp-icon-btn commit-btn" title="提交当前结果" @click="stopWf('commit')">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
-                </button>
-              </template>
-              <template v-else-if="wfRunState.status === 'paused'">
-                <button class="fp-icon-btn" title="恢复" @click="resumeWf()">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-                </button>
-                <input v-model.number="wfNewBudget" type="number" min="0" placeholder="新预算(token)" style="width:90px;font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:4px;background:var(--bg-raised);color:var(--text-primary)"/>
-                <button class="fp-icon-btn commit-btn" title="提交当前结果" @click="stopWf('commit')">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
-                </button>
-              </template>
-            </div>
-            <button class="fp-icon-btn" :title="t('ws.close')" @click="showWfPanel = false">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <line x1="18" y1="6" x2="6" y2="18"/>
-                <line x1="6" y1="6" x2="18" y2="18"/>
-              </svg>
-            </button>
-          </div>
-          <!-- Phase 进度条 -->
-          <div class="wf-phases-bar">
-            <template v-for="(ph, pi) in wfRunState.phases" :key="ph.title">
-              <span class="wf-phase-dot" :class="ph.status" :title="ph.title"></span>
-              <span v-if="pi < wfRunState.phases.length - 1" class="wf-phase-line"
-                    :class="{ done: ph.status === 'done' || ph.status === 'running' }"></span>
+        <!-- Header: workflow 标题 + 操作按钮 或 原生 Agent 标题 -->
+        <div class="fp-header">
+          <span class="fp-title">
+            <template v-if="wfRunState">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                   style="vertical-align:middle;margin-right:4px"><polyline
+                  points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg> Workflow {{ wfRunState.name }}
             </template>
-            <span style="font-size:11px;color:var(--text-muted);margin-left:6px">{{
-                wfRunState.currentPhase || wfRunState.phases?.find(p => p.status === 'running')?.title
-              }}</span>
+            <template v-else>Agent 活动 ({{ agentRuns.length }})</template>
+          </span>
+          <div v-if="wfRunState" class="fp-header-actions">
+            <template v-if="wfRunState.status === 'running'">
+              <button class="fp-icon-btn" title="暂停" @click="stopWf('pause')">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+              </button>
+              <button class="fp-icon-btn commit-btn" title="提交当前结果" @click="stopWf('commit')">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+              </button>
+            </template>
+            <template v-else-if="wfRunState.status === 'paused'">
+              <button class="fp-icon-btn" title="恢复" @click="resumeWf()">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              </button>
+              <input v-model.number="wfNewBudget" type="number" min="0" placeholder="新预算(token)" style="width:90px;font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:4px;background:var(--bg-raised);color:var(--text-primary)"/>
+              <button class="fp-icon-btn commit-btn" title="提交当前结果" @click="stopWf('commit')">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+              </button>
+            </template>
           </div>
-          <!-- Agent 列表 -->
-          <div class="wf-agents-list">
-            <div v-if="wfRunState.agents.length === 0"
-                 style="padding:20px;text-align:center;font-size:12px;color:var(--text-muted)">等待引擎分配 Agent...
-            </div>
-            <div v-for="ag in wfRunState.agents" :key="ag.id" class="wf-agent-row">
-              <span class="wf-ag-row-dot" :class="ag.status"></span>
-              <span class="wf-ag-row-label">{{ ag.id }}</span>
-              <span class="wf-ag-row-status" :class="ag.status">{{
-                  ag.status === 'running' ? '···' : ag.status === 'done' ? 'OK' : ag.status === 'error' ? 'ERR' : '—'
+          <button class="fp-icon-btn" :title="t('ws.close')" @click="showWfPanel = false">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="18" y1="6" x2="6" y2="18"/>
+              <line x1="6" y1="6" x2="18" y2="18"/>
+            </svg>
+          </button>
+        </div>
+
+        <!-- Phase 进度条 (仅 Workflow 时) -->
+        <div v-if="wfRunState" class="wf-phases-bar">
+          <template v-for="(ph, pi) in wfRunState.phases" :key="ph.title">
+            <span class="wf-phase-dot" :class="ph.status" :title="ph.title"></span>
+            <span v-if="pi < wfRunState.phases.length - 1" class="wf-phase-line"
+                  :class="{ done: ph.status === 'done' || ph.status === 'running' }"></span>
+          </template>
+          <span style="font-size:11px;color:var(--text-muted);margin-left:6px">{{
+              wfRunState.currentPhase || wfRunState.phases?.find(p => p.status === 'running')?.title
+            }}</span>
+        </div>
+
+        <!-- Agent 富卡片 (始终显示，数据源: agentRuns) -->
+        <div class="ag-panel-list">
+          <div v-if="agentRuns.length === 0" class="ag-panel-empty">
+            {{ wfRunState ? '等待引擎分配 Agent...' : '暂无 Agent 活动' }}
+          </div>
+          <div v-for="ag in agentRuns" :key="(ag.spawnTime || 0) + '-' + ag.agentType" class="ag-panel-card" :class="ag.status">
+            <!-- 卡片头部：类型 + 状态 + 耗时 -->
+            <div class="ag-card-head">
+              <span class="ag-card-dot" :class="ag.status"
+                    :style="ag.status === 'running' ? { background: agentColor(ag.agentType), boxShadow: '0 0 8px ' + agentColor(ag.agentType) } : {}"></span>
+              <span class="ag-card-type"><span v-html="agentIcon(ag.agentType)"
+                                               style="display:inline-flex;align-items:center"></span> {{
+                  ag.agentType
                 }}</span>
+              <span class="ag-card-status" :class="ag.status">
+              <template v-if="ag.status === 'spawning'">启动中...</template>
+              <template v-else-if="ag.status === 'running'">执行中</template>
+              <template v-else-if="ag.status === 'done'">已完成</template>
+              <template v-else-if="ag.status === 'paused'">已暂停</template>
+              <template v-else>错误</template>
+            </span>
+              <span v-if="ag.status === 'done' && ag.doneTime && ag.spawnTime"
+                    class="ag-card-time">{{ formatDuration(ag.doneTime - ag.spawnTime) }}</span>
+              <span v-else-if="ag.status === 'paused' && ag.spawnTime"
+                    class="ag-card-time paused">{{ formatDuration(Date.now() - ag.spawnTime) }}</span>
+              <span v-else-if="ag.status === 'running' && ag.spawnTime"
+                    class="ag-card-time running">{{ formatDuration(Date.now() - ag.spawnTime) }}</span>
+              <!-- 恢复按钮 (仅 workflow 内 paused 的 agent) -->
+              <button v-if="wfRunState && ag.source === 'workflow' && ag.status === 'paused'"
+                      class="fp-icon-btn" style="margin-left:auto;opacity:0.7" title="恢复此 Agent"
+                      @click="resumeAgent(ag.id)">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              </button>
+              <!-- 单 agent 暂停按钮 (仅 workflow 内 running 的 agent) -->
+              <button v-if="wfRunState && ag.source === 'workflow' && ag.status === 'running'"
+                      class="fp-icon-btn" style="margin-left:auto;opacity:0.7" title="暂停此 Agent"
+                      @click="stopAgent(ag.id)">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+              </button>
             </div>
+            <!-- 任务描述 -->
+            <div v-if="ag.description" class="ag-card-desc" :title="ag.description">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                   style="flex-shrink:0;margin-top:2px">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                <polyline points="14 2 14 8 20 8"/>
+              </svg>
+              <span>{{ ag.description }}</span>
+            </div>
+            <!-- 进度条 + 当前工具 -->
+            <div v-if="ag.status === 'running' || ag.status === 'done'" class="ag-card-progress">
+              <div v-if="ag.status === 'running'" class="ag-card-bar">
+                <div class="ag-card-bar-indeterminate"></div>
+              </div>
+              <div v-else class="ag-card-bar">
+                <div class="ag-card-bar-fill done"></div>
+              </div>
+              <div class="ag-card-tool-info">
+                <span v-if="ag.currentTool" class="ag-card-tool-name">{{ ag.currentTool }}</span>
+                <span v-if="ag.currentToolElapsed > 0" class="ag-card-tool-time">{{ ag.currentToolElapsed }}s</span>
+                <span v-if="ag.status === 'running' && ag.spawnTime"
+                      class="ag-card-elapsed">总耗时 {{ formatDuration(Date.now() - ag.spawnTime) }}</span>
+              </div>
+            </div>
+            <!-- 时间线 -->
+            <div class="ag-card-timeline">
+              <div class="ag-card-step"><span class="ag-step-label">创建</span><span
+                  class="ag-step-time">{{ formatTime(ag.spawnTime) }}</span></div>
+              <div class="ag-card-step"><span class="ag-step-label">启动</span><span
+                  class="ag-step-time">{{ ag.startTime ? formatTime(ag.startTime) : '—' }}</span></div>
+              <div class="ag-card-step"><span class="ag-step-label">{{
+                  ag.status === 'error' ? '错误' : '完成'
+                }}</span><span class="ag-step-time">{{ ag.doneTime ? formatTime(ag.doneTime) : '—' }}</span></div>
+            </div>
+            <div v-if="ag.transcriptPath" class="ag-card-record">记录已保存</div>
           </div>
-          <!-- 日志（最近 15 条） -->
+        </div>
+
+        <!-- 日志 + 底部状态栏 (仅 Workflow 时) -->
+        <template v-if="wfRunState">
           <div class="wf-logs">
             <div v-for="(l, li) in wfRunState.logs.slice(-15)" :key="li" class="wf-log-line">
               <span class="wf-log-phase">{{ l.phase }}</span>
@@ -4993,6 +5399,18 @@ const tokenTooltip = computed(() => {
       </div>
     </div>
 
+    <!-- 批量删除会话确认弹窗 -->
+    <div v-if="pendingBatchDelete" class="confirm-overlay" @click.self="pendingBatchDelete = null">
+      <div class="confirm-dialog glass">
+        <h3 class="confirm-title">{{ t('ws.batchDeleteTitle') }}</h3>
+        <p class="confirm-body">{{ t('ws.batchDeleteBody', { n: pendingBatchDelete.length }) }}</p>
+        <div class="confirm-actions">
+          <button class="confirm-btn cancel" @click="pendingBatchDelete = null">{{ t('common.cancel') }}</button>
+          <button class="confirm-btn danger" @click="confirmBatchDelete">{{ t('ws.batchDeleteConfirm') }}</button>
+        </div>
+      </div>
+    </div>
+
     <!-- 删除会话确认弹窗（危险操作，包含删除文件选项） -->
     <div v-if="pendingDelete" class="confirm-overlay" @click.self="pendingDelete = null">
       <div class="confirm-dialog glass">
@@ -5103,14 +5521,50 @@ const tokenTooltip = computed(() => {
 }
 
 /* ═══════════ 侧栏 Sidebar ═══════════ */
-/* 左侧固定 380px，flex 纵向排列：顶部 → 项目列表 → 底部状态 */
-.sidebar {
-  width: 380px;
-  background: var(--bg-base);
-  border-right: 1px solid var(--border);
+/* sidebar-wrapper 展开时包含 SidebarLeft + 切换按钮 */
+.sidebar-wrapper {
   display: flex;
-  flex-direction: column;
   flex-shrink: 0;
+  overflow: hidden;
+  position: relative;
+}
+
+/* 侧栏折叠后的窄竖条 */
+.sidebar-collapsed-strip {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  width: 28px;
+  flex-shrink: 0;
+  padding-top: 10px;
+  background: var(--bg-base);
+  cursor: pointer;
+  color: var(--text-muted);
+  transition: color var(--transition-fast);
+}
+.sidebar-collapsed-strip:hover { color: var(--text-primary); }
+
+/* 侧栏内部的折叠按钮——定位在右上角 */
+.sidebar-wrapper .sidebar-toggle-btn {
+  position: absolute;
+  top: 10px;
+  right: 4px;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+.sidebar-wrapper .sidebar-toggle-btn:hover {
+  background: var(--bg-raised);
+  color: var(--text-primary);
 }
 
 .sidebar-top {
@@ -7359,6 +7813,69 @@ const tokenTooltip = computed(() => {
   margin-right: 0;
 }
 
+/* ── 附件 chips ── */
+.attach-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.attach-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 3px 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  max-width: 200px;
+}
+.attach-thumb {
+  width: 24px; height: 24px;
+  object-fit: cover;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+.attach-icon {
+  font-size: 16px;
+  flex-shrink: 0;
+}
+.attach-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.attach-remove {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 0 2px;
+  flex-shrink: 0;
+}
+.attach-remove:hover { color: var(--accent); }
+
+/* ── 附件选择按钮 ── */
+.attach-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 6px 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  align-self: center;
+  border-radius: 8px;
+  transition: all var(--transition-normal);
+  flex-shrink: 0;
+}
+.attach-btn:hover { color: var(--accent); background: var(--bg-raised); }
+
 .input-wrapper {
   display: flex;
   align-items: flex-end;
@@ -7742,6 +8259,49 @@ const tokenTooltip = computed(() => {
   color: var(--accent);
 }
 
+.choice-opt-btn.other {
+  border-style: dashed;
+}
+
+.choice-custom-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin-top: 2px;
+}
+
+.choice-custom-input {
+  flex: 1;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: var(--bg-deep);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  font-size: 13px;
+  outline: none;
+  transition: border-color var(--transition-fast);
+}
+
+.choice-custom-input:focus {
+  border-color: var(--accent);
+}
+
+.choice-opt-btn.confirm {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+  white-space: nowrap;
+}
+
+.choice-opt-btn.confirm:hover {
+  opacity: 0.85;
+  color: #fff;
+}
+
+.choice-opt-btn.cancel {
+  white-space: nowrap;
+}
+
 /* ═══════════ 文件快照 Diff 面板 File Panel ═══════════ */
 /* 顶部工具栏的切换按钮，激活时红色高亮 */
 .panel-toggle-btn {
@@ -7866,12 +8426,34 @@ const tokenTooltip = computed(() => {
 /* 右侧文件面板容器 */
 /* 右侧面板容器 */
 .right-panels {
-  width: 360px;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
   overflow: hidden;
 }
+
+/* 面板拖拽分割线 —— 4px 宽，hover/active 时高亮为 accent 色 */
+.resize-handle {
+  width: 4px;
+  flex-shrink: 0;
+  cursor: col-resize;
+  background: transparent;
+  transition: background var(--transition-fast);
+  position: relative;
+  z-index: 10;
+}
+
+.resize-handle::before {
+  content: '';
+  position: absolute;
+  inset: 0 -6px;
+}
+
+.resize-handle:hover,
+.resize-handle.active {
+  background: var(--accent);
+}
+
 
 .file-panel {
   background: var(--bg-base);
@@ -7969,6 +8551,19 @@ const tokenTooltip = computed(() => {
   color: var(--warning);
 }
 
+.fp-git-info {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 12px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+}
+.fp-git-branch { color: var(--accent); font-weight: 500; }
+.fp-git-hash { opacity: .6; margin-left: 2px; }
+
 .fp-tree {
   flex: 1;
   overflow-y: auto;
@@ -7990,11 +8585,13 @@ const tokenTooltip = computed(() => {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 10px;
+  padding: 6px 70px 6px 10px;
   cursor: pointer;
   font-size: 15px;
   white-space: nowrap;
   transition: background var(--transition-fast);
+  min-width: 0;
+  position: relative;
 }
 
 .file-row:hover {
@@ -8014,9 +8611,12 @@ const tokenTooltip = computed(() => {
 }
 
 .fp-name {
+  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--text-secondary);
+  min-width: 0;
 }
 
 .fp-name.dir {
@@ -8074,14 +8674,12 @@ const tokenTooltip = computed(() => {
 }
 
 .fp-add {
-  flex-shrink: 0;
   font-size: 13px;
   font-family: var(--font-mono);
   color: var(--success);
 }
 
 .fp-del {
-  flex-shrink: 0;
   font-size: 13px;
   font-family: var(--font-mono);
   color: var(--error);
@@ -8203,7 +8801,11 @@ const tokenTooltip = computed(() => {
 }
 
 .fp-diff-btn {
-  flex-shrink: 0; margin-left: auto;
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  flex-shrink: 0;
   font-size: 13px; font-weight: 600; font-family: var(--font-body);
   padding: 6px 14px; border-radius: 6px;
   background: var(--bg-glass);
@@ -8691,6 +9293,11 @@ const tokenTooltip = computed(() => {
   border-color: var(--error);
 }
 
+.ag-panel-card.paused {
+  border-color: var(--text-muted);
+  opacity: 0.78;
+}
+
 .ag-card-head {
   display: flex;
   align-items: center;
@@ -8709,6 +9316,10 @@ const tokenTooltip = computed(() => {
 .ag-card-dot.running {
   background: var(--accent-gold);
   animation: wf-dot-pulse 1.2s ease-in-out infinite;
+}
+
+.ag-card-dot.paused {
+  background: var(--text-muted);
 }
 
 .ag-card-dot.done {

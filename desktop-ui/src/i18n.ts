@@ -401,12 +401,15 @@ const messages: Record<Locale, Record<string, string>> = {
     'ws.stopRefill': '停止并回填内容',
     'ws.queueSupplement': '补充指令', 'ws.queuePending': '待发送',
     'ws.injectNow': '中断并注入补充指令', 'ws.sendNow': '立即发送', 'ws.remove': '移除',
+    'ws.attachFile': '选择文件',
 
     // ────────────────────────────────────────────────────────────────────────
     // 确认横幅 —— 工具调用授权提示（允许/拒绝/选择）
     // ────────────────────────────────────────────────────────────────────────
     'ws.needAuth': '需要授权: {tool}',
     'ws.deny': '拒绝', 'ws.allow': '允许', 'ws.choose': '请选择',
+    'ws.other': '其他（自定义输入）', 'ws.customPlaceholder': '输入你的回复…',
+    'ws.send': '发送', 'ws.cancel': '取消',
 
     // ────────────────────────────────────────────────────────────────────────
     // Toast 通知 —— 即时反馈提示（操作结果、状态变更、错误提醒）
@@ -426,6 +429,7 @@ const messages: Record<Locale, Record<string, string>> = {
     'ws.fpTitle': '项目文件',
     'ws.fpRefresh': '刷新文件列表',
     'ws.close': '关闭',
+    'ws.hideSidebar': '隐藏侧栏', 'ws.showSidebar': '显示侧栏',
     'ws.fpAll': '全部', 'ws.fpChanged': '仅改动',
     'ws.fpBaseline': '基线 {time}', 'ws.fpNoBaseline': '无基线',
     'ws.fpMissing': '工作目录不存在',
@@ -473,6 +477,13 @@ const messages: Record<Locale, Record<string, string>> = {
     'ws.unsavedDiscard': '放弃更改',
     'ws.deleteSessionTitle': '删除会话',
     'ws.deleteSessionBody': '确定要删除此会话吗？其对话记录将被永久移除，此操作不可撤销。',
+    'ws.batchDeleteTitle': '批量删除会话',
+    'ws.batchDeleteBody': '确定要删除选中的 {n} 个会话吗？其对话记录将被永久移除，此操作不可撤销。',
+    'ws.batchDeleteConfirm': '确认删除',
+    'ws.batchMode': '批量管理',
+    'ws.exitBatchMode': '退出批量模式',
+    'ws.selectAll': '全选',
+    'ws.deselectAll': '取消全选',
     'ws.closeTabTitle': '关闭标签页',
     'ws.closeTabBody': '关闭标签页将断开当前会话的连接，进行中的任务将被中断。未提交的文件变更不受影响。确定关闭？',
     'ws.closeTabConfirm': '确认关闭',
@@ -550,6 +561,8 @@ const messages: Record<Locale, Record<string, string>> = {
     'sys.revertedSkip': ' · {n} 个不可回退已跳过',
     'sys.committed': '已提交修改 · 新基线含 {n} 个文件，记录点已清空',
     'sys.committedSelective': '已提交 {n} 个文件 · 保留 {kept} 个记录点',
+    'sys.committedGit': '已提交修改 · 新基线含 {n} 个文件，记录点已清空\nGit: {hash} — {subject}',
+    'sys.committedSelectiveGit': '已提交 {n} 个文件 · 保留 {kept} 个记录点\nGit: {hash} — {subject}',
     'err.revertFail': '回退失败: {msg}', 'err.commitFail': '提交失败: {msg}',
     'err.clickSettings': ' 请点设置', 'err.connectFail': '连接失败: {msg}',
     'err.historyLoad': '历史消息加载失败，将以空白会话开始',
@@ -834,10 +847,13 @@ const messages: Record<Locale, Record<string, string>> = {
     'ws.stopRefill': 'Stop and restore text',
     'ws.queueSupplement': 'Supplement', 'ws.queuePending': 'Pending',
     'ws.injectNow': 'Interrupt and inject', 'ws.sendNow': 'Send now', 'ws.remove': 'Remove',
+    'ws.attachFile': 'Attach files',
 
     // ── Confirm banner ──
     'ws.needAuth': 'Authorization needed: {tool}',
     'ws.deny': 'Deny', 'ws.allow': 'Allow', 'ws.choose': 'Please choose',
+    'ws.other': 'Other (custom input)', 'ws.customPlaceholder': 'Type your reply…',
+    'ws.send': 'Send', 'ws.cancel': 'Cancel',
 
     // ── System / toast ──
     'ws.taskCanceled': 'Task canceled',
@@ -853,6 +869,7 @@ const messages: Record<Locale, Record<string, string>> = {
     'ws.fpTitle': 'Project Files',
     'ws.fpRefresh': 'Refresh file list',
     'ws.close': 'Close',
+    'ws.hideSidebar': 'Hide sidebar', 'ws.showSidebar': 'Show sidebar',
     'ws.fpAll': 'All', 'ws.fpChanged': 'Changed',
     'ws.fpBaseline': 'Baseline {time}', 'ws.fpNoBaseline': 'No baseline',
     'ws.fpMissing': 'Working directory not found',
@@ -890,6 +907,13 @@ const messages: Record<Locale, Record<string, string>> = {
     'ws.confirmRewind': 'Confirm Revert', 'ws.rewinding': 'Reverting...',
     'ws.deleteSessionTitle': 'Delete Session',
     'ws.deleteSessionBody': 'Delete this session? Its conversation log is permanently removed. This cannot be undone.',
+    'ws.batchDeleteTitle': 'Batch Delete Sessions',
+    'ws.batchDeleteBody': 'Delete {n} selected sessions? Their conversation logs are permanently removed. This cannot be undone.',
+    'ws.batchDeleteConfirm': 'Delete Selected',
+    'ws.batchMode': 'Batch Manage',
+    'ws.exitBatchMode': 'Exit Batch Mode',
+    'ws.selectAll': 'Select All',
+    'ws.deselectAll': 'Deselect All',
     'ws.closeTabTitle': 'Close Tab',
     'ws.closeTabBody': 'Closing this tab will disconnect the session. In-progress tasks will be interrupted. Uncommitted file changes are unaffected. Close anyway?',
     'ws.closeTabConfirm': 'Close',
@@ -957,6 +981,8 @@ const messages: Record<Locale, Record<string, string>> = {
     'sys.revertedSkip': ' · {n} not revertible skipped',
     'sys.committed': 'Committed · new baseline has {n} files, checkpoints cleared',
     'sys.committedSelective': 'Committed {n} files · {kept} checkpoints kept',
+    'sys.committedGit': 'Committed · new baseline has {n} files, checkpoints cleared\nGit: {hash} — {subject}',
+    'sys.committedSelectiveGit': 'Committed {n} files · {kept} checkpoints kept\nGit: {hash} — {subject}',
     'err.revertFail': 'Revert failed: {msg}', 'err.commitFail': 'Commit failed: {msg}',
     'err.clickSettings': ' Open Settings', 'err.connectFail': 'Connection failed: {msg}',
     'err.historyLoad': 'Failed to load history, starting with empty session',

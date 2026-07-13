@@ -303,18 +303,31 @@ return { bugs: realBugs, totalReported: allBugs.length, confirmedCount: realBugs
 
     // ─── 3. 评委面板 ───
     'judge-panel.mjs': `// ─── Judge Panel ───
-// 多方案独立生成 → 并行评分 → 选优融合，适合架构选型/方案对比
+// Explore(单 agent 读代码) → Draft(三路并行出方案，共享同一份分析) → Judge(评分) → Synthesize(融合)
 export const meta = {
   name: 'judge-panel',
-  description: '多方案独立生成 + 并行评分 + 优胜融合，适合架构选型/方案对比',
+  description: '探索代码 → 三角度出方案 → 评分 → 融合，代码只读一次',
   phases: [
-    { title: 'Draft', detail: '多角度独立生成方案' },
+    { title: 'Explore', detail: '单 agent 读取并分析代码' },
+    { title: 'Draft', detail: '三路并行出方案（共享分析结果）' },
     { title: 'Judge', detail: '并行评分' },
     { title: 'Synthesize', detail: '融合最优方案' },
   ],
 }
 
 const problem = args.problem || args.task || '如何优化当前项目的构建速度?'
+
+// Phase 1: 单个 agent 探索代码库，输出结构化分析（只读一次）
+phase('Explore')
+const codeAnalysis = await agent(
+  '探索当前项目，输出一份结构化的代码分析（中文），供后续方案设计使用。\\n' +
+  '需覆盖: 1)涉及的关键文件和模块 2)现有的架构/模式/依赖关系 3)变更的风险点和约束 4)代码规模和复杂度估算。\\n' +
+  '只做分析，不要提方案。输出纯文本即可，不要 JSON。',
+  { label: 'explore', phase: 'Explore', agentType: 'Explore' }
+)
+log('代码分析完成 (' + codeAnalysis.length + ' 字符)')
+
+// Phase 2: 三路并行出方案，共享同一份 Explore 结果，不再各自读文件
 const ANGLES = [
   { key: 'mvp', prompt: '从最小可行方案出发（改动最少、风险最低）: ' + problem },
   { key: 'best', prompt: '从技术最优方案出发（不考虑迁移成本）: ' + problem },
@@ -323,7 +336,10 @@ const ANGLES = [
 
 phase('Draft')
 const drafts = await parallel(ANGLES.map(a =>
-  () => agent(a.prompt, { label: 'draft:' + a.key, phase: 'Draft', model: 'sonnet' })
+  () => agent(
+    a.prompt + '\\n\\n## 代码分析（已提前完成，直接使用，不要再读文件）\\n' + codeAnalysis,
+    { label: 'draft:' + a.key, phase: 'Draft', model: 'sonnet' }
+  )
 ))
 const validDrafts = drafts.filter(Boolean)
 
@@ -629,9 +645,17 @@ const RUN_STATE_TTL_MS = 5 * 60 * 1000
 
 function getRunState(nameOrWfId) {
     // 先按 wfId 查找，再按 name 查找最新活跃 wfId
-    if (_runStates.has(nameOrWfId)) return _runStates.get(nameOrWfId)
-    const wfId = _activeByName.get(nameOrWfId)
-    return wfId ? (_runStates.get(wfId) || null) : null
+    let state = _runStates.has(nameOrWfId) ? _runStates.get(nameOrWfId) : null
+    if (!state) {
+        const wfId = _activeByName.get(nameOrWfId)
+        state = wfId ? (_runStates.get(wfId) || null) : null
+    }
+    if (!state) return null
+    // 转换 _pausedAgents Map → 可序列化数组
+    const pausedAgents = state._pausedAgents
+        ? [...state._pausedAgents.entries()].map(([label, info]) => ({label, pausedAt: info.pausedAt}))
+        : []
+    return {...state, pausedAgents}
 }
 
 function presetRunState(name) {
@@ -805,13 +829,17 @@ function listWorkflows() {
 }
 
 function getWorkflow(name) {
-    const fp = join(WF_DIR, name)
-    if (!existsSync(fp)) return null
-    try {
-        return readFileSync(fp, 'utf8')
-    } catch {
-        return null
+    // 先尝试原名称，再尝试追加 .mjs / .js 扩展名
+    for (const candidate of [name, name + '.mjs', name + '.js']) {
+        const fp = join(WF_DIR, candidate)
+        if (!existsSync(fp)) continue
+        try {
+            return readFileSync(fp, 'utf8')
+        } catch {
+            return null
+        }
     }
+    return null
 }
 
 function saveWorkflow(name, content) {
@@ -963,7 +991,7 @@ function extractJSON(text) {
 }
 
 // ── 单个 agent() 执行（核心） ──
-async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCache, wfId, budgetRef, abortedRef, _cacheKey = null) {
+async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCache, wfId, budgetRef, abortedRef, _cacheKey = null, _agentAborts = null, _agentHandles = null) {
     const {
         label, schema, model, phase: agentPhase, isolation,
         agentType: rawAgentType, maxTurns, permissionMode, effort,
@@ -973,8 +1001,13 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
     const agentType = resolveAgentType(rawAgentType, workDir)
 
     const agLabel = label || 'agent'
-    logFn('[Agent:' + agLabel + '] 启动' + (model ? ' (model=' + model + ')' : '')
-        + (effort ? ' (effort=' + effort + ')' : '') + (isolation === 'worktree' ? ' [worktree]' : ''), agentPhase)
+    // 提取任务摘要: 首行截断到 100 字符，去掉换行
+    const taskSummary = (prompt || '').replace(/[\r\n]+/g, ' ').trim().substring(0, 100)
+    logFn('[Agent:' + agLabel + '] 启动 | ' + taskSummary
+        + (agentType ? ' (type=' + agentType + ')' : '')
+        + (model ? ' (model=' + model + ')' : '')
+        + (effort ? ' (effort=' + effort + ')' : '')
+        + (isolation === 'worktree' ? ' [worktree]' : ''), agentPhase)
 
     // ── Budget 硬上限拦截 ──
     if (budgetRef && budgetRef.total) {
@@ -1039,6 +1072,7 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
 
     // ── 启动 query ──
     const q = _deps.query({prompt: pushStream, options: queryOpts})
+    if (_agentHandles) _agentHandles.set(agLabel, {q, pushStream, sessionId, status: 'running', _prompt: prompt, _opts: opts})
     pushStream.push({
         type: 'user', session_id: sessionId,
         message: {role: 'user', content: [{type: 'text', text: prompt}]},
@@ -1049,24 +1083,84 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
     let output = ''
     let usage = null
     let resolved = false
+    const _seenEventTypes = new Set()
+    const _seenDeltaTypes = new Set()
+    const _seenMsgTypes = new Set()
 
     const streamPromise = (async () => {
         try {
             for await (const sdkMsg of q) {
                 if (resolved) break
-                // 暂停信号: 立即中断迭代并 q.return() 让 SDK 关闭底层 query，终止 agent 后台运行避免继续耗 token
+                // DEBUG: 记录首次出现的 message type + keys
+                if (!_seenMsgTypes.has(sdkMsg.type)) {
+                    _seenMsgTypes.add(sdkMsg.type)
+                    logFn('[DEBUG:' + agLabel + '] sdkMsg type=' + sdkMsg.type + ' keys=' + JSON.stringify(Object.keys(sdkMsg)).slice(0,200), agentPhase)
+                }
+                // 捕获 SDK conversation ID，持久化映射供 scanProjects 过滤 agent session
+                if (sdkMsg.type === 'system' && sdkMsg.subtype === 'init' && sdkMsg.session_id) {
+                    try { _deps.persistSdkSessionId(workDir, sessionId, sdkMsg.session_id) } catch {}
+                }
+                // 工作流级暂停信号
                 if (abortedRef?.()) {
                     try { await q.return?.() } catch {}
                     break
                 }
+                // 单 agent 独立暂停信号 → 抛错误触发 VM polling loop，不写 journal
+                if (_agentAborts?.get(agLabel)) {
+                    logFn('[Agent:' + agLabel + '] 已暂停，等待恢复...', agentPhase)
+                    try { await q.return?.() } catch {}
+                    const err = new Error('AgentPaused: ' + agLabel)
+                    err.code = 'AGENT_PAUSED'
+                    throw err
+                }
                 if (sdkMsg.type === 'assistant') {
                     for (const block of (sdkMsg.message?.content || [])) {
                         if (block.type === 'text' && block.text) output += block.text
+                        // tool_use 块：捕获工具名称到日志
+                        if (block.type === 'tool_use' && block.name) {
+                            logFn('[Agent:' + agLabel + '] 工具: ' + block.name, agentPhase)
+                        }
+                    }
+                }
+                // stream_event：捕获 text_delta（非 Anthropic SDK 模型文本可能只走 delta 流）
+                if (sdkMsg.type === 'stream_event') {
+                    const ev = sdkMsg.event
+                    // DEBUG: 记录实际收到的 stream_event 类型和结构
+                    if (!_seenEventTypes.has(ev.type)) {
+                        _seenEventTypes.add(ev.type)
+                        logFn('[DEBUG:' + agLabel + '] stream_event type=' + ev.type + ' keys=' + JSON.stringify(Object.keys(ev)).slice(0,120), agentPhase)
+                    }
+                    if (ev.type === 'content_block_delta') {
+                        if (!_seenDeltaTypes.has(ev.delta?.type)) {
+                            _seenDeltaTypes.add(ev.delta?.type)
+                            logFn('[DEBUG:' + agLabel + '] delta type=' + ev.delta?.type + ' keys=' + JSON.stringify(Object.keys(ev.delta || {})).slice(0,120), agentPhase)
+                        }
+                        if (ev.delta?.type === 'text_delta' && ev.delta.text) {
+                            output += ev.delta.text
+                        }
+                        // thinking_delta 也收集
+                        if (ev.delta?.type === 'thinking_delta' && ev.delta.thinking) {
+                            output += ev.delta.thinking
+                        }
+                    }
+                    if (ev.type === 'content_block_start') {
+                        if (ev.content_block?.type === 'tool_use') {
+                            logFn('[Agent:' + agLabel + '] 工具: ' + (ev.content_block.name || ''), agentPhase)
+                        }
+                        if (ev.content_block?.type === 'text') {
+                            // 有些 SDK 在 content_block_start 时就带了文本
+                            if (ev.content_block.text) output += ev.content_block.text
+                        }
+                    }
+                    if (ev.type === 'content_block_stop') {
+                        // noop
                     }
                 }
                 if (sdkMsg.type === 'result') {
                     usage = sdkMsg.usage
-                    output = sdkMsg.result || output
+                    // 0.3.x: SDKResultError 无 result 字段，改用 errors 数组
+                    output = sdkMsg.result || (sdkMsg.errors?.join('\n')) || output
+                    logFn('[DEBUG:' + agLabel + '] result: sdkMsg.result=' + (sdkMsg.result ? sdkMsg.result.slice(0,200) : 'NULL') + ' output.len=' + output.length, agentPhase)
                     break
                 }
             }
@@ -1091,6 +1185,7 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
         // 无论正常结束/超时/暂停，都显式调 q.return() 关闭底层 SDK query，
         //   防止 agent 在超时/暂停后仍后台运行继续消耗 API token
         try { await q.return?.() } catch {}
+        _agentHandles?.delete(agLabel)
     }
 
     // ── 清理 worktree ──
@@ -1110,7 +1205,10 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
         let parsed = extractJSON(output)
         let retries = 0
 
-        while (retries <= SCHEMA_MAX_RETRIES) {
+        // 首轮就空输出说明模型响应格式问题，重试不会改善，直接跳过
+        if (!parsed && !output) {
+            logFn('[Agent:' + agLabel + '] 输出为空，跳过 Schema 重试（模型可能不支持 JSON 输出）', agentPhase)
+        } else while (retries < SCHEMA_MAX_RETRIES) {
             if (parsed) {
                 const validation = validateSchema(parsed, schema)
                 if (validation.valid) {
@@ -1121,7 +1219,6 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
             } else {
                 logFn('[Agent:' + agLabel + '] 未提取到 JSON，重试 ' + (retries + 1) + '/' + SCHEMA_MAX_RETRIES, agentPhase)
             }
-            if (retries >= SCHEMA_MAX_RETRIES) break
 
             const retryPrompt = prompt + '\n\n[IMPORTANT] You MUST output ONLY valid JSON matching: ' + JSON.stringify(schema)
                 + (parsed ? '\nValidation error: ' + validateSchema(parsed, schema).error : '\nNo JSON found.')
@@ -1129,8 +1226,8 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
                 label: agLabel + '-retry' + (retries + 1), agentType, model,
                 maxTurns: Math.max(3, (maxTurns || DEFAULT_MAX_TURNS) - 5),
             }, workDir, broadcast, logFn, journalCache, wfId, budgetRef, abortedRef, _cacheKey)
-            parsed = extractJSON(typeof retryResult === 'string' ? retryResult : JSON.stringify(retryResult))
             retries++
+            parsed = extractJSON(typeof retryResult === 'string' ? retryResult : JSON.stringify(retryResult))
         }
     }
 
@@ -1163,11 +1260,57 @@ function stopWorkflow(name) {
         journalCache: state._journalCache, tokenSpent: state._tokenSpent,
         currentPhase: state._currentPhase,
         _countedKeys: [...(state._countedKeys || [])],
+        _agentAborts: new Map(state._agentAborts || []),
+        _agentHandles: new Map(state._agentHandles || []),
+        _pausedAgents: new Map(state._pausedAgents || []),
     })
     state.status = 'paused'
     // 调用 _abort() 桥接闭包变量 aborted 和 state._aborted，确保 VM 沙箱内 agent()/parallel()/pipeline() 感知到暂停
     if (typeof state._abort === 'function') state._abort()
     else state._aborted = true  // 兜底：旧版本 runState 没有 _abort 方法
+    return true
+}
+
+// ── 单 agent 独立暂停 ──
+function stopWorkflowAgent(wfId, agentLabel) {
+    const state = _runStates.get(wfId)
+    if (!state) return false
+    // 设置中止标记：executeAgent 的 for-await 感知
+    if (!state._agentAborts) state._agentAborts = new Map()
+    state._agentAborts.set(agentLabel, true)
+    // 保存暂停元信息供 UI 查询
+    if (!state._pausedAgents) state._pausedAgents = new Map()
+    const handle = state._agentHandles?.get(agentLabel)
+    state._pausedAgents.set(agentLabel, {
+        prompt: handle?._prompt || '', opts: handle?._opts || {}, pausedAt: Date.now()
+    })
+    // 如果有活跃 handle，直接关闭底层 query 加速响应
+    if (handle && handle.status === 'running') {
+        handle.status = 'paused'
+        try { handle.pushStream?.close() } catch {}
+        try { handle.q?.return?.() } catch {}
+    }
+    // 广播给前端
+    if (state._parentSid && _deps?.broadcast) {
+        _deps.broadcast(state._parentSid, {
+            type: 'agent_paused', workflowId: wfId, agentLabel,
+        })
+    }
+    return true
+}
+
+// ── 单 agent 恢复 ──
+function resumeWorkflowAgent(wfId, agentLabel) {
+    const state = _runStates.get(wfId)
+    if (!state || !state._agentAborts) return false
+    state._agentAborts.delete(agentLabel)
+    state._pausedAgents?.delete(agentLabel)
+    // 广播给前端
+    if (state._parentSid && _deps?.broadcast) {
+        _deps.broadcast(state._parentSid, {
+            type: 'agent_resumed', workflowId: wfId, agentLabel,
+        })
+    }
     return true
 }
 
@@ -1296,17 +1439,37 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
             effort: opts.effort,
             isolation: opts.isolation,
         })
-        const result = await executeAgent(prompt, opts, workDir, _broadcast, logFn,
-            journalCache, wfId, budgetRef, () => aborted, cacheKey)
+        const agLabel = opts.label || 'agent'
 
-        // 更新 token 统计，防重复计数
-        if (journalCache[cacheKey] && !_countedKeys.has(cacheKey)) {
-            tokenSpent += journalCache[cacheKey].tokenSpent
-            _countedKeys.add(cacheKey)
-            runState._tokenSpent = tokenSpent
+        // 轮询重试: 单 agent 暂停后等待恢复，然后重新执行
+        while (true) {
+            if (aborted) throw new Error('WorkflowAborted: 工作流已被暂停')
+            try {
+                const result = await executeAgent(prompt, opts, workDir, _broadcast, logFn,
+                    journalCache, wfId, budgetRef, () => aborted, cacheKey, runState._agentAborts, runState._agentHandles)
+
+                // 成功 → 更新 token 统计，防重复计数
+                if (journalCache[cacheKey] && !_countedKeys.has(cacheKey)) {
+                    tokenSpent += journalCache[cacheKey].tokenSpent
+                    _countedKeys.add(cacheKey)
+                    runState._tokenSpent = tokenSpent
+                }
+                return result
+            } catch (e) {
+                if (e.code === 'AGENT_PAUSED') {
+                    logFn('[Agent:' + agLabel + '] 等待用户恢复...')
+                    // 轮询: 每 500ms 检查是否已恢复
+                    while (!aborted && runState._agentAborts?.get(agLabel)) {
+                        await new Promise(r => safeSetTimeout(r, 500))
+                    }
+                    if (aborted) throw new Error('WorkflowAborted: 工作流已被暂停')
+                    // 标记已清除，循环重新执行
+                    logFn('[Agent:' + agLabel + '] 已恢复，重新执行', agentPhase)
+                    continue
+                }
+                throw e  // 其他错误正常抛出
+            }
         }
-
-        return result
     }
 
     // ── Sandbox 全局: parallel(thunks) ──
@@ -1446,6 +1609,7 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
             error: (...a) => logFn('[Error] ' + a.map(String).join(' ')),
             warn: (...a) => logFn('[Warn] ' + a.map(String).join(' ')),
         },
+        process: {cwd: () => workDir, env: {}},
         setTimeout: safeSetTimeout, clearTimeout: safeClearTimeout,
         Promise, JSON, Array, Object, String, Number, Boolean,
         Math, Date, Error, RegExp, Map, Set,
@@ -1490,6 +1654,9 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
         _aborted: false, _journalCache: journalCache, _tokenSpent: tokenSpent,
         _currentPhase: currentPhase,
         _countedKeys: _countedKeys,
+        _agentAborts: resumeState?._agentAborts || new Map(),
+        _agentHandles: resumeState?._agentHandles || new Map(),
+        _pausedAgents: resumeState?._pausedAgents || new Map(),
     }
     // 暴露 abort 控制（必须在 _runStates.set 之前定义，防止 stopWorkflow 竞态拿到没有 _abort 的 state）
     runState._abort = () => {
@@ -1574,7 +1741,7 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
                                         schema: opts.schema, effort: opts.effort, isolation: opts.isolation,
                                     })
                                     const result = await executeAgent(prompt, opts, workDir, _broadcast, enhancedLog,
-                                        journalCache, wfId, budgetRef, () => aborted, cacheKey)
+                                        journalCache, wfId, budgetRef, () => aborted, cacheKey, runState._agentAborts, runState._agentHandles)
                                     if (journalCache[cacheKey] && !_countedKeys.has(cacheKey)) {
                                         tokenSpent += journalCache[cacheKey].tokenSpent
                                         _countedKeys.add(cacheKey)
@@ -1868,6 +2035,8 @@ export {
     getRunState,
     presetRunState,
     stopWorkflow,
+    stopWorkflowAgent,
+    resumeWorkflowAgent,
     resumeWorkflow,
     commitWorkflow,
     queryHistory,
