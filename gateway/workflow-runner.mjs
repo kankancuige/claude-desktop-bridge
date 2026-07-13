@@ -1083,6 +1083,7 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
     let output = ''
     let usage = null
     let resolved = false
+    let sdkSessionId = null  // 捕获 SDK conversation ID，用于事后清理
     const _seenEventTypes = new Set()
     const _seenDeltaTypes = new Set()
     const _seenMsgTypes = new Set()
@@ -1096,9 +1097,9 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
                     _seenMsgTypes.add(sdkMsg.type)
                     logFn('[DEBUG:' + agLabel + '] sdkMsg type=' + sdkMsg.type + ' keys=' + JSON.stringify(Object.keys(sdkMsg)).slice(0,200), agentPhase)
                 }
-                // 捕获 SDK conversation ID，持久化映射供 scanProjects 过滤 agent session
+                // 捕获 SDK conversation ID，供事后清理使用
                 if (sdkMsg.type === 'system' && sdkMsg.subtype === 'init' && sdkMsg.session_id) {
-                    try { _deps.persistSdkSessionId(workDir, sessionId, sdkMsg.session_id) } catch {}
+                    sdkSessionId = sdkMsg.session_id
                 }
                 // 工作流级暂停信号
                 if (abortedRef?.()) {
@@ -1186,6 +1187,11 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
         //   防止 agent 在超时/暂停后仍后台运行继续消耗 API token
         try { await q.return?.() } catch {}
         _agentHandles?.delete(agLabel)
+        // 清理 SDK transcript 文件，防止 agent 子 session 残留
+        if (_deps?.deleteSession && _deps?.encodeProjectName && sdkSessionId) {
+            const projectsDir = join(homedir(), '.claude', 'projects', _deps.encodeProjectName(workDir))
+            try { await _deps.deleteSession(sdkSessionId, {dir: projectsDir}) } catch {}
+        }
     }
 
     // ── 清理 worktree ──

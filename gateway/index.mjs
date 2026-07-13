@@ -365,7 +365,7 @@ function broadcast(sid, msg) {
 }
 
 // 注入依赖到 workflow-runner（供 VM 沙箱内 agent() 调用）
-setDeps({query, makeQueryOptions, loadCliSettings, loadWfConfig, PushStream, broadcast, sessions, persistSdkSessionId})
+setDeps({query, deleteSession, makeQueryOptions, loadCliSettings, loadWfConfig, PushStream, broadcast, sessions, persistSdkSessionId, encodeProjectName})
 
 // 收口：任一通道响应或超时都走这里，幂等（已 settled 则忽略）
 // ── 确认请求收口（settlePending）──
@@ -1537,6 +1537,16 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
                         })
                     } catch {
                     }
+                    // 清理子 agent transcript 文件，防止积累
+                    try {
+                        if (input.agent_transcript_path) {
+                            const tp = input.agent_transcript_path
+                            if (existsSync(tp)) unlinkSync(tp)
+                            // 同时清理空 subagents 目录
+                            const subDir = dirname(tp)
+                            try { if (existsSync(subDir)) rmdirSync(subDir) } catch {}
+                        }
+                    } catch {}
                     return {}
                 }]
             }],
