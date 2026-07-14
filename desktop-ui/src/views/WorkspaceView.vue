@@ -480,6 +480,7 @@ interface TabState {
   turnThinkingText: string
   lastUserMessage: string
   mirrorState: Record<string, boolean>
+  turnCompleted: boolean
 }
 
 /** 创建初始标签页状态（所有字段有默认值） */
@@ -506,6 +507,7 @@ function initialTabState(): TabState {
     turnThinkingText: '',
     lastUserMessage: '',
     mirrorState: { wechat: false, feishu: false, dingtalk: false },
+    turnCompleted: false,
   }
 }
 
@@ -533,6 +535,7 @@ function snapshotTabState(): TabState {
     turnThinkingText,
     lastUserMessage,
     mirrorState: { ...mirrorState.value },
+    turnCompleted: _turnCompleted,
   }
 }
 
@@ -559,6 +562,7 @@ function restoreTabState(s: TabState) {
   turnThinkingText = s.turnThinkingText
   lastUserMessage = s.lastUserMessage
   mirrorState.value = { ...s.mirrorState }
+  _turnCompleted = s.turnCompleted
 }
 
 interface TabSession {
@@ -2148,8 +2152,15 @@ async function connectWS(sid: string, resumed = false) {
           loadBalance()
           checkCostLimit()  // 费用达余额阈值时提醒一次
         }
-        status.value = 'idle'
-        flushMsgQueue()
+        // result 标志本轮回合结束。若子 Agent 还在跑，暂不切 idle，
+        // 设 _turnCompleted 标记，等最后一个子 Agent done 时再切 idle 并清队列。
+        // 避免用户看到 idle 就发新消息打断正在运行的子 Agent。
+        if (runningAgentTotal.value > 0) {
+          _turnCompleted = true
+        } else {
+          status.value = 'idle'
+          flushMsgQueue()
+        }
         if (fg) {
           syncPetState('success', { message: 'Done!', bubble: petPick(BUBBLE_SUCCESS, myProject) })
           setTimeout(() => { syncPetState('idle'); petBubble.value = '' }, 3000)
@@ -2161,8 +2172,9 @@ async function connectWS(sid: string, resumed = false) {
       }
 
       case 'error':
-        // SDK 错误：清空待处理工具，显示错误消息
+        // SDK 错误：清空待处理工具，显示错误消息。同时清理 agent 追踪、turn 标记。
         pendingTools.value = []
+        _turnCompleted = false
         messages.value.push({role: 'error', text: msg.message, time: Date.now()})
         status.value = 'idle'
         flushMsgQueue()
@@ -2230,8 +2242,42 @@ async function connectWS(sid: string, resumed = false) {
             break
           }
         }
+        // 最后一个子 Agent 完成且回合已结束时，切 idle 并清队列
+        if (_turnCompleted && runningAgentTotal.value === 0) {
+          _turnCompleted = false
+          status.value = 'idle'
+          flushMsgQueue()
+        }
         break
       }
+
+        // ── WS 重连时后端推送的 workflow/agent 运行态快照 ──
+      case 'workflow_state_snapshot':
+        wfRunState.value = {
+          name: msg.name, status: msg.status, phases: msg.phases || [], currentPhase: msg.currentPhase || '',
+          logs: [], agents: msg.agents || [], tokenSpent: msg.tokenSpent || 0, wfId: msg.wfId,
+          startedAt: msg.startedAt,
+        }
+        // 恢复 agentRuns — 将快照中的 agent 注入内联卡片
+        for (const ag of (msg.agents || [])) {
+          const existing = agentRuns.value.find(a => a.id === ag.id && a.source === 'workflow')
+          if (!existing) {
+            agentRuns.value.push({
+              id: ag.id,
+              agentType: ag.agentType || ag.id,
+              description: ag.description || '',
+              status: 'running',
+              spawnTime: Date.now(),
+              startTime: Date.now(),
+              doneTime: 0,
+              progress: '',
+              source: 'workflow',
+              currentTool: '',
+              currentToolElapsed: 0,
+            })
+          }
+        }
+        break
 
         // ── Workflow 事件 ──
       case 'workflow_started':
@@ -2329,6 +2375,12 @@ async function connectWS(sid: string, resumed = false) {
             ag.doneTime = Date.now()
           }
         }
+        // Workflow 结束后检查是否所有 Agent 都已完成，若回合已结束则切 idle
+        if (_turnCompleted && runningAgentTotal.value === 0) {
+          _turnCompleted = false
+          status.value = 'idle'
+          flushMsgQueue()
+        }
         break
 
       case 'workflow_paused':
@@ -2361,6 +2413,12 @@ async function connectWS(sid: string, resumed = false) {
             ag.status = 'error';
             ag.doneTime = Date.now()
           }
+        }
+        // Workflow 异常结束，若回合已完成且无其他运行中 Agent，切 idle
+        if (_turnCompleted && runningAgentTotal.value === 0) {
+          _turnCompleted = false
+          status.value = 'idle'
+          flushMsgQueue()
         }
         break
 
@@ -2598,7 +2656,7 @@ function runCompact() {
     showToast(t('ws.notConnected'));
     return
   }
-  if (status.value === 'thinking') {
+  if (status.value === 'thinking' || runningAgentTotal.value > 0) {
     showToast(t('ws.thinkingWait'));
     return
   }
@@ -2615,8 +2673,8 @@ async function sendMessage() {
   if (!text) return
   if (!ws || ws.readyState !== 1) return
 
-  if (status.value === 'thinking' || _flushingQueue) {
-    // thinking/队列清空中: 新消息进入排队，避免与 flushMsgQueue 交织
+  if (status.value === 'thinking' || _flushingQueue || runningAgentTotal.value > 0) {
+    // thinking/队列清空中/子Agent还在跑: 新消息进入排队，避免打断正在执行的 Agent
     queueId++
     msgQueue.value.push({id: queueId, text, time: Date.now()})
     inputText.value = ''
@@ -2752,6 +2810,7 @@ function doSend(text: string, wire?: string) {
   // buildWireText 等异步操作期间 WS 可能已断开，再次检查防止 ! 崩溃
   if (!ws || ws.readyState !== 1) return
   status.value = 'thinking'
+  _turnCompleted = false  // 新一轮开始: 重置回合完成标记
   startTaskDurationTimer()
   lastUserMessage = text
   turnThinkingText = ''  // 新一轮开始: 清空本轮思考文本累计，result 时重新估算
@@ -2779,6 +2838,7 @@ function cancelTask() {
     ws.send(JSON.stringify({type: 'stop_generation'}))
   }
   status.value = 'idle'
+  _turnCompleted = false  // 取消任务: 重置回合完成标记
   if (lastUserMessage) {
     inputText.value = lastUserMessage
     lastUserMessage = ''
@@ -2862,6 +2922,8 @@ function removeQueued(item: QItem) {
 
 /** flushMsgQueue 重入互斥锁：防止 result+sendMessage 并发交织消息 */
 let _flushingQueue = false
+/** 标记本轮已收到 result（回合完成），但子 Agent 可能还在执行中。在最后一个子 Agent done 且此标记为 true 时才切 idle */
+let _turnCompleted = false
 
 /** thinking 结束后自动发送所有排队消息，逐条 dispatch 避免并发乱序 */
 async function flushMsgQueue() {

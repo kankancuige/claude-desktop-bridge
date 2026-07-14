@@ -683,6 +683,7 @@ function scheduleRunStateCleanup(wfId) {
         }
         _runStates.delete(wfId)
         _cleanupTimers.delete(wfId)
+        cleanupJournal(wfId)
     }, RUN_STATE_TTL_MS)
     _cleanupTimers.set(wfId, timer)
 }
@@ -1188,9 +1189,30 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
         try { await q.return?.() } catch {}
         _agentHandles?.delete(agLabel)
         // 清理 SDK transcript 文件，防止 agent 子 session 残留
-        if (_deps?.deleteSession && _deps?.encodeProjectName && sdkSessionId) {
-            const projectsDir = join(homedir(), '.claude', 'projects', _deps.encodeProjectName(workDir))
-            try { await _deps.deleteSession(sdkSessionId, {dir: projectsDir}) } catch {}
+        if (_deps?.deleteSession && _deps?.encodeProjectName) {
+            // 使用 effectiveWorkDir 而非 workDir: worktree 隔离时 SDK transcript
+            // 落在 worktree 路径对应的 project 目录，两个路径 encodeProjectName 不同
+            const projectsDir = join(homedir(), '.claude', 'projects', _deps.encodeProjectName(effectiveWorkDir))
+            if (sdkSessionId) {
+                try { await _deps.deleteSession(sdkSessionId, {dir: projectsDir}) } catch {}
+            } else {
+                // 兜底: SDK 启动即崩溃等极端情况下 system/init 未送达，sdkSessionId 未捕获
+                // 先尝试用本 agent 的 sessionId 直接删 (SDK 可能以此作文件名)
+                try { await _deps.deleteSession(sessionId, {dir: projectsDir}) } catch {}
+                // 再扫描项目目录查找引用本 sessionId 的残留 .jsonl
+                try {
+                    for (const f of readdirSync(projectsDir)) {
+                        if (!f.endsWith('.jsonl') || f.startsWith('.trash-')) continue
+                        try {
+                            const head = readFileSync(join(projectsDir, f), 'utf8').slice(0, 4096)
+                            if (head.includes(sessionId)) {
+                                await _deps.deleteSession(f.replace('.jsonl', ''), {dir: projectsDir})
+                                break
+                            }
+                        } catch {}
+                    }
+                } catch {}
+            }
         }
     }
 
@@ -2030,6 +2052,50 @@ async function runWorkflow(name, parentSid, extraArgs) {
     return await _runWorkflowInternal(name, parentSid, extraArgs, null)
 }
 
+// 获取指定 session 的 workflow/agent 运行态快照，供 WS 重连时前端恢复 UI
+function getSessionWorkflowState(sessionId) {
+    for (const [wfId, state] of _runStates) {
+        if (state._parentSid !== sessionId) continue
+        const agents = []
+        if (state._agentHandles) {
+            for (const [label, h] of state._agentHandles) {
+                agents.push({
+                    id: label,
+                    agentType: label,
+                    description: h._prompt ? h._prompt.slice(0, 100) : '',
+                    status: h.status || 'running',
+                    source: 'workflow',
+                    progress: '',
+                })
+            }
+        }
+        // 暂停的 agent（不在 _agentHandles 中）
+        if (state._pausedAgents) {
+            for (const [label, info] of state._pausedAgents) {
+                if (!agents.find(a => a.id === label)) {
+                    agents.push({
+                        id: label, agentType: label, description: '',
+                        status: 'paused', source: 'workflow', progress: '',
+                    })
+                }
+            }
+        }
+        const phases = state.phases || []
+        const currentPhase = state.currentPhase || phases.find(p => p.status === 'running')?.title || ''
+        return {
+            wfId,
+            name: state.name,
+            status: state.status,
+            phases,
+            currentPhase,
+            agents,
+            tokenSpent: state._tokenSpent || 0,
+            startedAt: state.startedAt,
+        }
+    }
+    return null
+}
+
 export {
     setDeps,
     listWorkflows,
@@ -2039,6 +2105,7 @@ export {
     runWorkflow,
     parseMeta,
     getRunState,
+    getSessionWorkflowState,
     presetRunState,
     stopWorkflow,
     stopWorkflowAgent,

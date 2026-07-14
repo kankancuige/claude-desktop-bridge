@@ -5,7 +5,7 @@
  */
 
 import {createServer} from 'node:http'
-import {readdirSync, statSync, readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, rmdirSync, renameSync, openSync, readSync, closeSync, realpathSync} from 'node:fs'
+import {readdirSync, statSync, readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, rmdirSync, renameSync, rmSync, openSync, readSync, closeSync, realpathSync} from 'node:fs'
 import {execSync, spawn, spawnSync} from 'node:child_process'
 import crypto from 'node:crypto'
 import {homedir} from 'node:os'
@@ -27,6 +27,7 @@ import {
     runWorkflow as runWfScript,
     parseMeta,
     getRunState,
+    getSessionWorkflowState,
     presetRunState,
     stopWorkflow,
     stopWorkflowAgent,
@@ -1538,15 +1539,21 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
                     } catch {
                     }
                     // 清理子 agent transcript 文件，防止积累
-                    try {
-                        if (input.agent_transcript_path) {
-                            const tp = input.agent_transcript_path
-                            if (existsSync(tp)) unlinkSync(tp)
-                            // 同时清理空 subagents 目录
-                            const subDir = dirname(tp)
+                    if (input.agent_transcript_path) {
+                        const tp = input.agent_transcript_path
+                        const subDir = dirname(tp)
+                        const inSubagents = basename(subDir) === 'subagents'
+                        // 即时删除 transcript 文件
+                        try { if (existsSync(tp)) unlinkSync(tp) } catch {}
+                        if (inSubagents) {
+                            // subagents/ 内文件: 直接删文件即可，尝试删空目录
                             try { if (existsSync(subDir)) rmdirSync(subDir) } catch {}
+                        } else {
+                            // 顶层 agent-*.jsonl: 调 SDK deleteSession 完整清理
+                            const sid = basename(tp).replace('.jsonl', '')
+                            deleteSession(sid, {dir: subDir}).catch(() => {})
                         }
-                    } catch {}
+                    }
                     return {}
                 }]
             }],
@@ -1720,6 +1727,14 @@ async function startStreamPump(sessionId) {
         const s2 = sessions.get(sessionId);
         // 仅当 query 未被重建替换时才置空，避免覆盖新 pump 持有的 query
         if (s2 && s2.query === myQuery) s2.query = null
+        // 定时任务临时 session (无固定 sessionId) 完成后自动清理，防止累积
+        if (s2?._autoDelete && !s2.clients?.size) {
+            markSessionDeleted(sessionId)
+            sessions.delete(sessionId)
+            if (focusedSessionId === sessionId) focusedSessionId = null
+            invalidateProjectsCache()
+            deleteSessionFiles(sessionId).catch(() => {})
+        }
     }
 }
 
@@ -2058,7 +2073,8 @@ async function executeScheduledTask(id) {
         runtimeEnv: opts.runtimeEnv,  // 供 classifyWorkflowViaAI 同进程 fetch，不污染 process.env
         parentSessionId: null, agentName: 'scheduler',
         taskId: null, children: new Set(), depth: 0,
-        turnText: '', turnToolCount: 0
+        turnText: '', turnToolCount: 0,
+        _autoDelete: !task.sessionId  // 无固定 sessionId 的临时任务完成后自动清理
     })
     pushStream.push({
         type: 'user', session_id: sessionId,
@@ -5217,7 +5233,9 @@ const httpServer = createServer(async (req, res) => {
             for (const ed of readdirSync(bp)) {
                 // 跳过非项目目录（无 jsonl session 记录）
                 // 过滤子 agent 转录文件，仅以主 session .jsonl 判断项目存在性
-                const jls = readdirSync(join(bp, ed)).filter(f => f.endsWith('.jsonl') && !f.startsWith('.trash-') && !f.startsWith('agent-') && !f.startsWith('wf-agent-'));
+                let jls = readdirSync(join(bp, ed)).filter(f => f.endsWith('.jsonl') && !f.startsWith('.trash-') && !f.startsWith('agent-') && !f.startsWith('wf-agent-'));
+                // 白名单二次过滤: 排除 UUID 命名的 agent transcript
+                jls = jls.filter(f => !isAgentTranscriptByContent(join(bp, ed, f)));
                 if (!jls.length) continue;
                 const md = join(bp, ed, 'memory');
                 const fl = existsSync(md) ? readdirSync(md).filter(f => f.endsWith('.md')) : [];
@@ -5643,6 +5661,15 @@ wss.on('connection', (ws, req) => {
     ws._source = params.source || 'desktop'
     if (params.source === 'desktop') focusedSessionId = sessionId
     ws.send(JSON.stringify({type: 'connected', sessionId}))
+    // 切换 tab 重连时发送当前 workflow/agent 运行态快照，供前端恢复 agent 面板
+    if (params.source === 'desktop') {
+        try {
+            const wfState = getSessionWorkflowState(sessionId)
+            if (wfState) {
+                ws.send(JSON.stringify({type: 'workflow_state_snapshot', ...wfState}))
+            }
+        } catch {}
+    }
     log.info({
         sessionId: sessionId?.slice(0, 8),
         source: params.source || 'desktop',
@@ -5940,6 +5967,8 @@ checkRtkUpdate().catch(e => log.warn({err: e}, 'RTK 版本检查异常'))
 httpServer.listen(PORT, '127.0.0.1', () => {
     log.info({port: PORT}, `Gateway 已启动`)
     resumeScheduledTasks()
+    // 启动时清理上次崩溃残留的幽灵 session 目录
+    cleanupOrphanSessionDirs()
     // 启动时预热 DeepSeek 代理端口，供 settings.json ANTHROPIC_BASE_URL 引用
     startDeepSeekProxy('https://api.deepseek.com/anthropic').catch(e => log.warn({err: e}, 'proxy boot 启动失败'))
     startOpenCodeProxy().catch(e => log.warn({err: e}, 'opencode proxy boot 启动失败'))
@@ -5957,6 +5986,41 @@ function readFileHeadLines(path, maxBytes = 4096) {
     } finally {
         closeSync(fd);
     }
+}
+
+// 启动时清理幽灵目录: {sessionId}/subagents/ 无对应主 .jsonl 的孤儿残留
+// 来源: SDK Task tool 子 agent transcript 在主 session 被删除后残留 / Gateway 崩溃未完成清理
+function cleanupOrphanSessionDirs() {
+    const projectsDir = join(CLAUDE_HOME, 'projects')
+    let cleaned = 0
+    try {
+        for (const projectEntry of readdirSync(projectsDir)) {
+            const projectDir = join(projectsDir, projectEntry)
+            try {
+                if (!statSync(projectDir).isDirectory()) continue
+                for (const entry of readdirSync(projectDir)) {
+                    if (entry.endsWith('.jsonl') || entry.startsWith('.trash-') || entry === 'bridge-session-map.json'
+                        || entry === 'bridge-snapshot' || entry === 'bridge-checkpoints'
+                        || entry === 'bridge-deleted-sessions.json' || entry === 'bridge-scheduled-tasks.json'
+                        || entry === 'bridge-workflow-history.jsonl' || entry === 'bridge-config.json') continue
+                    const entryPath = join(projectDir, entry)
+                    try {
+                        if (!statSync(entryPath).isDirectory()) continue
+                        const subagentsDir = join(entryPath, 'subagents')
+                        const mainJsonl = join(projectDir, entry + '.jsonl')
+                        if (existsSync(subagentsDir) && !existsSync(mainJsonl)) {
+                            rmSync(entryPath, {recursive: true, force: true})
+                            // 同时清理可能的 .trash- 残余
+                            const trashJsonl = join(projectDir, '.trash-' + entry + '.jsonl')
+                            try { if (existsSync(trashJsonl)) unlinkSync(trashJsonl) } catch {}
+                            cleaned++
+                        }
+                    } catch {}
+                }
+            } catch {}
+        }
+    } catch {}
+    if (cleaned > 0) log.info({cleaned}, '启动时清理幽灵 session 目录')
 }
 
 // ---- Project scanning (hand-rolled) ----
@@ -6002,7 +6066,7 @@ function _schedulePersistDeleted() {
 }
 
 function markSessionDeleted(sessionId) {
-    _deletedSessionIds.set(sessionId, Date.now() + 600_000)  // 10 分钟窗口，容忍 SDK 进程退出滞后
+    _deletedSessionIds.set(sessionId, Date.now() + 1_800_000)  // 30 分钟窗口，Windows 下 SDK 进程退出可能滞后远超 10 分钟
     if (_deletedSessionIds.size > 500) {  // 惰性清理，防内存泄漏
         const now = Date.now()
         for (const [k, v] of _deletedSessionIds) { if (v < now) _deletedSessionIds.delete(k) }
@@ -6040,78 +6104,115 @@ async function scanProjects() {
         for (const name of readdirSync(base)) {
             const full = join(base, name);
             if (!statSync(full).isDirectory()) continue
+
+            // 构建主 session SDK ID 白名单: session-map 中非 agent/wf-agent 前缀的 value
+            // + 内存中活跃 session 的 lastSessionId（解决 system/init 未到达的竞态）
+            let mainSdkIds = null
+            let agentSdkIds = new Set()  // session-map 中已知的 agent SDK ID，直接排除
+            try {
+                const smPath = join(full, 'bridge-session-map.json')
+                if (existsSync(smPath)) {
+                    mainSdkIds = new Set()
+                    const sm = JSON.parse(readFileSync(smPath, 'utf8'))
+                    for (const [k, v] of Object.entries(sm)) {
+                        if (k.startsWith('@rev:')) continue
+                        if (k.startsWith('agent-') || k.startsWith('wf-agent-')) {
+                            agentSdkIds.add(v)
+                        } else {
+                            mainSdkIds.add(v)
+                        }
+                    }
+                }
+            } catch {}
+            // 内存中活跃 session 的 SDK ID 也加入白名单
+            for (const [gwSid, sess] of sessions) {
+                if (sess.lastSessionId) {
+                    if (!mainSdkIds) mainSdkIds = new Set()
+                    mainSdkIds.add(sess.lastSessionId)
+                }
+            }
+
+            const agentCleanupQueue = []  // 扫描到的 agent transcript，触发后台清理
             const files = readdirSync(full).filter(f => {
                 if (!f.endsWith('.jsonl')) return false
                 if (f.startsWith('.trash-')) return false
-                // 已标记删除的会话：尝试再次清理残留文件，跳过展示
                 const sid = f.replace('.jsonl', '')
+                // 已标记删除的会话：尝试再次清理残留文件，跳过展示
                 if (_deletedSessionIds.has(sid)) {
                     const trashPath = join(full, `.trash-${Date.now()}-${sid}.jsonl`)
                     try { renameSync(join(full, f), trashPath) } catch {}
+                    const ghostDir = join(full, sid)
+                    try { if (existsSync(ghostDir)) rmSync(ghostDir, {recursive: true, force: true}) } catch {}
                     return false
                 }
-                // 过滤子 agent 转录文件（SDK Task tool subagent → agent-*.jsonl；
-                // workflow agent → wf-agent-*.jsonl），避免被当作独立 session 展示
-                if (sid.startsWith('agent-') || sid.startsWith('wf-agent-')) return false
+                // agent-/wf-agent- 前缀: 直接过滤并加入后台清理队列
+                if (sid.startsWith('agent-') || sid.startsWith('wf-agent-')) {
+                    agentCleanupQueue.push(sid)
+                    return false
+                }
+                // 白名单中的主 session → 展示
+                if (mainSdkIds && mainSdkIds.has(sid)) return true
+                // session-map 已知的 agent SDK ID → 过滤 + 清理
+                if (agentSdkIds.has(sid)) {
+                    agentCleanupQueue.push(sid)
+                    return false
+                }
+                // 不在白名单也不在 agent 列表:
+                // session-map 存在 → 未知文件，大概率是 agent/workflow 残留，过滤 + 清理
+                // session-map 不存在 → 兜底内容检测
+                if (mainSdkIds !== null) {
+                    agentCleanupQueue.push(sid)
+                    return false
+                }
+                // 兜底: session-map 不存在，内容检测排除 agent transcript
+                if (isAgentTranscriptByContent(join(full, f))) {
+                    agentCleanupQueue.push(sid)
+                    return false
+                }
                 return true
             })
                 .map(f => ({name: f, mtime: statSync(join(full, f)).mtimeMs}))
                 .sort((a, b) => b.mtime - a.mtime)
                 .map(f => f.name);
-            // ── 二次过滤: 基于 session-map + content 排除 agent session ──
-            // SDK 的 query() 会为每个 conversation 创建 UUID.jsonl，
-            // workflow agent / SDK Task tool subagent 也会产生独立 jsonl 文件。
-            // 这里通过 bridge-session-map.json 白名单 + 内容标记双重过滤。
-            let _agentSdkIds, _mainSdkIds, _hasSm
-            try {
-                const smPath = join(full, 'bridge-session-map.json')
-                if (existsSync(smPath)) {
-                    const sm = JSON.parse(readFileSync(smPath, 'utf8'))
-                    _agentSdkIds = new Set(); _mainSdkIds = new Set(); _hasSm = true
-                    for (const [k, v] of Object.entries(sm)) {
-                        if (k.startsWith('@rev:')) continue
-                        if (k.startsWith('wf-agent-') || k.startsWith('agent-')) _agentSdkIds.add(v)
-                        else _mainSdkIds.add(v)
+
+            // 后台清理发现的 agent transcript
+            for (const agentSid of agentCleanupQueue) {
+                try {
+                    const agentJsonl = join(full, agentSid + '.jsonl')
+                    const trashPath = join(full, `.trash-${Date.now()}-${agentSid}.jsonl`)
+                    if (existsSync(agentJsonl)) {
+                        try { renameSync(agentJsonl, trashPath) } catch {}
                     }
+                    const ghostDir = join(full, agentSid)
+                    try { if (existsSync(ghostDir)) rmSync(ghostDir, {recursive: true, force: true}) } catch {}
+                } catch {}
+            }
+
+            // 清理幽灵目录: 项目目录下 {uuid}/subagents/ 无对应主 .jsonl 的孤儿残留
+            try {
+                for (const entry of readdirSync(full)) {
+                    if (entry.startsWith('.trash-')) continue
+                    if (entry.endsWith('.jsonl')) continue
+                    const entryPath = join(full, entry)
+                    try {
+                        if (!statSync(entryPath).isDirectory()) continue
+                        const subagentsDir = join(entryPath, 'subagents')
+                        const mainJsonl = join(full, entry + '.jsonl')
+                        const trashJsonl = join(full, '.trash-' + entry + '.jsonl')
+                        if (existsSync(subagentsDir) && !existsSync(mainJsonl)) {
+                            rmSync(entryPath, {recursive: true, force: true})
+                            if (existsSync(trashJsonl)) {
+                                try { unlinkSync(trashJsonl) } catch {}
+                            }
+                        }
+                    } catch {}
                 }
             } catch {}
-            function _isAgentSession(sid, filePath) {
-                // session-map 白名单: 已知主会话 → 放行；已知 agent → 拒绝
-                if (_hasSm) {
-                    if (_mainSdkIds.has(sid)) return false
-                    if (_agentSdkIds.has(sid)) return true
-                }
-                // 兜底: 内容检测 — 读第一行 JSON 查 SDK subagent 标记
-                try {
-                    const hd = readFileHeadLines(filePath, 2048)
-                    for (const line of hd) {
-                        if (!line.trim()) continue
-                        try {
-                            const obj = JSON.parse(line)
-                            if (obj.isSidechain === true) return true
-                            // agentId + parentUuid 是 SDK subagent 的特征字段组合
-                            if (obj.agentId && obj.parentUuid !== undefined) return true
-                        } catch {}
-                        break // 只检查第一条可解析的 JSON
-                    }
-                } catch {}
-                return false
-            }
-            const filteredFiles = []
-            for (const f of files) {
-                const sid = f.replace('.jsonl', '')
-                if (!_isAgentSession(sid, join(full, f))) filteredFiles.push(f)
-            }
-            const filesArr = filteredFiles
-            // 日志: 过滤掉了多少 agent session
-            if (filteredFiles.length < files.length) {
-                log.info({dir: name, total: files.length, kept: filteredFiles.length, filtered: files.length - filteredFiles.length}, 'scanProjects 过滤 agent session')
-            }
-            // ── 二次过滤结束，后续使用 filesArr ──
-            if (!filesArr.length) continue
+
+            if (!files.length) continue
             // 遍历所有 jsonl 找 cwd，不只看最新的（删除后最新文件可能缺 cwd）
             let wd = null
-            for (const fn of filesArr) {
+            for (const fn of files) {
                 try {
                     const head = readFileHeadLines(join(full, fn), 4096);
                     const c = head.join('\n');
@@ -6123,7 +6224,7 @@ async function scanProjects() {
             if (!wd) {
                 wd = decodeProjectName(name) || name
             }
-            const sds = filesArr.map(f => {
+            const sds = files.map(f => {
                 const id = f.replace('.jsonl', '');
                 let t = id.slice(0, 8);
                 try {
@@ -6149,16 +6250,16 @@ async function scanProjects() {
                     if (!ex.sessions.find(es => es.id === s.id)) ex.sessions.push(s)
                 }
                 ;ex.sessionCount = ex.sessions.length;
-                const lm = await getLastModified(full, filesArr);
+                const lm = await getLastModified(full, files);
                 if (lm > (ex.lastActive || 0)) ex.lastActive = lm;
                 continue
             }
             results.push({
                 workDir: wd,
                 encodedDir: name,
-                sessionCount: filesArr.length,
+                sessionCount: files.length,
                 sessions: sds,
-                lastActive: await getLastModified(full, filesArr)
+                lastActive: await getLastModified(full, files)
             })
         }
     } catch {
@@ -6229,19 +6330,102 @@ async function deleteSessionFiles(sessionId) {
             }
         } catch {}
     }
+    // 清理记录点 (bridge-checkpoints/{gwSid}.json)
+    for (const e of entries) {
+        const cp1 = join(projectsDir, e, 'bridge-checkpoints', sessionId + '.json')
+        try { if (existsSync(cp1)) unlinkSync(cp1) } catch {}
+        try {
+            const wd = decodeProjectName(e)
+            if (wd) {
+                const map = loadSessionMap(wd)
+                const gw = map['@rev:' + sessionId]
+                if (gw) {
+                    const cp2 = join(projectsDir, e, 'bridge-checkpoints', gw + '.json')
+                    try { if (existsSync(cp2)) unlinkSync(cp2) } catch {}
+                }
+            }
+        } catch {}
+    }
+    // 清理幽灵目录: SDK Task tool 子 agent 生成的 {sessionId}/subagents/ 目录
+    // SDK deleteSession 在主 .jsonl 被 rename 为 .trash- 后找不到文件，可能 skip 清理
+    for (const e of entries) {
+        const ghostDir = join(projectsDir, e, sessionId)
+        try {
+            if (existsSync(ghostDir) && statSync(ghostDir).isDirectory()) {
+                rmSync(ghostDir, {recursive: true, force: true})
+            }
+        } catch {}
+    }
 }
 function invalidateProjectsCache() { _projectsCache = null }
 
+// 通过内容检测判断 transcript 是否为 SDK subagent (Task tool 子 agent)
+// 检查前 5 条可解析 JSON 行中是否存在 isSidechain 或 agentId+parentUuid 标记
+// 注意: 首行可能是 system/init (不含 agent 标记)，需扫描多行覆盖
+function isAgentTranscriptByContent(filePath) {
+    try {
+        const hd = readFileHeadLines(filePath, 2048)
+        let scanned = 0
+        for (const line of hd) {
+            if (!line.trim()) continue
+            try {
+                const obj = JSON.parse(line)
+                if (obj.isSidechain === true) return true
+                // agentId + parentUuid 是 SDK subagent 的特征字段组合
+                if (obj.agentId && obj.parentUuid !== undefined) return true
+                scanned++
+                if (scanned >= 5) break
+            } catch {}
+        }
+    } catch {}
+    return false
+}
+
 async function listProjectSessions(ed) {
     const base = join(CLAUDE_HOME, 'projects', ed);
+    // 构建主 session SDK ID 白名单: session-map + 内存活跃 session
+    let mainSdkIds = null
+    let agentSdkIds = new Set()
+    try {
+        const smPath = join(base, 'bridge-session-map.json')
+        if (existsSync(smPath)) {
+            mainSdkIds = new Set()
+            const sm = JSON.parse(readFileSync(smPath, 'utf8'))
+            for (const [k, v] of Object.entries(sm)) {
+                if (k.startsWith('@rev:')) continue
+                if (k.startsWith('agent-') || k.startsWith('wf-agent-')) {
+                    agentSdkIds.add(v)
+                } else {
+                    mainSdkIds.add(v)
+                }
+            }
+        }
+    } catch {}
+    for (const [, sess] of sessions) {
+        if (sess.lastSessionId) {
+            if (!mainSdkIds) mainSdkIds = new Set()
+            mainSdkIds.add(sess.lastSessionId)
+        }
+    }
     const r = []
     try {
         for (const f of readdirSync(base).filter(x => x.endsWith('.jsonl') && !x.startsWith('.trash-') && !x.startsWith('agent-') && !x.startsWith('wf-agent-'))) {
             const id = f.replace('.jsonl', '');
-            const st = statSync(join(base, f));
+            const filePath = join(base, f)
+            // 白名单过滤: 在 session-map + agent 列表中存在时做精确判断
+            if (mainSdkIds !== null) {
+                if (mainSdkIds.has(id)) { /* 主 session，放行 */ }
+                else if (agentSdkIds.has(id)) continue  // 已知 agent → 跳过
+                // 不在任何列表 → session-map 存在时大概率是 agent/workflow 残留，跳过
+                else continue
+            } else {
+                // 兜底: session-map 不存在，内容检测排除 agent transcript
+                if (isAgentTranscriptByContent(filePath)) continue
+            }
+            const st = statSync(filePath);
             let t = id.slice(0, 8);
             try {
-                const l = readFileHeadLines(join(base, f), 4096);
+                const l = readFileHeadLines(filePath, 4096);
                 for (let i = 0; i < l.length; i++) {
                     if (!l[i].trim()) continue;
                     const e = JSON.parse(l[i]);
