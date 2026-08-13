@@ -15,17 +15,35 @@
  * - bridge-paired.json: 已配对的用户白名单
  * - adapter-sessions.json: 用户→session 绑定关系(mirror 模式用)
  */
-import {readFileSync, writeFileSync} from 'node:fs'
+import {readFileSync} from 'node:fs'
 import {join} from 'node:path'
 import {homedir} from 'node:os'
+import {randomInt} from 'node:crypto'
 import WebSocket from 'ws'
 import {createLogger} from './logger.mjs'
 import {detectCommand, executeCommand} from './im-commands.mjs'
+import {gatewayFetch, gatewayWsOptions, gatewayHttpBase, gatewayWsUrl} from './gateway-client.mjs'
+import {SessionTaskQueue} from './session-task-queue.mjs'
+import {ImMessageDeduper} from './im-message-dedupe.mjs'
+import {claimDurableInboxMessage, ImInbox} from './im-inbox.mjs'
+import {SecurePayloadCodec} from './secure-payload.mjs'
+import {NotificationOutbox} from './notification-outbox.mjs'
+import {startNotificationWorker, sendOrQueue} from './notification-worker.mjs'
+import {splitTextByUtf8Bytes} from './text-chunks.mjs'
+import {normalizeWeChatBaseUrl} from './wechat-url.mjs'
+import {loadPairedUsers, savePairedUsers} from './paired-users.mjs'
+import {readAdapterConfig} from './adapter-config.mjs'
+import {turnFallbackText} from './im-turn-finish.mjs'
+import {validateImText} from './im-input.mjs'
+import {createMirrorStateResolver} from './mirror-state.mjs'
+import {platformEntryFilePath} from './platform-entry-store.mjs'
+import {PendingConfirmRegistry} from './pending-confirm.mjs'
+import {findLatestAdapterUserForSession} from './adapter-bindings.mjs'
 
 const log = createLogger('wechat')
 
 // ── 常量定义 ──
-const GW = 'http://127.0.0.1:3456'              // Gateway 本地 HTTP 地址
+const GW = () => gatewayHttpBase()              // Gateway 本地 HTTP 地址
 const CLAUDE_HOME = join(homedir(), '.claude')   // Claude 配置根目录
 const POLL_TIMEOUT = 35000                        // 长轮询超时(毫秒)，略小于微信服务端超时避免断开
 
@@ -36,22 +54,38 @@ const POLL_TIMEOUT = 35000                        // 长轮询超时(毫秒)，�
 // 关键数据流: adapters.json 加载 token → 生成配对码 → 启动 poll() → 返回钩子对象
 export function startWeChatAdapter(token) {
     let botToken, baseUrl
+    let stopped = false
+    let activePollController = null
+    const activeSockets = new Set()
+    const delayCancels = new Set()
+
+    function wait(ms) {
+        if (stopped) return Promise.resolve()
+        return new Promise(resolve => {
+            const timer = setTimeout(done, ms)
+            function done() {
+                clearTimeout(timer)
+                delayCancels.delete(done)
+                resolve()
+            }
+            delayCancels.add(done)
+        })
+    }
 
     // ── reloadToken ──
     // 功能说明: 从磁盘重新加载微信 Bot 凭据
-    // 实现方式: 优先读 adapters.json(新格式)，回退读 channels/wechat/default/account.json(旧格式)，
-    //          双层兼容确保迁移期平滑过渡。
+    // 实现方式: 优先读取统一加密配置，回退旧账号文件仅用于迁移兼容。
     // SIDE_EFFECT: 修改模块级变量 botToken / baseUrl
     function reloadToken() {
         try {
-            const adapters = JSON.parse(readFileSync(join(CLAUDE_HOME, 'adapters.json'), 'utf8'))
+            const adapters = readAdapterConfig(join(CLAUDE_HOME, 'adapters.json'))
             botToken = adapters.wechat?.botToken
-            baseUrl = adapters.wechat?.baseUrl
+            baseUrl = normalizeWeChatBaseUrl(adapters.wechat?.baseUrl)
             if (!botToken) {
                 // 回退：旧格式凭据路径
                 const acc = JSON.parse(readFileSync(join(CLAUDE_HOME, 'channels', 'wechat', 'default', 'account.json'), 'utf8'))
                 botToken = acc.token;
-                baseUrl = acc.baseUrl
+                baseUrl = normalizeWeChatBaseUrl(acc.baseUrl)
             }
             if (!botToken) {
                 log.warn('未找到微信凭据');
@@ -73,23 +107,20 @@ export function startWeChatAdapter(token) {
     // 实现方式: 文件不存在时默认空集合，首次配对成功时写入磁盘持久化。
     // 关键数据流: 磁盘 JSON → Set 内存 → 消息处理时 O(1) 查白名单
     const pairedFile = join(CLAUDE_HOME, 'bridge-paired.json')
-    let pairedUsers = new Set()
-    try {
-        const d = JSON.parse(readFileSync(pairedFile, 'utf8'));
-        pairedUsers = new Set(d.users || [])
-    } catch {
-    }
+    const pairedUsers = loadPairedUsers(pairedFile)
 
     // ── 配对码生成 ──
     // 功能说明: 每次适配器启动生成一个 6 位随机配对码，用户发送该码给 bot 完成配对
     // 实现方式: Math.random 生成 100000-999999 范围内数字字符串
-    const pairCode = String(Math.floor(100000 + Math.random() * 900000))
-    log.info({pairCodeMasked: pairCode.slice(0, 2) + '****'}, '配对码已生成')
+    const pairCode = String(randomInt(100000, 1000000))
+    log.info('配对码已生成，可在桌面端 IM 设置中查看')
 
     // ── 配对暴力破解防护 ──
     const pairFailCount = new Map()
     const PAIR_MAX_FAIL = 5
     const PAIR_COOLDOWN_MS = 10 * 60 * 1000
+    const PAIR_ATTEMPT_TTL_MS = 60 * 60 * 1000
+    const PAIR_MAX_TRACKED_USERS = 5000
     log.info('已加载凭据, 开始轮询')
 
     let buf = ''  // 长轮询游标缓存：服务端增量更新的 offset，避免重复拉取
@@ -99,19 +130,30 @@ export function startWeChatAdapter(token) {
     // 功能说明: 记录等待用户回复确认的请求，key 为 userId，value 包含 sessionId/requestId/type
     // 实现方式: Map 结构，用户下一条非确认回复消息会被拦截并当作确认结果提交到 /api/confirm
     // 关键数据流: permission_request/choice_request 写入 → 用户回复解析 → /api/confirm POST → 删除
-    const pendingConfirm = new Map()
+    const pendingConfirm = new PendingConfirmRegistry()
+    const sessionQueue = new SessionTaskQueue({maxDepth: 8})
+    const messageDeduper = new ImMessageDeduper()
+    const payloadCodec = new SecurePayloadCodec(join(CLAUDE_HOME, 'bridge-store-key'))
+    const legacyInboxFile = join(CLAUDE_HOME, 'bridge-im-inbox.json')
+    const legacyOutboxFile = join(CLAUDE_HOME, 'bridge-notification-outbox.json')
+    const inbox = new ImInbox({
+        filePath: platformEntryFilePath(CLAUDE_HOME, 'bridge-im-inbox', 'wechat'), legacyFilePath: legacyInboxFile,
+        platform: 'wechat', payloadCodec,
+        onPersistError: error => log.error({err: error}, 'IM inbox 持久化失败'),
+    })
+    const outbox = new NotificationOutbox({
+        filePath: platformEntryFilePath(CLAUDE_HOME, 'bridge-notification-outbox', 'wechat'), legacyFilePath: legacyOutboxFile,
+        platform: 'wechat', payloadCodec,
+        onPersistError: error => log.error({err: error}, '通知 outbox 持久化失败'),
+    })
     // pendingConfirm TTL 清理：60s 间隔扫描，清理超时条目防止内存泄漏
     const _confirmCleanup = setInterval(() => {
-      const cutoff = Date.now() - 5 * 60 * 1000
-      for (const [uid, pc] of pendingConfirm) {
-        if ((pc._at || 0) < cutoff) pendingConfirm.delete(uid)
+      pendingConfirm.cleanup()
+      for (const [uid, attempt] of pairFailCount) {
+        if (Date.now() - Number(attempt.lastAttemptAt || 0) > PAIR_ATTEMPT_TTL_MS) pairFailCount.delete(uid)
       }
     }, 60 * 1000)
     if (_confirmCleanup.unref) _confirmCleanup.unref()
-    // 包装 set 自动注入 _at 时间戳，供 TTL 清理使用
-    const _pcSet = pendingConfirm.set.bind(pendingConfirm)
-    pendingConfirm.set = (k, v) => _pcSet(k, {...v, _at: Date.now()})
-
     // ── parseConfirmReply ──
     // 功能说明: 解析用户的确认回复文本，支持二选一(allow/deny)和多选项(choice)两种模式
     // 实现方式:
@@ -143,54 +185,65 @@ export function startWeChatAdapter(token) {
     //   - AbortError: 超时后自动进入下一轮，不抛异常
     // 关键数据流: HTTP POST → 服务端 SSE 风格增量推送 → buf 游标推进 → msgs[] 分发
     async function poll() {
-        while (true) {
+        while (!stopped) {
             try {
                 const bn = baseUrl.endsWith('/') ? baseUrl : baseUrl + '/'
-                const res = await fetch(`${bn}ilink/bot/getupdates`, {
-                    method: 'POST', headers: buildHeaders(),
-                    body: JSON.stringify({
-                        get_updates_buf: buf,
-                        longpolling_timeout_ms: POLL_TIMEOUT,
-                        base_info: {device_id: '', client_version: '2.1.7'}
-                    }),
-                    signal: AbortSignal.timeout(POLL_TIMEOUT + 10000),
-                })
+                const controller = new AbortController()
+                activePollController = controller
+                const timeout = setTimeout(() => controller.abort(), POLL_TIMEOUT + 10000)
+                let res
+                try {
+                    res = await fetch(`${bn}ilink/bot/getupdates`, {
+                        method: 'POST', headers: buildHeaders(),
+                        body: JSON.stringify({
+                            get_updates_buf: buf,
+                            longpolling_timeout_ms: POLL_TIMEOUT,
+                            base_info: {device_id: '', client_version: '2.1.7'}
+                        }),
+                        signal: controller.signal,
+                    })
+                } finally {
+                    clearTimeout(timeout)
+                    if (activePollController === controller) activePollController = null
+                }
                 if (!res.ok) {
                     log.error({status: res.status}, 'getupdates HTTP 错误')
                     if (res.status === 404 || res.status === 401) {
                         // reloadToken 失败不退出循环：token 暂时不可用，长退避后重试，避免适配器静默死亡
                         if (!reloadToken()) {
                             log.error('token 重新加载失败，60s 后重试')
-                            await sleep(60000)
+                            await wait(60000)
                             continue
                         }
                     }
-                    await sleep(5000);
+                    await wait(5000);
                     continue
                 }
                 const data = await res.json()
                 if (data.ret === -14 || data.errcode === -14) {
                     log.error('session 过期, 需重新扫码');
-                    await sleep(30000);
+                    await wait(30000);
                     continue
                 }
                 if ((data.ret && data.ret !== 0) || (data.errcode && data.errcode !== 0)) {
-                    await sleep(5000);
+                    await wait(5000);
                     continue
                 }
-                if (data.get_updates_buf) buf = data.get_updates_buf  // 更新游标实现增量拉取
                 for (const msg of (data.msgs || [])) {
                     handleMessage(msg)
                 }
+                // handleMessage 在返回 Promise 前同步完成 inbox claim；全部 claim 成功后才推进游标。
+                if (data.get_updates_buf) buf = data.get_updates_buf
             } catch (e) {
+                if (stopped) break
                 // AbortError/TimeoutError 是正常超时，静默进入下一轮长轮询
                 if (e.name === 'AbortError' || e.name === 'TimeoutError') {
                     _pollBackoff = 5000  // 正常超时重置退避
-                    await sleep(5000)
+                    await wait(5000)
                 } else {
                     log.error({err: e}, '轮询异常')
                     _pollBackoff = Math.min((_pollBackoff || 5000) * 2, 120000)
-                    await sleep(_pollBackoff)
+                    await wait(_pollBackoff)
                 }
             }
         }
@@ -204,23 +257,17 @@ export function startWeChatAdapter(token) {
     //   3. 有挂起确认→拦截当前消息作为确认回复
     //   4. 正常对话→resolve session → injectAndWait
     // 关键数据流: raw msg → extractText → 配对检查 → session resolve → injectAndWait → 结果回传
-    async function handleMessage(msg) {
+    async function processMessage(msg) {
+        if (stopped) return
         const uid = msg.from_user_id
         const ctx = msg.context_token
+        const messageId = msg.message_id || msg.msg_id || msg.id || ''
         const text = extractText(msg)
         if (!text) return
-        log.info({userId: uid?.slice(0, 8), text: text.slice(0, 50)}, '← 消息')
+        const identity = {source: 'wechat', userId: uid}
+        log.info({userId: uid?.slice(0, 8), textLength: text.length}, '← 消息')
 
-        // ── 第0层: IM 自定义命令 ──
-        const cmd = detectCommand(text)
-        if (cmd) {
-            executeCommand(cmd).then(r => {
-                if (r?.replyText) sendMsg(uid, ctx, r.replyText).catch(() => {})
-            })
-            return
-        }
-
-        // ── 第1层: 配对鉴权 ──
+        // ── 第0层: 配对鉴权 ──
         // 未配对用户需发送配对码，否则提示并拒绝后续处理
         if (!pairedUsers.has(uid)) {
             const fc = pairFailCount.get(uid)
@@ -232,16 +279,18 @@ export function startWeChatAdapter(token) {
             if (text.trim() === pairCode) {
                 pairedUsers.add(uid)
                 pairFailCount.delete(uid)
-                writeFileSync(pairedFile, JSON.stringify({users: [...pairedUsers]}))  // SIDE_EFFECT: 持久化白名单
+                savePairedUsers(pairedFile, pairedUsers)  // SIDE_EFFECT: 持久化白名单
                 await sendMsg(uid, ctx, '配对成功！现在可以开始对话了。')
             } else {
                 const cur = pairFailCount.get(uid) || {count: 0, cooldownUntil: 0}
                 cur.count++
+                cur.lastAttemptAt = Date.now()
                 if (cur.count >= PAIR_MAX_FAIL) {
                     cur.cooldownUntil = Date.now() + PAIR_COOLDOWN_MS
                     log.warn({userId: uid?.slice(0, 8), failCount: cur.count}, '配对码暴力破解触发冷却')
                 }
                 pairFailCount.set(uid, cur)
+                while (pairFailCount.size > PAIR_MAX_TRACKED_USERS) pairFailCount.delete(pairFailCount.keys().next().value)
                 const left = PAIR_MAX_FAIL - cur.count
                 await sendMsg(uid, ctx, left > 0
                     ? `配对码错误，还剩 ${left} 次机会`
@@ -250,29 +299,42 @@ export function startWeChatAdapter(token) {
             return
         }
 
+        // ── 第1层: 已配对用户命令 ──
+        const command = detectCommand(text)
+        if (command) {
+            executeCommand(command, token, identity).then(r => {
+                if (r?.replyText) return sendMsg(uid, ctx, r.replyText)
+            }).catch(error => log.error({err: error}, 'IM 命令执行或回复失败'))
+            return
+        }
+
         // ── 第2层: 挂起确认拦截 ──
         // 该用户有未完成的确认请求时，本条消息视为确认回复而非新 prompt
-        if (pendingConfirm.has(uid)) {
-            const pc = pendingConfirm.get(uid)
+        const pc = pendingConfirm.peek(uid)
+        if (pc) {
             const parsed = parseConfirmReply(text, pc.type)
             if (!parsed) {
                 await sendMsg(uid, ctx, pc.type === 'choice' ? '请回复选项编号（如 1、2）' : '请回复 y/确认 或 n/拒绝')
                 return
             }
             try {
-                const r = await fetch(`${GW}/api/confirm`, {
+                const r = await gatewayFetch(`${GW()}/api/confirm`, token, {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({sessionId: pc.sessionId, requestId: pc.requestId, ...parsed}),
                     signal: AbortSignal.timeout(5000),
-                })
+                }, identity)
                 const d = await r.json()
-                if (d.ok) await sendMsg(uid, ctx, '✅ 已提交，继续处理中...')
-                else await sendMsg(uid, ctx, '该请求已处理（可能桌面端已操作或已超时）')
+                if (r.ok || d.reason === 'already_resolved') {
+                    pendingConfirm.remove(uid, pc)
+                    if (d.ok) await sendMsg(uid, ctx, '✅ 已提交，继续处理中...')
+                    else await sendMsg(uid, ctx, '该请求已处理（可能桌面端已操作或已超时）')
+                } else {
+                    await sendMsg(uid, ctx, '提交失败，请稍后重试')
+                }
             } catch (e) {
                 await sendMsg(uid, ctx, '提交失败，请稍后重试')
             }
-            pendingConfirm.delete(uid)  // 无论成功与否都清除挂起状态，避免死锁
             return
         }
 
@@ -282,10 +344,10 @@ export function startWeChatAdapter(token) {
             let sid = null, noActive = false
             // 解析用户绑定的活跃 session
             try {
-                const r = await fetch(`${GW}/api/sessions/resolve`, {
+                const r = await gatewayFetch(`${GW()}/api/sessions/resolve`, token, {
                     method: 'POST', headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({userId: uid}), signal: AbortSignal.timeout(5000),
-                })
+                }, identity)
                 if (r.ok) {
                     const d = await r.json();
                     sid = d.sessionId;
@@ -293,7 +355,8 @@ export function startWeChatAdapter(token) {
                 } else if (r.status === 409) {
                     noActive = true
                 }  // 409 表示无活跃桌面会话
-            } catch {
+            } catch (error) {
+                log.warn({err: error, userId: uid?.slice(0, 8)}, '解析桌面 Session 失败')
             }
             if (noActive) {
                 // 有活跃 session 才处理正常消息；无则明确提示
@@ -304,15 +367,60 @@ export function startWeChatAdapter(token) {
                 await sendMsg(uid, ctx, '无法连接会话。请确保 Gateway 正常运行。');
                 return
             }
-            // 注入消息到 Gateway WebSocket，等待 Claude 完整回复
-            await injectAndWait(sid, uid, ctx, text)
+            // 同一 Session 串行注入，避免多个 WS 监听器同时消费同一个 result。
+            const position = sessionQueue.depth(sid)
+            if (position > 0) await sendMsg(uid, ctx, `当前会话已有 ${position} 条消息处理中，本条将按顺序执行`)
+            await sessionQueue.enqueue(sid, () => injectAndWait(sid, uid, ctx, text, messageId))
         } catch (e) {
+            if (e?.code === 'queue_full') {
+                await sendMsg(uid, ctx, '当前会话待处理消息已达上限，请稍后重试')
+                return
+            }
+            if (e?.code === 'session_cancelled') {
+                await sendMsg(uid, ctx, '当前会话已停止，本条排队消息已取消')
+                return
+            }
             log.error({err: e, userId: uid?.slice(0, 8)}, '处理失败')
             try {
                 await sendMsg(uid, ctx, '处理失败，请稍后重试')
-            } catch {
+            } catch (notifyError) {
+                log.warn({err: notifyError, userId: uid?.slice(0, 8)}, '发送处理失败提示失败')
             }
         }
+    }
+
+    function handleMessage(msg) {
+        const messageId = msg?.message_id || msg?.msg_id || msg?.id || ''
+        const text = extractText(msg)
+        const validation = msg?.invalid_input ? {ok: false, code: 'invalid_input'} : validateImText(text || '')
+        if (!validation.ok && !messageId) return sendReliableText(msg?.from_user_id, msg?.context_token || '', turnFallbackText('invalid_input'))
+        if (!messageId) return processMessage(msg)
+        const recoveryPayload = validation.ok ? {
+            from_user_id: msg?.from_user_id,
+            context_token: msg?.context_token || '',
+            message_id: messageId,
+            item_list: [{type: 1, text_item: {text}}],
+        } : {
+            from_user_id: msg?.from_user_id,
+            context_token: msg?.context_token || '',
+            message_id: messageId,
+            invalid_input: true,
+        }
+        const claim = claimDurableInboxMessage({inbox, deduper: messageDeduper, messageId, payload: recoveryPayload})
+        if (!claim.accepted) return
+        return (async () => {
+            try {
+                if (validation.ok) await processMessage(msg)
+                else await sendReliableText(msg?.from_user_id, msg?.context_token || '', turnFallbackText('invalid_input'))
+                if (stopped) return
+                if (!inbox.complete(messageId)) log.error({messageId: String(messageId).slice(0, 32)}, 'IM inbox 完成状态持久化失败')
+            } catch (error) {
+                if (stopped) return
+                messageDeduper.forget(messageId)
+                if (!inbox.fail(messageId, error)) log.error({messageId: String(messageId).slice(0, 32)}, 'IM inbox 失败状态持久化失败')
+                log.error({err: error, messageId: String(messageId).slice(0, 32)}, 'inbox 消息处理失败')
+            }
+        })()
     }
 
     // ── injectAndWait ── WS 注入 + 进度反馈 + 回复发送
@@ -321,22 +429,25 @@ export function startWeChatAdapter(token) {
     //   1. 连接 Gateway WS /ws/{sessionId}?source=wechat
     //   2. 发送 user_message 后持续监听 assistant_message / text_delta / tool_use_start /
     //      permission_request / choice_request / result 等事件
-    //   3. result 事件后 500ms 内通过 /api/wechat/reply 发送完整回复(三阶段: ACK→进度→回复)
+    //   3. result 事件后 500ms 内通过 iLink API 发送完整回复(三阶段: ACK→进度→回复)
     //   4. 超时 5.5 分钟后自动结束，防止 WS 假死导致 Promise 永久挂起
     // 异常处理: WS error/close 触发 finish()，确保 Promise resolve
     // mirror 模式: 若 mirror 开关开启则跳过独立回复(bridge 统一广播)，避免重复消息
-    // 关键数据流: user_message → WS 事件流 → replyText 累积 → /api/wechat/reply → 微信用户
-    async function injectAndWait(sessionId, userId, ctx, text) {
-        return new Promise(async (resolve) => {
+    // 关键数据流: user_message → WS 事件流 → replyText 累积 → iLink sendmessage → 微信用户
+    async function injectAndWait(sessionId, userId, ctx, text, messageId = '') {
+        if (stopped) return
+        return new Promise((resolve) => {
             let ws
             try {
-                ws = new WebSocket(`ws://127.0.0.1:3456/ws/${sessionId}?source=wechat&token=${encodeURIComponent(token)}`)
+                ws = new WebSocket(gatewayWsUrl(`/ws/${sessionId}?source=wechat`), gatewayWsOptions(token, {source: 'wechat', userId}))
+                activeSockets.add(ws)
             } catch (e) {
                 resolve()
                 return
             }
             let toolCount = 0, done = false, replyText = ''
-            let mirrorOn = false
+            let expectedTurnId = null
+            const mirrorState = createMirrorStateResolver(() => shouldSkipReply(sessionId, userId))
             let timeoutId = null
 
             // ── finish ── 必须在所有事件处理器之前定义
@@ -344,26 +455,29 @@ export function startWeChatAdapter(token) {
                 if (done) return;
                 done = true;
                 if (timeoutId) clearTimeout(timeoutId)
-                try { ws.close() } catch {}
-                if (await shouldSkipReply(sessionId)) {
-                    log.info({sessionId: sessionId?.slice(0, 8)}, 'mirror 已开启，跳过独立回复');
-                    resolve(); return
+                activeSockets.delete(ws)
+                try { ws.close() } catch (error) {
+                    log.debug({err: error}, '关闭微信注入 WebSocket 失败')
                 }
-                if (!replyText.trim()) {
-                    await sendMsg(userId, ctx, reason === 'result' ? '处理完成，无文本回复' : '处理超时或连接中断，请稍后重试').catch(() => {})
-                    resolve(); return
-                }
-                fetch(`${GW}/api/wechat/reply`, {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({sessionId, userId, contextToken: ctx, replyText}),
-                    signal: AbortSignal.timeout(15000),
-                }).then(async (r) => {
-                    if (r.ok) {
-                        const d = await r.json();
-                        log.info({sessionId: sessionId?.slice(0, 8), sent: d.sent, length: d.length}, '← 回复')
+                try {
+                    if (stopped || reason === 'adapter_stopped') return
+                    if (await mirrorState.resolve()) {
+                        log.info({sessionId: sessionId?.slice(0, 8)}, 'mirror 已开启，跳过独立回复')
+                        return
                     }
-                }).catch(e => log.error({err: e, sessionId: sessionId?.slice(0, 8)}, 'reply 失败')).finally(resolve)
+                    if (!replyText.trim()) {
+                        await sendReliableText(userId, ctx, turnFallbackText(reason))
+                        return
+                    }
+                    const result = await sendOrQueue(outbox, {
+                        kind: 'reply', userId, contextToken: ctx, text: replyText,
+                    }, deliverNotification)
+                    log.info({sessionId: sessionId?.slice(0, 8), sent: result.sent, queued: result.queued, length: replyText.length}, '← 回复')
+                } catch (error) {
+                    log.error({err: error, sessionId: sessionId?.slice(0, 8), reason}, '微信回合收尾失败')
+                } finally {
+                    resolve()
+                }
             }
 
             // 事件处理器必须在 await 前注册: await 会让出事件循环，localhost WS 握手极快，
@@ -373,16 +487,36 @@ export function startWeChatAdapter(token) {
             timeoutId = setTimeout(() => finish('timeout'), 5 * 60 * 1000 + 30000)
 
             ws.onopen = () => {
-                ws.send(JSON.stringify({type: 'user_message', content: text}));
-                log.info({sessionId: sessionId?.slice(0, 8), text: text.slice(0, 50)}, '→session')
+                ws.send(JSON.stringify({type: 'user_message', content: text, messageId, permissionMode: 'default'}));
+                log.info({sessionId: sessionId?.slice(0, 8), textLength: text.length}, '→session')
             }
-
-            // mirrorOn 获取可后置: onmessage 内用到 mirrorOn 时已赋值
-            mirrorOn = await shouldSkipReply(sessionId)
 
             ws.onmessage = (e) => {
                 try {
                     const msg = JSON.parse(e.data)
+                    if (msg.type === 'connected') {
+                        if (typeof msg.mirrorEnabled === 'boolean') {
+                            mirrorState.set(msg.mirrorEnabled)
+                        }
+                        return
+                    }
+                    if (msg.type === 'message_accepted') {
+                        if (!messageId || msg.messageId === messageId) expectedTurnId = msg.turnId || null
+                        return
+                    }
+                    if (msg.type === 'message_duplicate') {
+                        finish('duplicate')
+                        return
+                    }
+                    if (msg.type === 'message_rejected') {
+                        finish(msg.code === 'input_queue_full' ? 'queue_full' : 'invalid_input')
+                        return
+                    }
+                    if (msg.type === 'error') {
+                        finish('ws_error')
+                        return
+                    }
+                    if (expectedTurnId && msg.turnId && msg.turnId !== expectedTurnId) return
                     if (msg.type === 'assistant_message') {
                         const parts = []
                         for (const block of (msg.message?.content || [])) {
@@ -393,32 +527,43 @@ export function startWeChatAdapter(token) {
                         replyText += msg.text
                     } else if (msg.type === 'tool_use_start') {
                         toolCount++
-                        if (!mirrorOn) sendMsg(userId, ctx, `⏳ [${toolCount}] 🔧 ${msg.tool_name || '工具'}...`)
+                        if (!mirrorState.value) sendMsg(userId, ctx, `⏳ [${toolCount}] 🔧 ${msg.tool_name || '工具'}...`)
                     } else if (msg.type === 'permission_request') {
-                        if (!mirrorOn) {
-                            pendingConfirm.set(userId, {sessionId, requestId: msg.requestId, type: 'permission'})
-                            sendMsg(userId, ctx, `🔐 需要授权\n工具: ${msg.toolName}\n${permSummary(msg.input)}\n\n回复 y/确认 允许，n/拒绝 拒绝`)
+                        if (!mirrorState.value) {
+                            if (pendingConfirm.add(userId, {sessionId, requestId: msg.requestId, type: 'permission'})) {
+                                sendReliableText(userId, ctx, `🔐 需要授权\n工具: ${msg.toolName}\n${permSummary(msg.input)}\n\n回复 y/确认 允许，n/拒绝 拒绝`)
+                            }
                         }
                     } else if (msg.type === 'choice_request') {
-                        if (!mirrorOn) {
+                        if (!mirrorState.value) {
                             const lines = []
                             const q = msg.questions?.[0]
                             if (q?.question) lines.push(q.question)
                             ;(q?.options || []).forEach((o, i) => lines.push(`${i + 1}. ${o.label}`))
-                            pendingConfirm.set(userId, {sessionId, requestId: msg.requestId, type: 'choice', questions: msg.questions})
-                            sendMsg(userId, ctx, `🔢 请选择\n${lines.join('\n')}\n\n回复选项编号`)
+                            if (pendingConfirm.add(userId, {sessionId, requestId: msg.requestId, type: 'choice', questions: msg.questions})) {
+                                sendReliableText(userId, ctx, `🔢 请选择\n${lines.join('\n')}\n\n回复选项编号`)
+                            }
                         }
                     } else if (msg.type === 'confirmation_resolved') {
-                        if (msg.wonBy && msg.wonBy !== 'wechat' && pendingConfirm.has(userId)) {
-                            pendingConfirm.delete(userId)
-                            if (!mirrorOn) sendMsg(userId, ctx, '桌面端已处理该确认')
+                        if (msg.wonBy && msg.wonBy !== 'wechat' && pendingConfirm.removeByRequest(sessionId, msg.requestId)) {
+                            if (!mirrorState.value) sendMsg(userId, ctx, '桌面端已处理该确认')
                         }
                     } else if (msg.type === 'result') {
-                        if (toolCount > 0 && !mirrorOn) sendMsg(userId, ctx, `✅ 共执行 ${toolCount} 个工具，正在整理回复...`)
+                        if (toolCount > 0 && !mirrorState.value) sendMsg(userId, ctx, `✅ 共执行 ${toolCount} 个工具，正在整理回复...`)
                         setTimeout(() => finish('result'), 500)
+                    } else if (msg.type === 'generation_stopped') {
+                        sessionQueue.cancel(sessionId)
+                        finish('stopped')
                     }
-                } catch {}
+                } catch (error) {
+                    log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '微信 WebSocket 消息处理失败')
+                    void finish('ws_message_error')
+                }
             }
+
+            void mirrorState.resolve().catch(error => {
+                log.debug({err: error, sessionId: sessionId?.slice(0, 8)}, '预读取微信镜像状态失败')
+            })
 
         })
     }
@@ -432,7 +577,8 @@ export function startWeChatAdapter(token) {
         if (input.file_path) return `文件: ${input.file_path}`
         try {
             return JSON.stringify(input).slice(0, 200)
-        } catch {
+        } catch (error) {
+            log.debug({err: error}, '微信权限输入无法序列化')
             return ''
         }
     }
@@ -457,6 +603,7 @@ export function startWeChatAdapter(token) {
     // 异常处理: 捕获异常仅打印日志不抛出，避免因发送失败中断主流程
     // 关键数据流: 参数组装 → POST iLink API → 微信服务端 → 用户微信客户端
     async function sendMsg(userId, ctx, text) {
+        if (stopped) return false
         const bn = baseUrl.endsWith('/') ? baseUrl : baseUrl + '/'
         // ctx 为空时用 message_state=1（推送消息），有 ctx 时用 message_state=2（回复消息）
         const messageState = ctx ? 2 : 1
@@ -477,12 +624,39 @@ export function startWeChatAdapter(token) {
                     base_info: {channel_version: '0.1.0'},
                 }),
             })
+            if (!res.ok) return false
             const d = await res.json()
-            if (d.ret && d.ret !== 0) log.error({ret: d.ret, errmsg: d.errmsg}, 'sendmessage 返回错误')
-            else log.debug({text: text.slice(0, 30)}, 'sendMsg ok')
+            if (d.ret && d.ret !== 0) {
+                log.error({ret: d.ret, errmsg: d.errmsg}, 'sendmessage 返回错误')
+                return false
+            }
+            log.debug({textLength: text.length}, 'sendMsg ok')
+            return true
         } catch (e) {
             log.error({err: e}, 'sendmessage 异常')
+            return false
         }
+    }
+
+    async function deliverNotification(payload) {
+        if (stopped) return false
+        return sendMsg(payload.userId, payload.contextToken || '', payload.text)
+    }
+
+    const notificationWorker = startNotificationWorker({outbox, deliver: deliverNotification, log})
+
+    async function sendReliableText(userId, contextToken, text) {
+        if (stopped) return false
+        const parts = splitTextByUtf8Bytes(text, 3500)
+        let sent = true
+        for (let i = 0; i < parts.length; i++) {
+            const content = parts.length > 1 ? `【${i + 1}/${parts.length}】${parts[i]}` : parts[i]
+            const result = await sendOrQueue(outbox, {
+                kind: 'direct', userId, contextToken: contextToken || '', text: content,
+            }, deliverNotification)
+            if (!result.sent) sent = false
+        }
+        return sent
     }
 
     // ── buildHeaders ──
@@ -504,32 +678,24 @@ export function startWeChatAdapter(token) {
 
     // ── findUserForSession ──
     // 功能说明: 根据 sessionId 查找绑定的微信用户 ID
-    // 实现方式: 读取 adapter-sessions.json，精确匹配 sessionId，
-    //          找不到则回退到最近活跃用户(updatedAt 最大)。
+    // 实现方式: 读取 adapter-sessions.json，仅匹配 wechat 平台的精确绑定；找不到则不发送，避免串发给其他用户。
     // 关键数据流: sid → adapter-sessions.json → 遍历 entries → uid
     function findUserForSession(sid) {
         let ad = {}
         try {
             ad = JSON.parse(readFileSync(join(CLAUDE_HOME, 'adapter-sessions.json'), 'utf8'))
-        } catch {
+        } catch (error) {
+            log.debug({err: error, sessionId: sid?.slice(0, 8)}, '读取微信镜像状态失败')
         }
-        let best = null, bestAt = -1
-        for (const [uid, v] of Object.entries(ad)) {
-            if (v?.sessionId === sid) return uid  // 精确匹配优先
-            if ((v?.updatedAt || 0) > bestAt) {
-                bestAt = v?.updatedAt || 0;
-                best = uid
-            }  // 回退最近活跃
-        }
-        return best
+        return findLatestAdapterUserForSession(ad, 'wechat', sid)
     }
 
     // ── onConfirmRequest ── 镜像确认请求(桌面端发起)
     // 功能说明: 收到桌面回合的授权/选择请求 → 推送给微信用户 + 登记 pendingConfirm
     // 实现方式: 通过 findUserForSession 找到目标用户 → 发送对应格式的确认消息 → 写入 pendingConfirm
-    // 关键数据流: info → findUserForSession → pendingConfirm.set → sendMsg(微信用户)
+    // 关键数据流: info → findUserForSession → pendingConfirm.add → sendMsg(微信用户)
     function onConfirmRequest(info) {
-        const uid = findUserForSession(info.sessionId)
+        const uid = info.userId || findUserForSession(info.sessionId)
         if (!uid || !pairedUsers.has(uid)) return
         if (info.type === 'choice') {
             const lines = []
@@ -537,16 +703,17 @@ export function startWeChatAdapter(token) {
             if (q?.question) lines.push(q.question)
             ;
             (q?.options || []).forEach((o, i) => lines.push(`${i + 1}. ${o.label}`))
-            pendingConfirm.set(uid, {
+            const added = pendingConfirm.add(uid, {
                 sessionId: info.sessionId,
                 requestId: info.requestId,
                 type: 'choice',
                 questions: info.questions
             })
-            sendMsg(uid, '', `🔢 请选择（桌面）\n${lines.join('\n')}\n\n回复选项编号`)
+            if (added) sendReliableText(uid, '', `🔢 请选择（桌面）\n${lines.join('\n')}\n\n回复选项编号`)
         } else {
-            pendingConfirm.set(uid, {sessionId: info.sessionId, requestId: info.requestId, type: 'permission'})
-            sendMsg(uid, '', `🔐 需要授权（桌面）\n工具: ${info.toolName}\n${permSummary(info.input)}\n\n回复 y/确认 允许，n/拒绝 拒绝`)
+            if (pendingConfirm.add(uid, {sessionId: info.sessionId, requestId: info.requestId, type: 'permission'})) {
+                sendReliableText(uid, '', `🔐 需要授权（桌面）\n工具: ${info.toolName}\n${permSummary(info.input)}\n\n回复 y/确认 允许，n/拒绝 拒绝`)
+            }
         }
     }
 
@@ -554,12 +721,7 @@ export function startWeChatAdapter(token) {
     // 功能说明: 桌面端或其它通道已处理该确认 → 清除本地对应挂起
     // 实现方式: 遍历 pendingConfirm，按 sessionId + requestId 精确匹配并删除
     function onConfirmResolved(sessionId, requestId) {
-        for (const [uid, pc] of pendingConfirm) {
-            if (pc.sessionId === sessionId && pc.requestId === requestId) {
-                pendingConfirm.delete(uid);
-                break
-            }
-        }
+        pendingConfirm.removeByRequest(sessionId, requestId)
     }
 
     // ── sendToUser ── Mirror 发送到绑定用户(支持长文本分段)
@@ -568,57 +730,78 @@ export function startWeChatAdapter(token) {
     //          超出则按 3500 字节一段切割，每段前加【N/M】标记。
     // 注意: 分段使用 Buffer.byteLength(text, 'utf8') 精确计算 UTF-8 字节数，
     //        避免中文字符被截断产生乱码，切割时通过 while 回退确保不在多字节字符中间切断。
-    async function sendToUser(sid, text) {
-        const uid = findUserForSession(sid)
+    async function sendToUser(sid, text, targetUserId = null) {
+        const uid = targetUserId || findUserForSession(sid)
         if (!uid || !text) return
-        const bn = baseUrl.endsWith('/') ? baseUrl : baseUrl + '/'
-        const WX_MAX = 3500  // 微信单条消息最大字节数(UTF-8)，经验值
-        if (Buffer.byteLength(text, 'utf8') <= WX_MAX) {
-            await sendMsg(uid, '', text);
-            return
-        }
-        // ── 长文本分段 ──
-        // 功能说明: 按字节安全地将长文本切成多段，确保不会在 UTF-8 多字节字符中间切断
-        // 实现方式: 每段尝试 WX_MAX-16 字节(预留 16 字节给【N/M】标记)，
-        //          用 while 回退直到 cut 位置恰好在合法字符边界。
-        const parts = []
-        let remain = text
-        while (Buffer.byteLength(remain, 'utf8') > WX_MAX) {
-            let cut = WX_MAX - 16
-            while (cut > 0 && Buffer.byteLength(remain.slice(0, cut), 'utf8') > WX_MAX - 16) cut--
-            parts.push(remain.slice(0, cut));
-            remain = remain.slice(cut)
-        }
-        if (remain) parts.push(remain)
-        for (let i = 0; i < parts.length; i++) {
-            await sendMsg(uid, '', `【${i + 1}/${parts.length}】${parts[i]}`)
-        }
+        if (!pairedUsers.has(uid)) return false
+        return sendReliableText(uid, '', text)
     }
 
     // ── shouldSkipReply ──
     // 功能说明: 检查 session 的 mirror 开关是否已开启
     // 实现方式: GET /api/sessions/{sid}/mirror 查询，3 秒超时
     // 返回值: true 表示 mirror 开启(适配器跳过独立回复，由 gateway 统一广播)
-    async function shouldSkipReply(sid) {
+    async function shouldSkipReply(sid, userId) {
         try {
-            const r = await fetch(`http://127.0.0.1:3456/api/sessions/${sid}/mirror`, {signal: AbortSignal.timeout(3000)})
+            const r = await gatewayFetch(`${GW()}/api/sessions/${sid}/mirror`, token, {signal: AbortSignal.timeout(3000)}, {source: 'wechat', userId})
             if (r.ok) {
                 const d = await r.json();
                 return !!d.mirrors?.wechat
             }
-        } catch {
+        } catch (error) {
+            log.debug({err: error, sessionId: sid?.slice(0, 8)}, '查询微信镜像状态失败，按未开启处理')
         }
         return false
     }
 
     // ── 启动长轮询 ──
+    queueMicrotask(() => {
+        for (const entry of inbox.recoverable()) {
+            inbox.fail(entry.messageId, 'restart_recovery')
+            messageDeduper.forget(entry.messageId)
+            Promise.resolve().then(() => handleMessage(entry.payload))
+                .catch(e => log.error({err: e, messageId: entry.messageId.slice(0, 32)}, '恢复 inbox 失败'))
+        }
+    })
     poll().catch(e => log.error({err: e}, 'poll 异常退出'))
 
-    // 返回镜像钩子对象供 Gateway 注册
-    return {onConfirmRequest, onConfirmResolved, findUserForSession, sendToUser}
-}
+    function stop() {
+        if (stopped) return
+        stopped = true
+        activePollController?.abort()
+        for (const cancel of [...delayCancels]) cancel()
+        for (const ws of [...activeSockets]) {
+            try { ws.close(4002, 'adapter stopped') } catch (error) {
+                log.debug({err: error}, '微信 WebSocket 已关闭，无需重复停止')
+            }
+        }
+        activeSockets.clear()
+        sessionQueue.cancelAll()
+        pendingConfirm.clear()
+        clearInterval(_confirmCleanup)
+        notificationWorker.stop()
+        log.info('适配器已停止')
+    }
 
-// ── sleep ── 异步延时工具函数
-function sleep(ms) {
-    return new Promise(r => setTimeout(r, ms))
+    function retryNotifications() {
+        const reset = outbox.retryFailed()
+        notificationWorker.flush().catch(error => log.warn({err: error}, '手动重试通知失败'))
+        return {reset, ...outbox.summary()}
+    }
+
+    function discardNotifications() {
+        const deleted = outbox.discard({states: ['dead']})
+        return {deleted, ...outbox.summary()}
+    }
+
+    // 返回镜像钩子对象供 Gateway 注册
+    return {
+        onConfirmRequest, onConfirmResolved, findUserForSession, sendToUser,
+        notificationStatus: notificationWorker.summary,
+        retryNotifications,
+        discardNotifications,
+        pairingCode: () => pairCode,
+        connectionStatus: () => ({state: stopped ? 'stopped' : 'running'}),
+        stop,
+    }
 }

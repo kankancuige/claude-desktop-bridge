@@ -4,17 +4,29 @@
  * query() + PushStream — MCP/工具直接透传，兼容 DeepSeek。
  */
 
-import {createServer} from 'node:http'
-import {readdirSync, statSync, readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, rmdirSync, renameSync, rmSync, openSync, readSync, closeSync, realpathSync} from 'node:fs'
-import {execSync, spawn, spawnSync} from 'node:child_process'
+import {createServer, request as httpRequest} from 'node:http'
+import {request as httpsRequest} from 'node:https'
+import {readdirSync, statSync, lstatSync, readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, rmdirSync, renameSync, rmSync, openSync, readSync, closeSync} from 'node:fs'
+import {execFileSync, execSync, spawn, spawnSync} from 'node:child_process'
 import crypto from 'node:crypto'
 import {homedir} from 'node:os'
-import {join, dirname, basename, relative, resolve, sep, extname as pathExtname} from 'node:path'
+import {join, dirname, basename, relative, resolve} from 'node:path'
 import {fileURLToPath} from 'node:url'
 import {WebSocketServer} from 'ws'
 import {config as loadEnv} from 'dotenv'
-import {query, deleteSession} from '@anthropic-ai/claude-agent-sdk'
+import {safeBasename, safeChildPath} from './path-security.mjs'
+import {query, deleteSession, forkSession} from '@anthropic-ai/claude-agent-sdk'
 import {createLogger, logHttpRequest} from './logger.mjs'
+import {buildSessionStopResponse, hasStoppableSessionWork} from './session-stop.mjs'
+import {resolveSessionResume} from './session-resume.mjs'
+import {getSessionRuntimeState} from './session-runtime-state.mjs'
+import {classifyTranscriptFile} from './transcript-classifier.mjs'
+import {parseSessionHistory} from './session-history.mjs'
+import {findSessionTranscript, listProjectTranscriptCandidates} from './project-transcript-location.mjs'
+import {resolveMappedGatewaySessionId, updateSessionMap} from './session-map-consistency.mjs'
+import {initialSessionIdentity, resolveSessionCreateMode} from './session-create-mode.mjs'
+import {buildProjectContinuationContext, composeContinuationPrompt} from './project-continuation-context.mjs'
+import {buildAgentDescriptor, buildAgentToolLifecycleEvent} from './agent-tool-lifecycle.mjs'
 import {startWeChatAdapter} from './wechat.mjs'
 import {startFeishuAdapter} from './feishu.mjs'
 import {startDingTalkAdapter} from './dingtalk.mjs'
@@ -23,6 +35,7 @@ import {
     listWorkflows,
     getWorkflow,
     saveWorkflow,
+    validateWorkflowContent,
     deleteWorkflow as deleteWorkflowFile,
     runWorkflow as runWfScript,
     parseMeta,
@@ -45,21 +58,53 @@ import {
     buildCacheInjectionText,
     cacheFilePath
 } from './project-cache.mjs'
-import {startDeepSeekProxy, getProxyUrl, stopDeepSeekProxy, isProxyRunning} from './deepseek-proxy.mjs'
+import {startDeepSeekProxy, getProxyUrl, stopDeepSeekProxy, isProxyConfiguredFor} from './deepseek-proxy.mjs'
 import {startOpenCodeProxy, getOpenCodeProxyUrl, stopOpenCodeProxy, isOpenCodeProxyRunning} from './opencode-proxy.mjs'
+import {validateProviderUrl, resolveProviderUrl, resolveProviderRedirect, buildProviderModelsUrl, buildProviderFallbackUrls, createPinnedLookup} from './provider-url-security.mjs'
+import {listAdapterBindings, normalizeAdapterBindings, removeAdapterBindings, upsertAdapterBinding} from './adapter-bindings.mjs'
+import {readNotificationSummary} from './notification-outbox.mjs'
+import {
+    buildIncompleteMirrorText,
+    canResumeTask,
+    classifyTaskResult,
+} from './task-result-outcome.mjs'
+import {createTaskStatePatch, recoverTaskState, taskStateForClient, taskStateForError, taskStateForStop, taskStateFromResult, taskStateFileId} from './task-state.mjs'
+import {clearPlatformEntries, platformEntryFilePath} from './platform-entry-store.mjs'
+import {createTurnIdentity, shouldDeliverTurnEvent, shouldRouteMirror} from './turn-routing.mjs'
+import {normalizeWeChatBaseUrl} from './wechat-url.mjs'
+import {migrateAdapterConfig, readAdapterConfig, writeAdapterConfig} from './adapter-config.mjs'
+import {configureSecurePayloadMasterKey} from './secure-payload.mjs'
+import {extractWebSocketToken} from './websocket-auth.mjs'
+import {redactSecretMap, restoreSecretMap, restoreSecretValue} from './config-redaction.mjs'
+import {buildWindowsRtkExtractArgs, buildWindowsRtkExtractEnv, selectRtkReleaseAsset, verifyRtkAssetDigest} from './rtk-archive.mjs'
+import {getCodexRelayProxyUrl, startCodexRelayProxy, stopCodexRelayProxy} from './codex-relay-proxy.mjs'
+import {BRIDGE_PROVIDER_ENV_KEYS, extractBridgeProviderSettings, normalizeBridgeProviderSettings, overlayBridgeProviderSettings} from './bridge-provider-settings.mjs'
+import {applyContextProfile, classifyContextProfile, nextContextProfile, normalizeContextProfile} from './context-profile.mjs'
+import {applySkillRoute, routeSkills} from './skill-router.mjs'
+import {buildSystemInitEvent} from './session-init-event.mjs'
+import {resolveRtkCommandArgs} from './rtk-command.mjs'
+import {describeAttachment, isImageAttachment} from './attachment-type.mjs'
+import {cleanupUploadDir, prepareUploadDir} from './upload-storage.mjs'
+import {parseDeepSeekBalance, resolveBalanceProvider} from './balance-provider.mjs'
+import {
+    calculateAutoCompactWindow,
+    compactBoundaryToEvent,
+    contextUsageEvent,
+    isSyntheticCompactSummary,
+    parseTokenCount,
+} from './context-lifecycle.mjs'
 let _proxyStarting = null
 let _ocProxyStarting = null
 import cron from 'node-cron'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 loadEnv({path: join(__dirname, '.env'), override: true})
+const log = createLogger('gateway')
 
 // ── 版本号（读取本 package.json 的 version 字段）──
 const PKG_VERSION = (() => {
     try { return JSON.parse(readFileSync(join(__dirname, 'package.json'), 'utf8')).version || '0.0.0' } catch { return '0.0.0' }
 })()
-
-const log = createLogger('gateway')
 
 const PORT = parseInt(process.env.PORT || '3456', 10)
 // npm 全局包解析: 从 shim 所在目录找到 node_modules/@anthropic-ai/claude-code 下的可用入口
@@ -141,8 +186,7 @@ function getClaudeExe() {
             const r = resolveFromPkgDir(join(dirname(raw), 'node_modules', '@anthropic-ai', 'claude-code'))
             if (r) return (_exe = r)
         }
-    } catch {
-    }
+    } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
 
     // ── 4. npm root -g (以 npm 权威答案兜底) ──
     try {
@@ -151,8 +195,7 @@ function getClaudeExe() {
             const r = resolveFromPkgDir(join(root, '@anthropic-ai', 'claude-code'))
             if (r) return (_exe = r)
         }
-    } catch {
-    }
+    } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
 
     // ── 5. nvm/fnm/Volta 版本目录 ──
     const nvmHomes = [
@@ -179,8 +222,7 @@ function getClaudeExe() {
                     if (r) return (_exe = r)
                 }
             }
-        } catch {
-        }
+        } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
     }
 
     // ── 6. 常见全局路径兜底 ──
@@ -208,10 +250,97 @@ function mapModel(name) {
 
 const CLAUDE_HOME = join(homedir(), '.claude')
 const BRIDGE_TOKEN_PATH = join(CLAUDE_HOME, 'bridge-token')
+const BRIDGE_PROVIDER_SETTINGS_PATH = join(CLAUDE_HOME, 'bridge-provider.json')
+const ADAPTER_SESSIONS_PATH = join(CLAUDE_HOME, 'adapter-sessions.json')
+const ADAPTER_CONFIG_PATH = join(CLAUDE_HOME, 'adapters.json')
+const SECURE_PAYLOAD_KEY_PATH = join(CLAUDE_HOME, 'bridge-store-key')
 // 本地 API 认证 token: 启动时生成随机 token，写入文件供桌面端读取
 // 所有 POST/PUT/DELETE 请求须携带 x-bridge-token header 与此匹配
 const BRIDGE_TOKEN = crypto.randomUUID()
-try { writeFileSync(BRIDGE_TOKEN_PATH, BRIDGE_TOKEN, 'utf8') } catch {}
+function persistBridgeToken() {
+    mkdirSync(CLAUDE_HOME, {recursive: true})
+    writeFileSync(BRIDGE_TOKEN_PATH, BRIDGE_TOKEN, {encoding: 'utf8', mode: 0o600})
+}
+const ALLOW_TOKEN_ENDPOINT = process.env.BRIDGE_ALLOW_TOKEN_ENDPOINT === '1'
+const ADAPTER_PLATFORMS = ['wechat', 'feishu', 'dingtalk']
+const NUDGE_ACTIONS = new Set(['switch_project', 'switch_session', 'new_session', 'toggle_mirror', 'stop'])
+// Adapter 只拿到按平台派生的进程内 token；主 token 不会传入 Adapter。
+const ADAPTER_TOKENS = new Map(ADAPTER_PLATFORMS.map((platform) => [
+    platform,
+    crypto.createHmac('sha256', BRIDGE_TOKEN).update(`adapter:${platform}`).digest('hex'),
+]))
+let adapterConfigReadError = null
+
+function tokenMatches(received, expected) {
+    if (typeof received !== 'string' || typeof expected !== 'string') return false
+    const a = Buffer.from(received)
+    const b = Buffer.from(expected)
+    return a.length === b.length && crypto.timingSafeEqual(a, b)
+}
+
+function authenticateBridgeToken(received) {
+    if (tokenMatches(received, BRIDGE_TOKEN)) return {kind: 'desktop'}
+    for (const [platform, token] of ADAPTER_TOKENS) {
+        if (tokenMatches(received, token)) return {kind: 'adapter', platform}
+    }
+    return null
+}
+
+function loadAdapterConfig({strict = false} = {}) {
+    try {
+        const config = readAdapterConfig(ADAPTER_CONFIG_PATH, {keyPath: SECURE_PAYLOAD_KEY_PATH})
+        adapterConfigReadError = null
+        return config
+    } catch (error) {
+        adapterConfigReadError = String(error?.message || error)
+        if (strict) throw error
+        log.error({err: error}, 'IM 加密配置读取失败')
+        return {}
+    }
+}
+
+function saveAdapterConfig(config) {
+    writeAdapterConfig(ADAPTER_CONFIG_PATH, config, {keyPath: SECURE_PAYLOAD_KEY_PATH})
+    adapterConfigReadError = null
+}
+
+function migrateAdapterCredentials() {
+    let config = {}
+    if (existsSync(ADAPTER_CONFIG_PATH)) {
+        const result = migrateAdapterConfig(ADAPTER_CONFIG_PATH, {keyPath: SECURE_PAYLOAD_KEY_PATH})
+        config = result.config
+        if (result.migrated) log.info('IM 凭据已从明文配置迁移为加密存储')
+    }
+
+    const legacyWechatPath = join(CLAUDE_HOME, 'channels', 'wechat', 'default', 'account.json')
+    if (existsSync(legacyWechatPath)) {
+        const legacy = readJSON(legacyWechatPath)
+        if (!config.wechat?.botToken && legacy?.token) {
+            config.wechat = {
+                ...(config.wechat || {}),
+                botToken: legacy.token,
+                accountId: legacy.botId || config.wechat?.accountId || '',
+                baseUrl: normalizeWeChatBaseUrl(legacy.baseUrl),
+            }
+            saveAdapterConfig(config)
+            log.info('微信旧版账号凭据已迁移为加密存储')
+        }
+        if (config.wechat?.botToken) {
+            try { unlinkSync(legacyWechatPath) } catch (error) {
+                log.warn({err: error}, '微信旧版明文账号文件清理失败')
+            }
+        }
+    }
+    return config
+}
+
+function safeDecodeURIComponent(value) {
+    try {
+        return decodeURIComponent(String(value || ''))
+    } catch {
+        return ''
+    }
+}
 
 // ---- 动态模型/命令缓存 ----
 // supportedModels()/supportedCommands() 是控制请求，需活跃 query；冷启动设置页读这里的缓存
@@ -222,8 +351,7 @@ const dynamicCache = {models: null, commands: null, agentNames: null, updatedAt:
 try {
     const c = readJSON(DYNAMIC_CACHE_FILE);
     if (c) Object.assign(dynamicCache, c)
-} catch {
-}
+} catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
 
 let _persistDynamicTimer = null
 function persistDynamicCache() {
@@ -233,8 +361,7 @@ function persistDynamicCache() {
         _persistDynamicTimer = null
         try {
             writeFileSync(DYNAMIC_CACHE_FILE, JSON.stringify(dynamicCache), 'utf8')
-        } catch {
-        }
+        } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
     }, 500)
 }
 
@@ -263,6 +390,28 @@ function withTimeout(promise, ms) {
     let timer
     const timeout = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('timeout')), ms) })
     return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
+}
+
+async function closeSessionRuntime(session, {sessionId = '', reason = 'unknown', timeoutMs = 5000} = {}) {
+    if (!session) return {pushStreamClosed: true, queryClosed: true}
+    let pushStreamClosed = true
+    let queryClosed = true
+    try {
+        session.pushStream?.close()
+    } catch (error) {
+        pushStreamClosed = false
+        log.warn({err: error, sessionId: sessionId?.slice(0, 8), reason}, '关闭 Session 输入流失败')
+    }
+    try {
+        const closing = session.query?.return?.()
+        if (closing && typeof closing.then === 'function') {
+            await withTimeout(Promise.resolve(closing), timeoutMs)
+        }
+    } catch (error) {
+        queryClosed = false
+        log.warn({err: error, sessionId: sessionId?.slice(0, 8), reason}, '关闭 Session query 失败')
+    }
+    return {pushStreamClosed, queryClosed}
 }
 
 // ---- 文件快照 Diff：常量 ----
@@ -328,7 +477,192 @@ class PushStream {
 // ---- Session pool ----
 const sessions = new Map()
 let focusedSessionId = null
+const IM_SOURCES = new Set(['wechat', 'feishu', 'dingtalk'])
+const MAX_SESSION_INPUT_QUEUE = 32
+const VALID_PERMISSION_MODES = new Set(['default', 'acceptEdits', 'plan', 'bypassPermissions'])
+const VALID_THINKING_LEVELS = new Set(['auto', 'off', 'low', 'medium', 'high', 'xhigh', 'max'])
+
+function taskStateStorePath(workDir, sessionId) {
+    const safeId = taskStateFileId(sessionId, null)
+    return safeId ? join(CLAUDE_HOME, 'projects', encodeProjectName(workDir), 'bridge-task-state', `${safeId}.json`) : null
+}
+
+function saveTaskState(session, sessionId) {
+    try {
+        if (!session?.taskState || !session.workDir || !sessionId) return true
+        writeJSON(taskStateStorePath(session.workDir, sessionId), session.taskState)
+        const sdkSessionId = session.taskState.sdkSessionId || session.lastSessionId
+        if (sdkSessionId && sdkSessionId !== sessionId) {
+            writeJSON(taskStateStorePath(session.workDir, sdkSessionId), session.taskState)
+        }
+        return true
+    } catch (error) {
+        log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, 'task-state 保存失败')
+        return false
+    }
+}
+
+function loadTaskState(workDir, sessionId) {
+    const path = taskStateStorePath(workDir, sessionId)
+    const raw = path ? readJSON(path) : null
+    return raw ? recoverTaskState(raw) : null
+}
+
+function updateTaskState(session, sessionId, next) {
+    if (!session) return null
+    session.taskState = createTaskStatePatch(next)
+    saveTaskState(session, sessionId)
+    return session.taskState
+}
+
+function isValidSessionId(value) {
+    return typeof value === 'string'
+        && value.length >= 1
+        && value.length <= 128
+        && value !== '.'
+        && value !== '..'
+        && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value)
+}
+
+function isDirectoryPath(value) {
+    if (typeof value !== 'string' || !value.trim()) return false
+    try {
+        return statSync(value).isDirectory()
+    } catch {
+        return false
+    }
+}
 const pendingQRCodes = new Map()
+const UPLOAD_QUOTA_BYTES = 50 * 1024 * 1024
+const UPLOAD_TTL_MS = Math.min(30 * 24 * 60 * 60 * 1000, Math.max(5 * 60 * 1000,
+    parseInt(process.env.BRIDGE_UPLOAD_TTL_MS || String(24 * 60 * 60 * 1000), 10) || 24 * 60 * 60 * 1000))
+
+function getUploadDir(workDir) {
+    return safeChildPath(workDir, '.bridge-uploads', {allowNested: false})
+}
+
+function cleanupSessionUploads(workDir, removeAll = false) {
+    return cleanupUploadDir(getUploadDir(workDir), {
+        removeAll,
+        ttlMs: UPLOAD_TTL_MS,
+        onError: (error, path) => log.debug({err: error, path}, '读取附件元数据失败'),
+    })
+}
+
+function acceptSessionInput(s, source, messageId, userId = null) {
+    const now = Date.now()
+    if (!s._inputIds) s._inputIds = new Map()
+    for (const [id, at] of s._inputIds) {
+        if (now - at > 10 * 60 * 1000) s._inputIds.delete(id)
+    }
+    const id = String(messageId || crypto.randomUUID()).slice(0, 200)
+    const dedupeKey = `${String(source || 'desktop')}\0${String(userId || '')}\0${id}`
+    if (s._inputIds.has(dedupeKey)) return {ok: false, duplicate: true, messageId: id}
+    const queued = (s._pendingInputs?.length || 0) + (s.activeTurnId ? 1 : 0)
+    if (queued >= MAX_SESSION_INPUT_QUEUE) return {ok: false, error: 'input_queue_full', queuePosition: queued}
+    const turnId = crypto.randomUUID()
+    s._inputIds.set(dedupeKey, now)
+    if (!Array.isArray(s._pendingInputs)) s._pendingInputs = []
+    s._pendingInputs.push({
+        messageId: id,
+        turnId,
+        source,
+        userId: IM_SOURCES.has(source) ? String(userId || '') : null,
+        dedupeKey,
+    })
+    return {ok: true, messageId: id, turnId, queuePosition: queued, dedupeKey}
+}
+
+function rollbackSessionInput(s, accepted) {
+    if (!s || !accepted?.turnId) return false
+    const index = s._pendingInputs?.findIndex(item => item.turnId === accepted.turnId) ?? -1
+    if (index < 0) return false
+    s._pendingInputs.splice(index, 1)
+    if (accepted.dedupeKey) s._inputIds?.delete(accepted.dedupeKey)
+    return true
+}
+
+function failPendingSessionInputs(sessionId, s, error) {
+    const pending = Array.isArray(s?._pendingInputs) ? s._pendingInputs.splice(0) : []
+    s._pendingSources = []
+    for (const input of pending) {
+        if (input.dedupeKey) s._inputIds?.delete(input.dedupeKey)
+        const identity = createTurnIdentity(input.source, input.userId, IM_SOURCES)
+        broadcastTurn(sessionId, {
+            type: 'error',
+            code: error?.code || 'session_input_failed',
+            message: String(error?.message || error || '消息处理失败'),
+            turnId: input.turnId || null,
+        }, identity)
+    }
+    return pending.length
+}
+
+function cancelPendingSessionInputs(sessionId, s) {
+    const pending = Array.isArray(s?._pendingInputs) ? s._pendingInputs.splice(0) : []
+    s._pendingSources = []
+    for (const input of pending) {
+        if (input.dedupeKey) s._inputIds?.delete(input.dedupeKey)
+        const identity = createTurnIdentity(input.source, input.userId, IM_SOURCES)
+        broadcastTurn(sessionId, {
+            type: 'generation_stopped',
+            turnId: input.turnId || null,
+        }, identity)
+    }
+    return pending.length
+}
+
+async function stopSessionGeneration(sessionId, s) {
+    if (!s) return {stopped: false, cancelledInputs: 0}
+    if (s._stopPromise) return s._stopPromise
+    if (!hasStoppableSessionWork(s)) return {stopped: false, cancelledInputs: 0}
+    const operation = (async () => {
+        const stoppedTurnId = s.activeTurnId || null
+        const stoppedTurnIdentity = s.activeTurnIdentity ? {...s.activeTurnIdentity} : null
+        for (const id of [...(s.pending?.keys() || [])]) settlePending(sessionId, id, {
+            behavior: 'deny',
+            message: '已取消',
+            interrupt: true,
+        }, 'stopped')
+        await closeSessionRuntime(s, {sessionId, reason: 'stop_generation'})
+        s.query = null
+        s.pushStream = null
+        try {
+            finalizeCheckpoint(sessionId)
+        } catch (error) {
+            log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '停止生成时保存 checkpoint 失败')
+        }
+        s.pendingTurn = null
+        s._rebuildPromise = null
+        s._rebuildId = null
+        s._pendingMessages = null
+        const cancelledInputs = cancelPendingSessionInputs(sessionId, s)
+        s._pendingTurns = []
+        s._generating = false
+        s.activeTurnId = null
+        s.activeTurnIdentity = null
+        s.lastSessionId = s.lastSessionId || sessionId
+        updateTaskState(s, sessionId, taskStateForStop({sdkSessionId: s.lastSessionId, historySessionId: s.lastSessionId}))
+        broadcastTurn(sessionId, {type: 'generation_stopped', turnId: stoppedTurnId, taskState: taskStateForClient(s.taskState)}, stoppedTurnIdentity)
+        return {stopped: true, cancelledInputs, turnId: stoppedTurnId}
+    })()
+    s._stopPromise = operation
+    try {
+        return await operation
+    } finally {
+        if (s._stopPromise === operation) s._stopPromise = null
+    }
+}
+
+function markInternalInput(s) {
+    if (!Array.isArray(s._pendingInputs)) s._pendingInputs = []
+    s._pendingInputs.unshift({messageId: null, turnId: null, source: s.lastTurnSource || 'desktop', userId: null})
+}
+
+// 活跃 Session 的附件目录定期回收；非活跃 Session 会在删除或下次上传时回收。
+setInterval(() => {
+    for (const s of sessions.values()) cleanupSessionUploads(s.workDir)
+}, 15 * 60 * 1000).unref()
 // 每 60s 清理过期二维码（5 分钟有效期，保守清理）
 setInterval(() => {
     const now = Date.now()
@@ -340,6 +674,73 @@ setInterval(() => {
 // ---- 确认请求注册表（权限/方案选择双通道）----
 let reqCounter = 0
 const confirmHooks = []   // [{platform, onConfirmRequest, onConfirmResolved, findUserForSession, sendToUser}] —— 各 IM 适配器注册的钩子
+const ADAPTER_STARTERS = new Map([
+    ['wechat', startWeChatAdapter],
+    ['feishu', startFeishuAdapter],
+    ['dingtalk', startDingTalkAdapter],
+])
+
+function getAdapterHook(platform) {
+    return confirmHooks.find(hook => hook.platform === platform) || null
+}
+
+function stopAdapter(platform) {
+    const index = confirmHooks.findIndex(hook => hook.platform === platform)
+    if (index < 0) return false
+    const [hook] = confirmHooks.splice(index, 1)
+    try {
+        hook.stop?.()
+    } catch (error) {
+        log.warn({err: error, platform}, '停止 IM 适配器失败')
+    }
+    return true
+}
+
+function startAdapter(platform) {
+    if (getAdapterHook(platform)) return getAdapterHook(platform)
+    const starter = ADAPTER_STARTERS.get(platform)
+    if (!starter) return null
+    try {
+        const hooks = starter(ADAPTER_TOKENS.get(platform))
+        if (!hooks) return null
+        const registered = {...hooks, platform}
+        confirmHooks.push(registered)
+        return registered
+    } catch (error) {
+        log.error({err: error, platform}, '启动 IM 适配器失败')
+        return null
+    }
+}
+
+function restartAdapter(platform) {
+    stopAdapter(platform)
+    return startAdapter(platform)
+}
+
+function clearAdapterPlatformState(platform) {
+    stopAdapter(platform)
+    const bindings = clearAdapterBindings(binding => binding.platform === platform)
+    const inbox = clearPlatformEntries(platformEntryFilePath(CLAUDE_HOME, 'bridge-im-inbox', platform), platform)
+        + clearPlatformEntries(join(CLAUDE_HOME, 'bridge-im-inbox.json'), platform)
+    const notifications = clearPlatformEntries(platformEntryFilePath(CLAUDE_HOME, 'bridge-notification-outbox', platform), platform)
+        + clearPlatformEntries(join(CLAUDE_HOME, 'bridge-notification-outbox.json'), platform)
+    const pairedFiles = {
+        wechat: 'bridge-paired.json',
+        feishu: 'bridge-paired-feishu.json',
+        dingtalk: 'bridge-paired-dingtalk.json',
+    }
+    let paired = false
+    const pairedFile = pairedFiles[platform] ? join(CLAUDE_HOME, pairedFiles[platform]) : null
+    if (pairedFile && existsSync(pairedFile)) {
+        try {
+            unlinkSync(pairedFile)
+            paired = true
+        } catch (error) {
+            log.warn({err: error, platform}, '清理 IM 配对白名单失败')
+        }
+    }
+    return {bindings, inbox, notifications, paired}
+}
 
 // ── WebSocket 广播 ──
 // 功能说明: 向指定 session 的所有已连接 WebSocket 客户端广播一条 JSON 消息
@@ -353,19 +754,48 @@ function broadcast(sid, msg) {
     let raw
     try {
         raw = JSON.stringify(msg)
-    } catch {
+    } catch (error) {
         // 循环引用或 BigInt 等不可序列化值 → 静默丢弃，避免中断整个 broadcast pipeline
+        log.debug({err: error, sessionId: sid?.slice(0, 8), messageType: msg?.type}, '序列化广播消息失败')
         return
     }
     // 防御性拷贝: onclose 回调可能删除 s.clients 成员，遍历 Set 时并发修改会漏发
     for (const w of [...s.clients]) {
         if (w.readyState === 1) {
-            try { w.send(raw) } catch {}
+            try {
+                w.send(raw)
+            } catch (error) {
+                s.clients.delete(w)
+                log.debug({err: error, sessionId: sid?.slice(0, 8)}, '广播消息发送失败，已移除失效连接')
+            }
         }
     }
 }
 
-// 注入依赖到 workflow-runner（供 VM 沙箱内 agent() 调用）
+function broadcastTurn(sid, msg, identity = null) {
+    const s = sessions.get(sid)
+    if (!s) return
+    let raw
+    try {
+        raw = JSON.stringify(msg)
+    } catch (error) {
+        log.debug({err: error, sessionId: sid?.slice(0, 8), messageType: msg?.type}, '序列化回合消息失败')
+        return
+    }
+    for (const ws of [...s.clients]) {
+        if (ws.readyState !== 1) continue
+        if (!shouldDeliverTurnEvent(ws._source, ws._adapterUserId, identity)) continue
+        try { ws.send(raw) } catch (error) {
+            log.debug({err: error, sessionId: sid?.slice(0, 8), source: ws._source}, '回合消息发送失败')
+        }
+    }
+}
+
+function broadcastDesktop(sid, msg) {
+    broadcastTurn(sid, msg, null)
+}
+
+// 注入依赖到 workflow-runner，供 Workflow 子进程通过受控 IPC 请求 agent() 调用
 setDeps({query, deleteSession, makeQueryOptions, loadCliSettings, loadWfConfig, PushStream, broadcast, sessions, persistSdkSessionId, encodeProjectName})
 
 // 收口：任一通道响应或超时都走这里，幂等（已 settled 则忽略）
@@ -391,15 +821,14 @@ function settlePending(sessionId, requestId, result, wonBy) {
     s.pending.delete(requestId)
     try {
         entry.resolve(result)
-    } catch {
-    }
+    } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
     // 通知 desktop 弹框关闭 + 所有适配器清除挂起
-    broadcast(sessionId, {type: 'confirmation_resolved', requestId, wonBy})
+    broadcastTurn(sessionId, {type: 'confirmation_resolved', requestId, wonBy, turnId: entry.turnId || null},
+        entry.userId ? {source: entry.source, userId: entry.userId} : null)
     for (const hook of confirmHooks) {
         try {
             hook.onConfirmResolved?.(sessionId, requestId)
-        } catch {
-        }
+        } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
     }
 }
 
@@ -429,40 +858,45 @@ function makeCanUseTool(sessionId) {
             resolve({behavior: 'deny', message: 'session 已关闭', interrupt: true});
             return
         }
-        // 动态权限: 切换 permissionMode 后下一个工具调用立即生效，无需重建 query
-        if (s.permissionMode === 'bypassPermissions') {
+        const requestId = `req-${++reqCounter}`
+
+        // Agent/Task/Workflow 均由 SDK 内部执行，必须先广播生命周期再走权限短路。
+        const lifecycleEvent = buildAgentToolLifecycleEvent(
+            toolName,
+            input,
+            requestId,
+            Date.now(),
+            s.queryOpts?.agents || {},
+            {toolUseId: toolUseID},
+        )
+        if (lifecycleEvent) {
+            if (lifecycleEvent.type === 'subagent_spawning') {
+                s.pendingAgentSpawns = s.pendingAgentSpawns || []
+                s.pendingAgentSpawns.push(lifecycleEvent)
+            }
+            log.info({
+                sessionId: sessionId?.slice(0, 8),
+                toolName: lifecycleEvent.agentType,
+                task: lifecycleEvent.task || 'no task'
+            }, `${toolName} tool`)
+            broadcast(sessionId, lifecycleEvent)
             resolve({behavior: 'allow', updatedInput: input})
             return
         }
-        const requestId = `req-${++reqCounter}`
 
-        // Task / Workflow 工具 → 自动允许（SDK 内部处理子 agent 创建，hooks 负责广播状态）
-        if (toolName === 'Task' || toolName === 'Workflow') {
-            const st = input.name || input.subagent_type || 'unknown'
-            const desc = input.description || ''
-            log.info({
-                sessionId: sessionId?.slice(0, 8),
-                toolName: st,
-                description: desc || 'no desc'
-            }, `${toolName} tool`)
-            broadcast(sessionId, {
-                type: toolName === 'Workflow' ? 'workflow_started' : 'subagent_spawning',
-                requestId,
-                name: input.name || st,
-                agentType: st,
-                description: desc,
-                ts: Date.now(),
-                phases: input.phases || [],
-                workflowId: 'wf-' + (input.name || st) + '-' + Date.now().toString(36),
-            })
+        // 动态权限: 切换 permissionMode 后下一个普通工具调用立即生效，无需重建 query
+        if (s.permissionMode === 'bypassPermissions') {
             resolve({behavior: 'allow', updatedInput: input})
             return
         }
 
         const isChoice = toolName === 'AskUserQuestion'
+        const turnIdentity = s.activeTurnIdentity ? {...s.activeTurnIdentity} : null
         const entry = {
             id: requestId, sessionId, type: isChoice ? 'choice' : 'permission',
             toolName, input, questions: isChoice ? (input?.questions || []) : undefined,
+            source: turnIdentity?.source || 'desktop', userId: turnIdentity?.userId || null,
+            turnId: s.activeTurnId || null,
             resolve, settled: false, timeout: null,
         }
         // 5 分钟超时 → 拒绝并中断
@@ -478,12 +912,13 @@ function makeCanUseTool(sessionId) {
         }, {once: true})
         log.info({sessionId: sessionId?.slice(0, 8), requestId, type: entry.type, toolName}, '确认请求')
         // 推 desktop
-        broadcast(sessionId, isChoice
-            ? {type: 'choice_request', requestId, toolName, questions: entry.questions}
-            : {type: 'permission_request', requestId, toolName, input})
+        broadcastTurn(sessionId, isChoice
+            ? {type: 'choice_request', requestId, toolName, questions: entry.questions, turnId: entry.turnId}
+            : {type: 'permission_request', requestId, toolName, input, turnId: entry.turnId}, turnIdentity)
         // 权限确认推给 mirror 已开启的适配器（mirror 开启时由 hook 下发；关闭时适配器走 WS 内联路径）
         for (const hook of confirmHooks) {
             if (!s.mirrors[hook.platform]) continue
+            if (!shouldRouteMirror(hook.platform, turnIdentity)) continue
             try {
                 hook.onConfirmRequest?.({
                     sessionId,
@@ -491,10 +926,10 @@ function makeCanUseTool(sessionId) {
                     type: entry.type,
                     toolName,
                     input,
-                    questions: entry.questions
+                    questions: entry.questions,
+                    userId: turnIdentity?.userId || null,
                 })
-            } catch {
-            }
+            } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
         }
     })
 }
@@ -541,16 +976,180 @@ function readJSON(p) {
     }
 }
 
+function requestPinnedProvider(target, options = {}) {
+    const {parsed, address, family} = target
+    const transport = parsed.protocol === 'https:' ? httpsRequest : httpRequest
+    const requestHeaders = new Headers(options.headers || {})
+    // 连接使用已校验的 IP，但 Host/SNI 仍保留供应商域名，避免证书和虚拟主机路由失效。
+    requestHeaders.set('host', parsed.host)
+    const requestOptions = {
+        protocol: parsed.protocol,
+        hostname: parsed.hostname.replace(/^\[|\]$/g, ''),
+        port: parsed.port || undefined,
+        path: `${parsed.pathname || '/'}${parsed.search || ''}`,
+        method: options.method || 'GET',
+        headers: Object.fromEntries(requestHeaders.entries()),
+        lookup: createPinnedLookup(address, family),
+        signal: options.signal,
+        ...(parsed.protocol === 'https:' ? {servername: parsed.hostname.replace(/^\[|\]$/g, '')} : {}),
+    }
+    return new Promise((resolve, reject) => {
+        const MAX_PROVIDER_RESPONSE_BYTES = 5 * 1024 * 1024
+        let settled = false
+        const req = transport(requestOptions, (res) => {
+            const chunks = []
+            let totalBytes = 0
+            res.on('data', (chunk) => {
+                if (settled) return
+                totalBytes += chunk.length
+                if (totalBytes > MAX_PROVIDER_RESPONSE_BYTES) {
+                    settled = true
+                    res.destroy()
+                    req.destroy()
+                    reject(new Error('provider response too large'))
+                    return
+                }
+                chunks.push(chunk)
+            })
+            res.on('end', () => {
+                if (settled) return
+                settled = true
+                const headers = new Headers()
+                for (const [key, value] of Object.entries(res.headers)) {
+                    if (Array.isArray(value)) value.forEach((item) => headers.append(key, item))
+                    else if (value != null) headers.set(key, String(value))
+                }
+                resolve(new Response(Buffer.concat(chunks), {
+                    status: res.statusCode || 502,
+                    statusText: res.statusMessage || '',
+                    headers,
+                }))
+            })
+            res.on('error', error => {
+                if (settled) return
+                settled = true
+                reject(error)
+            })
+        })
+        req.on('error', error => {
+            if (settled) return
+            settled = true
+            reject(error)
+        })
+        if (options.body != null) req.write(options.body)
+        req.end()
+    })
+}
+
+async function fetchProviderResponse(rawUrl, options = {}) {
+    let currentUrl = rawUrl
+    const allowedOrigin = new URL(rawUrl).origin
+    for (let hop = 0; hop < 4; hop++) {
+        // 每一跳都只使用这一次 DNS 解析返回的已校验地址，避免校验后由底层 fetch 再次解析到内网。
+        const target = await resolveProviderUrl(currentUrl)
+        const response = await requestPinnedProvider(target, options)
+        if (response.status < 300 || response.status >= 400) return {response, url: currentUrl}
+        const location = response.headers.get('location')
+        if (!location) return {response, url: currentUrl}
+        currentUrl = resolveProviderRedirect(currentUrl, location, allowedOrigin)
+    }
+    throw new Error('provider redirect limit exceeded')
+}
+
+function getAdapterIdentity(req) {
+    const source = req.headers['x-bridge-source']
+    const userId = req.headers['x-bridge-user-id']
+    if (typeof source !== 'string' || typeof userId !== 'string' || !IM_SOURCES.has(source)
+        || !userId || userId.length > 512 || /[\0\r\n]/.test(userId)) return null
+    return {source, userId}
+}
+
+function adapterRouteAllowed(method, pathname, platform) {
+    if (method === 'POST' && ['/api/confirm', '/api/sessions/resolve', '/api/desktop/nudge', '/api/mirror', '/api/sessions-by-label'].includes(pathname)) return true
+    if (method === 'GET' && ['/api/sessions/focused', '/api/projects'].includes(pathname)) return true
+    if (method === 'GET' && /^\/api\/sessions\/[^/]+\/mirror$/.test(pathname)) return true
+    return false
+}
+
+function adapterOwnsSession(source, userId, sessionId) {
+    const bindings = readAdapterBindings()
+    const binding = bindings[`${source}:${userId}`]
+    return binding?.platform === source && binding?.userId === userId && binding?.sessionId === sessionId
+}
+
+function adapterOwnsFocusedSession(identity) {
+    return !!identity && !!focusedSessionId && adapterOwnsSession(identity.source, identity.userId, focusedSessionId)
+}
+
+function adapterOwnsProject(identity, encodedDir) {
+    if (!identity || typeof encodedDir !== 'string') return false
+    const binding = readAdapterBindings()[`${identity.source}:${identity.userId}`]
+    return !!binding && encodeProjectName(binding.workDir) === safeDecodeURIComponent(encodedDir)
+}
+
+function readAdapterBindings() {
+    if (!existsSync(ADAPTER_SESSIONS_PATH)) return {}
+    try {
+        return normalizeAdapterBindings(JSON.parse(readFileSync(ADAPTER_SESSIONS_PATH, 'utf8')), ADAPTER_PLATFORMS)
+    } catch (error) {
+        const corruptPath = `${ADAPTER_SESSIONS_PATH}.corrupt-${Date.now()}`
+        try {
+            renameSync(ADAPTER_SESSIONS_PATH, corruptPath)
+            log.error({err: error, corruptPath}, 'IM Session 绑定文件损坏，已隔离并重新建立')
+            return {}
+        } catch (renameError) {
+            throw new AggregateError([error, renameError], 'IM Session 绑定文件损坏且无法隔离')
+        }
+    }
+}
+
+function writeAdapterBindings(bindings) {
+    writeJSON(ADAPTER_SESSIONS_PATH, normalizeAdapterBindings(bindings, ADAPTER_PLATFORMS))
+}
+
+function isAdapterSessionActive(sessionId) {
+    if (sessions.has(sessionId)) return true
+    for (const session of sessions.values()) {
+        if (session.lastSessionId === sessionId) return true
+    }
+    return false
+}
+
+function clearAdapterBindings(predicate) {
+    const result = removeAdapterBindings(readAdapterBindings(), predicate, ADAPTER_PLATFORMS)
+    if (result.deleted > 0) writeAdapterBindings(result.bindings)
+    return result.deleted
+}
+
+function clearAdapterBindingsForSessions(...sessionIds) {
+    const ids = new Set(sessionIds.filter(Boolean).map(String))
+    if (ids.size === 0) return 0
+    return clearAdapterBindings(binding => ids.has(binding.sessionId))
+}
+
 // 功能说明: 写入 JSON 文件（格式化缩进 2 空格，原子写入防崩溃损坏）
 // 实现方式: JSON.stringify → writeFileSync(tmp) → rename(tmp, p)，避免中途崩溃导致文件损坏
 // 关键数据流: 对象 → JSON.stringify → 临时文件 → rename → 目标文件
 function writeJSON(p, d) {
     const tmp = p + '.tmp'
-    writeFileSync(tmp, JSON.stringify(d, null, 2), 'utf8')
-    try { renameSync(tmp, p) } catch {
+    const json = JSON.stringify(d, null, 2)
+    mkdirSync(dirname(p), {recursive: true})
+    writeFileSync(tmp, json, {encoding: 'utf8', mode: 0o600})
+    try {
+        renameSync(tmp, p)
+    } catch (renameError) {
         // Windows 下 rename 有时因文件锁/权限失败，回退到直接覆盖写
-        try { writeFileSync(p, JSON.stringify(d, null, 2), 'utf8') } catch {}
-        try { unlinkSync(tmp) } catch {}
+        try {
+            writeFileSync(p, json, {encoding: 'utf8', mode: 0o600})
+        } catch (writeError) {
+            try { unlinkSync(tmp) } catch (cleanupError) {
+                log.warn({err: cleanupError, path: tmp}, 'JSON 临时文件清理失败')
+            }
+            throw new AggregateError([renameError, writeError], `JSON 写入失败: ${p}`)
+        }
+        try { unlinkSync(tmp) } catch (cleanupError) {
+            log.warn({err: cleanupError, path: tmp}, 'JSON 临时文件清理失败')
+        }
     }
 }
 
@@ -560,69 +1159,74 @@ function writeJSON(p, d) {
 function backupFile(p) {
     try {
         writeFileSync(p + '.bak', readFileSync(p))
-    } catch {
-    }
+    } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
 }
 
 // 功能说明: 加载 ~/.claude/settings.json 配置文件，不存在则返回 {}
 // 实现方式: readJSON 封装 JSON.parse + readFileSync + try/catch，失败返回 null → || {} 兜底
 // 关键数据流: ~/.claude/settings.json → readFileSync → JSON.parse → 配置对象 或 {}
-function loadCliSettings() {
-    return readJSON(join(CLAUDE_HOME, 'settings.json')) || {}
+function loadBridgeProviderSettings() {
+    const stored = readJSON(BRIDGE_PROVIDER_SETTINGS_PATH)
+    if (stored && typeof stored === 'object' && !Array.isArray(stored)) {
+        return normalizeBridgeProviderSettings(stored)
+    }
+    // 首次隔离时只使用 Bridge 自己的 gateway/.env；正式包没有 .env 时使用无密钥默认值。
+    // 绝不从 settings.json 迁移 CCSwitch 的本地代理地址或 token。
+    return normalizeBridgeProviderSettings({
+        model: process.env.ANTHROPIC_MODEL || MODEL,
+        env: {
+            ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL || 'https://api.deepseek.com/anthropic',
+            ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_API_KEY,
+        },
+    })
 }
 
-// ── Hook 脚本存在性校验 ──
-// 启动时扫描 settings.json hooks，剔除脚本文件不存在的条目，防止 CLI 进程崩溃 (ZodError)
-// SIDE_EFFECT: 修改 ~/.claude/settings.json
+function saveBridgeProviderSettings(settings) {
+    const normalized = normalizeBridgeProviderSettings(settings)
+    mkdirSync(CLAUDE_HOME, {recursive: true})
+    writeJSON(BRIDGE_PROVIDER_SETTINGS_PATH, normalized)
+    return normalized
+}
+
+function loadCliSettings() {
+    const raw = readJSON(join(CLAUDE_HOME, 'settings.json')) || {}
+    return overlayBridgeProviderSettings(raw, loadBridgeProviderSettings())
+}
+
+function loadCliSettingsForUpdate() {
+    const settingsPath = join(CLAUDE_HOME, 'settings.json')
+    if (!existsSync(settingsPath)) return {}
+    const value = JSON.parse(readFileSync(settingsPath, 'utf8'))
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error('settings.json 内容无效，已拒绝覆盖原文件')
+    }
+    return value
+}
+
+// ── Hook 脚本存在性审计 ──
+// 启动时只记录明显缺失的脚本。Gateway 不应在用户未确认时改写全局 settings.json。
 function validateHooks() {
     const sp = join(CLAUDE_HOME, 'settings.json')
     const s = readJSON(sp)
     if (!s || !s.hooks || typeof s.hooks !== 'object') return
 
-    let changed = false
     const hooksDir = join(CLAUDE_HOME, 'hooks')
 
     for (const [eventType, entries] of Object.entries(s.hooks)) {
         if (!Array.isArray(entries)) continue
-        const kept = []
         for (const entry of entries) {
-            const validHooks = (entry.hooks || []).filter(h => {
-                if (h.type !== 'command') return true  // 非 command 类型不做文件校验
+            for (const h of (entry.hooks || [])) {
+                if (h.type !== 'command') continue
                 const cmd = h.command || ''
-                // 提取脚本路径: bash $HOME/.claude/hooks/foo.sh → foo.sh
-                const scriptFile = cmd.split(/\s+/).pop() || ''
-                if (!scriptFile) return true  // 无法提取文件名，保留
-                const scriptPath = join(hooksDir, scriptFile)
-                if (existsSync(scriptPath)) return true
-                log.warn({eventType, script: scriptFile}, 'Hook 脚本缺失，已自动剔除')
-                return false
-            })
-            // 必须在赋值前比较长度，赋值后原长度已丢；长度变化才标 dirty 避免无变更也触发 disk write
-            if (validHooks.length !== (entry.hooks || []).length) changed = true
-            if (validHooks.length > 0) {
-                entry.hooks = validHooks
-                kept.push(entry)
-            } else {
-                changed = true
+                const rawLastArg = cmd.match(/(?:"([^"]+)"|'([^']+)'|(\S+))\s*$/)
+                const scriptFile = basename(rawLastArg?.[1] || rawLastArg?.[2] || rawLastArg?.[3] || '')
+                if (!scriptFile || !/\.(sh|js|mjs|cjs|ps1)$/i.test(scriptFile)) continue
+                const scriptPath = safeBasename(hooksDir, scriptFile, {extensions: ['.sh', '.js', '.mjs', '.cjs', '.ps1']})
+                if (scriptPath && !existsSync(scriptPath)) {
+                    log.warn({eventType, script: scriptFile}, 'Hook 脚本缺失，请在设置页确认或修复')
+                }
             }
         }
-        if (kept.length > 0) {
-            if (kept.length !== entries.length) changed = true
-            s.hooks[eventType] = kept
-        } else {
-            delete s.hooks[eventType]
-            changed = true
-        }
-    }
-
-    if (Object.keys(s.hooks).length === 0) {
-        delete s.hooks
-        changed = true
-    }
-
-    if (changed) {
-        writeJSON(sp, s)
-        log.info('已清理无效 hooks 配置')
     }
 }
 
@@ -649,26 +1253,6 @@ const CAVEMAN_VERSION_FILE = join(CAVEMAN_SKILL_DIR, 'VERSION')
 const CAVEMAN_DEFAULT_CONFIG = {enabled: true, level: 'full'}
 const CAVEMAN_VALID_LEVELS = ['lite', 'full', 'ultra', 'wenyan']
 
-function ensureCavemanSkill() {
-    try {
-        if (!existsSync(CAVEMAN_SKILL_FILE)) {
-            mkdirSync(CAVEMAN_SKILL_DIR, {recursive: true})
-            // 内置原版 Caveman SKILL.md（MIT）——从 gateway/builtin-skills/caveman/SKILL.md 读取
-            const builtinPath = join(__dirname, 'builtin-skills', 'caveman', 'SKILL.md')
-            if (existsSync(builtinPath)) {
-                writeFileSync(CAVEMAN_SKILL_FILE, readFileSync(builtinPath, 'utf8'), 'utf8')
-            }
-            log.info('caveman skill 已安装')
-        }
-        // 确保 VERSION 文件存在
-        if (!existsSync(CAVEMAN_VERSION_FILE)) {
-            writeFileSync(CAVEMAN_VERSION_FILE, 'builtin', 'utf8')
-        }
-    } catch (e) {
-        log.warn({err: e}, 'caveman skill 安装失败')
-    }
-}
-
 // ── 语义化版本号提取（从 v0.43.0 / dev-0.43.0-rc.292 等标签中提取 [major, minor, patch]）──
 function extractSemver(tag) {
     const m = tag.match(/(\d+)\.(\d+)\.(\d+)/)
@@ -690,7 +1274,9 @@ async function checkCavemanUpdate() {
     let current = 'builtin'
     try {
         if (existsSync(CAVEMAN_VERSION_FILE)) current = readFileSync(CAVEMAN_VERSION_FILE, 'utf8').trim()
-    } catch {}
+    } catch (error) {
+        log.debug({err: error, path: CAVEMAN_VERSION_FILE}, '读取 Caveman 版本文件失败')
+    }
     dynamicCache.cavemanCurrent = current
     try {
         const resp = await fetch('https://api.github.com/repos/JuliusBrussee/caveman/releases?per_page=5', {
@@ -720,12 +1306,14 @@ async function checkCavemanUpdate() {
 
 // ── Caveman SKILL.md 更新（下载指定版本替换）──
 async function downloadAndReplaceCaveman(targetVersion) {
+    if (!/^[A-Za-z0-9._-]{1,64}$/.test(targetVersion)) throw new Error('Caveman 版本号格式不合法')
     const skillUrl = `https://raw.githubusercontent.com/JuliusBrussee/caveman/${targetVersion}/skills/caveman/SKILL.md`
     log.info({version: targetVersion, url: skillUrl}, 'Caveman 开始下载')
     const resp = await fetch(skillUrl, {signal: AbortSignal.timeout(30000)})
     if (!resp.ok) throw new Error(`下载失败 ${resp.status}`)
-    const content = await resp.text()
+    const content = (await readFetchBodyLimited(resp, MAX_REMOTE_TEXT_BYTES)).toString('utf8')
     if (!content.trim()) throw new Error('下载内容为空')
+    mkdirSync(CAVEMAN_SKILL_DIR, {recursive: true})
     // 备份旧文件
     if (existsSync(CAVEMAN_SKILL_FILE)) {
         writeFileSync(CAVEMAN_SKILL_FILE + '.bak', readFileSync(CAVEMAN_SKILL_FILE, 'utf8'), 'utf8')
@@ -748,7 +1336,7 @@ function loadCavemanConfig() {
 }
 
 function saveCavemanConfig(cfg) {
-    const s = readJSON(join(CLAUDE_HOME, 'settings.json')) || {}
+    const s = loadCliSettingsForUpdate()
     s.caveman = cfg
     writeJSON(join(CLAUDE_HOME, 'settings.json'), s)
 }
@@ -772,6 +1360,39 @@ function buildCavemanSystemPrompt(cfg) {
 const RTK_TIMEOUT = 5000  // rtk 进程超时（ms）
 const RTK_REJECT_RATIO = 0.95  // 压缩比 > 95% → 驳回
 const RTK_CRITICAL_PATTERN = /fatal|panic|denied|segfault|corruption/i  // 致命关键词
+const MAX_RTK_ARCHIVE_BYTES = 100 * 1024 * 1024
+const MAX_REMOTE_TEXT_BYTES = 2 * 1024 * 1024
+
+async function readFetchBodyLimited(response, maxBytes) {
+    const declared = Number(response.headers.get('content-length') || 0)
+    if (Number.isFinite(declared) && declared > maxBytes) {
+        try { await response.body?.cancel() } catch (cancelError) {
+            log.debug({err: cancelError}, '取消声明长度超限的下载流失败')
+        }
+        throw new Error('下载文件超过大小限制')
+    }
+    if (!response.body) return Buffer.alloc(0)
+    const reader = response.body.getReader()
+    const chunks = []
+    let total = 0
+    try {
+        while (true) {
+            const {done, value} = await reader.read()
+            if (done) break
+            total += value.byteLength
+            if (total > maxBytes) throw new Error('下载文件超过大小限制')
+            chunks.push(Buffer.from(value))
+        }
+    } catch (error) {
+        try { await reader.cancel(error) } catch (cancelError) {
+            log.debug({err: cancelError}, '取消超限下载流失败')
+        }
+        throw error
+    } finally {
+        reader.releaseLock()
+    }
+    return Buffer.concat(chunks, total)
+}
 
 function locateRtk() {
     const plat = process.platform
@@ -808,7 +1429,7 @@ function loadRtkConfig() {
 }
 
 function saveRtkConfig(cfg) {
-    const s = readJSON(join(CLAUDE_HOME, 'settings.json')) || {}
+    const s = loadCliSettingsForUpdate()
     s.bashCompress = cfg
     writeJSON(join(CLAUDE_HOME, 'settings.json'), s)
 }
@@ -819,7 +1440,9 @@ async function checkRtkUpdate() {
     let current = 'unknown'
     try {
         if (existsSync(versionFile)) current = readFileSync(versionFile, 'utf8').trim()
-    } catch {}
+    } catch (error) {
+        log.debug({err: error, path: versionFile}, '读取 RTK 版本文件失败')
+    }
     // 持久化当前版本号供前端显示
     dynamicCache.rtkCurrent = current
     try {
@@ -854,6 +1477,7 @@ async function checkRtkUpdate() {
 //   仅支持 Windows (.zip) 和 Linux/macOS (.tar.gz)
 // SIDE_EFFECT: 覆盖 rtk-bin/ 或 resources/rtk/ 下的二进制 + version.txt
 async function downloadAndReplaceRtk(targetVersion) {
+    if (!/^[A-Za-z0-9._-]{1,64}$/.test(targetVersion)) throw new Error('RTK 版本号格式不合法')
     const plat = process.platform
     const arch = process.arch
     const binName = {
@@ -873,49 +1497,76 @@ async function downloadAndReplaceRtk(targetVersion) {
     })
     if (!releaseResp.ok) throw new Error(`GitHub API 返回 ${releaseResp.status}`)
     const release = await releaseResp.json()
-    const asset = (release.assets || []).find(a => a.name && a.name.includes(binName.replace('.exe', '')))
-    if (!asset) throw new Error(`未找到 ${binName} 的下载链接`)
+    const asset = selectRtkReleaseAsset(release.assets, binName, plat)
     const downloadUrl = asset.browser_download_url
     // 校验下载 URL 必须是 GitHub 域名（防止 GitHub API 响应被污染时 SSRF）
-    if (!/^https?:\/\/[^/]*\.?github\.com\//i.test(downloadUrl)) throw new Error('RTK 下载链接域名不合法')
+    let parsedDownloadUrl
+    try { parsedDownloadUrl = new URL(downloadUrl) } catch { throw new Error('RTK 下载链接格式不合法') }
+    if (parsedDownloadUrl.protocol !== 'https:' || parsedDownloadUrl.hostname.toLowerCase() !== 'github.com') {
+        throw new Error('RTK 下载链接域名不合法')
+    }
 
     // 2. 下载到临时文件
     log.info({version: targetVersion, url: downloadUrl}, 'RTK 开始下载')
     const tmpFile = join(rtkDir, `_rtk_download${plat === 'win32' ? '.zip' : '.tar.gz'}`)
     const dlResp = await fetch(downloadUrl, {signal: AbortSignal.timeout(120000)})
     if (!dlResp.ok) throw new Error(`下载失败 ${dlResp.status}`)
-    const buf = Buffer.from(await dlResp.arrayBuffer())
+    const buf = await readFetchBodyLimited(dlResp, MAX_RTK_ARCHIVE_BYTES)
+    const digest = verifyRtkAssetDigest(buf, asset.digest)
     writeFileSync(tmpFile, buf)
-    log.info({version: targetVersion, size: buf.length}, 'RTK 下载完成')
+    log.info({version: targetVersion, size: buf.length, sha256: digest}, 'RTK 下载完成并通过哈希校验')
 
     // 3. 解压
+    const dest = join(rtkDir, binName)
+    const pendingDest = dest + '.new'
+    const backupDest = dest + '.bak'
     try {
+        if (existsSync(pendingDest)) unlinkSync(pendingDest)
         if (plat === 'win32') {
-            const extractDir = join(rtkDir, '_rtk_extract')
-            if (existsSync(extractDir)) rmdirSync(extractDir, {recursive: true})
-            mkdirSync(extractDir, {recursive: true})
-            const psResult = spawnSync('powershell.exe', [
-                '-NoProfile', '-NonInteractive', '-Command',
-                'Expand-Archive', '-LiteralPath', tmpFile, '-DestinationPath', extractDir, '-Force'
-            ], {timeout: 30000, windowsHide: true})
+            const psResult = spawnSync('powershell.exe', buildWindowsRtkExtractArgs(), {
+                timeout: 30000,
+                windowsHide: true,
+                env: buildWindowsRtkExtractEnv(tmpFile, pendingDest),
+            })
             if (psResult.error) throw new Error(`解压失败: ${psResult.error.message}`)
-            const extracted = join(extractDir, 'rtk.exe')
-            if (existsSync(extracted)) {
-                const dest = join(rtkDir, binName)
-                if (existsSync(dest)) unlinkSync(dest)
-                writeFileSync(dest, readFileSync(extracted))
-            } else {
-                throw new Error('解压后未找到 rtk 可执行文件')
-            }
-            rmdirSync(extractDir, {recursive: true})
+            if (psResult.status !== 0 || !existsSync(pendingDest)) throw new Error('解压后未找到 rtk.exe')
         } else {
-            const tarResult = spawnSync('tar', ['-xzf', tmpFile, '-C', rtkDir], {timeout: 30000})
-            if (tarResult.error) throw new Error(`解压失败: ${tarResult.error.message}`)
-            const dest = join(rtkDir, binName)
-            try { spawnSync('chmod', ['+x', dest]) } catch {}
+            const listResult = spawnSync('tar', ['-tzf', tmpFile], {
+                timeout: 30000, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024,
+            })
+            if (listResult.error || listResult.status !== 0) {
+                throw new Error(`读取归档目录失败: ${listResult.error?.message || listResult.stderr || listResult.status}`)
+            }
+            const entries = listResult.stdout.split(/\r?\n/).filter(Boolean)
+            if (entries.some(entry => entry.startsWith('/') || entry.split('/').some(segment => segment === '..'))) {
+                throw new Error('RTK 归档包含非法路径')
+            }
+            const binaryEntry = entries.find(entry => entry.split('/').pop() === binName)
+            if (!binaryEntry) throw new Error(`归档中未找到 ${binName}`)
+            const extractResult = spawnSync('tar', ['-xOzf', tmpFile, binaryEntry], {
+                timeout: 30000, encoding: null, maxBuffer: MAX_RTK_ARCHIVE_BYTES,
+            })
+            if (extractResult.error || extractResult.status !== 0 || !extractResult.stdout?.length) {
+                throw new Error(`提取二进制失败: ${extractResult.error?.message || extractResult.stderr?.toString() || extractResult.status}`)
+            }
+            writeFileSync(pendingDest, extractResult.stdout)
         }
+        if (plat !== 'win32') {
+            const chmodResult = spawnSync('chmod', ['+x', pendingDest], {timeout: 5000})
+            if (chmodResult.error || chmodResult.status !== 0) throw new Error('设置 RTK 可执行权限失败')
+        }
+        if (existsSync(backupDest)) unlinkSync(backupDest)
+        if (existsSync(dest)) renameSync(dest, backupDest)
+        try {
+            renameSync(pendingDest, dest)
+        } catch (error) {
+            if (existsSync(backupDest) && !existsSync(dest)) renameSync(backupDest, dest)
+            throw error
+        }
+        if (existsSync(backupDest)) unlinkSync(backupDest)
     } finally {
         if (existsSync(tmpFile)) unlinkSync(tmpFile)
+        if (existsSync(pendingDest)) unlinkSync(pendingDest)
     }
 
     // 4. 更新 version.txt
@@ -1077,13 +1728,23 @@ function findGitBashDirs() {
                 seen.add(gitExe)
                 // Git for Windows 标准布局: <GitRoot>/cmd/git.exe → ../usr/bin
                 const usrBin = resolve(dirname(gitExe), '..', 'usr', 'bin')
-                try { if (statSync(usrBin).isDirectory()) dirs.push(usrBin) } catch {}
+                try {
+                    if (statSync(usrBin).isDirectory()) dirs.push(usrBin)
+                } catch (error) {
+                    if (error?.code !== 'ENOENT') log.debug({err: error, path: usrBin}, '检查 Git Bash usr/bin 失败')
+                }
                 // 也加入 git.exe 自身目录（部分命令如 git 本身在此）
                 const binDir = dirname(gitExe)
-                try { if (statSync(binDir).isDirectory() && !dirs.includes(binDir)) dirs.push(binDir) } catch {}
+                try {
+                    if (statSync(binDir).isDirectory() && !dirs.includes(binDir)) dirs.push(binDir)
+                } catch (error) {
+                    if (error?.code !== 'ENOENT') log.debug({err: error, path: binDir}, '检查 Git 可执行目录失败')
+                }
             }
         }
-    } catch {}
+    } catch (error) {
+        log.debug({err: error}, '动态探测 Git Bash 目录失败')
+    }
     // 动态探测失败 → 回退常见路径兜底
     if (dirs.length === 0) {
         const fallbacks = [
@@ -1094,7 +1755,11 @@ function findGitBashDirs() {
             join(homedir(), 'scoop', 'apps', 'git', 'current', 'usr', 'bin'),
         ]
         for (const d of fallbacks) {
-            try { if (statSync(d).isDirectory()) dirs.push(d) } catch {}
+            try {
+                if (statSync(d).isDirectory()) dirs.push(d)
+            } catch (error) {
+                if (error?.code !== 'ENOENT') log.debug({err: error, path: d}, '检查 Git Bash 回退目录失败')
+            }
         }
     }
     return dirs
@@ -1111,7 +1776,8 @@ function findGitBashDirs() {
 // @returns {Promise<string>} stdout 输出
 function spawnRtk(rtkPath, cmd, _text) {
     return new Promise((resolve, reject) => {
-        const args = cmd ? parseShellArgs(cmd) : []
+        const parsedArgs = cmd ? parseShellArgs(cmd) : []
+        const args = resolveRtkCommandArgs(parsedArgs)
         if (args.length === 0) { resolve(''); return }
         // Windows 上 rtk 子进程需要 Unix 命令 → 动态探测 Git Bash 的 bin 目录合并到 PATH
         const env = {...process.env}
@@ -1119,7 +1785,11 @@ function spawnRtk(rtkPath, cmd, _text) {
             const gitBashDirs = findGitBashDirs()
             const existing = (env.PATH || '').split(';')
             for (const d of gitBashDirs) {
-                try { if (statSync(d).isDirectory() && !existing.includes(d)) existing.push(d) } catch {}
+                try {
+                    if (statSync(d).isDirectory() && !existing.includes(d)) existing.push(d)
+                } catch (error) {
+                    if (error?.code !== 'ENOENT') log.debug({err: error, path: d}, '合并 RTK PATH 失败')
+                }
             }
             env.PATH = existing.join(';')
         }
@@ -1177,11 +1847,9 @@ function loadAgentDefinitions() {
                     ...(tools ? {tools} : {}),
                     ...(fm.model && fm.model !== 'inherit' ? {model: fm.model} : {}),
                 }
-            } catch {
-            }
+            } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
         }
-    } catch {
-    }
+    } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
     return defs
 }
 
@@ -1197,7 +1865,15 @@ function decodeProjectName(n) {
 // 路径规范化：消除编码歧义，确保相同物理路径产生相同编码结果
 //   D:\a\b → D:/a/b，D://a//b → D:/a/b，D:/a/b/ → D:/a/b
 function normalizeWorkDir(wd) {
-    return wd.replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/+$/, '') || '/'
+    if (typeof wd !== 'string') return ''
+    const raw = wd.trim()
+    if (!raw) return ''
+    const slashPath = raw.replace(/\\/g, '/')
+    const isUnc = slashPath.startsWith('//')
+    let normalized = slashPath.replace(/\/+/g, '/')
+    if (isUnc) normalized = `//${normalized.replace(/^\/+/, '')}`
+    if (normalized === '/' || /^[A-Za-z]:\/$/.test(normalized)) return normalized
+    return normalized.replace(/\/+$/, '')
 }
 
 // 功能说明: 将工作目录路径编码为文件系统安全的目录名
@@ -1211,34 +1887,47 @@ function encodeProjectName(wd) {
 }
 
 // 功能说明: 从 HTTP 请求流中读取完整 body 并解析为 JSON 对象
-// 实现方式: 监听 data 事件拼接字符串，end 事件时 JSON.parse；解析失败返回 {}（不抛异常）
-// 关键数据流: req stream → data 拼接 → JSON.parse → 对象 或 {}
+// 实现方式: 按字节累计 Buffer，超过 10MB 后停止缓存并排空请求；end 时 JSON.parse
+// 关键数据流: req stream → Buffer[] → UTF-8 JSON.parse → 对象或显式错误标记
 function readBody(req) {
-    return new Promise(r => {
-        let d = '';
-        const cleanup = () => {
-            if (!settled) { settled = true; r({_bodyError: true}) }
-        }
+    return new Promise(resolve => {
+        const chunks = []
+        let totalBytes = 0
         let settled = false
-        req.on('data', c => {
-            d += c
-            if (d.length > 10_000_000) {  // 10MB 上限，防止 OOM
-                settled = true
-                req.destroy()
-                r({_bodyTooLarge: true})
-            }
-        });
-        req.on('end', () => {
+        const cleanup = () => {
+            req.removeListener('data', onData)
+            req.removeListener('end', onEnd)
+            req.removeListener('error', onError)
+            req.removeListener('aborted', onAborted)
+        }
+        const settle = value => {
             if (settled) return
             settled = true
-            try {
-                r(JSON.parse(d || '{}'))
-            } catch {
-                r({_parseError: true})
+            cleanup()
+            resolve(value)
+        }
+        const onData = c => {
+            totalBytes += c.length
+            if (totalBytes > 10_000_000) {  // 10MB 字节上限，防止 OOM
+                req.resume()
+                settle({_bodyTooLarge: true})
+                return
             }
-        })
-        req.on('error', cleanup)
-        req.on('aborted', cleanup)
+            chunks.push(c)
+        }
+        req.on('data', onData)
+        const onEnd = () => {
+            try {
+                settle(JSON.parse(chunks.length ? Buffer.concat(chunks).toString('utf8') : '{}'))
+            } catch {
+                settle({_parseError: true})
+            }
+        }
+        const onError = () => settle({_bodyError: true})
+        const onAborted = () => settle({_bodyError: true})
+        req.on('end', onEnd)
+        req.on('error', onError)
+        req.on('aborted', onAborted)
     })
 }
 
@@ -1248,29 +1937,44 @@ function readBody(req) {
 function parseMultipart(req) {
     return new Promise((resolve, reject) => {
         const chunks = []
+        const MAX_UPLOAD_FILE = 8 * 1024 * 1024
         const MAX_MULTIPART = 10_000_000  // 10MB 上限，与 readBody 一致
         let totalLen = 0
         let settled = false
+        const cleanup = () => {
+            req.removeListener('data', onData)
+            req.removeListener('end', onEnd)
+            req.removeListener('error', onError)
+            req.removeListener('aborted', onAborted)
+        }
+        const settleResolve = value => {
+            if (settled) return
+            settled = true
+            cleanup()
+            resolve(value)
+        }
+        const settleReject = error => {
+            if (settled) return
+            settled = true
+            cleanup()
+            reject(error)
+        }
         const onData = (c) => {
             totalLen += c.length
             if (totalLen > MAX_MULTIPART) {
-                settled = true
-                req.destroy()
-                req.removeListener('data', onData)
-                reject(new Error('upload too large'))
+                req.resume()
+                settleReject(new Error('upload too large'))
                 return
             }
             chunks.push(c)
         }
         req.on('data', onData)
-        req.on('end', () => {
-            if (settled) return
-            settled = true
+        const onEnd = () => {
             try {
                 const buf = Buffer.concat(chunks)
                 const ct = req.headers['content-type'] || ''
                 const bm = ct.match(/boundary=(?:"([^"]+)"|([^;]+))/)
-                if (!bm) { resolve({fields: {}, files: {}}); return }
+                if (!bm) { settleResolve({fields: {}, files: {}}); return }
                 const boundary = bm[1] || bm[2]
                 const boundaryBuf = Buffer.from('--' + boundary)
                 const fields = {}
@@ -1296,6 +2000,7 @@ function parseMultipart(req) {
                     if (nameM) {
                         const name = nameM[1]
                         if (filenameM) {
+                            if (bodyContent.length > MAX_UPLOAD_FILE) throw new Error('file too large')
                             files[name] = {filename: filenameM[1], data: bodyContent, contentType: (headerStr.match(/Content-Type:\s*([^\s;]+)/i) || [])[1] || 'application/octet-stream'}
                         } else {
                             fields[name] = bodyContent.toString()
@@ -1303,10 +2008,14 @@ function parseMultipart(req) {
                     }
                     pos = nextPos
                 }
-                resolve({fields, files})
-            } catch (e) { reject(e) }
-        })
-        req.on('error', reject)
+                settleResolve({fields, files})
+            } catch (e) { settleReject(e) }
+        }
+        const onError = error => settleReject(error)
+        const onAborted = () => settleReject(new Error('upload aborted'))
+        req.on('end', onEnd)
+        req.on('error', onError)
+        req.on('aborted', onAborted)
     })
 }
 
@@ -1348,17 +2057,44 @@ function convertSdkToWs(sdkMsg, sessionId) {
                 // PROVIDERS 查不到时，用 session 存储的前端传入 modelMeta 作为回退
                 const s = sessions.get(sessionId);
                 const mm = s?.modelMeta;
+                return buildSystemInitEvent({sdkMsg, gatewaySessionId: sessionId, modelInfo: info, modelMeta: mm});
+            }
+            if (sdkMsg.subtype === 'compact_boundary') return compactBoundaryToEvent(sdkMsg)
+            if (sdkMsg.subtype === 'task_started') {
+                const s = sessions.get(sessionId)
+                const agentType = String(sdkMsg.subagent_type || sdkMsg.task_type || 'unknown')
+                const descriptor = buildAgentDescriptor(agentType, {
+                    description: sdkMsg.description,
+                    prompt: sdkMsg.prompt,
+                }, s?.queryOpts?.agents || {})
                 return {
-                    type: 'system_init',
-                    cwd: sdkMsg.cwd,
-                    model: sdkMsg.model,
-                    tools: sdkMsg.tools,
-                    sessionId,
-                    permissionMode: sdkMsg.permissionMode,
-                    skills: sdkMsg.skills,
-                    contextWindow: info.contextWindow !== 1000000 ? info.contextWindow : (mm?.contextWindow || info.contextWindow),
-                    pricing: info.pricing || mm?.pricing || null
-                };
+                    type: 'subagent_start',
+                    agentId: sdkMsg.task_id,
+                    toolUseId: sdkMsg.tool_use_id || null,
+                    agentType,
+                    description: descriptor.task || descriptor.purpose,
+                    ...descriptor,
+                    ts: Date.now(),
+                }
+            }
+            if (sdkMsg.subtype === 'task_progress') return {
+                type: 'subagent_progress',
+                agentId: sdkMsg.task_id,
+                toolUseId: sdkMsg.tool_use_id || null,
+                agentType: sdkMsg.subagent_type || 'unknown',
+                currentAction: sdkMsg.last_tool_name || sdkMsg.description || '',
+                progress: sdkMsg.summary || sdkMsg.description || '',
+                usage: sdkMsg.usage || null,
+                ts: Date.now(),
+            }
+            if (sdkMsg.subtype === 'task_notification') return {
+                type: 'subagent_done',
+                agentId: sdkMsg.task_id,
+                toolUseId: sdkMsg.tool_use_id || null,
+                status: sdkMsg.status,
+                summary: sdkMsg.summary || '',
+                usage: sdkMsg.usage || null,
+                ts: Date.now(),
             }
             return null
         case 'stream_event':
@@ -1366,8 +2102,11 @@ function convertSdkToWs(sdkMsg, sessionId) {
         case 'assistant':
             return {type: 'assistant_message', message: sdkMsg.message, error: sdkMsg.error}
         case 'user':
+            if (isSyntheticCompactSummary(sdkMsg)) return null
             return {type: 'user_message_echo', message: sdkMsg.message, timestamp: sdkMsg.timestamp}
         case 'result':
+            const taskResult = classifyTaskResult(sdkMsg)
+            const resultSession = sessions.get(sessionId)
             return {
                 type: 'result',
                 subtype: sdkMsg.subtype,
@@ -1376,7 +2115,10 @@ function convertSdkToWs(sdkMsg, sessionId) {
                 num_turns: sdkMsg.num_turns,
                 // 0.3.x: SDKResultError 无 result 字段，改用 errors 数组
                 result: sdkMsg.result || sdkMsg.errors?.join('\n'),
-                usage: sdkMsg.usage
+                usage: sdkMsg.usage,
+                modelUsage: sdkMsg.modelUsage,
+                ...taskResult,
+                resumable: canResumeTask(taskResult, Boolean(resultSession?.lastSessionId || sdkMsg.session_id)),
             }
         case 'tool_progress':
             return {
@@ -1432,20 +2174,86 @@ function mapStreamEvent(event) {
 //   2. 删除 ELECTRON_RUN_AS_NODE（claude.exe 是 Electron 二进制，带此 env 会当 node 跑导致 ENOENT）
 //   3. 非 bypass 模式注册 canUseTool 回调；bypass 下 SDK 不触发回调所以不注册
 // 关键数据流: body + env + cliS → merge → {model, executable, cwd, permissionMode, thinking, maxTurns, mcpServers, env, canUseTool?}
+function sanitizeMcpServers(input) {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) return undefined
+    const out = {}
+    for (const [name, raw] of Object.entries(input)) {
+        if (!/^[a-zA-Z0-9._-]{1,64}$/.test(name) || !raw || typeof raw !== 'object') continue
+        const transport = raw.type || raw.transport || 'stdio'
+        if (!['stdio', 'sse', 'http'].includes(transport)) continue
+        if (transport === 'stdio') {
+            if (typeof raw.command !== 'string' || !raw.command || raw.command.length > 2048 || /[\0\r\n]/.test(raw.command)) continue
+            const args = Array.isArray(raw.args) ? raw.args : []
+            if (args.length > 100 || args.some(a => typeof a !== 'string' || a.length > 4096 || /[\0\r\n]/.test(a))) continue
+            const env = {}
+            for (const [key, value] of Object.entries(raw.env || {})) {
+                if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) && typeof value === 'string' && value.length <= 4096 && !/[\0\r\n]/.test(value)
+                    && !['BRIDGE_TOKEN', 'BRIDGE_ALLOW_TOKEN_ENDPOINT', 'NODE_OPTIONS', 'ELECTRON_RUN_AS_NODE'].includes(key)) env[key] = value
+            }
+            out[name] = {type: 'stdio', command: raw.command, args, ...(Object.keys(env).length ? {env} : {}), ...(raw.enabled === false ? {enabled: false} : {})}
+            continue
+        }
+        let parsedUrl
+        try { parsedUrl = new URL(raw.url) } catch { continue }
+        if (!['http:', 'https:'].includes(parsedUrl.protocol)) continue
+        const headers = {}
+        for (const [key, value] of Object.entries(raw.headers || {})) {
+            if (key.toLowerCase() !== 'x-bridge-token' && /^[\x21-\x7e]{1,128}$/.test(key) && typeof value === 'string' && value.length <= 4096 && !/[\0\r\n]/.test(value)) headers[key] = value
+        }
+        out[name] = {type: transport, url: raw.url, ...(Object.keys(headers).length ? {headers} : {}), ...(raw.enabled === false ? {enabled: false} : {})}
+    }
+    return Object.keys(out).length ? out : undefined
+}
+
+const CHILD_ENV_KEYS = [
+    'PATH', 'Path', 'PATHEXT', 'ComSpec', 'SystemRoot', 'WINDIR', 'TEMP', 'TMP',
+    'HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'PROGRAMDATA', 'LANG', 'LC_ALL', 'TZ',
+    'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'SSL_CERT_FILE', 'NODE_EXTRA_CA_CERTS',
+]
+
+function buildChildProcessEnv() {
+    const env = {}
+    for (const key of CHILD_ENV_KEYS) {
+        if (typeof process.env[key] === 'string' && process.env[key]) env[key] = process.env[key]
+    }
+    return env
+}
+
 async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = null) {
     // 三源合并: body(前端临时切换) > cliS.env(settings) ; 不读 process.env 避免父进程 env 与 settings 不一致
-    const apiKey = body.apiKey || cliS.env?.ANTHROPIC_AUTH_TOKEN || cliS.env?.ANTHROPIC_API_KEY
+    const configuredApiKey = cliS.env?.ANTHROPIC_AUTH_TOKEN || cliS.env?.ANTHROPIC_API_KEY || ''
+    // 设置接口会脱敏返回 provider key；会话入口必须在 Gateway 内恢复，不能把 [REDACTED] 发给上游。
+    const requestedApiKey = restoreSecretValue(body.apiKey || '', configuredApiKey)
+    const apiKey = requestedApiKey || configuredApiKey
     let baseUrl = body.baseUrl || cliS.env?.ANTHROPIC_BASE_URL
     const exe = body.claudeExe || process.env.CLAUDE_EXE || cliS.claudeExe || getClaudeExe()
-    const permissionMode = body.permissionMode || 'default'
-    const agents = body._agents || loadAgentDefinitions()  // sub-session 可覆盖为单个 agent
+    const permissionMode = VALID_PERMISSION_MODES.has(body.permissionMode) ? body.permissionMode : 'default'
+    const requestedMaxTurns = Number(body.maxTurns || cliS.maxTurns || 40)
+    const contextProfile = normalizeContextProfile(body.contextProfile)
+    const skillRoute = Array.isArray(body.skillRoute)
+        ? [...new Set(body.skillRoute.filter(name => typeof name === 'string' && name.length <= 128))]
+        : routeSkills({
+            text: body.text || '',
+            workDir,
+            profile: contextProfile,
+            targetFiles: body.targetFiles || [],
+        })
+    const agents = contextProfile === 'full' ? (body._agents || loadAgentDefinitions()) : {}
 
     // DeepSeek 兼容代理: 自动路由请求通过本地代理修复参数冲突
-    if (baseUrl && baseUrl.includes('deepseek') && !isProxyRunning()) {
+    const usesDeepSeek = typeof baseUrl === 'string' && /deepseek/i.test(baseUrl)
+    const usesCodexRelay = typeof baseUrl === 'string' && /\/api\/codex\/backend-api\/codex(?:\/|$)/i.test(baseUrl)
+    let deepSeekProxyReady = false
+    if (usesDeepSeek) {
         if (!_proxyStarting) {
             _proxyStarting = startDeepSeekProxy(baseUrl).finally(() => { _proxyStarting = null })
         }
-        try { await _proxyStarting } catch (e) { log.error({err: e}, 'DeepSeek proxy 启动失败') }
+        try {
+            await _proxyStarting
+            deepSeekProxyReady = isProxyConfiguredFor(baseUrl)
+        } catch (e) {
+            log.error({err: e}, 'DeepSeek proxy 启动失败')
+        }
     }
     // OpenCode 协议翻译代理: Anthropic Messages → OpenAI Chat Completions
     // Zen /v1/messages 仅 Claude/Qwen，其他模型须走 /chat/completions
@@ -1455,37 +2263,56 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
         }
         try { await _ocProxyStarting } catch (e) { log.error({err: e}, 'OpenCode proxy 启动失败') }
     }
-    const effectiveBaseUrl = (baseUrl && baseUrl.includes('deepseek') && isProxyRunning()) ? getProxyUrl()
+    let effectiveBaseUrl = deepSeekProxyReady ? getProxyUrl()
         : (baseUrl && baseUrl.includes('opencode') && isOpenCodeProxyRunning()) ? getOpenCodeProxyUrl()
         : baseUrl
 
     // 模型选择: 用户显式选 → body.model; 未选 → 按消息复杂度自动匹配 modelTiers; 都没有 → settings.model
     const autoModel = (!body.model && body.text) ? pickTierModelByContent(body.text, loadWfConfig()) : null
-    const resolvedModel = mapModel(body.model) || autoModel || cliS.model || MODEL
-    const opts = {
+    let resolvedModel = mapModel(body.model) || autoModel || cliS.model || MODEL
+    if (usesCodexRelay && !/^(?:gpt-|o\d|codex|computer-use)/i.test(String(resolvedModel || ''))) {
+        resolvedModel = cliS.env?.CODEX_MODEL || 'gpt-5.6-sol'
+    }
+    let sdkApiKey = apiKey
+    if (usesCodexRelay) {
+        const relayConfig = {upstream: baseUrl, apiKey, model: resolvedModel}
+        try {
+            const relay = await startCodexRelayProxy(relayConfig)
+            effectiveBaseUrl = getCodexRelayProxyUrl()
+            sdkApiKey = relay.token
+        } catch (error) {
+            log.error({err: error}, 'Codex Relay 代理启动失败')
+            throw new Error(`Codex Relay 代理启动失败: ${error?.message || error}`)
+        }
+    }
+    const configuredContextCap = parseTokenCount(body.maxContextTokens || cliS.maxContextTokens)
+    const knownContextWindow = parseTokenCount(body.modelMeta?.contextWindow) || lookupModelInfo(resolvedModel).contextWindow
+    const autoCompactWindow = calculateAutoCompactWindow(knownContextWindow, configuredContextCap)
+    let opts = {
         model: resolvedModel,
         executable: 'node',
         cwd: workDir,
         permissionMode,
         allowDangerouslySkipPermissions: permissionMode === 'bypassPermissions',
-        thinking: mapThinkingLevel(body.thinkingLevel || 'auto'),
-        maxTurns: body.maxTurns || cliS.maxTurns || 40,
-        mcpServers: cliS.mcpServers || undefined,
+        thinking: mapThinkingLevel(VALID_THINKING_LEVELS.has(body.thinkingLevel) ? body.thinkingLevel : 'auto'),
+        maxTurns: Number.isFinite(requestedMaxTurns) ? Math.min(100, Math.max(1, requestedMaxTurns)) : 40,
+        mcpServers: sanitizeMcpServers(cliS.mcpServers),
+        skills: skillRoute,
         stderr: (msg) => process.stderr.write(`[claude.exe stderr] ${msg}`),
         env: (() => {
             const modelName = resolvedModel
             const e = {
-                ...process.env,
+                ...buildChildProcessEnv(),
                 CLAUDE_CODE_ENTRYPOINT: 'claude',
-                ANTHROPIC_API_KEY: apiKey,
-                ANTHROPIC_AUTH_TOKEN: apiKey,
+                ANTHROPIC_API_KEY: sdkApiKey,
+                ANTHROPIC_AUTH_TOKEN: sdkApiKey,
                 ANTHROPIC_BASE_URL: effectiveBaseUrl,
                 ANTHROPIC_MODEL: modelName, ...extraEnv
             };
             delete e.ELECTRON_RUN_AS_NODE;
             // 子 agent 默认用 claude-* 模型名发给第三方供应商会 403，统一映射到当前模型
             // 须在 ANTHROPIC_API_KEY 之后再设 DEFAULT，防止 process.env 中的旧值残留
-            if (effectiveBaseUrl && (effectiveBaseUrl.includes('minimax') || effectiveBaseUrl.includes('deepseek') || effectiveBaseUrl.includes('moonshot') || effectiveBaseUrl.includes('opencode') || effectiveBaseUrl.includes('bigmodel') || effectiveBaseUrl.includes('aliyun') || effectiveBaseUrl.includes('volces'))) {
+            if (usesCodexRelay || (effectiveBaseUrl && (effectiveBaseUrl.includes('minimax') || effectiveBaseUrl.includes('deepseek') || effectiveBaseUrl.includes('moonshot') || effectiveBaseUrl.includes('opencode') || effectiveBaseUrl.includes('bigmodel') || effectiveBaseUrl.includes('aliyun') || effectiveBaseUrl.includes('volces')))) {
                 e.ANTHROPIC_DEFAULT_OPUS_MODEL = modelName
                 e.ANTHROPIC_DEFAULT_SONNET_MODEL = modelName
                 e.ANTHROPIC_DEFAULT_HAIKU_MODEL = modelName
@@ -1500,8 +2327,13 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
         })(),
         // 0.3.x 默认不发 stream_event，必须显式开启
         includePartialMessages: true,
+        // 由 SDK 在安全阈值执行压缩，避免 Bridge 在 Agent 或工具运行中并发插入 /compact。
+        settings: {
+            autoCompactEnabled: true,
+            ...(autoCompactWindow ? {autoCompactWindow} : {}),
+        },
     }
-    // Caveman: 会话级 systemPrompt.append 注入，仅对 bridge 会话生效，不污染任何 CLAUDE.md
+    // Caveman: 会话级 systemPrompt.append 注入，仅对 Bridge 会话生效，不污染外部规则文件。
     const cavemanPrompt = buildCavemanSystemPrompt(cliS.caveman)
     if (cavemanPrompt) opts.systemPrompt = {type: 'preset', preset: 'claude_code', append: cavemanPrompt}
     // 有 native binary 路径时才传，否则 SDK 自动走自带的 cli.js
@@ -1515,43 +2347,77 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
         opts.hooks = {
             SubagentStart: [{
                 matcher: '', timeout: 30, hooks: [(input) => {
-                    try {
-                        broadcast(sessionId, {
-                            type: 'subagent_start',
-                            agentId: input.agent_id,
-                            agentType: input.agent_type,
-                            ts: Date.now()
-                        })
-                    } catch {
+                    const session = sessions.get(sessionId)
+                    const queue = session?.pendingAgentSpawns || []
+                    const pendingIndex = queue.findIndex(item => item.agentType === input.agent_type)
+                    const pending = pendingIndex >= 0 ? queue.splice(pendingIndex, 1)[0] : null
+                    const descriptor = pending || buildAgentDescriptor(input.agent_type, {}, agents)
+                    if (session && pending?.toolUseId) {
+                        session.agentToolUseByAgentId = session.agentToolUseByAgentId || new Map()
+                        session.agentToolUseByAgentId.set(input.agent_id, pending.toolUseId)
                     }
+                    broadcast(sessionId, {
+                        type: 'subagent_start',
+                        agentId: input.agent_id,
+                        requestId: pending?.requestId,
+                        toolUseId: pending?.toolUseId || null,
+                        agentType: input.agent_type,
+                        description: pending?.description || descriptor.task || descriptor.purpose,
+                        purpose: descriptor.purpose,
+                        task: descriptor.task || '',
+                        scope: descriptor.scope || '',
+                        currentAction: descriptor.currentAction || '',
+                        descriptionSource: descriptor.descriptionSource || 'builtin',
+                        ts: Date.now()
+                    })
                     return {}
                 }]
             }],
             SubagentStop: [{
                 matcher: '', timeout: 30, hooks: [(input) => {
-                    try {
-                        broadcast(sessionId, {
-                            type: 'subagent_done',
-                            agentId: input.agent_id,
-                            transcriptPath: input.agent_transcript_path,
-                            ts: Date.now()
-                        })
-                    } catch {
-                    }
+                    const session = sessions.get(sessionId)
+                    const toolUseId = session?.agentToolUseByAgentId?.get(input.agent_id) || null
+                    session?.agentToolUseByAgentId?.delete(input.agent_id)
+                    broadcast(sessionId, {
+                        type: 'subagent_done',
+                        agentId: input.agent_id,
+                        agentType: input.agent_type,
+                        toolUseId,
+                        transcriptPath: input.agent_transcript_path,
+                        ts: Date.now()
+                    })
                     // 清理子 agent transcript 文件，防止积累
                     if (input.agent_transcript_path) {
-                        const tp = input.agent_transcript_path
+                        const projectsRoot = join(CLAUDE_HOME, 'projects')
+                        const transcriptRelativePath = relative(projectsRoot, resolve(String(input.agent_transcript_path)))
+                        const tp = safeChildPath(projectsRoot, transcriptRelativePath, {extensions: ['.jsonl']})
+                        if (!tp) {
+                            log.warn({sessionId: sessionId?.slice(0, 8)}, '拒绝清理项目目录外的子 Agent transcript')
+                            return {}
+                        }
                         const subDir = dirname(tp)
                         const inSubagents = basename(subDir) === 'subagents'
                         // 即时删除 transcript 文件
-                        try { if (existsSync(tp)) unlinkSync(tp) } catch {}
+                        try {
+                            if (existsSync(tp)) unlinkSync(tp)
+                        } catch (error) {
+                            log.warn({err: error, sessionId: sessionId?.slice(0, 8), path: tp}, '清理子 Agent transcript 失败')
+                        }
                         if (inSubagents) {
                             // subagents/ 内文件: 直接删文件即可，尝试删空目录
-                            try { if (existsSync(subDir)) rmdirSync(subDir) } catch {}
+                            try {
+                                if (existsSync(subDir)) rmdirSync(subDir)
+                            } catch (error) {
+                                if (error?.code !== 'ENOTEMPTY' && error?.code !== 'ENOENT') {
+                                    log.debug({err: error, sessionId: sessionId?.slice(0, 8), path: subDir}, '清理子 Agent 空目录失败')
+                                }
+                            }
                         } else {
                             // 顶层 agent-*.jsonl: 调 SDK deleteSession 完整清理
                             const sid = basename(tp).replace('.jsonl', '')
-                            deleteSession(sid, {dir: subDir}).catch(() => {})
+                            deleteSession(sid, {dir: subDir}).catch(error => {
+                                log.warn({err: error, sessionId: sid?.slice(0, 8), path: subDir}, 'SDK 清理子 Agent Session 失败')
+                            })
                         }
                     }
                     return {}
@@ -1560,16 +2426,34 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
             PostToolUse: [{
                 matcher: '', timeout: 10, hooks: [rtkPostToolUseHandler]
             }],
+            PreCompact: [{
+                matcher: '', timeout: 30, hooks: [(input) => {
+                    broadcast(sessionId, {type: 'context_compacting', trigger: input.trigger || 'auto', ts: Date.now()})
+                    return {}
+                }]
+            }],
+            PostCompact: [{
+                matcher: '', timeout: 30, hooks: [(input) => {
+                    // 摘要仅供用户按需展开，不能进入普通用户消息气泡。
+                    broadcast(sessionId, {
+                        type: 'context_compaction_summary',
+                        trigger: input.trigger || 'auto',
+                        summary: input.compact_summary || '',
+                        ts: Date.now(),
+                    })
+                    return {}
+                }]
+            }],
         }
     }
     // 暴露本次生效的 env 给同进程 fetch 路径（classifyWorkflowViaAI 等），替代写 process.env 全局
     opts.runtimeEnv = {
         ANTHROPIC_BASE_URL: effectiveBaseUrl,
-        ANTHROPIC_API_KEY: apiKey,
-        ANTHROPIC_AUTH_TOKEN: apiKey,
+        ANTHROPIC_API_KEY: sdkApiKey,
+        ANTHROPIC_AUTH_TOKEN: sdkApiKey,
         ANTHROPIC_MODEL: resolvedModel,
     }
-    if (effectiveBaseUrl && (effectiveBaseUrl.includes('minimax') || effectiveBaseUrl.includes('deepseek') || effectiveBaseUrl.includes('moonshot') || effectiveBaseUrl.includes('opencode') || effectiveBaseUrl.includes('bigmodel') || effectiveBaseUrl.includes('aliyun') || effectiveBaseUrl.includes('volces'))) {
+    if (usesCodexRelay || (effectiveBaseUrl && (effectiveBaseUrl.includes('minimax') || effectiveBaseUrl.includes('deepseek') || effectiveBaseUrl.includes('moonshot') || effectiveBaseUrl.includes('opencode') || effectiveBaseUrl.includes('bigmodel') || effectiveBaseUrl.includes('aliyun') || effectiveBaseUrl.includes('volces')))) {
         opts.runtimeEnv.ANTHROPIC_DEFAULT_OPUS_MODEL = resolvedModel
         opts.runtimeEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = resolvedModel
         opts.runtimeEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL = resolvedModel
@@ -1579,20 +2463,14 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
         opts.runtimeEnv.API_TIMEOUT_MS = '600000'
         opts.runtimeEnv.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'
     }
+    opts = applyContextProfile(opts, contextProfile, resolvedModel)
+    opts = applySkillRoute(opts, skillRoute)
+    // 仅供 Bridge 保存 Session 状态；Claude Agent SDK 会忽略未知选项。
+    opts.bridgeContextProfile = contextProfile
+    opts.bridgeSkillRoute = skillRoute
+    opts.bridgeContextSafetyCap = configuredContextCap
     // SDK 的 Anthropic client 读 process.env(不读 opts.env)，直接设 process.env
     // 不再 restore: 多个 session 共享 process.env，restore 会导致 A 恢复 B 的值
-    process.env.ANTHROPIC_BASE_URL = effectiveBaseUrl
-    process.env.ANTHROPIC_API_KEY = apiKey
-    process.env.ANTHROPIC_AUTH_TOKEN = apiKey
-    process.env.ANTHROPIC_MODEL = resolvedModel
-    if (effectiveBaseUrl && effectiveBaseUrl.includes('minimax')) {
-        process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = resolvedModel
-        process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = resolvedModel
-        process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL = resolvedModel
-        process.env.ANTHROPIC_SMALL_FAST_MODEL = resolvedModel
-        process.env.API_TIMEOUT_MS = '600000'
-        process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'
-    }
     return opts
 }
 
@@ -1610,6 +2488,24 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
 //   → 并行: finalizeCheckpoint() + maybeMirror() (result 时)
 //   → 并行: maybeMirrorProgress() (tool_use_start 时)
 //   → catch: stream_error → broadcast error
+async function refreshContextUsage(sessionId, session, reason) {
+    if (!session?.query || typeof session.query.getContextUsage !== 'function') return
+    if (session._contextUsageInFlight) return session._contextUsageInFlight
+    session._contextUsageInFlight = (async () => {
+        try {
+            const usage = await session.query.getContextUsage()
+            const event = contextUsageEvent(usage, {reason})
+            session.contextUsage = event
+            broadcast(sessionId, event)
+        } catch (error) {
+            log.debug({err: error, sessionId: sessionId?.slice(0, 8), reason}, 'SDK 上下文用量读取失败')
+        } finally {
+            session._contextUsageInFlight = null
+        }
+    })()
+    return session._contextUsageInFlight
+}
+
 async function startStreamPump(sessionId) {
     const s = sessions.get(sessionId);
     if (!s) return
@@ -1619,8 +2515,18 @@ async function startStreamPump(sessionId) {
             if (sdkMsg.type === 'system' && sdkMsg.subtype === 'init') {
                 if (sdkMsg.session_id) {
                     s.lastSessionId = sdkMsg.session_id; s._hasConversation = true
+                    if (s.taskState?.status === 'running') {
+                        updateTaskState(s, sessionId, {
+                            ...s.taskState,
+                            sdkSessionId: sdkMsg.session_id,
+                            historySessionId: sdkMsg.session_id,
+                            resumable: true,
+                        })
+                    }
                     // 持久化 gateway sessionId → SDK conversationId 映射，供重启 resume 使用
-                    persistSdkSessionId(s.workDir, sessionId, sdkMsg.session_id)
+                    if (!persistSdkSessionId(s.workDir, sessionId, sdkMsg.session_id)) {
+                        log.warn({sessionId: sessionId?.slice(0, 8)}, 'Session 映射未持久化，重启后可能无法续接')
+                    }
                 }
                 // 顺手把 init 暴露的命令/agent 名单缓存下来，供设置页冷启动读取
                 if (Array.isArray(sdkMsg.slash_commands)) {
@@ -1642,6 +2548,19 @@ async function startStreamPump(sessionId) {
                     argumentHint: ''
                 } : n)
                 builtinCache.updatedAt = Date.now()
+                void refreshContextUsage(sessionId, s, 'init')
+            }
+            // SDK 真正消费 user prompt 时才切换回合上下文。输入可能提前排队，不能在
+            // WebSocket 到达时重置上一回合的文本和工具计数，否则镜像会串回合。
+            if (sdkMsg.type === 'user') {
+                const inputMeta = s._pendingInputs?.shift()
+                const legacySource = s._pendingSources?.shift()
+                s._generating = true
+                s.activeTurnId = inputMeta?.turnId || null
+                s.lastTurnSource = inputMeta?.source || legacySource || s.lastTurnSource || 'desktop'
+                s.activeTurnIdentity = createTurnIdentity(s.lastTurnSource, inputMeta?.userId, IM_SOURCES)
+                s.turnText = ''
+                s.turnToolCount = 0
             }
             // 累积本轮文本（assistant 消息为权威完整版，用于 IM 镜像同步）
             // assistant 覆盖 text_delta 的增量累积，保证 mirror 拿到 SDK 提供的完整文本
@@ -1660,8 +2579,7 @@ async function startStreamPump(sessionId) {
                             let wfArgs = {};
                             try {
                                 wfArgs = JSON.parse(wfMatch[2]);
-                            } catch {
-                            }
+                            } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
                             const valid = getWorkflow(wfName + '.mjs') || getWorkflow(wfName);
                             if (!valid) {
                                 log.warn({sessionId: sessionId?.slice(0, 8), wfName}, '[WF:run] 脚本名无效，已忽略');
@@ -1678,6 +2596,21 @@ async function startStreamPump(sessionId) {
             }
             // result 标志一个回合结束 → 结算记录点 + 镜像到所有已开启的 IM 平台
             if (sdkMsg.type === 'result') {
+                const taskResult = classifyTaskResult(sdkMsg)
+                s.lastTaskResult = {
+                    ...taskResult,
+                    resumable: canResumeTask(taskResult, Boolean(s.lastSessionId || sdkMsg.session_id)),
+                    result: sdkMsg.result || sdkMsg.errors?.join('\n') || '',
+                    numTurns: sdkMsg.num_turns || 0,
+                    at: Date.now(),
+                }
+                updateTaskState(s, sessionId, taskStateFromResult({
+                    ...taskResult,
+                    subtype: sdkMsg.subtype,
+                    result: sdkMsg.result || sdkMsg.errors?.join('\n') || '',
+                    numTurns: sdkMsg.num_turns || 0,
+                    resumable: canResumeTask(taskResult, Boolean(s.lastSessionId || sdkMsg.session_id)),
+                }, {sdkSessionId: s.lastSessionId || sdkMsg.session_id}))
                 // maybeUpdateProjectCache 必须在 finalizeCheckpoint 之前调用：
                 // finalizeCheckpoint 会清 s.pendingTurn，而 maybeUpdateProjectCache 依赖它拿 preSnapshot
                 try {
@@ -1691,14 +2624,20 @@ async function startStreamPump(sessionId) {
                     log.warn({err: e, sessionId: sessionId?.slice(0, 8)}, 'finalizeCheckpoint 失败')
                 }
                 try {
-                    maybeMirror(sessionId)
+                    maybeMirror(sessionId, taskResult)
                 } catch (e) {
                     log.warn({err: e, sessionId: sessionId?.slice(0, 8)}, 'mirror 失败')
                 }
                 s.turnText = ''
+                void refreshContextUsage(sessionId, s, 'result')
             }
+            if (sdkMsg.type === 'result') s._generating = false
             const wsMsg = convertSdkToWs(sdkMsg, sessionId)
-            if (wsMsg) broadcast(sessionId, wsMsg)
+            if (wsMsg) broadcastTurn(sessionId, {...wsMsg, turnId: s.activeTurnId || null}, s.activeTurnIdentity)
+            if (sdkMsg.type === 'result') {
+                s.activeTurnId = null
+                s.activeTurnIdentity = null
+            }
             // text_delta 兜底累积到 turnText，防止后续轮次 SDK 不发 assistant 消息导致 mirror 丢文本
             if (wsMsg?.type === 'text_delta' && wsMsg.text) {
                 s.turnText = ((s.turnText || '') + wsMsg.text).slice(-100000)
@@ -1707,33 +2646,55 @@ async function startStreamPump(sessionId) {
             if (wsMsg?.type === 'tool_use_start') {
                 try {
                     maybeMirrorProgress(sessionId, wsMsg.tool_name)
-                } catch {
-                }
+                } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
                 ;
                 try {
                     maybeInjectProjectCache(sessionId, s, wsMsg)
-                } catch {
-                }
+                } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
                 try {
                     maybeInjectGitContext(sessionId, s)
-                } catch {
-                }
+                } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
             }
         }
     } catch (e) {
         log.error({err: e, sessionId: sessionId?.slice(0, 8)}, 'pump 异常')
-        if (e.message !== 'cancelled') broadcast(sessionId, {type: 'error', message: e.message, code: 'stream_error'})
+        const failedSession = sessions.get(sessionId)
+        const failedTurnIdentity = failedSession?.activeTurnIdentity ? {...failedSession.activeTurnIdentity} : null
+        if (failedSession?.query === myQuery) {
+            failedSession._generating = false
+            failedSession.activeTurnId = null
+            failedSession.activeTurnIdentity = null
+            failPendingSessionInputs(sessionId, failedSession, e)
+            updateTaskState(failedSession, sessionId, taskStateForError(e, {
+                sdkSessionId: failedSession.lastSessionId,
+                historySessionId: failedSession.lastSessionId,
+            }))
+        }
+        if (e.message !== 'cancelled') broadcastTurn(sessionId, {type: 'error', message: e.message, code: 'stream_error'}, failedTurnIdentity)
     } finally {
         const s2 = sessions.get(sessionId);
         // 仅当 query 未被重建替换时才置空，避免覆盖新 pump 持有的 query
-        if (s2 && s2.query === myQuery) s2.query = null
+        if (s2 && s2.query === myQuery) {
+            s2._generating = false
+            s2.query = null
+        }
+        if (s2 && s2.query === null && s2._onPumpDone) {
+            const onPumpDone = s2._onPumpDone
+            s2._onPumpDone = null
+            try { onPumpDone() } catch (e) {
+                log.warn({err: e, sessionId: sessionId?.slice(0, 8)}, '定时任务清理回调失败')
+            }
+        }
         // 定时任务临时 session (无固定 sessionId) 完成后自动清理，防止累积
         if (s2?._autoDelete && !s2.clients?.size) {
             markSessionDeleted(sessionId)
             sessions.delete(sessionId)
+            clearAdapterBindingsForSessions(sessionId, s2.lastSessionId)
             if (focusedSessionId === sessionId) focusedSessionId = null
             invalidateProjectsCache()
-            deleteSessionFiles(sessionId).catch(() => {})
+            deleteSessionFiles(sessionId, [s2.lastSessionId]).catch(error => {
+                log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '清理临时 Session 文件失败')
+            })
         }
     }
 }
@@ -1820,15 +2781,17 @@ async function sendWeChatChunks(bn, token, userId, contextToken, fullText) {
 // 实现方式: 取 s.turnText 文本，trim 后非空则逐适配器 hook.sendToUser(sid, text)；各适配器负责自己的格式化/发送逻辑
 // 关键数据流: s.turnText（startStreamPump 中累积）→ 遍历 confirmHooks
 //   → check s.mirrors[hook.platform] → hook.sendToUser(sid, text) → IM 平台
-async function maybeMirror(sid) {
+async function maybeMirror(sid, taskResult = {outcome: 'succeeded'}) {
     const s = sessions.get(sid)
     if (!s) return
-    const text = (s.turnText || '').trim()
+    const text = buildIncompleteMirrorText(s.turnText, taskResult)
     if (!text) return
+    const turnIdentity = s.activeTurnIdentity ? {...s.activeTurnIdentity} : null
     for (const hook of confirmHooks) {
         if (!s.mirrors[hook.platform]) continue
+        if (!shouldRouteMirror(hook.platform, turnIdentity)) continue
         try {
-            await hook.sendToUser(sid, text)
+            await hook.sendToUser(sid, text, turnIdentity?.userId || null)
         } catch (e) {
             log.warn({err: e, platform: hook.platform, sessionId: sid?.slice(0, 8)}, 'mirror sendToUser 失败')
         }
@@ -1844,11 +2807,15 @@ function maybeMirrorProgress(sid, toolName) {
     const s = sessions.get(sid)
     if (!s) return
     s.turnToolCount = (s.turnToolCount || 0) + 1
+    const turnIdentity = s.activeTurnIdentity ? {...s.activeTurnIdentity} : null
     for (const hook of confirmHooks) {
         if (!s.mirrors[hook.platform]) continue
+        if (!shouldRouteMirror(hook.platform, turnIdentity)) continue
         try {
-            hook.sendToUser(sid, `⏳ [${s.turnToolCount}] 🔧 ${toolName || '工具'}...`)
-        } catch {
+            Promise.resolve(hook.sendToUser(sid, `⏳ [${s.turnToolCount}] 🔧 ${toolName || '工具'}...`, turnIdentity?.userId || null))
+                .catch(error => log.warn({err: error, platform: hook.platform, sessionId: sid?.slice(0, 8)}, 'mirror 进度发送失败'))
+        } catch (error) {
+            log.warn({err: error, platform: hook.platform, sessionId: sid?.slice(0, 8)}, 'mirror 进度发送失败')
         }
     }
 }
@@ -1870,6 +2837,7 @@ function maybeInjectProjectCache(sessionId, s, wsMsg) {
     const text = buildCacheInjectionText(cache)
     if (!text) return
     s._cacheInjected = true
+    markInternalInput(s)
     s.pushStream.push({
         type: 'user',
         session_id: sessionId,
@@ -1943,6 +2911,7 @@ function maybeInjectGitContext(sessionId, s) {
     if (!s.pushStream) return
     if (!s._gitContext) return
     s._gitInjected = true
+    markInternalInput(s)
     s.pushStream.push({
         type: 'user',
         session_id: sessionId,
@@ -2033,6 +3002,73 @@ const builtinCache = {skills: [...BUILTIN_SKILLS], agents: [...BUILTIN_AGENTS], 
 const SCHEDULED_TASKS_FILE = join(CLAUDE_HOME, 'bridge-scheduled-tasks.json')
 const scheduledTasks = readJSON(SCHEDULED_TASKS_FILE) || {}
 const cronJobs = new Map()
+const scheduledRuns = new Map()
+const MAX_SCHEDULED_CONCURRENT = Math.min(8, Math.max(1, parseInt(process.env.BRIDGE_SCHEDULED_MAX_CONCURRENT || '2', 10) || 2))
+const MAX_SCHEDULED_DURATION_MS = Math.min(24 * 60 * 60 * 1000, Math.max(60_000,
+    parseInt(process.env.BRIDGE_SCHEDULED_MAX_DURATION_MS || String(30 * 60 * 1000), 10) || 30 * 60 * 1000))
+const MAX_OCR_CONCURRENT = Math.min(4, Math.max(1, parseInt(process.env.BRIDGE_OCR_MAX_CONCURRENT || '1', 10) || 1))
+let activeOcr = 0
+
+function finishScheduledRun(id) {
+    const run = scheduledRuns.get(id)
+    if (!run) return
+    if (run.timer) clearTimeout(run.timer)
+    scheduledRuns.delete(id)
+}
+
+/**
+ * 空白会话只在第一条消息判断一次跨会话接力。内部上下文送入 SDK，
+ * checkpoint、IM echo 和前端气泡仍保留用户原文。
+ */
+function resolveSdkInputContent(sessionId, session, prompt) {
+    if (!session || session.hasUserTurns || session._continuationResolved) return prompt
+    session._continuationResolved = true
+    try {
+        const transcripts = listProjectTranscriptCandidates({
+            claudeHome: CLAUDE_HOME,
+            encodedDir: encodeProjectName(session.workDir),
+            workDir: session.workDir,
+        })
+        const context = buildProjectContinuationContext({
+            prompt,
+            currentSessionId: session.lastSessionId || null,
+            transcripts,
+        })
+        if (!context) return prompt
+        log.info({
+            sessionId: sessionId?.slice(0, 8),
+            sourceSessionId: context.sourceSessionId?.slice(0, 8),
+            contextLength: context.text.length,
+        }, '已按需注入项目会话接力上下文')
+        return composeContinuationPrompt(prompt, context)
+    } catch (error) {
+        log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '项目会话接力上下文读取失败，已按原消息继续')
+        return prompt
+    }
+}
+
+function destroyScheduledJob(id) {
+    const job = cronJobs.get(id)
+    if (!job) return
+    cronJobs.delete(id)
+    try {
+        if (typeof job.destroy === 'function') job.destroy()
+        else job.stop()
+    } catch (error) {
+        log.warn({err: error, taskId: id}, '销毁定时任务失败')
+    }
+}
+
+function registerScheduledJob(id, expression) {
+    const job = cron.schedule(expression, () => {
+        executeScheduledTask(id).catch(error => {
+            log.error({err: error, taskId: id}, '定时任务执行失败')
+        })
+    })
+    destroyScheduledJob(id)
+    cronJobs.set(id, job)
+    return job
+}
 
 // ── executeScheduledTask — 执行单个定时任务 ──
 // 功能说明: Cron 触发后，创建独立 session 并注入 prompt 启动 Agent 处理
@@ -2046,42 +3082,116 @@ const cronJobs = new Map()
 async function executeScheduledTask(id) {
     const task = scheduledTasks[id]
     if (!task || !task.enabled) return
-    log.info({taskId: id, prompt: task.prompt?.slice(0, 50)}, '定时任务触发')
-    const body = {workDir: task.workDir, model: task.model || MODEL}
+    if (scheduledRuns.has(id)) {
+        log.warn({taskId: id}, '定时任务仍在运行，已跳过本次触发')
+        return {started: false, reason: 'already_running'}
+    }
+    if (scheduledRuns.size >= MAX_SCHEDULED_CONCURRENT) {
+        log.warn({taskId: id, active: scheduledRuns.size}, '定时任务达到并发上限，已跳过本次触发')
+        return {started: false, reason: 'concurrency_limit'}
+    }
+    if (typeof task.prompt !== 'string' || !task.prompt.trim() || task.prompt.length > 20_000
+        || !isDirectoryPath(task.workDir)) {
+        throw new Error('scheduled task has invalid prompt or workDir')
+    }
+    log.info({taskId: id, promptLength: task.prompt?.length || 0}, '定时任务触发')
+    const body = {
+        workDir: task.workDir,
+        model: task.model || MODEL,
+        permissionMode: task.permissionMode || 'default',
+        maxTurns: Math.min(100, Math.max(1, Number(task.maxTurns) || 20)),
+    }
     const sessionId = task.sessionId || crypto.randomUUID()
+    scheduledRuns.set(id, {sessionId, startedAt: Date.now(), timer: null})
     const pushStream = new PushStream()
-    const cliS = loadCliSettings()
-    const opts = await makeQueryOptions(body, task.workDir, cliS, {}, sessionId)
+    let opts
+    try {
+        const cliS = loadCliSettings()
+        opts = await makeQueryOptions(body, task.workDir, cliS, {}, sessionId)
+    } catch (error) {
+        finishScheduledRun(id)
+        throw error
+    }
     if (task.sessionId) opts.resume = task.sessionId
-    const q = query({prompt: pushStream, options: opts})
+    let q
+    try {
+        q = query({prompt: pushStream, options: opts})
+    } catch (error) {
+        finishScheduledRun(id)
+        throw error
+    }
     // 若 sessionId 已存在，先清理旧资源再覆盖，防止 WS 监听器/query 泄漏
     const old = sessions.get(sessionId)
     if (old) {
-        try { old.pushStream?.close() } catch {}
-        try { old.query?.return?.() } catch {}
+        try {
+            old.pushStream?.close()
+        } catch (error) {
+            log.warn({err: error, taskId: id}, '关闭旧定时任务输入流失败')
+        }
+        try {
+            await old.query?.return?.()
+        } catch (error) {
+            log.warn({err: error, taskId: id}, '关闭旧定时任务 query 失败')
+        }
         old.query = null
         old.pushStream = null
     }
-    sessions.set(sessionId, {
+    const scheduledSession = {
         query: q, workDir: task.workDir,
         pushStream, clients: new Set(),
         createdAt: Date.now(), pending: new Map(),
-        permissionMode: opts.permissionMode || 'bypassPermissions',
+        permissionMode: opts.permissionMode || 'default',
         thinkingLevel: task.thinkingLevel || 'auto',
         mirrors: {wechat: false, feishu: false, dingtalk: false},
         queryOpts: opts,
         runtimeEnv: opts.runtimeEnv,  // 供 classifyWorkflowViaAI 同进程 fetch，不污染 process.env
         parentSessionId: null, agentName: 'scheduler',
         taskId: null, children: new Set(), depth: 0,
-        turnText: '', turnToolCount: 0,
+                turnText: '', turnToolCount: 0,
+                _pendingSources: [],
+                _pendingTurns: [],
+                _pendingInputs: [],
+                _inputIds: new Map(),
+                activeTurnId: null,
+                activeTurnIdentity: null,
+        _onPumpDone: () => finishScheduledRun(id),
         _autoDelete: !task.sessionId  // 无固定 sessionId 的临时任务完成后自动清理
-    })
+    }
+    sessions.set(sessionId, scheduledSession)
+    markInternalInput(scheduledSession)
     pushStream.push({
         type: 'user', session_id: sessionId,
         message: {role: 'user', content: [{type: 'text', text: task.prompt}]},
         parent_tool_use_id: null,
     })
     startStreamPump(sessionId)
+    const run = scheduledRuns.get(id)
+    if (run) {
+        run.timer = setTimeout(() => {
+            const current = sessions.get(sessionId)
+            if (current !== scheduledSession) {
+                finishScheduledRun(id)
+                return
+            }
+            log.warn({taskId: id, sessionId: sessionId.slice(0, 8)}, '定时任务运行超时，正在停止')
+            try {
+                current.pushStream?.close()
+            } catch (error) {
+                log.warn({err: error, taskId: id}, '关闭超时定时任务输入流失败')
+            }
+            try {
+                const closing = current.query?.return?.()
+                Promise.resolve(closing).catch(error => {
+                    log.warn({err: error, taskId: id}, '关闭超时定时任务 query 失败')
+                })
+            } catch (error) {
+                log.warn({err: error, taskId: id}, '关闭超时定时任务 query 异常')
+            }
+            finishScheduledRun(id)
+        }, MAX_SCHEDULED_DURATION_MS)
+        run.timer.unref?.()
+    }
+    return {started: true, sessionId}
 }
 
 // ── resumeScheduledTasks — Gateway 启动时恢复所有已启用的定时任务 ──
@@ -2098,12 +3208,7 @@ function resumeScheduledTasks() {
             continue
         }
         try {
-            const job = cron.schedule(task.cron, () => {
-                executeScheduledTask(id).catch(e => {
-                    log.error({err: e, taskId: id}, '定时任务执行失败')
-                })
-            })
-            cronJobs.set(id, job)
+            registerScheduledJob(id, task.cron)
         } catch (e) {
             log.warn({err: e, taskId: id}, '定时任务恢复失败')
         }
@@ -2181,7 +3286,7 @@ async function classifyWorkflowViaAI(text, sessionId) {
     ].join('\n')
 
     try {
-        const resp = await fetch(apiUrl, {
+        const fetched = await fetchProviderResponse(apiUrl, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -2197,6 +3302,7 @@ async function classifyWorkflowViaAI(text, sessionId) {
             }),
             signal: AbortSignal.timeout(8000),
         })
+        const resp = fetched.response
         if (!resp.ok) return null
         const data = await resp.json()
         const answer = (data.content?.[0]?.text || '').trim().toLowerCase()
@@ -2235,6 +3341,7 @@ function analyzeMessageForWorkflow(text) {
 async function autoTriggerWorkflow(sessionId, msgContent) {
     const wfCfg = loadWfConfig()
     if (!wfCfg.enabled) return
+    if (classifyContextProfile(msgContent) === 'light') return
 
     let matchedWf = null
     const kwResult = analyzeMessageForWorkflow(msgContent)
@@ -2253,7 +3360,17 @@ async function autoTriggerWorkflow(sessionId, msgContent) {
     const exists = wfList.some(w => w.name.replace('.mjs', '') === matchedWf)
     if (!exists) return
 
-    const wfId = 'wf-' + matchedWf + '-' + Date.now().toString(36)
+    let wfId
+    try {
+        // 先预注册真实运行状态，广播的 ID 与 runWfScript 内部使用的 ID 保持一致；
+        // 同名 Workflow 已在运行时直接跳过，避免自动触发覆盖手工运行。
+        wfId = presetRunState(matchedWf)
+    } catch (error) {
+        if (error?.code !== 'WORKFLOW_ALREADY_RUNNING') {
+            log.warn({err: error, sessionId: sessionId?.slice(0, 8), workflow: matchedWf}, '自动 Workflow 预注册失败')
+        }
+        return
+    }
     log.info({sessionId: sessionId?.slice(0, 8), workflow: matchedWf, wfId}, '自动启动 workflow')
     broadcast(sessionId, {
         type: 'workflow_auto_started',
@@ -2427,6 +3544,18 @@ const PROVIDERS = [
         pricing: {input: '0.30 USD/1M tokens', output: '1.20 USD/1M tokens'},
     },
     {
+        id: 'codex-relay', name: 'AICodeMirror Codex', icon: 'CM',
+        baseUrl: 'https://api.claudecode.net.cn/api/codex/backend-api/codex',
+        officialUrl: 'https://www.aicodemirror.ai',
+        docsUrl: 'https://www.aicodemirror.ai',
+        models: [
+            {id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', contextWindow: '256K'},
+            {id: 'gpt-5.6-terra', name: 'GPT-5.6 Terra', contextWindow: '256K'},
+            {id: 'gpt-5.5', name: 'GPT-5.5', contextWindow: '256K'},
+        ],
+        pricing: {input: '按 AICodeMirror 账户计费', output: '按 AICodeMirror 账户计费'},
+    },
+    {
         id: 'codex', name: 'Codex', icon: 'X',
         baseUrl: 'https://api.openai.com/v1',
         officialUrl: 'https://github.com/openai/codex',
@@ -2450,11 +3579,7 @@ const PROVIDERS = [
 
 /** 解析 contextWindow 字符串为 token 数（如 '1M' → 1000000, '128K' → 128000） */
 function parseContextWindow(cw) {
-    if (!cw) return 1000000;
-    const m = /^(\d+(?:\.\d+)?)\s*(M|K)$/i.exec(String(cw));
-    if (!m) return 1000000;
-    const n = parseFloat(m[1]);
-    return m[2].toUpperCase() === 'M' ? Math.round(n * 1e6) : Math.round(n * 1000);
+    return parseTokenCount(cw)
 }
 
 /** 解析 pricing 字符串提取价格数字和货币 */
@@ -2467,7 +3592,7 @@ function parsePricingPrice(s) {
 
 /** 根据模型 ID 查找 contextWindow 和定价 */
 function lookupModelInfo(modelId) {
-    const fallback = {contextWindow: 1000000, pricing: null};
+    const fallback = {contextWindow: null, pricing: null};
     for (const p of PROVIDERS) {
         for (const m of p.models) {
             if (m.id === modelId) {
@@ -2491,7 +3616,7 @@ function lookupModelInfo(modelId) {
 // 实现方式: 单 createServer 回调 + URL pathname 匹配 + method 检查；路由按 pathname 分组（sessions/config/wechat/confirm/projects）
 //   匹配失败返回 404
 // 关键数据流: HTTP request → URL pathname 匹配 → method dispatch → JSON response
-const httpServer = createServer(async (req, res) => {
+async function handleHttpRequest(req, res) {
     res.setHeader('X-Source', 'github.com/kankancuige/claude-desktop-bridge')
     const httpStart = Date.now()
     // 拦截 res.end，记录 HTTP 请求日志
@@ -2510,28 +3635,56 @@ const httpServer = createServer(async (req, res) => {
         res.setHeader('Vary', 'Origin')
     }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-bridge-token')
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-bridge-token, x-bridge-source, x-bridge-user-id')
     if (req.method === 'OPTIONS') {
         res.writeHead(204);
         res.end();
         return
     }
     // URL 解析需提前到认证之前（认证白名单依赖 pathname）
-    const url = new URL(req.url, `http://127.0.0.1:${PORT}`)
-    // 本地 API 认证: 仅浏览器请求（有 Origin 头）需校 token
-    // 浏览器跨域请求必带 Origin 头（含 Electron file://→Origin:null）；Node.js fetch() 不带
-    // IM 适配器/内部进程用 Node.js fetch → 无 Origin → 免 token
-    // 跨域恶意网页有 Origin 但无 token → 403
-    // 桌面端有 Origin 但有 token（api.ts 拦截器自动注）→ 放行
-    // 白名单 /api/bridge-token 仅 GET: dev/浏览器首次取 token 用，token 注入前无 token
+    let url
+    try {
+        url = new URL(req.url, `http://127.0.0.1:${PORT}`)
+    } catch {
+        res.writeHead(400)
+        res.end(JSON.stringify({error: 'invalid request URL'}))
+        return
+    }
+    // 本地 API 默认全部校验 token，浏览器、Electron 和内部适配器使用同一认证规则。
+    // /api/bridge-token 仅用于显式开启的浏览器开发模式，生产环境不暴露运行凭据。
     const isTokenEndpoint = req.method === 'GET' && url.pathname === '/api/bridge-token'
-    const isBrowserRequest = !!req.headers.origin
-    if (!isTokenEndpoint && isBrowserRequest) {
-        const token = req.headers['x-bridge-token']
-        if (token !== BRIDGE_TOKEN) {
+    let requestAuth = null
+    if (isTokenEndpoint) {
+        if (!ALLOW_TOKEN_ENDPOINT) {
+            res.writeHead(404)
+            res.end(JSON.stringify({error: 'not found'}))
+            return
+        }
+    } else {
+        requestAuth = authenticateBridgeToken(req.headers['x-bridge-token'])
+        if (!requestAuth) {
             res.writeHead(403)
             res.end(JSON.stringify({error: 'forbidden: missing or invalid bridge token'}))
             return
+        }
+    }
+    const requestIdentity = getAdapterIdentity(req)
+    if (requestAuth?.kind === 'adapter') {
+        if (!requestIdentity || requestIdentity.source !== requestAuth.platform) {
+            res.writeHead(403); res.end(JSON.stringify({error: 'adapter identity mismatch'})); return
+        }
+        if (!adapterRouteAllowed(req.method, url.pathname, requestAuth.platform)) {
+            res.writeHead(403); res.end(JSON.stringify({error: 'adapter route not allowed'})); return
+        }
+    }
+    if (requestIdentity) {
+        if (url.pathname === '/api/sessions' || url.pathname.startsWith('/api/workflows')) {
+            res.writeHead(403); res.end(JSON.stringify({error: 'adapter route not allowed'})); return
+        }
+        const sessionRoute = url.pathname.match(/^\/api\/sessions\/([^/]+)/)
+        if (sessionRoute && !['resolve', 'focused'].includes(sessionRoute[1])
+            && !adapterOwnsSession(requestIdentity.source, requestIdentity.userId, sessionRoute[1])) {
+            res.writeHead(403); res.end(JSON.stringify({error: 'session ownership mismatch'})); return
         }
     }
     res.setHeader('Content-Type', 'application/json')
@@ -2540,15 +3693,6 @@ const httpServer = createServer(async (req, res) => {
     if (url.pathname === '/api/bridge-token' && req.method === 'GET') {
         res.writeHead(200);
         res.end(JSON.stringify({token: BRIDGE_TOKEN}));
-        return
-    }
-
-    // GET /debug-log —— 前端诊断用，msg 参数写入终端日志
-    if (url.pathname === '/debug-log' && req.method === 'GET') {
-        const msg = url.searchParams.get('msg') || ''
-        log.info(msg)
-        res.writeHead(200);
-        res.end(JSON.stringify({ok: true, msg}));
         return
     }
 
@@ -2567,77 +3711,147 @@ const httpServer = createServer(async (req, res) => {
     //   → snapshot + checkpoints 恢复 → startStreamPump() → 201 {sessionId, workDir, resumed}
     if (req.method === 'POST' && url.pathname === '/api/sessions') {
         const body = await readBody(req);
-        // 规范化 workDir 消除编码歧义（双斜杠/反斜杠/末尾斜杠等）
-        const workDir = normalizeWorkDir(body.workDir || '')
-        if (!workDir) {
-            res.writeHead(400);
-            res.end(JSON.stringify({error: 'workDir required'}));
+        if (body._bodyTooLarge || body._bodyError || body._parseError) {
+            res.writeHead(body._bodyTooLarge ? 413 : 400)
+            res.end(JSON.stringify({error: body._bodyTooLarge ? 'payload too large' : 'invalid JSON'}))
             return
         }
-        let sessionId = body.resume || crypto.randomUUID()
+        if (typeof body.workDir !== 'string'
+            || (body.resume !== undefined && !isValidSessionId(body.resume))
+            || (body.forkFrom !== undefined && !isValidSessionId(body.forkFrom))
+            || (body.permissionMode !== undefined && !VALID_PERMISSION_MODES.has(body.permissionMode))
+            || (body.thinkingLevel !== undefined && !VALID_THINKING_LEVELS.has(body.thinkingLevel))
+            || (body.model !== undefined && (typeof body.model !== 'string' || body.model.length > 256))
+            || (body.maxTurns !== undefined && (!Number.isFinite(Number(body.maxTurns)) || Number(body.maxTurns) < 1 || Number(body.maxTurns) > 100))
+            || (body.baseUrl !== undefined && (typeof body.baseUrl !== 'string' || body.baseUrl.length > 2048))
+            || (body.apiKey !== undefined && (typeof body.apiKey !== 'string' || body.apiKey.length > 8192))) {
+            res.writeHead(400)
+            res.end(JSON.stringify({error: 'invalid session parameters'}))
+            return
+        }
+        // 规范化 workDir 消除编码歧义（双斜杠/反斜杠/末尾斜杠等）
+        const workDir = normalizeWorkDir(body.workDir || '')
+        if (!isDirectoryPath(workDir)) {
+            res.writeHead(400);
+            res.end(JSON.stringify({error: 'workDir must be an existing directory'}));
+            return
+        }
+        let createMode
+        try {
+            createMode = resolveSessionCreateMode(body)
+        } catch (error) {
+            res.writeHead(400)
+            res.end(JSON.stringify({error: error.message, code: 'SESSION_CREATE_MODE_INVALID'}))
+            return
+        }
+        let sessionId = crypto.randomUUID()
         let resumeSid = null  // 传给 SDK 的 conversation ID，null = 不 resume
-        if (body.resume) {
-            // 先查正向映射: gateway UUID → SDK ID
-            const sdkSid = lookupSdkSessionId(workDir, body.resume)
-            if (sdkSid) {
-                resumeSid = sdkSid
-            } else {
-                // 反查: body.resume 可能是 SDK ID（侧栏点 session）→ 找回 gateway UUID
-                const gwSid = lookupGatewaySessionId(workDir, body.resume)
-                if (gwSid) {
-                    sessionId = gwSid
-                    resumeSid = body.resume  // body.resume 本身就是 SDK ID
-                } else {
-                    // 都查不到：检查 body.resume 是否对应存在的 .jsonl（规范路径）
-                    const encDir = encodeProjectName(workDir)
-                    const jsonlPath = join(CLAUDE_HOME, 'projects', encDir, body.resume + '.jsonl')
-                    if (existsSync(jsonlPath)) {
-                        resumeSid = body.resume  // 就是 SDK conversation ID
-                    } else {
-                        // 兜底：path 编码可能因历史双斜杠不匹配，跨所有项目目录搜 .jsonl
-                        //   找到同名 .jsonl 且其 cwd 解码后与 workDir 同目录（忽略大小写），则复用
-                        const found = findSessionJsonl(body.resume, workDir)
-                        if (found) {
-                            // 修正：将 session-map 补写到规范编码目录，下次不再走兜底
-                            try { saveSessionMap(workDir, loadSessionMap(workDir)) } catch {}
-                            resumeSid = body.resume
-                        }
-                    }
+        let forkedFrom = null
+        let forkSourceId = null
+        if (createMode.mode === 'fork') {
+            const encDir = encodeProjectName(workDir)
+            const sourceTranscript = findSessionTranscript({
+                claudeHome: CLAUDE_HOME,
+                encodedDir: encDir,
+                sessionId: createMode.sourceSessionId,
+                workDir,
+            })
+            if (sourceTranscript.status !== 'found') {
+                res.writeHead(404)
+                res.end(JSON.stringify({
+                    error: '分支源会话不存在或 transcript 已损坏',
+                    code: 'SESSION_FORK_SOURCE_NOT_FOUND',
+                }))
+                return
+            }
+            forkSourceId = createMode.sourceSessionId
+        } else if (createMode.mode === 'resume') {
+            const encDir = encodeProjectName(workDir)
+            const requestedTranscript = findSessionTranscript({
+                claudeHome: CLAUDE_HOME,
+                encodedDir: encDir,
+                sessionId: body.resume,
+                workDir,
+            })
+            const transcriptExists = requestedTranscript.status === 'found'
+            let activeRuntime = null
+            for (const [candidateId, candidate] of sessions) {
+                if (normalizeWorkDir(candidate?.workDir).toLowerCase() !== workDir.toLowerCase()) continue
+                if (candidateId === body.resume || candidate?.lastSessionId === body.resume) {
+                    activeRuntime = {gatewaySessionId: candidateId, sdkSessionId: candidate.lastSessionId || null}
+                    break
                 }
             }
+            const mappedSdkCandidate = lookupSdkSessionId(workDir, body.resume)
+            const mappedSdkTranscript = mappedSdkCandidate
+                ? findSessionTranscript({claudeHome: CLAUDE_HOME, encodedDir: encDir, sessionId: mappedSdkCandidate, workDir})
+                : null
+            const mappedGatewayCandidate = transcriptExists ? lookupGatewaySessionId(workDir, body.resume) : null
+            const mappedRuntime = mappedGatewayCandidate ? sessions.get(mappedGatewayCandidate) : null
+            const mappedRuntimeSdkId = mappedRuntime?.lastSessionId || mappedRuntime?.queryOpts?.resume || null
+            const reusableMappedGateway = !mappedRuntime || mappedRuntimeSdkId === body.resume
+                ? mappedGatewayCandidate
+                : null
+            const resolution = resolveSessionResume({
+                requestedResume: body.resume,
+                activeGatewaySessionId: activeRuntime?.gatewaySessionId,
+                activeSdkSessionId: activeRuntime?.sdkSessionId,
+                mappedSdkSessionId: mappedSdkTranscript?.status === 'found' ? mappedSdkCandidate : null,
+                mappedGatewaySessionId: reusableMappedGateway,
+                transcriptExists,
+                newGatewaySessionId: sessionId,
+            })
+            if (resolution.mode === 'missing') {
+                log.warn({resume: body.resume.slice(0, 8), workDir}, 'session resume 目标不存在')
+                res.writeHead(404)
+                res.end(JSON.stringify({
+                    error: '历史会话不存在或 transcript 已损坏',
+                    code: 'SESSION_RESUME_NOT_FOUND',
+                }))
+                return
+            }
+            sessionId = resolution.gatewaySessionId
+            resumeSid = resolution.sdkSessionId
         }
         try {
             const cliS = loadCliSettings();
             const pushStream = new PushStream()
+            // 新会话先使用轻量上下文；恢复/分支会话必须保留完整工具和项目上下文。
+            body.contextProfile = createMode.mode === 'new' ? 'light' : 'full'
             const opts = await makeQueryOptions(body, workDir, cliS, {}, sessionId)
+            if (forkSourceId) {
+                try {
+                    // 配置和代理初始化成功后才复制 transcript，减少失败时产生孤儿 fork。
+                    // 不传 dir：兼容旧版本把 Unicode 项目写入错误编码目录的 transcript。
+                    const forked = await forkSession(forkSourceId)
+                    resumeSid = forked?.sessionId || null
+                    if (!resumeSid || !isValidSessionId(resumeSid)) throw new Error('SDK 未返回有效的分支会话 ID')
+                    forkedFrom = forkSourceId
+                } catch (error) {
+                    log.error({err: error, sourceSessionId: forkSourceId.slice(0, 8), workDir}, 'Session 分支失败')
+                    res.writeHead(500)
+                    res.end(JSON.stringify({error: '无法从源会话创建分支', code: 'SESSION_FORK_FAILED'}))
+                    return
+                }
+            }
             if (resumeSid) {
                 opts.resume = resumeSid
-            }
-            // 有 body.resume 但所有 lookup（含跨目录兜底）均失败:
-            //   放弃 resume，生成新 sessionId 避免 SDK 收到无效 ID 创建出新 conversation（"一变二"）
-            if (body.resume && !resumeSid) {
-                log.warn({
-                    resume: body.resume?.slice(0, 8),
-                    workDir: workDir,
-                    module: 'gateway'
-                }, 'session resume 映射丢失，创建新会话 — 旧 .jsonl 可能成为幽灵 session，请手动清理')
-                sessionId = crypto.randomUUID()
             }
             // 若 sessionId 已有活跃会话（query 仍在运行、仍有客户端连接），
             // 直接复用，不销毁重建——否则会中断正在进行的对话 + 导致重复 session
             const oldSess = sessions.get(sessionId)
-            if (oldSess?.query && oldSess?.pushStream && oldSess.clients?.size > 0) {
+            if (oldSess?.query && oldSess?.pushStream) {
                 focusedSessionId = sessionId
                 res.writeHead(200);
-                res.end(JSON.stringify({sessionId, workDir, resumed: true,
+                res.end(JSON.stringify({sessionId, workDir, resumed: true, historySessionId: oldSess.lastSessionId || resumeSid,
+                    taskState: taskStateForClient(oldSess.taskState),
                     gitInfo: sessions.get(sessionId)?.snapshot?.gitHead || null}));
                 return
             }
             const q = query({prompt: pushStream, options: opts})
             // 清理已死的旧会话资源
             if (oldSess) {
-                try { oldSess.pushStream?.close() } catch {}
-                try { oldSess.query?.return?.() } catch {}
+                await closeSessionRuntime(oldSess, {sessionId, reason: 'replace_stale_session'})
                 oldSess.query = null
                 oldSess.pushStream = null
             }
@@ -2653,14 +3867,44 @@ const httpServer = createServer(async (req, res) => {
                 mirrors: {wechat: false, feishu: false, dingtalk: false},
                 queryOpts: opts,
                 runtimeEnv: opts.runtimeEnv,  // 供 classifyWorkflowViaAI 同进程 fetch，不污染 process.env
+                contextProfile: opts.bridgeContextProfile || 'full',
+                skillRoute: opts.bridgeSkillRoute || [],
+                ...initialSessionIdentity(resumeSid),
+                forkedFrom,
                 parentSessionId: null,
                 agentName: body._agentName || 'main',
                 taskId: null,
                 children: new Set(),
+                turnText: '', turnToolCount: 0,
+                _pendingSources: [],
+                _pendingTurns: [],
+                _pendingInputs: [],
+                _inputIds: new Map(),
+                activeTurnId: null,
+                activeTurnIdentity: null,
                 depth: body._depth || 0,
                 modelMeta: body.modelMeta || null,  // 前端传入的 model contextWindow/pricing，供 lookupModelInfo 回退
                 _gitContext: null  // git 仓库上下文，snapshot 构建后填充
             })
+            const createdSession = sessions.get(sessionId)
+            const persistedTaskState = resumeSid
+                ? (loadTaskState(workDir, sessionId) || loadTaskState(workDir, resumeSid))
+                : null
+            createdSession.taskState = persistedTaskState || createTaskStatePatch({
+                status: 'idle',
+                outcome: null,
+                continuationReason: null,
+                resumable: false,
+                sdkSessionId: resumeSid,
+                historySessionId: resumeSid,
+            })
+            if (resumeSid && createdSession.taskState.status === 'running') {
+                createdSession.taskState = recoverTaskState(createdSession.taskState)
+            }
+            saveTaskState(createdSession, sessionId)
+            if (resumeSid && !persistSdkSessionId(workDir, sessionId, resumeSid)) {
+                log.warn({sessionId: sessionId?.slice(0, 8), historySessionId: resumeSid.slice(0, 8)}, '恢复 Session 映射未立即持久化')
+            }
             // 文件 diff 基线：优先载入已持久化的基线（重启/resume 后仍显示累计改动）；没有才新拍并落盘
             try {
                 const ss = sessions.get(sessionId)
@@ -2672,7 +3916,9 @@ const httpServer = createServer(async (req, res) => {
                         // 异步落盘：2MB+ JSON 同步写会阻塞 session 创建响应，推迟到下一 tick
                         const snapSession = ss
                         setImmediate(() => {
-                            try { saveSnapshot(snapSession, sessionId) } catch {}
+                            if (!saveSnapshot(snapSession, sessionId)) {
+                                log.warn({sessionId: sessionId?.slice(0, 8)}, '保存 Session snapshot 失败')
+                            }
                         })
                     }
                 }
@@ -2684,7 +3930,9 @@ const httpServer = createServer(async (req, res) => {
                 const sss = sessions.get(sessionId)
                 const ctx = buildGitContext(workDir)
                 if (ctx && sss) sss._gitContext = ctx
-            } catch {}
+            } catch (error) {
+                log.debug({err: error, sessionId: sessionId?.slice(0, 8), workDir}, '构建 Git 上下文失败')
+            }
             // resume 续接：载入历史记录点 + 恢复递增序号
             try {
                 const ss = sessions.get(sessionId)
@@ -2698,14 +3946,17 @@ const httpServer = createServer(async (req, res) => {
             focusedSessionId = sessionId
             startStreamPump(sessionId)
             // 后台异步构建项目结构缓存（仅首次，后续会话直接复用）
-            if (!existsSync(cacheFilePath(workDir))) {
+            const projectCachePath = cacheFilePath(workDir)
+            if (projectCachePath && !existsSync(projectCachePath)) {
                 buildProjectCache(workDir).then(c => {
                     if (c) saveProjectCache(workDir, c)
                 }).catch(e => log.warn({err: e, workDir}, '后台 project-cache 构建失败'))
             }
             invalidateProjectsCache()
             res.writeHead(201);
-            res.end(JSON.stringify({sessionId, workDir, resumed: !!body.resume,
+            res.end(JSON.stringify({sessionId, workDir, resumed: createMode.mode === 'resume', forked: createMode.mode === 'fork', forkedFrom,
+                historySessionId: resumeSid,
+                taskState: taskStateForClient(sessions.get(sessionId)?.taskState),
                 gitInfo: sessions.get(sessionId)?.snapshot?.gitHead || null}))
         } catch (e) {
             log.error({err: e}, 'session 创建失败')
@@ -2717,25 +3968,75 @@ const httpServer = createServer(async (req, res) => {
         return
     }
 
+    // ── POST /api/sessions/:id/stop —— 幂等停止当前生成，不删除 transcript ──
+    const stopM = url.pathname.match(/^\/api\/sessions\/([^/]+)\/stop$/)
+    if (req.method === 'POST' && stopM) {
+        const requestedId = stopM[1]
+        let id = requestedId
+        let session = sessions.get(id)
+        if (!session) {
+            for (const [candidateId, candidate] of sessions) {
+                if (candidate.lastSessionId === requestedId) {
+                    id = candidateId
+                    session = candidate
+                    break
+                }
+            }
+        }
+        if (!session) {
+            res.writeHead(404)
+            res.end(JSON.stringify({error: '会话不存在', code: 'SESSION_NOT_FOUND'}))
+            return
+        }
+        try {
+            const result = await stopSessionGeneration(id, session)
+            res.writeHead(200)
+            res.end(JSON.stringify(buildSessionStopResponse(session, result)))
+        } catch (error) {
+            log.error({err: error, sessionId: id.slice(0, 8)}, '停止 Session 失败')
+            res.writeHead(500)
+            res.end(JSON.stringify({error: '停止会话失败', code: 'SESSION_STOP_FAILED'}))
+        }
+        return
+    }
+
     // ── POST /api/sessions/resolve —— IM 接入 resolve 会话 ──
     // 功能说明: 微信/飞书/钉钉等 IM 平台在收到用户消息后，通过此接口关联到当前桌面端正打开的活跃 session
-    //   复用 focusedSessionId，并将 userId→sessionId 映射写入 adapter-sessions.json 用于后续消息路由
+    //   复用 focusedSessionId，并将 platform:userId→sessionId 映射写入 adapter-sessions.json 用于后续消息路由
     // 实现方式:
-    //   1. 检查 focusedSessionId 是否有效 → 有则复用，将 {userId: {sessionId, workDir, updatedAt}} 写 adapter-sessions.json
+    //   1. 检查 focusedSessionId 是否有效 → 有则复用，将 {platform, userId, sessionId, workDir, updatedAt} 写入绑定表
     //   2. 没有活跃 session → 返回 409 no_active_session，告知微信「请先在桌面端打开一个项目会话」
-    // 关键数据流: POST {userId} → focusedSessionId 查找 → 写入 adapter-sessions.json → 200 {sessionId, reused:true}
+    // 关键数据流: POST {userId} + identity headers → focusedSessionId 查找 → 写入绑定表 → 200 {sessionId, reused:true}
     //   或 409 {error:'no_active_session'}
     if (req.method === 'POST' && url.pathname === '/api/sessions/resolve') {
         const body = await readBody(req);
         const userId = body.userId
-        const af = join(CLAUDE_HOME, 'adapter-sessions.json');
-        const ad = readJSON(af) || {}
+        const identity = getAdapterIdentity(req)
+        if (!identity || identity.userId !== userId) {
+            res.writeHead(403)
+            res.end(JSON.stringify({error: 'adapter identity mismatch'}))
+            return
+        }
+        const ad = readAdapterBindings()
         // 微信注入 desktop 当前打开的窗口（遥控模式）：复用 focusedSessionId
         if (focusedSessionId && sessions.has(focusedSessionId)) {
             const s = sessions.get(focusedSessionId)
             if (userId) {
-                ad[userId] = {sessionId: focusedSessionId, workDir: s.workDir, updatedAt: Date.now()};
-                writeJSON(af, ad)
+                const updatedBindings = upsertAdapterBinding(ad, {
+                    userId,
+                    platform: identity.source,
+                    sessionId: focusedSessionId,
+                    workDir: s.workDir,
+                    updatedAt: Date.now(),
+                }, ADAPTER_PLATFORMS)
+                try {
+                    writeAdapterBindings(updatedBindings)
+                } catch (error) {
+                    log.error({err: error, platform: identity.source}, 'IM Session 绑定写入失败')
+                    res.writeHead(500)
+                    res.end(JSON.stringify({error: 'adapter binding persist failed'}))
+                    return
+                }
             }
             res.writeHead(200);
             res.end(JSON.stringify({sessionId: focusedSessionId, workDir: s.workDir, reused: true}));
@@ -2769,6 +4070,10 @@ const httpServer = createServer(async (req, res) => {
     //   用于外部模块（如 IM 适配器）判断当前是否有活跃的桌面会话
     // 关键数据流: GET → focusedSessionId 查找 → 200 {sessionId, workDir} 或 404
     if (req.method === 'GET' && url.pathname === '/api/sessions/focused') {
+        const identity = getAdapterIdentity(req)
+        if (identity && !adapterOwnsFocusedSession(identity)) {
+            res.writeHead(403); res.end(JSON.stringify({error: 'session ownership mismatch'})); return
+        }
         if (focusedSessionId && sessions.has(focusedSessionId)) {
             const s = sessions.get(focusedSessionId);
             res.writeHead(200);
@@ -2797,20 +4102,35 @@ const httpServer = createServer(async (req, res) => {
     // body: { action: 'switch_project'|'new_session'|'switch_session'|'toggle_mirror'|'stop', args: {...}, source?: string }
     // 关键数据流: POST → 遍历 sessions → 广播给 source=desktop 的 WS → 200 {ok, delivered, nudgeId}
     if (req.method === 'POST' && url.pathname === '/api/desktop/nudge') {
+        const identity = getAdapterIdentity(req)
+        if (identity && !adapterOwnsFocusedSession(identity)) {
+            res.writeHead(403); res.end(JSON.stringify({error: 'session ownership mismatch'})); return
+        }
         const body = await readBody(req)
+        if (!NUDGE_ACTIONS.has(body.action) || !body.args || typeof body.args !== 'object' || Array.isArray(body.args)) {
+            res.writeHead(400); res.end(JSON.stringify({error: 'invalid nudge'})); return
+        }
         const nudge = {type: 'nudge', action: body.action, args: body.args || {}, nudgeId: crypto.randomUUID(), source: body.source || 'hook'}
         let delivered = false
-        // 先发给控制通道（桌面端无 session 时也能收到）
-        for (const ws of controlClients) {
-            if (ws.readyState === 1) { ws.send(JSON.stringify(nudge)); delivered = true }
-        }
-        // 再发给所有 session 级的 desktop 客户端
-        for (const [, s] of sessions) {
-            for (const ws of s.clients) {
-                if (ws._source === 'desktop' && ws.readyState === 1) { ws.send(JSON.stringify(nudge)); delivered = true }
+        const directAdapterStop = body.action === 'stop' && identity && focusedSessionId && sessions.has(focusedSessionId)
+        let stopped = false
+        if (directAdapterStop) {
+            const result = await stopSessionGeneration(focusedSessionId, sessions.get(focusedSessionId))
+            stopped = result.stopped
+            delivered = stopped
+        } else {
+            // 先发给控制通道（桌面端无 session 时也能收到）
+            for (const ws of controlClients) {
+                if (ws.readyState === 1) { ws.send(JSON.stringify(nudge)); delivered = true }
+            }
+            // 再发给所有 session 级的 desktop 客户端
+            for (const [, s] of sessions) {
+                for (const ws of s.clients) {
+                    if (ws._source === 'desktop' && ws.readyState === 1) { ws.send(JSON.stringify(nudge)); delivered = true }
+                }
             }
         }
-        res.writeHead(200); res.end(JSON.stringify({ok: true, delivered, nudgeId: nudge.nudgeId}))
+        res.writeHead(200); res.end(JSON.stringify({ok: true, delivered, stopped, nudgeId: nudge.nudgeId}))
         return
     }
 
@@ -2841,30 +4161,32 @@ const httpServer = createServer(async (req, res) => {
                 message: '会话已删除',
                 interrupt: true
             }, 'deleted');
-            try {
-                s.pushStream?.close();
-                s.query?.return?.()
-            } catch (e) {
-                log.error({module: 'gateway'}, `关闭 SDK 资源失败 session=${id} — ${e.message}`)
-            }
+            await closeSessionRuntime(s, {sessionId: id, reason: 'delete_session'})
             // 断开引用让 GC 回收，帮助 SDK 底层释放文件句柄
             s.query = null
             s.pushStream = null
             // 关闭所有 WS 客户端连接，触发桌面端 onclose 清理 UI 状态
             for (const ws of [...s.clients]) {
-                try { ws.close(4001, JSON.stringify({error: 'session deleted'})) } catch {}
+                try {
+                    ws.close(4001, JSON.stringify({error: 'session deleted'}))
+                } catch (error) {
+                    log.debug({err: error, sessionId: id?.slice(0, 8)}, '关闭已删除 Session 的 WebSocket 失败')
+                }
             }
         }
         // 先标记删除再清内存（_deletedSessionIds 已持久化，scanProjects 不会扫回）
         markSessionDeleted(delParam)
         if (s) { sessions.delete(id); invalidateProjectsCache() }
+        clearAdapterBindingsForSessions(delParam, id, s?.lastSessionId)
         if (focusedSessionId === id) focusedSessionId = null;
         res.writeHead(200);
         res.end(JSON.stringify({ok: true}));
         // 磁盘文件异步清理: SDK 进程退出滞后可能导致 deleteSessionFiles
         // 指数退避长达 10s+，不阻塞 HTTP 响应
         if (url.searchParams.get('deleteFiles') === '1') {
-            deleteSessionFiles(delParam).catch(() => {})
+            deleteSessionFiles(delParam).catch(error => {
+                log.warn({err: error, sessionId: delParam?.slice(0, 8)}, '后台清理 Session 文件失败')
+            })
         }
         return
     }
@@ -2874,14 +4196,23 @@ const httpServer = createServer(async (req, res) => {
     const existsM = url.pathname.match(/^\/api\/sessions\/([^/]+)\/exists$/)
     if (req.method === 'GET' && existsM) {
         const eid = existsM[1]
+        let resolvedId = eid
         let s = sessions.get(eid)
         if (!s) {
             for (const [key, sess] of sessions) {
-                if (sess.lastSessionId === eid) { s = sess; break }
+                if (sess.lastSessionId === eid) { resolvedId = key; s = sess; break }
             }
         }
         res.writeHead(s ? 200 : 404)
-        res.end(JSON.stringify(s ? {exists: true} : {error: 'not found'}))
+        const runtimeState = s ? getSessionRuntimeState(s) : null
+        res.end(JSON.stringify(s ? {
+            exists: true,
+            sessionId: resolvedId,
+            historySessionId: s.lastSessionId || null,
+            workDir: s.workDir,
+            taskState: taskStateForClient(s.taskState),
+            ...runtimeState,
+        } : {error: 'not found'}))
         return
     }
 
@@ -2906,16 +4237,25 @@ const httpServer = createServer(async (req, res) => {
                 for (const pid of [...(s.pending?.keys() || [])]) settlePending(id, pid, {
                     behavior: 'deny', message: '会话已删除', interrupt: true
                 }, 'deleted')
-                try { s.pushStream?.close(); s.query?.return?.() } catch {}
+                await closeSessionRuntime(s, {sessionId: id, reason: 'batch_delete_session'})
                 s.query = null; s.pushStream = null
                 for (const ws of [...s.clients]) {
-                    try { ws.close(4001, JSON.stringify({error: 'session deleted'})) } catch {}
+                    try {
+                        ws.close(4001, JSON.stringify({error: 'session deleted'}))
+                    } catch (error) {
+                        log.debug({err: error, sessionId: id?.slice(0, 8)}, '关闭批量删除 Session 的 WebSocket 失败')
+                    }
                 }
                 sessions.delete(id)
+                clearAdapterBindingsForSessions(rawId, id, s.lastSessionId)
                 if (focusedSessionId === id) focusedSessionId = null
+                cleanupSessionUploads(s.workDir, deleteFiles)
             }
             markSessionDeleted(rawId)
-            if (deleteFiles) deleteSessionFiles(rawId).catch(() => {})
+            if (!s) clearAdapterBindingsForSessions(rawId)
+            if (deleteFiles) deleteSessionFiles(rawId).catch(error => {
+                log.warn({err: error, sessionId: rawId?.slice(0, 8)}, '后台批量清理 Session 文件失败')
+            })
             deleted++
         }
         invalidateProjectsCache()
@@ -2971,6 +4311,7 @@ const httpServer = createServer(async (req, res) => {
                 removed: 0
             }))
         }
+        const projectCache = loadProjectCache(s.workDir)
         res.writeHead(200);
         res.end(JSON.stringify({
             workDir: s.workDir,
@@ -2978,6 +4319,7 @@ const httpServer = createServer(async (req, res) => {
             snapshotAt: s.snapshot?.takenAt || null,
             gitInfo: s.snapshot?.gitHead || null,
             truncated: scan.truncated,
+            projectCacheWarnings: projectCache?.parserWarnings || [],
             files
         }))
         return
@@ -2996,49 +4338,81 @@ const httpServer = createServer(async (req, res) => {
             const file = files?.file
             if (!file) { res.writeHead(400); res.end(JSON.stringify({error: 'no file'})); return }
 
-            const uploadDir = join(s.workDir, '.bridge-uploads')
-            mkdirSync(uploadDir, {recursive: true})
-            // 消毒文件名：取 basename 防路径穿越，去除非安全字符，限扩展名白名单
-            const rawName = basename(file.filename || '')
-            const safeName = rawName.replace(/[^a-zA-Z0-9._-]/g, '_')
-            const ext = /\.(png|jpe?g|gif|webp|svg|bmp|pdf|txt|zip)$/i.test(safeName)
-                ? pathExtname(safeName).toLowerCase()
-                : '.png'
+            const uploadDir = getUploadDir(s.workDir)
+            if (!uploadDir) { res.writeHead(400); res.end(JSON.stringify({error: 'invalid upload directory'})); return }
+            prepareUploadDir(uploadDir, {
+                ttlMs: UPLOAD_TTL_MS,
+                onError: (error, path) => log.debug({err: error, path}, '读取附件元数据失败'),
+            })
+            const uploadTotal = readdirSync(uploadDir).reduce((sum, name) => {
+                try {
+                    const p = safeChildPath(uploadDir, name, {allowNested: false})
+                    const st = p ? lstatSync(p) : null
+                    return sum + (st?.isFile() ? st.size : 0)
+                } catch { return sum }
+            }, 0)
+            if (uploadTotal + file.data.length > UPLOAD_QUOTA_BYTES) {
+                res.writeHead(413); res.end(JSON.stringify({error: 'session upload quota exceeded'})); return
+            }
+            // 消毒文件名并保留真实文件类型；未知类型使用 .bin，绝不能伪装成图片。
+            const attachment = describeAttachment(file.filename, file.contentType)
+            const rawName = attachment.originalName
+            const ext = attachment.extension
             const destName = `upload-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`
-            const destPath = join(uploadDir, destName)
+            const destPath = safeChildPath(uploadDir, destName, {allowNested: false})
+            if (!destPath) { res.writeHead(400); res.end(JSON.stringify({error: 'invalid upload path'})); return }
             writeFileSync(destPath, file.data)
 
             // 检查当前模型是否支持多模态
             const modelName = s.queryOpts?.model || ''
             const isMultimodal = /claude|gpt-4o|gpt-5|gemini|haiku|sonnet|opus/i.test(modelName)
+            const isImage = isImageAttachment(attachment)
 
-            if (isMultimodal) {
-                // 多模态模型 → 返回相对路径，前端构造 image content block
+            if (isMultimodal && isImage) {
+                // 只有真实图片才能走多模态标记；Word/PDF 等文档始终按文件路径处理。
                 const relPath = relative(s.workDir, destPath)
                 res.writeHead(200)
-                res.end(JSON.stringify({ok: true, path: relPath, multimodal: true}))
+                res.end(JSON.stringify({ok: true, path: relPath, name: rawName, extension: ext, kind: attachment.kind, contentType: attachment.contentType, multimodal: true}))
+            } else if (!isImage) {
+                const relPath = relative(s.workDir, destPath)
+                res.writeHead(200)
+                res.end(JSON.stringify({ok: true, path: relPath, name: rawName, extension: ext, kind: attachment.kind, contentType: attachment.contentType, multimodal: false, ocrSkipped: true}))
             } else {
                 // 非多模态模型 → 尝试 OCR 提取文字
+                if (activeOcr >= MAX_OCR_CONCURRENT) {
+                    const relPath = relative(s.workDir, destPath)
+                    res.writeHead(200)
+                    res.end(JSON.stringify({ok: true, path: relPath, name: rawName, extension: ext, kind: attachment.kind, contentType: attachment.contentType, multimodal: false, ocrSkipped: true}))
+                    return
+                }
+                activeOcr++
                 let ocrText = ''
+                let worker = null
                 try {
                     const { createWorker } = await import('tesseract.js')
-                    const worker = await createWorker('chi_sim+eng')
+                    worker = await createWorker('chi_sim+eng')
                     const { data } = await worker.recognize(destPath)
                     ocrText = data.text || ''
-                    await worker.terminate()
                 } catch (ocrErr) {
                     log.warn({err: ocrErr, sessionId: sid?.slice(0, 8)}, 'OCR 失败，回退到文件路径引用')
+                } finally {
+                    try {
+                        await worker?.terminate?.()
+                    } catch (error) {
+                        log.debug({err: error, sessionId: sid?.slice(0, 8)}, '终止 OCR worker 失败')
+                    }
+                    activeOcr--
                 }
                 if (ocrText.trim()) {
                     res.writeHead(200)
                     res.end(JSON.stringify({
-                        ok: true, path: relative(s.workDir, destPath), multimodal: false,
+                        ok: true, path: relative(s.workDir, destPath), name: rawName, extension: ext, kind: attachment.kind, contentType: attachment.contentType, multimodal: false,
                         ocrText: ocrText.trim()
                     }))
                 } else {
                     const relPath = relative(s.workDir, destPath)
                     res.writeHead(200)
-                    res.end(JSON.stringify({ok: true, path: relPath, multimodal: false}))
+                    res.end(JSON.stringify({ok: true, path: relPath, name: rawName, extension: ext, kind: attachment.kind, contentType: attachment.contentType, multimodal: false}))
                 }
             }
         } catch (e) {
@@ -3067,8 +4441,7 @@ const httpServer = createServer(async (req, res) => {
             let size = 0;
             try {
                 size = statSync(abs).size
-            } catch {
-            }
+            } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
             ;res.writeHead(200);
             res.end(JSON.stringify({path: rel, binary: true, size}));
             return
@@ -3076,8 +4449,7 @@ const httpServer = createServer(async (req, res) => {
         let size = 0;
         try {
             size = statSync(abs).size
-        } catch {
-        }
+        } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
         if (size > MAX_SNAP_FILE_BYTES) {
             res.writeHead(413);
             res.end(JSON.stringify({error: 'too_large', size}));
@@ -3134,8 +4506,7 @@ const httpServer = createServer(async (req, res) => {
         if (curExists) {
             try {
                 newStr = readFileSync(abs, 'utf8')
-            } catch {
-            }
+            } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
         }
         const status = !snap ? 'added' : (!curExists ? 'deleted' : (oldStr === newStr ? 'unchanged' : 'modified'))
         const result = computeLineDiff(oldStr, newStr)
@@ -3160,7 +4531,7 @@ const httpServer = createServer(async (req, res) => {
         }
         try {
             s.snapshot = buildFileSnapshot(s.workDir)  // SIDE_EFFECT: mutates session.snapshot
-            saveSnapshot(s, snapM[1])                   // 持久化基线，重启后仍有效
+            if (!saveSnapshot(s, snapM[1])) throw new Error('snapshot 持久化失败')
             res.writeHead(200);
             res.end(JSON.stringify({ok: true, snapshotAt: s.snapshot.takenAt, fileCount: s.snapshot.files.size}))
         } catch (e) {
@@ -3200,8 +4571,7 @@ const httpServer = createServer(async (req, res) => {
             let beforeContent = null
             try {
                 beforeContent = readFileSync(abs, 'utf8')
-            } catch {
-            }
+            } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
             if (beforeContent === null) {
                 const snapEntry = s.snapshot?.files?.get(b.path)
                 if (snapEntry && !snapEntry.binary && !snapEntry.tooLarge && !snapEntry.readError && typeof snapEntry.content === 'string') {
@@ -3231,7 +4601,7 @@ const httpServer = createServer(async (req, res) => {
                 }],
                 revertible: beforeContent !== null,  // 新增文件不可回退
             })
-            saveCheckpoints(s, saveSnapM[1])
+            if (!saveCheckpoints(s, saveSnapM[1])) throw new Error('checkpoint 持久化失败')
             // 快照条目更新为保存前内容（beforeContent），持久化。
             // 文件面板 diffSnapshotVsCurrent(snapshot, 磁盘) → beforeContent ≠ 磁盘 → diff 按钮始终可见。
             // diff 端点 oldStr=snapshot.content, newStr=磁盘 → "上一版 vs 当前"。
@@ -3241,7 +4611,7 @@ const httpServer = createServer(async (req, res) => {
               s.snapshot.files.set(b.path, { binary: false, content: beforeContent, size: Buffer.byteLength(beforeContent, 'utf8'), lines: beforeContent.length ? beforeContent.split('\n').length : 0 })
             }
             s.snapshot.takenAt = Date.now()
-            saveSnapshot(s, saveSnapM[1])
+            if (!saveSnapshot(s, saveSnapM[1])) throw new Error('snapshot 持久化失败')
             res.writeHead(200);
             res.end(JSON.stringify({
                 ok: true,
@@ -3258,6 +4628,14 @@ const httpServer = createServer(async (req, res) => {
     // body: { platform, action?: 'query'|'set'|'toggle', enabled? }
     if (req.method === 'POST' && url.pathname === '/api/mirror') {
         const b = await readBody(req)
+        const identity = getAdapterIdentity(req)
+        const binding = identity ? readAdapterBindings()[`${identity.source}:${identity.userId}`] : null
+        if (!identity || !binding) {
+            res.writeHead(403); res.end(JSON.stringify({error: 'session ownership mismatch'})); return
+        }
+        if (focusedSessionId && !adapterOwnsFocusedSession(identity)) {
+            res.writeHead(403); res.end(JSON.stringify({error: 'session ownership mismatch'})); return
+        }
         const platform = b.platform
         // 查询所有镜像状态
         if (!platform) {
@@ -3268,6 +4646,9 @@ const httpServer = createServer(async (req, res) => {
             res.writeHead(200); res.end(JSON.stringify({ok: true, mirrors: s.mirrors || {wechat: false, feishu: false, dingtalk: false}, hasSession: true})); return
         }
         if (!['wechat', 'feishu', 'dingtalk'].includes(platform)) { res.writeHead(400); res.end(JSON.stringify({error: 'bad platform'})); return }
+        if (platform !== identity.source) {
+            res.writeHead(403); res.end(JSON.stringify({error: 'cross-platform mirror control is not allowed'})); return
+        }
         if (!focusedSessionId || !sessions.has(focusedSessionId)) {
             res.writeHead(200); res.end(JSON.stringify({ok: true, error: 'no_session', hasSession: false})); return
         }
@@ -3304,6 +4685,12 @@ const httpServer = createServer(async (req, res) => {
             res.end(JSON.stringify({error: 'session not found'}));
             return
         }
+        const identity = getAdapterIdentity(req)
+        if (identity && !adapterOwnsSession(identity.source, identity.userId, mirrorM[1])) {
+            res.writeHead(403)
+            res.end(JSON.stringify({error: 'session ownership mismatch'}))
+            return
+        }
         if (req.method === 'GET') {
             res.writeHead(200);
             res.end(JSON.stringify({mirrors: s.mirrors || {wechat: false, feishu: false, dingtalk: false}}));
@@ -3311,9 +4698,9 @@ const httpServer = createServer(async (req, res) => {
         }
         if (req.method === 'POST') {
             const b = await readBody(req)
-            if (!b.platform) {
+            if (!ADAPTER_PLATFORMS.includes(b.platform)) {
                 res.writeHead(400);
-                res.end(JSON.stringify({error: 'platform required'}));
+                res.end(JSON.stringify({error: 'valid platform required'}));
                 return
             }
             s.mirrors = s.mirrors || {wechat: false, feishu: false, dingtalk: false}
@@ -3389,19 +4776,22 @@ const httpServer = createServer(async (req, res) => {
                 s.checkpoints = []  // 全量提交：清空所有记录点
             }
 
-            saveSnapshot(s, commitM[1])
-            saveCheckpoints(s, commitM[1])
+            if (!saveSnapshot(s, commitM[1])) throw new Error('snapshot 持久化失败')
+            if (!saveCheckpoints(s, commitM[1])) throw new Error('checkpoint 持久化失败')
 
             // ── Git 自动提交 ──
             let gitCommit = null
+            let gitCommitError = null
             try {
                 const gitDir = execSync('git rev-parse --git-dir', {
                     cwd: s.workDir, encoding: 'utf8', timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
                 }).trim()
                 if (gitDir) {
                     // 收集提交信息：记录点 prompt 作标题 + 变更文件清单
-                    const prompts = [...new Set(committedCps.map(cp => cp.prompt).filter(Boolean))]
-                    const subject = prompts[0] || 'checkpoint commit'
+                    const prompts = [...new Set(committedCps
+                        .map(cp => typeof cp.prompt === 'string' ? cp.prompt.replace(/\0/g, '').trim() : '')
+                        .filter(Boolean))]
+                    const subject = (prompts[0] || 'checkpoint commit').split(/\r?\n/, 1)[0].slice(0, 200)
 
                     const fileSet = new Map()
                     for (const cp of committedCps) {
@@ -3413,19 +4803,22 @@ const httpServer = createServer(async (req, res) => {
                     const fileLines = [...fileSet.entries()]
                         .map(([p, st]) => {
                             const prefix = st === 'added' ? 'A' : st === 'deleted' ? 'D' : 'M'
-                            return `${prefix} ${p}`
+                            return `${prefix} ${String(p).replace(/[\r\n\0]/g, '_')}`
                         })
                         .join('\n')
 
                     const bodyParts = [subject]
-                    if (prompts.length > 1) bodyParts.push('', ...prompts.slice(1).map(p => `- ${p}`))
+                    if (prompts.length > 1) bodyParts.push('', ...prompts.slice(1, 20).map(p => `- ${p.slice(0, 1000)}`))
                     if (fileLines) bodyParts.push('', fileLines)
 
-                    execSync('git add -A', {cwd: s.workDir, encoding: 'utf8', timeout: 10000, stdio: ['pipe', 'pipe', 'pipe']})
-                    // 多行消息用多个 -m 参数，跨平台安全
-                    const msgArgs = bodyParts.map(part => `-m ${JSON.stringify(part)}`).join(' ')
-                    execSync(`git commit ${msgArgs} --allow-empty-message`, {
+                    execFileSync('git', ['add', '-A'], {
                         cwd: s.workDir, encoding: 'utf8', timeout: 10000, stdio: ['pipe', 'pipe', 'pipe']
+                    })
+                    // 从 stdin 传提交信息，既禁止 shell 解析，也不受 Windows 命令行长度限制。
+                    const commitMessage = bodyParts.join('\n').slice(0, 1024 * 1024)
+                    execFileSync('git', ['commit', '-F', '-', '--allow-empty-message'], {
+                        cwd: s.workDir, encoding: 'utf8', timeout: 10000,
+                        stdio: ['pipe', 'pipe', 'pipe'], input: commitMessage,
                     })
                     const hash = execSync('git rev-parse --short HEAD', {
                         cwd: s.workDir, encoding: 'utf8', timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
@@ -3433,8 +4826,9 @@ const httpServer = createServer(async (req, res) => {
                     gitCommit = {hash, subject}
                     log.info({sessionId: commitM[1]?.slice(0, 8), hash, subject}, 'Git 自动提交')
                 }
-            } catch (_) {
-                // 非 git 仓库 / git 不可用 / 无改动可提交：静默跳过
+            } catch (error) {
+                gitCommitError = String(error?.stderr || error?.message || error).trim().slice(0, 500)
+                log.warn({err: error, sessionId: commitM[1]?.slice(0, 8)}, '记录点已提交，但 Git 自动提交失败')
             }
 
             res.writeHead(200);
@@ -3443,7 +4837,8 @@ const httpServer = createServer(async (req, res) => {
                 snapshotAt: s.snapshot.takenAt,
                 fileCount: selectedFiles ? selectedFiles.size : s.snapshot.files.size,
                 keptCheckpoints: selectedFiles ? (s.checkpoints || []).length : 0,
-                gitCommit
+                gitCommit,
+                gitCommitError,
             }))
         } catch (e) {
             res.writeHead(500);
@@ -3514,28 +4909,23 @@ const httpServer = createServer(async (req, res) => {
                 log.warn({err: e, sessionId: rwM[1]?.slice(0, 8)}, 'rewind 后缓存更新失败')
             }
         }
-        res.writeHead(r.ok ? 200 : 404);
+        res.writeHead(r.ok ? 200 : r.code === 'persist_failed' ? 500 : 404);
         res.end(JSON.stringify(r));
         return
     }
 
     // ── Config endpoints ──
 
-    // ── /api/config/settings —— Claude Code 配置文件 CRUD ──
-    // 功能说明: GET 读取 ~/.claude/settings.json；PUT 全量写入（写入前自动 .bak 备份）
-    // 关键数据流: GET → readJSON → 200 配置对象 / 404
-    //   PUT → backupFile → writeJSON → 200 {ok:true}
+    // ── /api/config/settings —— 通用 Claude 配置 + Bridge 私有 provider 配置 ──
+    // provider 字段通过 bridge-provider.json 隔离保存；settings.json 中的同名字段
+    // 继续留给 Claude/CCSwitch，避免外部工具覆盖 Bridge 的会话供应商。
     if (url.pathname === '/api/config/settings') {
         const sp = join(CLAUDE_HOME, 'settings.json');
         if (req.method === 'GET') {
-            const d = readJSON(sp);
-            if (d) {
-                res.writeHead(200);
-                res.end(JSON.stringify(d))
-            } else {
-                res.writeHead(404);
-                res.end(JSON.stringify({error: 'not found'}))
-            }
+            const d = readJSON(sp) || {};
+            const effective = overlayBridgeProviderSettings(d, loadBridgeProviderSettings())
+            res.writeHead(200);
+            res.end(JSON.stringify({...effective, env: redactSecretMap(effective.env)}))
             ;
             return
         }
@@ -3547,9 +4937,15 @@ const httpServer = createServer(async (req, res) => {
                     res.end(JSON.stringify({error: b._bodyTooLarge ? 'payload too large' : 'invalid JSON'}));
                     return
                 }
-                // 清理 env 段中与当前供应商不匹配的残留字段，防止 claude.exe 读到旧模型名发给第三方 API 导致 403
+                const current = readJSON(sp) || {}
+                const currentBridgeProvider = loadBridgeProviderSettings()
+                const currentEffective = overlayBridgeProviderSettings(current, currentBridgeProvider)
                 if (b.env) {
+                    // 脱敏占位符必须从 Bridge 私有配置恢复，不能从 CCSwitch 的 settings 恢复。
+                    b.env = restoreSecretMap(b.env, currentEffective.env || {})
                     b.env.ANTHROPIC_MODEL = b.model || ''
+                    saveBridgeProviderSettings(extractBridgeProviderSettings(b, currentBridgeProvider))
+                    // 清理 env 段中与当前供应商不匹配的残留字段，防止 claude.exe 读到旧模型名发给第三方 API 导致 403
                     // 移除 ANTHROPIC_DEFAULT_* 和 cc-switch 非标准后缀字段
                     // makeQueryOptions 运行时会根据当前模型动态设置这些值
                     delete b.env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME
@@ -3558,8 +4954,14 @@ const httpServer = createServer(async (req, res) => {
                     delete b.env.ANTHROPIC_DEFAULT_SONNET_MODEL
                     delete b.env.ANTHROPIC_DEFAULT_HAIKU_MODEL
                 }
+                // 全局 settings 保留 CCSwitch/Claude 自己的 provider 字段；Bridge provider 已单独落盘。
+                // 这样本项目写入主题、宠物、MCP 等通用设置时不会反向接管外部工具的连接配置。
+                const persisted = {...b, env: {...(current.env || {})}}
+                for (const [key, value] of Object.entries(b.env || {})) {
+                    if (!BRIDGE_PROVIDER_ENV_KEYS.includes(key)) persisted.env[key] = value
+                }
                 backupFile(sp);
-                writeJSON(sp, b);
+                writeJSON(sp, persisted);
                 res.writeHead(200);
                 res.end(JSON.stringify({ok: true}))
             } catch (e) {
@@ -3611,7 +5013,7 @@ const httpServer = createServer(async (req, res) => {
                 res.end(JSON.stringify({ok: false, found: false, path: p, error: '文件不存在'}));
                 return
             }
-            const cliS = loadCliSettings()
+            const cliS = loadCliSettingsForUpdate()
             cliS.claudeExe = p
             backupFile(join(CLAUDE_HOME, 'settings.json'))
             writeJSON(join(CLAUDE_HOME, 'settings.json'), cliS)
@@ -3650,11 +5052,9 @@ const httpServer = createServer(async (req, res) => {
                         size: c.length,
                         source: 'custom'
                     })
-                } catch {
-                }
+                } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
             }
-        } catch {
-        }
+        } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
         ;
         for (const bn of builtinCache.skills) {
             if (!seen.has(bn)) r.push({
@@ -3672,8 +5072,20 @@ const httpServer = createServer(async (req, res) => {
     }
     const skillM = url.pathname.match(/^\/api\/config\/skills\/(.+)$/);
     if (skillM) {
-        const sn = decodeURIComponent(skillM[1]);
-        const sp = join(CLAUDE_HOME, 'skills', sn, 'SKILL.md');
+        const sn = safeDecodeURIComponent(skillM[1]);
+        const skillsDir = join(CLAUDE_HOME, 'skills')
+        if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(sn)) {
+            res.writeHead(400)
+            res.end(JSON.stringify({error: 'invalid skill name'}))
+            return
+        }
+        const skillDir = safeBasename(skillsDir, sn)
+        const sp = skillDir ? safeChildPath(skillDir, 'SKILL.md', {allowNested: false, extensions: ['.md']}) : null
+        if (!sp) {
+            res.writeHead(400)
+            res.end(JSON.stringify({error: 'invalid skill path'}))
+            return
+        }
         if (req.method === 'GET') {
             try {
                 const c = readFileSync(sp, 'utf8');
@@ -3690,7 +5102,8 @@ const httpServer = createServer(async (req, res) => {
         if (req.method === 'PUT') {
             try {
                 const b = await readBody(req);
-                if (!existsSync(dirname(sp))) mkdirSync(dirname(sp), {recursive: true});
+                if (!existsSync(skillsDir)) mkdirSync(skillsDir, {recursive: true})
+                if (!existsSync(skillDir)) mkdirSync(skillDir, {recursive: true})
                 backupFile(sp);
                 writeFileSync(sp, b.content, 'utf8');
                 res.writeHead(200);
@@ -3712,8 +5125,7 @@ const httpServer = createServer(async (req, res) => {
                     res.end(JSON.stringify({error: '请先禁用再删除'}))
                     return
                 }
-                const sd = join(CLAUDE_HOME, 'skills', sn)
-                if (existsSync(sd)) { backupFile(sd); rmdirSync(sd, {recursive: true}) }
+                if (existsSync(skillDir)) { backupFile(skillDir); rmdirSync(skillDir, {recursive: true}) }
                 res.writeHead(200)
                 res.end(JSON.stringify({ok: true}))
             } catch (e) {
@@ -3766,7 +5178,7 @@ const httpServer = createServer(async (req, res) => {
             const b = await readBody(req)
             const name = (b.name || '').trim()
             if (!name) { res.writeHead(400); res.end(JSON.stringify({error: 'name required'})); return }
-            const s = readJSON(join(CLAUDE_HOME, 'settings.json')) || {}
+            const s = loadCliSettingsForUpdate()
             if (!s.disabledSkills) s.disabledSkills = []
             if (b.disabled) {
                 if (!s.disabledSkills.includes(name)) s.disabledSkills.push(name)
@@ -3792,7 +5204,7 @@ const httpServer = createServer(async (req, res) => {
             const b = await readBody(req)
             const name = (b.name || '').trim()
             if (!name) { res.writeHead(400); res.end(JSON.stringify({error: 'name required'})); return }
-            const s = readJSON(join(CLAUDE_HOME, 'settings.json')) || {}
+            const s = loadCliSettingsForUpdate()
             if (!s.disabledMcpPlugins) s.disabledMcpPlugins = []
             if (b.disabled) {
                 if (!s.disabledMcpPlugins.includes(name)) s.disabledMcpPlugins.push(name)
@@ -3817,7 +5229,9 @@ const httpServer = createServer(async (req, res) => {
             try {
                 const r = await fetch(u, {signal: AbortSignal.timeout(8000)})
                 if (r.ok) { log.info({url: u}, 'fetchRawGithub 成功'); return r }
-            } catch {}
+            } catch (error) {
+                log.debug({err: error, url: u}, 'fetchRawGithub 镜像请求失败')
+            }
         }
         log.warn({owner, repo, ref, filePath}, 'fetchRawGithub 所有镜像均失败')
         return null
@@ -3917,7 +5331,7 @@ const httpServer = createServer(async (req, res) => {
             let resp = null
 
             // ── 情况 1: github.com/owner/repo (裸 repo URL) ──
-            const bareRepo = rawUrl.match(/^https?:\/\/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?\/?$/)
+            const bareRepo = rawUrl.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?\/?$/)
             if (bareRepo) {
                 const [_, owner, repo] = bareRepo
                 // 尝试多种可能的 SKILL.md 路径
@@ -3938,7 +5352,7 @@ const httpServer = createServer(async (req, res) => {
             }
 
             // ── 情况 2: github.com/owner/repo/blob/<ref>/<path> ──
-            const blobUrl = rawUrl.match(/^https?:\/\/github\.com\/([^/]+)\/([^/]+)\/blob\/([^/]+)\/(.+)$/)
+            const blobUrl = rawUrl.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/blob\/([^/]+)\/(.+)$/)
             if (!resp && blobUrl) {
                 resp = await fetchRawGithub(blobUrl[1], blobUrl[2], blobUrl[3], blobUrl[4])
                 if (!resp) {
@@ -3949,7 +5363,7 @@ const httpServer = createServer(async (req, res) => {
             }
 
             // ── 情况 3: raw.githubusercontent.com / cdn.jsdelivr.net 等直链 ──
-            const rawGitHub = rawUrl.match(/^https?:\/\/(?:raw\.githubusercontent\.com|cdn\.jsdelivr\.net\/gh|mirror\.ghproxy\.com\/https?\/raw\.githubusercontent\.com)\/([^/]+)\/([^/]+)\/([^/]+)\/(.+)$/)
+            const rawGitHub = rawUrl.match(/^https:\/\/(?:raw\.githubusercontent\.com|cdn\.jsdelivr\.net\/gh|mirror\.ghproxy\.com\/https\/raw\.githubusercontent\.com)\/([^/]+)\/([^/]+)\/([^/]+)\/(.+)$/)
             if (!resp && rawGitHub) {
                 resp = await fetchRawGithub(rawGitHub[1], rawGitHub[2], rawGitHub[3], rawGitHub[4])
                 if (!resp) {
@@ -3961,14 +5375,18 @@ const httpServer = createServer(async (req, res) => {
 
             // ── 情况 4: 其他直链 URL（仅允许已知代码托管平台，防止 SSRF）──
             if (!resp) {
-                const allowedHosts = /^https?:\/\/([^/]+\.)?(github\.com|githubusercontent\.com|gitlab\.com|bitbucket\.org|jsdelivr\.net|ghproxy\.com|gitee\.com)(\/|$)/i
+                const allowedHosts = /^https:\/\/([^/]+\.)?(github\.com|githubusercontent\.com|gitlab\.com|bitbucket\.org|jsdelivr\.net|ghproxy\.com|gitee\.com)(\/|$)/i
                 if (allowedHosts.test(rawUrl)) {
-                    try { resp = await fetch(rawUrl, {signal: AbortSignal.timeout(30000)}) } catch {}
+                    try {
+                        resp = await fetch(rawUrl, {signal: AbortSignal.timeout(30000)})
+                    } catch (error) {
+                        log.debug({err: error, url: rawUrl}, 'Skill 直链下载失败')
+                    }
                 }
             }
 
             if (!resp || !resp.ok) { res.writeHead(502); res.end(JSON.stringify({error: `下载失败 ${resp?.status || '网络不可达'}`})); return }
-            const content = await resp.text()
+            const content = (await readFetchBodyLimited(resp, MAX_REMOTE_TEXT_BYTES)).toString('utf8')
             if (!content.trim()) { res.writeHead(502); res.end(JSON.stringify({error: '下载内容为空'})); return }
 
             // ── 校验: 拒绝非 SKILL.md 内容（GitHub HTML 页面等）──
@@ -4112,25 +5530,35 @@ const httpServer = createServer(async (req, res) => {
                             const fn = basename(h.command?.split(/\s+/).pop() || '');
                             let c = '';
                             try {
-                                c = readFileSync(join(hd, fn), 'utf8')
-                            } catch {
-                            }
+                                const hookPath = safeBasename(hd, fn, {extensions: ['.sh', '.js']})
+                                if (hookPath) c = readFileSync(hookPath, 'utf8')
+                            } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
                             ;
                             return {...h, filename: fn, content: c, source: 'custom'}
                         })
                     }))
                 }
             }
-        } catch {
-        }
+        } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
         ;res.writeHead(200);
         res.end(JSON.stringify(hooks));
         return
     }
     const hookFileM = url.pathname.match(/^\/api\/config\/hooks\/([^/]+)$/);
     if (hookFileM) {
-        const fn = decodeURIComponent(hookFileM[1]);
-        const fp = join(CLAUDE_HOME, 'hooks', fn);
+        const fn = safeDecodeURIComponent(hookFileM[1]);
+        const hd = join(CLAUDE_HOME, 'hooks')
+        if (!/^[a-zA-Z0-9_.-]+\.(sh|js)$/.test(fn)) {
+            res.writeHead(400)
+            res.end(JSON.stringify({error: 'invalid hook filename'}))
+            return
+        }
+        const fp = safeBasename(hd, fn, {extensions: ['.sh', '.js']})
+        if (!fp) {
+            res.writeHead(400)
+            res.end(JSON.stringify({error: 'invalid hook path'}))
+            return
+        }
         if (req.method === 'GET') {
             try {
                 const c = readFileSync(fp, 'utf8');
@@ -4167,12 +5595,19 @@ const httpServer = createServer(async (req, res) => {
             const b = await readBody(req);
             let fn = (b.filename || 'new-hook').trim().replace(/[^a-zA-Z0-9_.-]/g, '-');
             if (!fn.endsWith('.sh') && !fn.endsWith('.js')) fn += '.sh';
-            const fp = join(CLAUDE_HOME, 'hooks', fn);
+            const hd = join(CLAUDE_HOME, 'hooks')
+            const fp = safeBasename(hd, fn, {extensions: ['.sh', '.js']})
+            if (!fp) {
+                res.writeHead(400)
+                res.end(JSON.stringify({error: 'invalid hook filename'}))
+                return
+            }
             if (existsSync(fp)) {
                 res.writeHead(409);
                 res.end(JSON.stringify({error: 'exists'}));
                 return
             }
+            if (!existsSync(hd)) mkdirSync(hd, {recursive: true})
             ;writeFileSync(fp, b.content || '#!/usr/bin/env bash\nset -euo pipefail\n', 'utf8');
             res.writeHead(201);
             res.end(JSON.stringify({ok: true, filename: fn}))
@@ -4203,8 +5638,7 @@ const httpServer = createServer(async (req, res) => {
                     const stem = entry.name.replace(/\.md$/, '');
                     const isBuiltin = BUILTIN_RULES.has(stem);
                     result.push({filename: relPath, content: c, frontmatter: fm, size: c.length, source: isBuiltin ? 'builtin' : 'custom'})
-                } catch {
-                }
+                } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
             }
         }
     }
@@ -4215,21 +5649,23 @@ const httpServer = createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/api/config/rules') {
         const rd = join(CLAUDE_HOME, 'rules');
         const r = [];
-        try { scanRulesDir(rd, rd, r); } catch {}
+        try {
+            scanRulesDir(rd, rd, r)
+        } catch (error) {
+            log.warn({err: error, rulesDir: rd}, '扫描 Rules 目录失败')
+        }
         res.writeHead(200);
         res.end(JSON.stringify({rules: r}));
         return
     }
     const ruleM = url.pathname.match(/^\/api\/config\/rules\/(.+)$/);
     if (ruleM) {
-        let fn = decodeURIComponent(ruleM[1]);
-        // 路径穿越白名单防护: resolve 后检查结果必须在 CLAUDE_HOME/rules 目录下
+        let fn = safeDecodeURIComponent(ruleM[1]);
         const rulesDir = join(CLAUDE_HOME, 'rules')
-        const resolved = resolve(rulesDir, fn)
-        if (!resolved.startsWith(rulesDir + sep) && resolved !== rulesDir) {
+        const fp = safeChildPath(rulesDir, fn, {extensions: ['.md']})
+        if (!fp) {
             res.writeHead(400); res.end(JSON.stringify({error: 'invalid filename'})); return
         }
-        const fp = resolved
         if (req.method === 'GET') {
             try {
                 const c = readFileSync(fp, 'utf8');
@@ -4324,11 +5760,9 @@ const httpServer = createServer(async (req, res) => {
                         loaded: isBuiltin,
                         source: 'custom'
                     }) // 有磁盘文件的始终是自定义
-                } catch {
-                }
+                } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
             }
-        } catch {
-        }
+        } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
         if (Array.isArray(builtinCache.agents)) {
             for (const an of builtinCache.agents) {
                 if (!seen.has(an)) r.push({
@@ -4351,7 +5785,7 @@ const httpServer = createServer(async (req, res) => {
     }
     const agentM = url.pathname.match(/^\/api\/config\/agents\/(.+)$/)
     if (agentM) {
-        const an = decodeURIComponent(agentM[1]).replace(/\.md$/, '').replace(/[^a-zA-Z0-9_-]/g, '-')
+        const an = safeDecodeURIComponent(agentM[1]).replace(/\.md$/, '').replace(/[^a-zA-Z0-9_-]/g, '-')
         const fp = join(CLAUDE_HOME, 'agents', an + '.md')
         if (req.method === 'GET') {
             try {
@@ -4474,13 +5908,21 @@ const httpServer = createServer(async (req, res) => {
             const cliS = loadCliSettings()
             const b = await readBody(req)
             const qBaseUrl = b.baseUrl || ''
-            const qApiKey = b.apiKey || ''
+            const storedApiKey = cliS.env?.ANTHROPIC_AUTH_TOKEN || cliS.env?.ANTHROPIC_API_KEY || ''
+            const qApiKey = restoreSecretValue(b.apiKey || '', storedApiKey)
             // 不再读 process.env：该端点面向 settings 配置查询，cliS.env 已覆盖；临时切换 provider 不经此路径
             const baseUrl = qBaseUrl || cliS.env?.ANTHROPIC_BASE_URL || ''
-            const key = qApiKey || cliS.env?.ANTHROPIC_AUTH_TOKEN || cliS.env?.ANTHROPIC_API_KEY || ''
+            const key = qApiKey || storedApiKey
             if (!baseUrl || !key) {
                 res.writeHead(200);
                 res.end(JSON.stringify({models: [], error: 'no_creds'}));
+                return
+            }
+            if (/\/api\/codex\/backend-api\/codex(?:\/|$)/i.test(baseUrl)) {
+                const preset = PROVIDERS.find(provider => provider.id === 'codex-relay')
+                const models = (preset?.models || []).map(model => ({value: model.id, displayName: model.name, description: model.contextWindow}))
+                res.writeHead(200)
+                res.end(JSON.stringify({models, source: 'codex-relay-preset'}))
                 return
             }
             // 不同供应商 /models 端点位置不同
@@ -4497,32 +5939,32 @@ const httpServer = createServer(async (req, res) => {
             } else {
                 modelsUrl = baseUrl.replace(/\/anthropic\/?$/, '').replace(/\/+$/, '') + '/models'
             }
-            let r = await fetch(modelsUrl, {
+            modelsUrl = buildProviderModelsUrl(baseUrl)
+            const providerUrl = await validateProviderUrl(baseUrl)
+            await validateProviderUrl(modelsUrl)
+            let fetched = await fetchProviderResponse(modelsUrl, {
                 headers: {Authorization: `Bearer ${key}`},
                 signal: AbortSignal.timeout(8000)
             })
+            let r = fetched.response
+            modelsUrl = fetched.url
             // 404/403 回退：部分供应商 models 不在根路径
             if (!r.ok && (r.status === 404 || r.status === 403)) {
                 try {
-                    const u = new URL(baseUrl)
-                    const origin = u.origin
-                    const pathBase = u.pathname.replace(/\/+$/, '')
+                    const candidates = buildProviderFallbackUrls(providerUrl.toString())
                     // 候选：pathBase/v1/models > parentPath/v1/models > origin/v1/models
-                    const candidates = [origin + '/v1/models']
-                    if (pathBase && pathBase !== '/') {
-                        candidates.unshift(origin + pathBase + '/v1/models')
-                        const parent = pathBase.replace(/\/[^/]+$/, '')
-                        if (parent && parent !== '/' && parent !== pathBase) candidates.unshift(origin + parent + '/v1/models')
-                    }
                     for (const fb of candidates) {
                         if (fb === modelsUrl) continue
-                        const r2 = await fetch(fb, {
+                        await validateProviderUrl(fb)
+                        const fallback = await fetchProviderResponse(fb, {
                             headers: {Authorization: `Bearer ${key}`},
                             signal: AbortSignal.timeout(8000)
                         })
-                        if (r2.ok) { r = r2; modelsUrl = fb; break }
+                        if (fallback.response.ok) { r = fallback.response; modelsUrl = fallback.url; break }
                     }
-                } catch {}
+                } catch (error) {
+                    log.debug({err: error, modelsUrl}, '供应商模型端点回退失败')
+                }
             }
             if (!r.ok) {
                 res.writeHead(200);
@@ -4548,11 +5990,33 @@ const httpServer = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/config/test-model') {
         try {
             const b = await readBody(req)
+            const cliS = loadCliSettings()
             const qBaseUrl = b.baseUrl || ''
-            const qApiKey = b.apiKey || ''
+            const storedApiKey = cliS.env?.ANTHROPIC_AUTH_TOKEN || cliS.env?.ANTHROPIC_API_KEY || ''
+            const qApiKey = restoreSecretValue(b.apiKey || '', storedApiKey)
             if (!qBaseUrl || !qApiKey) {
                 res.writeHead(200);
                 res.end(JSON.stringify({ok: false, error: 'missing baseUrl or apiKey'}));
+                return
+            }
+            if (/\/api\/codex\/backend-api\/codex(?:\/|$)/i.test(qBaseUrl)) {
+                const model = typeof b.model === 'string' && /^(?:gpt-|o\d|codex|computer-use)/i.test(b.model) ? b.model : 'gpt-5.6-sol'
+                const responsesUrl = qBaseUrl.replace(/\/+$/, '') + '/responses'
+                await validateProviderUrl(responsesUrl)
+                const probe = await fetchProviderResponse(responsesUrl, {
+                    method: 'POST',
+                    headers: {Authorization: `Bearer ${qApiKey}`, 'Content-Type': 'application/json'},
+                    body: JSON.stringify({model, input: 'Reply with OK only.', stream: false, store: false, max_output_tokens: 4}),
+                    signal: AbortSignal.timeout(15000),
+                })
+                if (!probe.response.ok) {
+                    const detail = (await probe.response.text()).slice(0, 300)
+                    res.writeHead(200)
+                    res.end(JSON.stringify({ok: false, error: `HTTP ${probe.response.status} ${detail}`}))
+                    return
+                }
+                res.writeHead(200)
+                res.end(JSON.stringify({ok: true, count: 1, list: [model], source: responsesUrl}))
                 return
             }
             // 不同供应商 /models 端点位置不同
@@ -4568,39 +6032,40 @@ const httpServer = createServer(async (req, res) => {
             } else {
                 modelsUrl = qBaseUrl.replace(/\/anthropic\/?$/, '').replace(/\/+$/, '') + '/models'
             }
-            let r = await fetch(modelsUrl, {
+            modelsUrl = buildProviderModelsUrl(qBaseUrl)
+            const providerUrl = await validateProviderUrl(qBaseUrl)
+            await validateProviderUrl(modelsUrl)
+            let fetched = await fetchProviderResponse(modelsUrl, {
                 headers: {Authorization: `Bearer ${qApiKey}`},
                 signal: AbortSignal.timeout(10000)
             })
+            let r = fetched.response
+            modelsUrl = fetched.url
             // 404/403 回退：部分供应商 models 不在根路径
             if (!r.ok && (r.status === 404 || r.status === 403)) {
                 try {
-                    const u = new URL(qBaseUrl)
-                    const origin = u.origin
-                    const pathBase = u.pathname.replace(/\/+$/, '')
                     // 候选：pathBase/v1/models > parentPath/v1/models > origin/v1/models
-                    const candidates = [origin + '/v1/models']
-                    if (pathBase && pathBase !== '/') {
-                        candidates.unshift(origin + pathBase + '/v1/models')
-                        const parent = pathBase.replace(/\/[^/]+$/, '')
-                        if (parent && parent !== '/' && parent !== pathBase) candidates.unshift(origin + parent + '/v1/models')
-                    }
+                    const candidates = buildProviderFallbackUrls(providerUrl.toString())
                     for (const fb of candidates) {
                         if (fb === modelsUrl) continue
-                        const r2 = await fetch(fb, {
+                        await validateProviderUrl(fb)
+                        const fallback = await fetchProviderResponse(fb, {
                             headers: {Authorization: `Bearer ${qApiKey}`},
                             signal: AbortSignal.timeout(10000)
                         })
-                        if (r2.ok) { r = r2; modelsUrl = fb; break }
+                        if (fallback.response.ok) { r = fallback.response; modelsUrl = fallback.url; break }
                     }
-                } catch {}
+                } catch (error) {
+                    log.debug({err: error, modelsUrl}, '测试供应商模型端点回退失败')
+                }
             }
             if (!r.ok) {
                 let detail = `HTTP ${r.status}`
                 try {
                     const b = await r.text();
                     if (b) detail += ` — ${b.slice(0, 200)}`
-                } catch {
+                } catch (error) {
+                    log.debug({err: error, modelsUrl}, '读取供应商错误响应失败')
                 }
                 res.writeHead(200);
                 res.end(JSON.stringify({ok: false, error: detail}));
@@ -4680,6 +6145,8 @@ const httpServer = createServer(async (req, res) => {
         const list = Object.entries(scheduledTasks).map(([id, t]) => ({
             id, cron: t.cron, prompt: t.prompt, workDir: t.workDir,
             model: t.model, enabled: t.enabled !== false,
+            permissionMode: t.permissionMode || 'default', maxTurns: t.maxTurns || 20,
+            running: scheduledRuns.has(id),
         }))
         res.writeHead(200); res.end(JSON.stringify({tasks: list}))
         return
@@ -4688,26 +6155,32 @@ const httpServer = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/config/scheduled-tasks') {
         const b = await readBody(req)
         const id = (b.id || crypto.randomUUID())
-        if (!b.cron || !b.prompt || !b.workDir) {
+        if (typeof id !== 'string' || !/^[a-zA-Z0-9._-]{1,64}$/.test(id)
+            || typeof b.cron !== 'string' || b.cron.length > 128
+            || typeof b.prompt !== 'string' || !b.prompt.trim() || b.prompt.length > 20_000
+            || !isDirectoryPath(b.workDir)) {
             res.writeHead(400); res.end(JSON.stringify({error: 'cron, prompt, workDir required'})); return
         }
+        const permissionMode = b.permissionMode || 'default'
+        if (!['default', 'acceptEdits', 'plan', 'bypassPermissions'].includes(permissionMode)) {
+            res.writeHead(400); res.end(JSON.stringify({error: 'invalid permissionMode'})); return
+        }
+        const maxTurns = Math.min(100, Math.max(1, Number(b.maxTurns) || 20))
         // validate cron
         if (!cron.validate(b.cron)) { res.writeHead(400); res.end(JSON.stringify({error: 'invalid cron expression'})); return }
         scheduledTasks[id] = {
             cron: b.cron, prompt: b.prompt, workDir: b.workDir,
-            model: b.model || MODEL, enabled: b.enabled !== false,
+            model: typeof b.model === 'string' && b.model.length <= 256 ? (b.model || MODEL) : MODEL,
+            permissionMode, maxTurns, enabled: b.enabled !== false,
         }
-        writeJSON(SCHEDULED_TASKS_FILE, scheduledTasks)
-        // 注册新 cron job
-        if (scheduledTasks[id].enabled) {
-            try {
-                const job = cron.schedule(b.cron, () => {
-                    executeScheduledTask(id).catch(e => {
-                        log.error({err: e, taskId: id}, '定时任务执行失败')
-                    })
-                })
-                cronJobs.set(id, job)
-            } catch {}
+        try {
+            if (scheduledTasks[id].enabled) registerScheduledJob(id, b.cron)
+            writeJSON(SCHEDULED_TASKS_FILE, scheduledTasks)
+        } catch (error) {
+            destroyScheduledJob(id)
+            delete scheduledTasks[id]
+            log.error({err: error, taskId: id}, '创建定时任务失败')
+            res.writeHead(500); res.end(JSON.stringify({error: 'failed to create scheduled task'})); return
         }
         res.writeHead(200); res.end(JSON.stringify({ok: true, id}))
         return
@@ -4717,24 +6190,44 @@ const httpServer = createServer(async (req, res) => {
     if (req.method === 'PUT' && schedPutM) {
         const id = schedPutM[1]
         if (!scheduledTasks[id]) { res.writeHead(404); res.end(JSON.stringify({error: 'not found'})); return }
+        const previousTask = {...scheduledTasks[id]}
         const b = await readBody(req)
         if (b.cron !== undefined) {
-            if (!cron.validate(b.cron)) { res.writeHead(400); res.end(JSON.stringify({error: 'invalid cron'})); return }
+            if (typeof b.cron !== 'string' || b.cron.length > 128 || !cron.validate(b.cron)) { res.writeHead(400); res.end(JSON.stringify({error: 'invalid cron'})); return }
             scheduledTasks[id].cron = b.cron
         }
-        if (b.prompt !== undefined) scheduledTasks[id].prompt = b.prompt
-        if (b.workDir !== undefined) scheduledTasks[id].workDir = b.workDir
-        if (b.model !== undefined) scheduledTasks[id].model = b.model
+        if (b.prompt !== undefined) {
+            if (typeof b.prompt !== 'string' || !b.prompt.trim() || b.prompt.length > 20_000) { res.writeHead(400); res.end(JSON.stringify({error: 'invalid prompt'})); return }
+            scheduledTasks[id].prompt = b.prompt
+        }
+        if (b.workDir !== undefined) {
+            if (!isDirectoryPath(b.workDir)) { res.writeHead(400); res.end(JSON.stringify({error: 'invalid workDir'})); return }
+            scheduledTasks[id].workDir = b.workDir
+        }
+        if (b.model !== undefined) {
+            if (typeof b.model !== 'string' || b.model.length > 256) { res.writeHead(400); res.end(JSON.stringify({error: 'invalid model'})); return }
+            scheduledTasks[id].model = b.model
+        }
+        if (b.permissionMode !== undefined) {
+            if (!['default', 'acceptEdits', 'plan', 'bypassPermissions'].includes(b.permissionMode)) { res.writeHead(400); res.end(JSON.stringify({error: 'invalid permissionMode'})); return }
+            scheduledTasks[id].permissionMode = b.permissionMode
+        }
+        if (b.maxTurns !== undefined) scheduledTasks[id].maxTurns = Math.min(100, Math.max(1, Number(b.maxTurns) || 20))
         if (b.enabled !== undefined) scheduledTasks[id].enabled = !!b.enabled
-        writeJSON(SCHEDULED_TASKS_FILE, scheduledTasks)
-        // 重启 cron job
-        if (cronJobs.has(id)) { cronJobs.get(id).stop(); cronJobs.delete(id) }
-        if (scheduledTasks[id].enabled) {
-            try { cronJobs.set(id, cron.schedule(scheduledTasks[id].cron, () => {
-                    executeScheduledTask(id).catch(e => {
-                        log.error({err: e, taskId: id}, '定时任务执行失败')
-                    })
-                })) } catch {}
+        try {
+            if (scheduledTasks[id].enabled) registerScheduledJob(id, scheduledTasks[id].cron)
+            else destroyScheduledJob(id)
+            writeJSON(SCHEDULED_TASKS_FILE, scheduledTasks)
+        } catch (error) {
+            scheduledTasks[id] = previousTask
+            try {
+                if (previousTask.enabled) registerScheduledJob(id, previousTask.cron)
+                else destroyScheduledJob(id)
+            } catch (restoreError) {
+                log.error({err: restoreError, taskId: id}, '恢复旧定时任务失败')
+            }
+            log.error({err: error, taskId: id}, '更新定时任务失败')
+            res.writeHead(500); res.end(JSON.stringify({error: 'failed to update scheduled task'})); return
         }
         res.writeHead(200); res.end(JSON.stringify({ok: true}))
         return
@@ -4743,9 +6236,23 @@ const httpServer = createServer(async (req, res) => {
     const schedDelM = url.pathname.match(/^\/api\/config\/scheduled-tasks\/([^/]+)$/)
     if (req.method === 'DELETE' && schedDelM) {
         const id = schedDelM[1]
-        if (cronJobs.has(id)) { cronJobs.get(id).stop(); cronJobs.delete(id) }
+        const previousTask = scheduledTasks[id] ? {...scheduledTasks[id]} : null
+        destroyScheduledJob(id)
         delete scheduledTasks[id]
-        writeJSON(SCHEDULED_TASKS_FILE, scheduledTasks)
+        try {
+            writeJSON(SCHEDULED_TASKS_FILE, scheduledTasks)
+        } catch (error) {
+            if (previousTask) {
+                scheduledTasks[id] = previousTask
+                try {
+                    if (previousTask.enabled) registerScheduledJob(id, previousTask.cron)
+                } catch (restoreError) {
+                    log.error({err: restoreError, taskId: id}, '恢复已删除定时任务失败')
+                }
+            }
+            log.error({err: error, taskId: id}, '删除定时任务失败')
+            res.writeHead(500); res.end(JSON.stringify({error: 'failed to delete scheduled task'})); return
+        }
         res.writeHead(200); res.end(JSON.stringify({ok: true}))
         return
     }
@@ -4756,11 +6263,102 @@ const httpServer = createServer(async (req, res) => {
         const task = scheduledTasks[id]
         if (!task) { res.writeHead(404); res.end(JSON.stringify({error: 'not found'})); return }
         if (!task.enabled) { res.writeHead(400); res.end(JSON.stringify({error: 'task is disabled'})); return }
-        res.writeHead(200); res.end(JSON.stringify({ok: true}))
-        // 异步执行，不阻塞响应
-        executeScheduledTask(id).catch(e => {
+        try {
+            const result = await executeScheduledTask(id)
+            res.writeHead(result?.started ? 200 : 409)
+            res.end(JSON.stringify({ok: !!result?.started, ...result}))
+        } catch (e) {
             log.error({err: e, taskId: id}, '手动执行定时任务失败')
+            res.writeHead(500)
+            res.end(JSON.stringify({error: String(e?.message || e)}))
+        }
+        return
+    }
+
+    // ── POST/DELETE /api/config/adapters/:platform/notifications —— 通知失败恢复 ──
+    const notificationRetryMatch = url.pathname.match(/^\/api\/config\/adapters\/([^/]+)\/notifications\/retry$/)
+    if (req.method === 'POST' && notificationRetryMatch) {
+        const platform = notificationRetryMatch[1]
+        if (!ADAPTER_PLATFORMS.includes(platform)) {
+            res.writeHead(400); res.end(JSON.stringify({error: 'platform not supported'})); return
+        }
+        const hook = getAdapterHook(platform)
+        if (!hook?.retryNotifications) {
+            res.writeHead(409); res.end(JSON.stringify({error: 'adapter is not running'})); return
+        }
+        const result = hook.retryNotifications()
+        res.writeHead(202)
+        res.end(JSON.stringify({ok: true, ...result}))
+        return
+    }
+
+    const notificationDiscardMatch = url.pathname.match(/^\/api\/config\/adapters\/([^/]+)\/notifications\/dead$/)
+    if (req.method === 'DELETE' && notificationDiscardMatch) {
+        const platform = notificationDiscardMatch[1]
+        if (!ADAPTER_PLATFORMS.includes(platform)) {
+            res.writeHead(400); res.end(JSON.stringify({error: 'platform not supported'})); return
+        }
+        const hook = getAdapterHook(platform)
+        if (!hook?.discardNotifications) {
+            res.writeHead(409); res.end(JSON.stringify({error: 'adapter is not running'})); return
+        }
+        const result = hook.discardNotifications()
+        res.writeHead(200)
+        res.end(JSON.stringify({ok: true, ...result}))
+        return
+    }
+
+    // ── GET/DELETE /api/config/adapters/bindings —— IM 用户与 Session 绑定管理 ──
+    if (req.method === 'GET' && url.pathname === '/api/config/adapters/bindings') {
+        const bindings = listAdapterBindings(readAdapterBindings(), {
+            allowedPlatforms: ADAPTER_PLATFORMS,
+            isSessionActive: isAdapterSessionActive,
         })
+        res.writeHead(200)
+        res.end(JSON.stringify({bindings}))
+        return
+    }
+
+    if (req.method === 'DELETE' && url.pathname === '/api/config/adapters/bindings') {
+        const staleOnly = url.searchParams.get('stale') === '1'
+        const deleted = clearAdapterBindings(binding => !staleOnly || !isAdapterSessionActive(binding.sessionId))
+        log.info({deleted, staleOnly}, 'IM Session 绑定已清理')
+        res.writeHead(200)
+        res.end(JSON.stringify({ok: true, deleted}))
+        return
+    }
+
+    const bindingUserMatch = url.pathname.match(/^\/api\/config\/adapters\/bindings\/([^/]+)\/([^/]+)$/)
+    if (req.method === 'DELETE' && bindingUserMatch) {
+        const platform = bindingUserMatch[1]
+        if (!ADAPTER_PLATFORMS.includes(platform)) {
+            res.writeHead(400); res.end(JSON.stringify({error: 'platform not supported'})); return
+        }
+        let userId
+        try {
+            userId = safeDecodeURIComponent(bindingUserMatch[2])
+        } catch {
+            res.writeHead(400); res.end(JSON.stringify({error: 'userId encoding invalid'})); return
+        }
+        if (!userId || userId.length > 512 || /[\0\r\n]/.test(userId)) {
+            res.writeHead(400); res.end(JSON.stringify({error: 'userId invalid'})); return
+        }
+        const deleted = clearAdapterBindings(binding => binding.platform === platform && binding.userId === userId)
+        res.writeHead(200)
+        res.end(JSON.stringify({ok: true, deleted}))
+        return
+    }
+
+    const bindingPlatformMatch = url.pathname.match(/^\/api\/config\/adapters\/bindings\/([^/]+)$/)
+    if (req.method === 'DELETE' && bindingPlatformMatch) {
+        const platform = bindingPlatformMatch[1]
+        if (!ADAPTER_PLATFORMS.includes(platform)) {
+            res.writeHead(400); res.end(JSON.stringify({error: 'platform not supported'})); return
+        }
+        const deleted = clearAdapterBindings(binding => binding.platform === platform)
+        log.info({platform, deleted}, 'IM 平台 Session 绑定已清理')
+        res.writeHead(200)
+        res.end(JSON.stringify({ok: true, deleted}))
         return
     }
 
@@ -4770,10 +6368,39 @@ const httpServer = createServer(async (req, res) => {
     //   前端适配器设置页面依赖此接口展示各平台卡片
     // 关键数据流: GET → adapters.json + confirmHooks 运行状态 → 200 {platforms: [{id, name, status, hasAccount, guideSteps, ...}]}
     if (req.method === 'GET' && url.pathname === '/api/config/adapters') {
-        const ad = readJSON(join(CLAUDE_HOME, 'adapters.json')) || {};
-        const isRunning = p => confirmHooks.some(h => h.platform === p);
+        const ad = loadAdapterConfig();
+        const runtimeStatus = p => {
+            const hook = getAdapterHook(p)
+            if (!hook) return {state: 'stopped'}
+            try { return hook.connectionStatus?.() || {state: 'running'} } catch (error) {
+                return {state: 'error', lastError: String(error?.message || error)}
+            }
+        }
+        const isRunning = p => !['stopped', 'error', 'failed'].includes(runtimeStatus(p).state)
+        const notificationStatus = p => {
+            const live = confirmHooks.find(h => h.platform === p)?.notificationStatus?.()
+            if (live) return live
+            const platformFile = platformEntryFilePath(CLAUDE_HOME, 'bridge-notification-outbox', p)
+            return existsSync(platformFile)
+                ? readNotificationSummary(platformFile, p)
+                : readNotificationSummary(join(CLAUDE_HOME, 'bridge-notification-outbox.json'), p)
+        }
+        const allBindings = listAdapterBindings(readAdapterBindings(), {
+            allowedPlatforms: ADAPTER_PLATFORMS,
+            isSessionActive: isAdapterSessionActive,
+        })
+        const bindingStatus = p => {
+            const values = allBindings.filter(binding => binding.platform === p)
+            return {
+                total: values.length,
+                active: values.filter(binding => binding.active).length,
+                stale: values.filter(binding => !binding.active).length,
+                users: values.map(binding => binding.userId),
+            }
+        }
         res.writeHead(200);
         res.end(JSON.stringify({
+            configError: adapterConfigReadError,
             platforms: [{
                 id: 'wechat',
                 name: '微信',
@@ -4784,8 +6411,13 @@ const httpServer = createServer(async (req, res) => {
                 guideSteps: ['1. 微信搜索并关注你的 iLink Bot', '2. 发送任意消息给 Bot', '3. 配对码发给Bot完成绑定'],
                 hasAccount: !!(ad.wechat?.botToken),
                 accountId: ad.wechat?.accountId || '',
-                baseUrl: ad.wechat?.baseUrl || 'https://ilinkai.weixin.qq.com',
-                status: isRunning('wechat') ? 'running' : (ad.wechat?.botToken ? 'configured' : 'not_configured')
+                baseUrl: normalizeWeChatBaseUrl(ad.wechat?.baseUrl),
+                pairedUsers: bindingStatus('wechat').users,
+                bindings: bindingStatus('wechat'),
+                notifications: notificationStatus('wechat'),
+                runtime: runtimeStatus('wechat'),
+                pairCode: getAdapterHook('wechat')?.pairingCode?.() || '',
+                status: adapterConfigReadError ? 'error' : (isRunning('wechat') ? 'running' : (ad.wechat?.botToken ? 'configured' : 'not_configured'))
             }, {
                 id: 'feishu',
                 name: '飞书',
@@ -4803,7 +6435,12 @@ const httpServer = createServer(async (req, res) => {
                 hasAccount: !!(ad.feishu?.appId && ad.feishu?.appSecret),
                 accountId: ad.feishu?.appId ? ad.feishu.appId.replace(/./g, '●').slice(0, 20) : '',
                 baseUrl: ad.feishu?.baseUrl || 'https://open.feishu.cn',
-                status: isRunning('feishu') ? 'running' : ((ad.feishu?.appId && ad.feishu?.appSecret) ? 'configured' : 'not_configured')
+                pairedUsers: bindingStatus('feishu').users,
+                bindings: bindingStatus('feishu'),
+                notifications: notificationStatus('feishu'),
+                runtime: runtimeStatus('feishu'),
+                pairCode: getAdapterHook('feishu')?.pairingCode?.() || '',
+                status: adapterConfigReadError ? 'error' : (isRunning('feishu') ? 'running' : ((ad.feishu?.appId && ad.feishu?.appSecret) ? 'configured' : 'not_configured'))
             }, {
                 id: 'dingtalk',
                 name: '钉钉',
@@ -4821,7 +6458,12 @@ const httpServer = createServer(async (req, res) => {
                 hasAccount: !!(ad.dingtalk?.appKey && ad.dingtalk?.appSecret),
                 accountId: ad.dingtalk?.appKey ? ad.dingtalk.appKey.replace(/./g, '●').slice(0, 20) : '',
                 baseUrl: ad.dingtalk?.baseUrl || 'https://api.dingtalk.com',
-                status: isRunning('dingtalk') ? 'running' : ((ad.dingtalk?.appKey && ad.dingtalk?.appSecret) ? 'configured' : 'not_configured')
+                pairedUsers: bindingStatus('dingtalk').users,
+                bindings: bindingStatus('dingtalk'),
+                notifications: notificationStatus('dingtalk'),
+                runtime: runtimeStatus('dingtalk'),
+                pairCode: getAdapterHook('dingtalk')?.pairingCode?.() || '',
+                status: adapterConfigReadError ? 'error' : (isRunning('dingtalk') ? 'running' : ((ad.dingtalk?.appKey && ad.dingtalk?.appSecret) ? 'configured' : 'not_configured'))
             }]
         }));
         return
@@ -4891,27 +6533,18 @@ const httpServer = createServer(async (req, res) => {
             });
             const s = await r.json();
             if (s.status === 'confirmed' && s.bot_token) {
-                const af = join(CLAUDE_HOME, 'adapters.json');
-                const a = readJSON(af) || {};
+                const a = loadAdapterConfig({strict: true});
+                const credentialsChanged = a.wechat?.botToken !== s.bot_token
                 a.wechat = {
                     ...(a.wechat || {}),
                     botToken: s.bot_token,
                     accountId: s.ilink_bot_id,
-                    baseUrl: s.baseurl || 'https://ilinkai.weixin.qq.com'
+                    baseUrl: normalizeWeChatBaseUrl(s.baseurl)
                 };
-                writeJSON(af, a);
+                saveAdapterConfig(a);
+                if (credentialsChanged) clearAdapterPlatformState('wechat')
                 pendingQRCodes.delete(pid);
-                try {
-                    const cd = join(CLAUDE_HOME, 'channels', 'wechat', 'default');
-                    if (!existsSync(cd)) mkdirSync(cd, {recursive: true});
-                    writeJSON(join(cd, 'account.json'), {
-                        token: s.bot_token,
-                        baseUrl: s.baseurl || 'https://ilinkai.weixin.qq.com',
-                        botId: s.ilink_bot_id,
-                        savedAt: new Date().toISOString()
-                    })
-                } catch {
-                }
+                restartAdapter('wechat')
                 ;res.writeHead(200);
                 res.end(JSON.stringify({status: 'confirmed'}))
             } else {
@@ -4932,24 +6565,27 @@ const httpServer = createServer(async (req, res) => {
     if (req.method === 'PUT' && apm) {
         const pid = apm[1];
         try {
-            const b = await readBody(req);
-            const a = readJSON(join(CLAUDE_HOME, 'adapters.json')) || {};
-            if (pid === 'feishu') a.feishu = {
-                ...(a.feishu || {}),
-                appId: b.appId,
-                appSecret: b.appSecret
-            }; else if (pid === 'dingtalk') a.dingtalk = {
-                ...(a.dingtalk || {}),
-                appKey: b.appKey,
-                appSecret: b.appSecret
-            }; else {
-                res.writeHead(400);
-                res.end(JSON.stringify({error: 'unsupported platform'}));
-                return
+            if (!['feishu', 'dingtalk'].includes(pid)) {
+                res.writeHead(400); res.end(JSON.stringify({error: 'unsupported platform'})); return
             }
-            ;writeJSON(join(CLAUDE_HOME, 'adapters.json'), a);
+            const b = await readBody(req);
+            const a = loadAdapterConfig({strict: true});
+            const appId = String(pid === 'feishu' ? b.appId || '' : b.appKey || '').trim()
+            const appSecret = String(b.appSecret || '').trim()
+            if (!appId || !appSecret || appId.length > 512 || appSecret.length > 1024 || /[\0\r\n]/.test(appId + appSecret)) {
+                res.writeHead(400); res.end(JSON.stringify({error: 'invalid adapter credentials'})); return
+            }
+            const previous = a[pid] || {}
+            const credentialsChanged = pid === 'feishu'
+                ? previous.appId !== appId || previous.appSecret !== appSecret
+                : previous.appKey !== appId || previous.appSecret !== appSecret
+            if (pid === 'feishu') a.feishu = {...previous, appId, appSecret}
+            else a.dingtalk = {...previous, appKey: appId, appSecret}
+            saveAdapterConfig(a)
+            if (credentialsChanged) clearAdapterPlatformState(pid)
+            const hook = restartAdapter(pid)
             res.writeHead(200);
-            res.end(JSON.stringify({ok: true}))
+            res.end(JSON.stringify({ok: true, running: !!hook}))
         } catch (e) {
             res.writeHead(500);
             res.end(JSON.stringify({error: e.message}))
@@ -4963,25 +6599,22 @@ const httpServer = createServer(async (req, res) => {
     if (req.method === 'DELETE' && apm) {
         const pid = apm[1];
         try {
-            const a = readJSON(join(CLAUDE_HOME, 'adapters.json')) || {};
+            if (!ADAPTER_PLATFORMS.includes(pid)) {
+                res.writeHead(400); res.end(JSON.stringify({error: 'platform not supported'})); return
+            }
+            const a = loadAdapterConfig({strict: true});
             delete a[pid];
-            writeJSON(join(CLAUDE_HOME, 'adapters.json'), a); // 同时清理 channels 目录下的账号缓存
+            saveAdapterConfig(a)
+            const cleaned = clearAdapterPlatformState(pid)
+            // 同时清理 channels 目录下的账号缓存
             try {
                 const cd = join(CLAUDE_HOME, 'channels', pid);
-                if (existsSync(cd)) {
-                    for (const f of readdirSync(cd)) {
-                        const fp = join(cd, f);
-                        try {
-                            statSync(fp).isDirectory() ? rmdirSync(fp, {recursive: true}) : unlinkSync(fp)
-                        } catch {
-                        }
-                    }
-                    rmdirSync(cd)
-                }
-            } catch {
+                if (existsSync(cd)) rmSync(cd, {recursive: true, force: true})
+            } catch (error) {
+                log.warn({err: error, platform: pid}, '清理 IM 账号缓存失败')
             }
             ;res.writeHead(200);
-            res.end(JSON.stringify({ok: true}))
+            res.end(JSON.stringify({ok: true, cleaned}))
         } catch (e) {
             log.error({err: e}, 'adapters DELETE 失败');
             res.writeHead(500);
@@ -5014,8 +6647,7 @@ const httpServer = createServer(async (req, res) => {
                     }
                 }
             }
-        } catch {
-        }
+        } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
         res.writeHead(200)
         res.end(JSON.stringify({plugins: [...pm.values()]}))
         return
@@ -5032,9 +6664,9 @@ const httpServer = createServer(async (req, res) => {
             transport: cfg.type || cfg.transport || 'stdio',
             command: cfg.command || '',
             args: cfg.args || [],
-            env: cfg.env || {},
+            env: redactSecretMap(cfg.env),
             url: cfg.url || '',
-            headers: cfg.headers || {},
+            headers: redactSecretMap(cfg.headers),
             enabled: cfg.enabled !== false,
         }))
         res.writeHead(200)
@@ -5052,23 +6684,74 @@ const httpServer = createServer(async (req, res) => {
             const body = await readBody(req)
             const name = (body.name || '').trim()
             if (!name) { res.writeHead(400); res.end(JSON.stringify({error: 'name 必填'})); return }
+            if (!/^[a-zA-Z0-9._-]{1,64}$/.test(name)) {
+                res.writeHead(400); res.end(JSON.stringify({error: 'MCP 名称只能包含字母、数字、点、下划线和连字符'})); return
+            }
             const transport = body.transport || 'stdio'
             if (!['stdio', 'sse', 'http'].includes(transport)) {
                 res.writeHead(400); res.end(JSON.stringify({error: 'transport 需为 stdio/sse/http'})); return
             }
-            const s = readJSON(join(CLAUDE_HOME, 'settings.json')) || {}
+            const s = loadCliSettingsForUpdate()
             if (!s.mcpServers) s.mcpServers = {}
             const existing = s.mcpServers[name] || {}
             const cfg = {type: transport}
             if (body.enabled !== undefined) cfg.enabled = !!body.enabled
             else if (existing.enabled !== undefined) cfg.enabled = existing.enabled
             if (transport === 'stdio') {
-                if (body.command) cfg.command = body.command
-                if (body.args && body.args.length) cfg.args = body.args
-                if (body.env && Object.keys(body.env).length) cfg.env = body.env
+                const command = typeof body.command === 'string' ? body.command.trim() : ''
+                if (!command || command.length > 2048 || /[\0\r\n]/.test(command)) {
+                    res.writeHead(400); res.end(JSON.stringify({error: 'stdio command 无效或超长'})); return
+                }
+                const args = body.args === undefined ? [] : body.args
+                if (!Array.isArray(args) || args.length > 100 || args.some(a => typeof a !== 'string' || a.length > 4096 || /[\0\r\n]/.test(a))) {
+                    res.writeHead(400); res.end(JSON.stringify({error: 'stdio args 必须是最多 100 个安全字符串'})); return
+                }
+                const envInput = body.env === undefined && (existing.type || existing.transport || 'stdio') === transport
+                    ? existing.env || {}
+                    : body.env === undefined ? {} : body.env
+                const env = restoreSecretMap(envInput, existing.env || {})
+                if (!env || typeof env !== 'object' || Array.isArray(env) || Object.keys(env).length > 50) {
+                    res.writeHead(400); res.end(JSON.stringify({error: 'stdio env 格式无效'})); return
+                }
+                for (const [key, value] of Object.entries(env)) {
+                    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || typeof value !== 'string' || value.length > 4096 || /[\0\r\n]/.test(value)) {
+                        res.writeHead(400); res.end(JSON.stringify({error: 'stdio env 包含非法键值'})); return
+                    }
+                    if (['BRIDGE_TOKEN', 'BRIDGE_ALLOW_TOKEN_ENDPOINT', 'NODE_OPTIONS', 'ELECTRON_RUN_AS_NODE'].includes(key)) {
+                        res.writeHead(400); res.end(JSON.stringify({error: `禁止覆盖运行时变量 ${key}`})); return
+                    }
+                }
+                cfg.command = command
+                cfg.args = args
+                if (Object.keys(env).length) cfg.env = env
             } else {
-                if (body.url) cfg.url = body.url
-                if (body.headers && Object.keys(body.headers).length) cfg.headers = body.headers
+                if (typeof body.url !== 'string' || body.url.length > 4096) {
+                    res.writeHead(400); res.end(JSON.stringify({error: 'MCP URL 无效'})); return
+                }
+                let parsedUrl
+                try { parsedUrl = new URL(body.url) } catch {
+                    res.writeHead(400); res.end(JSON.stringify({error: 'MCP URL 无效'})); return
+                }
+                if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+                    res.writeHead(400); res.end(JSON.stringify({error: 'MCP URL 仅支持 http/https'})); return
+                }
+                const headersInput = body.headers === undefined && (existing.type || existing.transport) === transport
+                    ? existing.headers || {}
+                    : body.headers === undefined ? {} : body.headers
+                const headers = restoreSecretMap(headersInput, existing.headers || {})
+                if (!headers || typeof headers !== 'object' || Array.isArray(headers) || Object.keys(headers).length > 50) {
+                    res.writeHead(400); res.end(JSON.stringify({error: 'MCP headers 格式无效'})); return
+                }
+                for (const [key, value] of Object.entries(headers)) {
+                    if (!/^[\x21-\x7e]{1,128}$/.test(key) || typeof value !== 'string' || value.length > 4096 || /[\0\r\n]/.test(value)) {
+                        res.writeHead(400); res.end(JSON.stringify({error: 'MCP headers 包含非法键值'})); return
+                    }
+                    if (key.toLowerCase() === 'x-bridge-token') {
+                        res.writeHead(400); res.end(JSON.stringify({error: '禁止转发 Gateway token'})); return
+                    }
+                }
+                cfg.url = body.url
+                if (Object.keys(headers).length) cfg.headers = headers
             }
             s.mcpServers[name] = cfg
             writeJSON(join(CLAUDE_HOME, 'settings.json'), s)
@@ -5088,8 +6771,11 @@ const httpServer = createServer(async (req, res) => {
     const delMcpM = url.pathname.match(/^\/api\/config\/mcp-servers\/([^/]+)$/)
     if (req.method === 'DELETE' && delMcpM) {
         try {
-            const name = delMcpM[1]
-            const s = readJSON(join(CLAUDE_HOME, 'settings.json')) || {}
+            const name = safeDecodeURIComponent(delMcpM[1])
+            if (!/^[a-zA-Z0-9._-]{1,64}$/.test(name)) {
+                res.writeHead(400); res.end(JSON.stringify({error: 'MCP 名称无效'})); return
+            }
+            const s = loadCliSettingsForUpdate()
             if (s.mcpServers) {
                 delete s.mcpServers[name]
                 writeJSON(join(CLAUDE_HOME, 'settings.json'), s)
@@ -5118,19 +6804,17 @@ const httpServer = createServer(async (req, res) => {
             }
             ;let t, u;
             try {
-                const a = readJSON(join(CLAUDE_HOME, 'adapters.json'));
+                const a = loadAdapterConfig({strict: true});
                 t = a.wechat?.botToken;
-                u = a.wechat?.baseUrl || 'https://ilinkai.weixin.qq.com'
-            } catch {
-            }
+                u = normalizeWeChatBaseUrl(a.wechat?.baseUrl)
+            } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
             ;
             if (!t) {
                 try {
                     const a = readJSON(join(CLAUDE_HOME, 'channels', 'wechat', 'default', 'account.json'));
                     t = a.token;
-                    u = a.baseUrl || 'https://ilinkai.weixin.qq.com'
-                } catch {
-                }
+                    u = normalizeWeChatBaseUrl(a.baseUrl)
+                } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
             }
             ;
             if (!t) {
@@ -5149,52 +6833,6 @@ const httpServer = createServer(async (req, res) => {
         ;
         return
     }
-    // ── POST /api/wechat/reply —— 回复微信消息 ──
-    // 功能说明: 通过 iLink Bot 回复微信用户消息，带 contextToken 维持会话上下文
-    //   自动分段发送长文本 + 返回发送结果
-    // 关键数据流: POST {sessionId, userId, contextToken, replyText} → sendWeChatChunks → 200 {sent, parts, length}
-    if (req.method === 'POST' && url.pathname === '/api/wechat/reply') {
-        try {
-            const {sessionId, userId, contextToken, replyText} = await readBody(req);
-            if (!sessionId || !userId || !replyText) {
-                res.writeHead(200);
-                res.end(JSON.stringify({sent: false}));
-                return
-            }
-            ;let t, u;
-            try {
-                const a = readJSON(join(CLAUDE_HOME, 'adapters.json'));
-                t = a.wechat?.botToken;
-                u = a.wechat?.baseUrl || 'https://ilinkai.weixin.qq.com'
-            } catch {
-            }
-            ;
-            if (!t) {
-                try {
-                    const a = readJSON(join(CLAUDE_HOME, 'channels', 'wechat', 'default', 'account.json'));
-                    t = a.token;
-                    u = a.baseUrl || 'https://ilinkai.weixin.qq.com'
-                } catch {
-                }
-            }
-            ;
-            if (!t) {
-                res.writeHead(500);
-                res.end(JSON.stringify({error: 'wechat bot token not configured'}));
-                return
-            }
-            ;const bn = u.replace(/\/+$/, '') + '/';
-            const r = await sendWeChatChunks(bn, t, userId, contextToken, replyText);
-            res.writeHead(200);
-            res.end(JSON.stringify({sent: r.sent, parts: r.parts, length: replyText.length}))
-        } catch (e) {
-            res.writeHead(500);
-            res.end(JSON.stringify({error: e.message}))
-        }
-        ;
-        return
-    }
-
     // 微信通道确认回复入口
     // ── POST /api/confirm —— 微信通道确认响应入口 ──
     // 功能说明: 微信 IM 消息通过此接口提交用户对权限/方案选择的确认结果
@@ -5205,6 +6843,7 @@ const httpServer = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/confirm') {
         const b = await readBody(req);
         const {sessionId: sid, requestId, decision, optionIndex, questionIndex} = b
+        const identity = getAdapterIdentity(req)
         const s = sessions.get(sid)
         const entry = s?.pending?.get(requestId)
         if (!entry) {
@@ -5212,10 +6851,18 @@ const httpServer = createServer(async (req, res) => {
             res.end(JSON.stringify({ok: false, reason: 'already_resolved'}));
             return
         }
+        const ownsRequest = !!identity && (entry.userId
+            ? entry.source === identity.source && entry.userId === identity.userId
+            : adapterOwnsSession(identity.source, identity.userId, sid))
+        if (!ownsRequest) {
+            res.writeHead(403)
+            res.end(JSON.stringify({error: 'confirmation ownership mismatch'}))
+            return
+        }
         const result = entry.type === 'choice'
             ? decisionToResult(entry, null, optionIndex, questionIndex)
             : decisionToResult(entry, decision)
-        settlePending(sid, requestId, result, 'wechat')
+        settlePending(sid, requestId, result, identity.source)
         res.writeHead(200);
         res.end(JSON.stringify({ok: true}));
         return
@@ -5244,8 +6891,7 @@ const httpServer = createServer(async (req, res) => {
                     const c = readFileSync(join(bp, ed, jls[0]), 'utf8');
                     const cm = c.match(/"cwd":\s*"([^"]+)"/);
                     if (cm) wd = cm[1].replace(/\\/g, '/')
-                } catch {
-                }
+                } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
                 ;rs.push({
                     workDir: wd,
                     encodedDir: ed,
@@ -5253,41 +6899,53 @@ const httpServer = createServer(async (req, res) => {
                     files: fl.map(f => ({filename: f, size: statSync(join(md, f)).size}))
                 })
             }
-        } catch {
-        }
+        } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
         ;rs.sort((a, b) => b.fileCount - a.fileCount);
         res.writeHead(200);
         res.end(JSON.stringify({projects: rs}));
         return
     }
-    // ── GET /api/balance —— 余额查询 ──
-    // 功能说明: 调用 DeepSeek API 查询账户余额（CNY），前端设置页展示
-    // 关键数据流: GET → fetch DeepSeek /user/balance → 200 {balance, currency}
+    // ── GET /api/balance —— 可选余额查询 ──
+    // 只有 DeepSeek 有稳定且已知的余额契约；其他供应商返回明确的降级状态，
+    // 不把第三方 token 误发到 DeepSeek 导致 401 和全局“服务处理失败”提示。
     if (req.method === 'GET' && url.pathname === '/api/balance') {
         try {
             const cliS = loadCliSettings();
-            const k = cliS.env?.ANTHROPIC_AUTH_TOKEN || cliS.env?.ANTHROPIC_API_KEY;
-            if (!k) {
-                res.writeHead(502);
-                res.end(JSON.stringify({error: 'API key not configured'}));
+            const provider = resolveBalanceProvider(cliS.env?.ANTHROPIC_BASE_URL)
+            const baseResponse = {
+                balance: 0,
+                currency: 'CNY',
+                used: 0,
+                supported: provider.supported,
+                provider: provider.id,
+            }
+            if (!provider.supported) {
+                res.writeHead(200);
+                res.end(JSON.stringify({...baseResponse, reason: provider.reason, message: provider.message}))
                 return
             }
-            ;const r = await fetch('https://api.deepseek.com/user/balance', {
+            const k = cliS.env?.ANTHROPIC_AUTH_TOKEN || cliS.env?.ANTHROPIC_API_KEY;
+            if (!k) {
+                res.writeHead(200);
+                res.end(JSON.stringify({...baseResponse, supported: false, reason: 'missing_credentials', message: '未配置 API Key'}));
+                return
+            }
+            const r = await fetch(provider.endpoint, {
                 headers: {Authorization: `Bearer ${k}`},
                 signal: AbortSignal.timeout(5000)
             });
             if (!r.ok) {
-                res.writeHead(502);
-                res.end(JSON.stringify({error: 'balance API returned ' + r.status}));
+                res.writeHead(200);
+                res.end(JSON.stringify({...baseResponse, supported: false, reason: r.status === 401 ? 'auth_failed' : 'upstream_error', message: `余额接口返回 HTTP ${r.status}`}));
                 return
             }
-            ;const d = await r.json();
-            const i = d.balance_infos?.[0] || {};
+            const d = await r.json();
             res.writeHead(200);
-            res.end(JSON.stringify({balance: parseFloat(i.total_balance || '0'), currency: i.currency || 'CNY'}))
-        } catch {
-            res.writeHead(502);
-            res.end(JSON.stringify({error: 'balance API unreachable'}))
+            res.end(JSON.stringify({...baseResponse, ...parseDeepSeekBalance(d)}))
+        } catch (error) {
+            log.debug({err: error}, '余额查询失败，已按可选能力降级')
+            res.writeHead(200);
+            res.end(JSON.stringify({balance: 0, currency: 'CNY', used: 0, supported: false, provider: 'unknown', reason: 'unreachable', message: '余额接口暂时不可用'}))
         }
         ;
         return
@@ -5298,6 +6956,11 @@ const httpServer = createServer(async (req, res) => {
     // 一次调用完成"查项目→查session"，返回 {ok, label, sessions}
     if (req.method === 'POST' && url.pathname === '/api/sessions-by-label') {
         const b = await readBody(req)
+        const identity = getAdapterIdentity(req)
+        const binding = identity ? readAdapterBindings()[`${identity.source}:${identity.userId}`] : null
+        if (!identity || !binding) {
+            res.writeHead(403); res.end(JSON.stringify({error: 'session ownership mismatch'})); return
+        }
         const label = (b.label || '').toLowerCase()
         if (!label) { res.writeHead(400); res.end(JSON.stringify({error: 'label required'})); return }
         const projects = await scanProjects()
@@ -5312,8 +6975,11 @@ const httpServer = createServer(async (req, res) => {
             })
         }
         if (!match) { res.writeHead(200); res.end(JSON.stringify({ok: true, label: b.label, sessions: []})); return }
-        const sessions = await listProjectSessions(match.encodedDir)
-        res.writeHead(200); res.end(JSON.stringify({ok: true, label: b.label, sessions: sessions.map(s => ({id: s.id, title: s.title}))})); return
+        const projectSessions = await listProjectSessions(match.encodedDir)
+        const ownedSession = focusedSessionId ? sessions.get(focusedSessionId) : null
+        const ownedId = ownedSession?.lastSessionId || binding.sessionId
+        const owned = projectSessions.filter(item => item.id === ownedId)
+        res.writeHead(200); res.end(JSON.stringify({ok: true, label: b.label, sessions: owned.map(s => ({id: s.id, title: s.title}))})); return
     }
 
     // ── GET /api/projects —— 扫描所有项目 ──
@@ -5321,31 +6987,78 @@ const httpServer = createServer(async (req, res) => {
     //   去重按 workDir 合并多 session 的同一项目
     // 关键数据流: GET → scanProjects() → 200 {projects: [{workDir, sessionCount, sessions, lastActive}]}
     if (req.method === 'GET' && url.pathname === '/api/projects') {
-        const projects = await scanProjects();
+        const identity = getAdapterIdentity(req)
+        const allProjects = await scanProjects();
+        let projects = allProjects
+        if (identity) {
+            const binding = readAdapterBindings()[`${identity.source}:${identity.userId}`]
+            if (!binding) {
+                res.writeHead(403); res.end(JSON.stringify({error: 'session ownership mismatch'})); return
+            }
+            projects = allProjects.filter(project => project.workDir === binding.workDir)
+        }
         res.writeHead(200);
         res.end(JSON.stringify({projects}));
         return
     }
     const psm = url.pathname.match(/^\/api\/projects\/([^/]+)\/sessions$/);
     if (req.method === 'GET' && psm) {
-        const sessions = await listProjectSessions(psm[1]);
+        const encodedDir = safeDecodeURIComponent(psm[1])
+        if (!encodedDir || basename(encodedDir) !== encodedDir) {
+            res.writeHead(400); res.end(JSON.stringify({error: 'invalid project'})); return
+        }
+        const identity = getAdapterIdentity(req)
+        if (identity && !adapterOwnsProject(identity, encodedDir)) {
+            res.writeHead(403); res.end(JSON.stringify({error: 'project ownership mismatch'})); return
+        }
+        const sessions = await listProjectSessions(encodedDir);
         res.writeHead(200);
         res.end(JSON.stringify({sessions}));
         return
     }
     const msm = url.pathname.match(/^\/api\/projects\/([^/]+)\/sessions\/([^/]+)\/messages$/);
     if (req.method === 'GET' && msm) {
-        const messages = await loadMessages(msm[1], msm[2]);
+        const identity = getAdapterIdentity(req)
+        if (identity && !adapterOwnsProject(identity, msm[1])) {
+            res.writeHead(403); res.end(JSON.stringify({error: 'project ownership mismatch'})); return
+        }
+        const location = findSessionTranscript({claudeHome: CLAUDE_HOME, encodedDir: msm[1], sessionId: msm[2]})
+        if (location.status === 'invalid') {
+            res.writeHead(400); res.end(JSON.stringify({error: 'invalid project or session'})); return
+        }
+        if (location.status === 'ambiguous') {
+            log.error({sessionId: msm[2].slice(0, 8), matches: location.matches}, '会话 transcript 目录存在歧义')
+            res.writeHead(409); res.end(JSON.stringify({error: '会话 transcript 目录存在歧义', code: 'HISTORY_LOCATION_AMBIGUOUS'})); return
+        }
+        if (location.status !== 'found') {
+            res.writeHead(404); res.end(JSON.stringify({error: '历史会话不存在', code: 'HISTORY_NOT_FOUND'})); return
+        }
+        if (identity && !adapterOwnsProject(identity, location.encodedDir)) {
+            res.writeHead(403); res.end(JSON.stringify({error: 'project ownership mismatch'})); return
+        }
+        let messages
+        try {
+            messages = parseSessionHistory(readFileSync(location.filePath, 'utf8'))
+        } catch (error) {
+            log.warn({err: error, sessionId: msm[2].slice(0, 8), encodedDir: location.encodedDir}, '读取会话历史失败')
+            res.writeHead(500); res.end(JSON.stringify({error: '历史会话读取失败', code: 'HISTORY_READ_FAILED'})); return
+        }
         res.writeHead(200);
-        res.end(JSON.stringify({messages}));
+        res.end(JSON.stringify({messages, encodedDir: location.encodedDir}));
         return
     }
 
     // ── GET /api/projects/:encodedDir/memory —— 读取项目所有 memory 文件 ──
     const projMemM = url.pathname.match(/^\/api\/projects\/([^/]+)\/memory$/);
     if (req.method === 'GET' && projMemM) {
-        const ed = projMemM[1];
-        const md = join(CLAUDE_HOME, 'projects', ed, 'memory');
+        const ed = safeDecodeURIComponent(projMemM[1]);
+        const projectDir = safeBasename(join(CLAUDE_HOME, 'projects'), ed)
+        const md = projectDir ? safeChildPath(projectDir, 'memory', {allowNested: false}) : null
+        if (!md) {
+            res.writeHead(400)
+            res.end(JSON.stringify({error: 'invalid project path'}))
+            return
+        }
         const files = [];
         try {
             if (existsSync(md)) {
@@ -5355,8 +7068,7 @@ const httpServer = createServer(async (req, res) => {
                     files.push({filename: f, content, size: Buffer.byteLength(content)});
                 }
             }
-        } catch {
-        }
+        } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
         res.writeHead(200);
         res.end(JSON.stringify({files}));
         return
@@ -5364,23 +7076,35 @@ const httpServer = createServer(async (req, res) => {
     // ── PUT/DELETE /api/projects/:encodedDir/memory/:filename —— 创建/编辑/删除 memory 文件 ──
     const projMemFileM = url.pathname.match(/^\/api\/projects\/([^/]+)\/memory\/([^/]+)$/);
     if (req.method === 'PUT' && projMemFileM) {
-        const ed = projMemFileM[1];
-        const fn = projMemFileM[2];
+        const ed = safeDecodeURIComponent(projMemFileM[1]);
+        const fn = safeDecodeURIComponent(projMemFileM[2]);
         const body = await readBody(req);
-        const md = join(CLAUDE_HOME, 'projects', ed, 'memory');
-        try { mkdirSync(md, {recursive: true}); } catch {
+        const projectDir = safeBasename(join(CLAUDE_HOME, 'projects'), ed)
+        const md = projectDir ? safeChildPath(projectDir, 'memory', {allowNested: false}) : null
+        const fp = md ? safeBasename(md, fn, {extensions: ['.md']}) : null
+        if (!md || !fp) {
+            res.writeHead(400)
+            res.end(JSON.stringify({error: 'invalid memory path'}))
+            return
         }
-        writeFileSync(join(md, fn), body.content || '', 'utf8');
+        try { mkdirSync(md, {recursive: true}); } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
+        writeFileSync(fp, body.content || '', 'utf8');
         res.writeHead(200);
         res.end(JSON.stringify({ok: true}));
         return
     }
     if (req.method === 'DELETE' && projMemFileM) {
-        const ed = projMemFileM[1];
-        const fn = projMemFileM[2];
-        const fp = join(CLAUDE_HOME, 'projects', ed, 'memory', fn);
-        try { unlinkSync(fp); } catch {
+        const ed = safeDecodeURIComponent(projMemFileM[1]);
+        const fn = safeDecodeURIComponent(projMemFileM[2]);
+        const projectDir = safeBasename(join(CLAUDE_HOME, 'projects'), ed)
+        const md = projectDir ? safeChildPath(projectDir, 'memory', {allowNested: false}) : null
+        const fp = md ? safeBasename(md, fn, {extensions: ['.md']}) : null
+        if (!fp) {
+            res.writeHead(400)
+            res.end(JSON.stringify({error: 'invalid memory path'}))
+            return
         }
+        try { unlinkSync(fp); } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
         res.writeHead(200);
         res.end(JSON.stringify({ok: true}));
         return
@@ -5409,13 +7133,18 @@ const httpServer = createServer(async (req, res) => {
     }
     const wfRunM = url.pathname.match(/^\/api\/workflows\/([^/]+)\/run$/)
     if (req.method === 'POST' && wfRunM) {
-        const name = decodeURIComponent(wfRunM[1])
+        const name = safeDecodeURIComponent(wfRunM[1])
         try {
             const body = await readBody(req);
             const sid = body.sessionId
             if (!sid || !sessions.has(sid)) {
                 res.writeHead(400);
                 res.end(JSON.stringify({error: 'sessionId 无效'}));
+                return
+            }
+            if (!getWorkflow(name)) {
+                res.writeHead(404);
+                res.end(JSON.stringify({error: 'Workflow 不存在'}));
                 return
             }
             const wfCfg = loadWfConfig()
@@ -5431,14 +7160,14 @@ const httpServer = createServer(async (req, res) => {
             res.writeHead(202);
             res.end(JSON.stringify({ok: true, name}))
         } catch (e) {
-            res.writeHead(500);
+            res.writeHead(e.code === 'WORKFLOW_ALREADY_RUNNING' ? 409 : 500);
             res.end(JSON.stringify({error: e.message}))
         }
         return
     }
     const wfStateM = url.pathname.match(/^\/api\/workflows\/([^/]+)\/state$/)
     if (req.method === 'GET' && wfStateM) {
-        const state = getRunState(decodeURIComponent(wfStateM[1]))
+        const state = getRunState(safeDecodeURIComponent(wfStateM[1]))
         res.writeHead(200);
         res.end(JSON.stringify(state || {status: 'not_run', logs: [], phases: []}))
         return
@@ -5446,7 +7175,7 @@ const httpServer = createServer(async (req, res) => {
     // POST /api/workflows/:name/stop → 暂停运行中的工作流
     const wfStopM = url.pathname.match(/^\/api\/workflows\/([^/]+)\/stop$/)
     if (req.method === 'POST' && wfStopM) {
-        const name = decodeURIComponent(wfStopM[1])
+        const name = safeDecodeURIComponent(wfStopM[1])
         const body = await readBody(req).catch(() => ({}))
         if (body.mode === 'commit') {
             try {
@@ -5467,13 +7196,18 @@ const httpServer = createServer(async (req, res) => {
     // POST /api/workflows/:name/resume → 恢复暂停的工作流
     const wfResumeM = url.pathname.match(/^\/api\/workflows\/([^/]+)\/resume$/)
     if (req.method === 'POST' && wfResumeM) {
-        const name = decodeURIComponent(wfResumeM[1])
+        const name = safeDecodeURIComponent(wfResumeM[1])
         try {
             const body = await readBody(req);
             const sid = body.sessionId
             if (!sid || !sessions.has(sid)) {
                 res.writeHead(400);
                 res.end(JSON.stringify({error: 'sessionId 无效'}));
+                return
+            }
+            if (!getWorkflow(name)) {
+                res.writeHead(404);
+                res.end(JSON.stringify({error: 'Workflow 不存在'}));
                 return
             }
             const wfCfg = loadWfConfig()
@@ -5491,7 +7225,7 @@ const httpServer = createServer(async (req, res) => {
             res.writeHead(202);
             res.end(JSON.stringify({ok: true, name, status: 'resumed'}))
         } catch (e) {
-            res.writeHead(500);
+            res.writeHead(e.code === 'WORKFLOW_ALREADY_RUNNING' ? 409 : 500);
             res.end(JSON.stringify({error: e.message}))
         }
         return
@@ -5499,8 +7233,8 @@ const httpServer = createServer(async (req, res) => {
     // POST /api/workflows/:name/agents/:label/stop → 单 agent 独立暂停
     const wfAgentStopM = url.pathname.match(/^\/api\/workflows\/([^/]+)\/agents\/([^/]+)\/stop$/)
     if (req.method === 'POST' && wfAgentStopM) {
-        const wfName = decodeURIComponent(wfAgentStopM[1])
-        const agentLabel = decodeURIComponent(wfAgentStopM[2])
+        const wfName = safeDecodeURIComponent(wfAgentStopM[1])
+        const agentLabel = safeDecodeURIComponent(wfAgentStopM[2])
         const state = getRunState(wfName)
         if (!state) { res.writeHead(404); res.end(JSON.stringify({error: 'workflow 未运行'})); return }
         const wfId = state.wfId
@@ -5512,8 +7246,8 @@ const httpServer = createServer(async (req, res) => {
     // POST /api/workflows/:name/agents/:label/resume → 单 agent 独立恢复
     const wfAgentResumeM = url.pathname.match(/^\/api\/workflows\/([^/]+)\/agents\/([^/]+)\/resume$/)
     if (req.method === 'POST' && wfAgentResumeM) {
-        const wfName = decodeURIComponent(wfAgentResumeM[1])
-        const agentLabel = decodeURIComponent(wfAgentResumeM[2])
+        const wfName = safeDecodeURIComponent(wfAgentResumeM[1])
+        const agentLabel = safeDecodeURIComponent(wfAgentResumeM[2])
         const state = getRunState(wfName)
         if (!state) { res.writeHead(404); res.end(JSON.stringify({error: 'workflow 未运行'})); return }
         const ok = resumeWorkflowAgent(state.wfId, agentLabel)
@@ -5523,7 +7257,7 @@ const httpServer = createServer(async (req, res) => {
     }
     const wfFileM = url.pathname.match(/^\/api\/workflows\/([^/]+)$/)
     if (wfFileM) {
-        const name = decodeURIComponent(wfFileM[1])
+        const name = safeDecodeURIComponent(wfFileM[1])
         if (req.method === 'GET') {
             const content = getWorkflow(name);
             const meta = content ? parseMeta(content) : null
@@ -5538,9 +7272,11 @@ const httpServer = createServer(async (req, res) => {
         }
         if (req.method === 'PUT') {
             const body = await readBody(req)
-            if (!body.content) {
-                res.writeHead(400);
-                res.end(JSON.stringify({error: 'content 不能为空'}));
+            try {
+                validateWorkflowContent(body.content)
+            } catch (error) {
+                res.writeHead(error?.code === 'WORKFLOW_SCRIPT_TOO_LARGE' ? 413 : 400)
+                res.end(JSON.stringify({error: error?.message || 'Workflow 内容无效'}))
                 return
             }
             // 安全校验：sessionId 有则验证，没有则要求至少一个活跃 session
@@ -5585,13 +7321,77 @@ const httpServer = createServer(async (req, res) => {
         res.writeHead(404);
         res.end(JSON.stringify({error: 'not found'}))
     }
+}
+
+const httpServer = createServer((req, res) => {
+    void handleHttpRequest(req, res).catch(error => {
+        log.error({err: error, method: req.method, url: String(req.url || '').slice(0, 512)}, 'HTTP 请求处理异常')
+        if (!res.headersSent) {
+            res.setHeader('Content-Type', 'application/json')
+            res.writeHead(500)
+            res.end(JSON.stringify({error: 'internal server error'}))
+            return
+        }
+        res.destroy(error)
+    })
 })
+httpServer.headersTimeout = 10_000
+httpServer.requestTimeout = 30_000
+httpServer.keepAliveTimeout = 5_000
+httpServer.maxRequestsPerSocket = 1_000
 
 // ---- WebSocket ----
 // 控制通道客户端池：独立于 session，用于接收 nudge 等全局事件
 const controlClients = new Set()
 
-const wss = new WebSocketServer({server: httpServer, maxPayload: 1048576})
+const wss = new WebSocketServer({noServer: true, maxPayload: 1048576})
+
+function rejectWebSocketUpgrade(socket, statusCode, reason) {
+    const text = String(reason || 'Forbidden').replace(/[\r\n]/g, ' ').slice(0, 100)
+    socket.write(`HTTP/1.1 ${statusCode} ${text}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`)
+    socket.destroy()
+}
+
+httpServer.on('upgrade', (req, socket, head) => {
+    if (typeof req.url !== 'string' || req.url.length > 4096) {
+        rejectWebSocketUpgrade(socket, 414, 'URI Too Long')
+        return
+    }
+    let parsed
+    try {
+        parsed = new URL(req.url, `ws://127.0.0.1:${PORT}`)
+    } catch {
+        rejectWebSocketUpgrade(socket, 400, 'Bad Request')
+        return
+    }
+    if (!/^\/ws\/(control\/?|[^/]+)$/.test(parsed.pathname)) {
+        rejectWebSocketUpgrade(socket, 404, 'Not Found')
+        return
+    }
+    const auth = authenticateBridgeToken(extractWebSocketToken(req))
+    if (!auth) {
+        rejectWebSocketUpgrade(socket, 401, 'Unauthorized')
+        return
+    }
+    const source = parsed.searchParams.get('source') || 'desktop'
+    const userId = req.headers['x-bridge-user-id']
+    if (auth.kind === 'adapter') {
+        if (source !== auth.platform || req.headers['x-bridge-source'] !== auth.platform || typeof userId !== 'string'
+            || !userId || userId.length > 512 || /[\0\r\n]/.test(userId)) {
+            rejectWebSocketUpgrade(socket, 403, 'Forbidden')
+            return
+        }
+        if (parsed.pathname === '/ws/control' || parsed.pathname === '/ws/control/') {
+            rejectWebSocketUpgrade(socket, 403, 'Forbidden')
+            return
+        }
+    } else if (IM_SOURCES.has(source)) {
+        rejectWebSocketUpgrade(socket, 403, 'Forbidden')
+        return
+    }
+    req.bridgeWsAuth = auth
+    wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req))
+})
 // WS 心跳: 每 30s ping 一次，60s 无 pong 则断开死连接
 const WS_PING_INTERVAL = 30_000
 const WS_PING_TIMEOUT = 60_000
@@ -5617,18 +7417,8 @@ const wsPingTimer = setInterval(() => {
 }, WS_PING_INTERVAL)
 wsPingTimer.unref()
 wss.on('connection', (ws, req) => {
-    // WebSocket 认证: 检查 upgrade 请求中的 bridge-token（兼容 header 和 query param）
-    const wsToken = req.headers['x-bridge-token'] || (() => {
-        const qm = (req.url || '').indexOf('?')
-        if (qm < 0) return null
-        const q = (req.url || '').slice(qm + 1)
-        for (const p of q.split('&')) {
-            const [k, v] = p.split('=')
-            if (k === 'token') return decodeURIComponent(v || '')
-        }
-        return null
-    })()
-    if (wsToken !== BRIDGE_TOKEN) {
+    const wsAuth = req.bridgeWsAuth
+    if (!wsAuth) {
         ws.close(4003, JSON.stringify({error: 'forbidden: missing or invalid bridge token'}))
         return
     }
@@ -5640,10 +7430,18 @@ wss.on('connection', (ws, req) => {
     const params = {};
     for (const p of qPart.split('&')) {
         const [k, v] = p.split('=');
-        if (k) params[decodeURIComponent(k)] = decodeURIComponent(v || '')
+        if (k) params[safeDecodeURIComponent(k)] = safeDecodeURIComponent(v || '')
+    }
+    if (wsAuth.kind === 'adapter' && params.source !== wsAuth.platform) {
+        ws.close(4003, JSON.stringify({error: 'adapter source mismatch'}))
+        return
     }
     // 控制通道：不绑定 session，桌面端启动即连，用于接收 nudge 事件
     if (pathPart === '/ws/control' || pathPart === '/ws/control/') {
+        if (wsAuth.kind !== 'desktop') {
+            ws.close(4003, JSON.stringify({error: 'adapter control channel not allowed'}))
+            return
+        }
         ws._source = 'desktop'
         controlClients.add(ws)
         ws._lastPong = Date.now()
@@ -5656,11 +7454,27 @@ wss.on('connection', (ws, req) => {
         ws.close(4000, JSON.stringify({error: 'unknown session'}));
         return
     }
+    const source = params.source || 'desktop'
+    if (IM_SOURCES.has(source)) {
+        const userId = req.headers['x-bridge-user-id']
+        if (wsAuth.kind !== 'adapter' || typeof userId !== 'string' || !adapterOwnsSession(source, userId, sessionId)) {
+            ws.close(4003, JSON.stringify({error: 'session ownership mismatch'}))
+            return
+        }
+        ws._adapterUserId = userId
+    }
     const s = sessions.get(sessionId);
     s.clients.add(ws)
-    ws._source = params.source || 'desktop'
+    ws._source = source
     if (params.source === 'desktop') focusedSessionId = sessionId
-    ws.send(JSON.stringify({type: 'connected', sessionId}))
+    ws.send(JSON.stringify({
+        type: 'connected',
+        sessionId,
+        mirrorEnabled: IM_SOURCES.has(source) ? !!s.mirrors?.[source] : false,
+    }))
+    if (params.source === 'desktop') {
+        ws.send(JSON.stringify({type: 'session_state_snapshot', ...getSessionRuntimeState(s), taskState: taskStateForClient(s.taskState)}))
+    }
     // 切换 tab 重连时发送当前 workflow/agent 运行态快照，供前端恢复 agent 面板
     if (params.source === 'desktop') {
         try {
@@ -5668,7 +7482,9 @@ wss.on('connection', (ws, req) => {
             if (wfState) {
                 ws.send(JSON.stringify({type: 'workflow_state_snapshot', ...wfState}))
             }
-        } catch {}
+        } catch (error) {
+            log.debug({err: error, sessionId: sessionId?.slice(0, 8)}, '发送工作流状态快照失败')
+        }
     }
     log.info({
         sessionId: sessionId?.slice(0, 8),
@@ -5676,7 +7492,9 @@ wss.on('connection', (ws, req) => {
         clients: s.clients.size
     }, 'WS 已连接')
 
-    ws.on('message', async (raw) => {
+    ws.on('message', (raw) => {
+        let acceptedInput = null
+        void (async () => {
         let msg;
         try {
             msg = JSON.parse(raw.toString())
@@ -5684,36 +7502,17 @@ wss.on('connection', (ws, req) => {
             return
         }
         if (msg.type === 'stop_generation') {
-            // 中止前先 reject 所有挂起的确认请求
-            for (const id of [...(s.pending?.keys() || [])]) settlePending(sessionId, id, {
-                behavior: 'deny',
-                message: '已取消',
-                interrupt: true
-            }, 'stopped')
-            // 懒重建: 只中止当前 query，下条消息来了再 spawn 新进程（避免 abort signal 冲突导致 ENOENT）
-            try {
-                s.pushStream?.close();
-                s.query?.return?.()
-            } catch {
-            }
-            s.query = null;
-            s.pushStream = null;
-            // 中止前结算记录点：preSnapshot 已就绪时立即 diff，不漏掉本轮已完成的文件修改
-            try { finalizeCheckpoint(sessionId) } catch {}
-            s.pendingTurn = null  // 清理未完成的回合快照，防止内存泄漏 + finalizeCheckpoint 误判
-            // 清理并发 rebuild 状态: 防止 rebuild finally 块把刚清掉的 pushStream 重新写入
-            // 注: 清 _pendingMessages 符合 stop=取消 语义；同时失效 _rebuildId 让在途旧 rebuild
-            //   finally 看到代际不匹配，不再触碰 pending（防旧 rebuild 覆盖此后新 rebuild 的状态）
-            s._rebuildPromise = null
-            s._rebuildId = null
-            s._pendingMessages = null
-            s.lastSessionId = s.lastSessionId || sessionId
-            ws.send(JSON.stringify({type: 'generation_stopped'}))
+            await stopSessionGeneration(sessionId, s)
             return
         }
         // 即时权限切换: 更新 session 并自动通过所有 pending 权限请求
         if (msg.type === 'setting_change') {
+            if (IM_SOURCES.has(ws._source)) return
             const newPerm = msg.permissionMode
+            if (!VALID_PERMISSION_MODES.has(newPerm)) {
+                ws.send(JSON.stringify({type: 'setting_rejected', code: 'invalid_permission_mode'}))
+                return
+            }
             if (newPerm && newPerm !== s.permissionMode) {
                 s.permissionMode = newPerm
                 log.info({sessionId: sessionId?.slice(0,8), permissionMode: newPerm}, 'permissionMode 变更 (即时)')
@@ -5738,17 +7537,24 @@ wss.on('connection', (ws, req) => {
             if (entry) settlePending(sessionId, msg.requestId, decisionToResult(entry, null, msg.optionIndex, msg.questionIndex, msg.customText), 'desktop')
             return
         }
-        if (msg.type === 'user_message' && msg.content) {
-            // 每轮消息前从 settings.json 刷新 process.env，确保设置页切换厂商后即时生效
+        if (msg.type === 'user_message') {
+            // 停止流程会清空旧一代 pending；新输入必须等它完成后再进入下一代。
+            if (s._stopPromise) await s._stopPromise
+            const desktopInput = !IM_SOURCES.has(ws._source)
+            if (typeof msg.content !== 'string' || !msg.content.trim() || Buffer.byteLength(msg.content, 'utf8') > 900_000
+                || (desktopInput && msg.permissionMode !== undefined && !VALID_PERMISSION_MODES.has(msg.permissionMode))
+                || (desktopInput && msg.thinkingLevel !== undefined && !VALID_THINKING_LEVELS.has(msg.thinkingLevel))
+                || (desktopInput && msg.model !== undefined && (typeof msg.model !== 'string' || msg.model.length > 256))) {
+                ws.send(JSON.stringify({type: 'message_rejected', messageId: String(msg.messageId || ''), code: 'invalid_input'}))
+                return
+            }
+            // 每轮消息前从 settings.json 刷新当前 session 的 runtimeEnv，确保设置页切换厂商后即时生效
             // 不需要新建 session，也不需要依赖前端传 baseUrl/apiKey
             (() => {
                 const fresh = loadCliSettings()
                 const key = fresh.env?.ANTHROPIC_AUTH_TOKEN || fresh.env?.ANTHROPIC_API_KEY || ''
                 const url = fresh.env?.ANTHROPIC_BASE_URL || ''
                 const mdl = fresh.model || ''
-                if (key) { process.env.ANTHROPIC_API_KEY = key; process.env.ANTHROPIC_AUTH_TOKEN = key }
-                if (url) process.env.ANTHROPIC_BASE_URL = url
-                if (mdl) process.env.ANTHROPIC_MODEL = mdl
                 // provider 变更检测: 比较当前 session runtimeEnv 与最新 settings
                 const prevUrl = s.runtimeEnv?.ANTHROPIC_BASE_URL || ''
                 const prevKey = s.runtimeEnv?.ANTHROPIC_AUTH_TOKEN || ''
@@ -5761,34 +7567,60 @@ wss.on('connection', (ws, req) => {
                     log.info({sessionId: sessionId?.slice(0,8), baseUrl: url?.slice(0,40)}, '厂商配置变更，将重建 query')
                 }
             })()
+            const inputAccepted = acceptSessionInput(s, ws._source, msg.messageId, ws._adapterUserId || null)
+            if (!inputAccepted.ok) {
+                ws.send(JSON.stringify(inputAccepted.duplicate
+                    ? {type: 'message_duplicate', messageId: inputAccepted.messageId}
+                    : {type: 'message_rejected', code: inputAccepted.error, queuePosition: inputAccepted.queuePosition || 0}))
+                return
+            }
+            acceptedInput = inputAccepted
+            ws.send(JSON.stringify({
+                type: 'message_accepted',
+                messageId: inputAccepted.messageId,
+                turnId: inputAccepted.turnId,
+                queuePosition: inputAccepted.queuePosition,
+            }))
+            updateTaskState(s, sessionId, {
+                status: 'running',
+                outcome: null,
+                continuationReason: null,
+                resumable: Boolean(s.lastSessionId),
+                sdkSessionId: s.lastSessionId,
+                historySessionId: s.lastSessionId,
+            })
             log.info({
                 sessionId: sessionId?.slice(0, 8),
                 source: ws._source,
-                text: msg.content?.slice(0, 80)
+                textLength: msg.content?.length || 0
             }, '← 用户消息')
             // IM 平台注入时，把消息 echo 给桌面端，让 desktop 窗口能看到
-            const imSources = ['wechat', 'feishu', 'dingtalk']
-            if (imSources.includes(ws._source)) broadcast(sessionId, {
+            if (IM_SOURCES.has(ws._source)) broadcastDesktop(sessionId, {
                 type: 'remote_user_message',
                 source: ws._source,
                 content: msg.content
             })
             // 记录本轮来源（desktop / wechat / feishu / dingtalk）+ 清空本轮回复累积/工具计数
-            s.lastTurnSource = ws._source
-            s.turnText = ''
-            s.turnToolCount = 0
+            s._pendingSources = s._pendingSources || []
+            s._pendingSources.push(ws._source)
             // 回合开始：拍「修改前」快照，本轮 result 时结算为记录点
-            const srcLabel = imSources.includes(ws._source) ? `[${ws._source}] ` : ''
-            beginTurn(sessionId, srcLabel + msg.content)
+            const srcLabel = IM_SOURCES.has(ws._source) ? `[${ws._source}] ` : ''
+            // 意图和 Skill 路由在下方完成后再开始记录本轮。
             // 检测权限/思考/模型设置是否变更，若变更则更新 session 并重建 query
-            const newPerm = msg.permissionMode
+            const newPerm = IM_SOURCES.has(ws._source) ? 'default' : msg.permissionMode
             const newThink = msg.thinkingLevel
             const newModel = msg.model
             const newMM = msg.modelMeta
+            const nextProfile = nextContextProfile(s.contextProfile || 'full', msg.content)
             const permChanged = newPerm && newPerm !== s.permissionMode
             const thinkChanged = newThink && newThink !== s.thinkingLevel
             const modelChanged = newModel && newModel !== s.queryOpts?.model
-            if (permChanged || thinkChanged || modelChanged) {
+            const contextChanged = nextProfile !== (s.contextProfile || 'full')
+            const sdkInputContent = resolveSdkInputContent(sessionId, s, msg.content)
+            const nextSkillRoute = routeSkills({text: sdkInputContent, workDir: s.workDir, profile: nextProfile})
+            const skillRouteChanged = JSON.stringify(nextSkillRoute) !== JSON.stringify(s.skillRoute || [])
+            beginTurn(sessionId, srcLabel + msg.content)
+            if (permChanged || thinkChanged || modelChanged || contextChanged || skillRouteChanged) {
                 if (permChanged) {
                     s.permissionMode = newPerm;
                     log.info({sessionId: sessionId?.slice(0, 8), permissionMode: newPerm}, 'permissionMode 变更')
@@ -5802,11 +7634,15 @@ wss.on('connection', (ws, req) => {
                     if (newMM) s.modelMeta = newMM;
                     log.info({sessionId: sessionId?.slice(0, 8), model: newModel}, 'model 变更')
                 }
-                try {
-                    s.pushStream?.close();
-                    s.query?.return?.()
-                } catch {
+                if (contextChanged) {
+                    s.contextProfile = nextProfile
+                    log.info({sessionId: sessionId?.slice(0, 8), contextProfile: nextProfile}, '上下文 profile 已更新')
                 }
+                if (skillRouteChanged) {
+                    s.skillRoute = nextSkillRoute
+                    log.info({sessionId: sessionId?.slice(0, 8), skills: nextSkillRoute}, 'Skill 路由已更新')
+                }
+                await closeSessionRuntime(s, {sessionId, reason: 'runtime_settings_changed'})
                 s.query = null;
                 s.pushStream = null;
                 // 失效重建状态: 若 _rebuildPromise 残留，后续消息进 if(s._rebuildPromise)
@@ -5822,73 +7658,78 @@ wss.on('connection', (ws, req) => {
                 // 防并发重建：不同 WS 连接可能同时进入此处，用 _rebuildPromise 互斥
                 if (s._rebuildPromise) {
                     if (!s._pendingMessages) s._pendingMessages = []
-                    s._pendingMessages.push(msg.content)
+                    s._pendingMessages.push(sdkInputContent)
                     if (!msg._noWorkflow) autoTriggerWorkflow(sessionId, msg.content).catch(e => {
                         log.warn({err: e, sessionId: sessionId?.slice(0, 8)}, 'autoTriggerWorkflow 异常')
                     })
+                    acceptedInput = null
                     return
                 }
-                s._pendingMessages = [msg.content]
+                s._pendingMessages = [sdkInputContent]
                 // rebuild 代际 ID: stop_generation 或新 rebuild 启动时旧 rebuild 的 finally
                 //   见此 ID 不匹配 → 不消费 pending（防止旧 rebuild 覆盖新 rebuild 的积压）
                 const myRebuildId = Symbol('rebuild')
                 s._rebuildId = myRebuildId
                 s._rebuildPromise = (async () => {
-                    try {
-                        const cliS = loadCliSettings()
-                        s.pushStream = new PushStream()
-                        const bodyOverride = {
-                            resume: s.lastSessionId || undefined,
-                            model: s.queryOpts?.model,
-                            permissionMode: s.permissionMode,
-                            thinkingLevel: s.thinkingLevel
-                        }
-                        // 厂商变更检测: session runtimeEnv 已刷新，携带最新 baseUrl/apiKey 避免回退到 cliS.env
-                        if (s.runtimeEnv?.ANTHROPIC_BASE_URL) bodyOverride.baseUrl = s.runtimeEnv.ANTHROPIC_BASE_URL
-                        if (s.runtimeEnv?.ANTHROPIC_AUTH_TOKEN) bodyOverride.apiKey = s.runtimeEnv.ANTHROPIC_AUTH_TOKEN
-                        const opts = await makeQueryOptions(bodyOverride, s.workDir, cliS, {}, sessionId)
-                        if (bodyOverride.resume) opts.resume = bodyOverride.resume
-                        s.query = query({prompt: s.pushStream, options: opts})
-                        s.runtimeEnv = opts.runtimeEnv  // 模型变更重建后刷新 runtimeEnv
-                        startStreamPump(sessionId)
-                    } finally {
-                        // CAS 守护: 仅当本 rebuild 仍是当前代际时才消费/清理 pending
-                        // 若 stop 或新 rebuild 已把 _rebuildId 换掉，说明本 rebuild 已作废，
-                        //   pending 属于新代际，本旧 rebuild 不应触碰
-                        const isCurrent = s._rebuildId === myRebuildId
-                        const pending = isCurrent ? (s._pendingMessages || []) : []
-                        if (isCurrent) {
-                            s._pendingMessages = null
-                            s._rebuildPromise = null
-                            s._rebuildId = null
-                        }
-                        // 重建完成后处理积压消息：先置 null 再消费，避免新消息写入旧数组
-                        // 守护 pushStream: stop_generation 可能并发清空了 s.pushStream
-                        if (s.query && s.pushStream && pending.length) {
-                            for (const content of pending) {
-                                s.pushStream.push({
-                                    type: 'user', session_id: sessionId,
-                                    message: {role: 'user', content: [{type: 'text', text: content}]},
-                                    parent_tool_use_id: null
-                                })
-                            }
-                        }
+                    const cliS = loadCliSettings()
+                    const rebuildPushStream = new PushStream()
+                    s.pushStream = rebuildPushStream
+                    const bodyOverride = {
+                        resume: s.hasUserTurns ? (s.lastSessionId || undefined) : undefined,
+                        model: s.queryOpts?.model,
+                        permissionMode: s.permissionMode,
+                        thinkingLevel: s.thinkingLevel,
+                        contextProfile: s.contextProfile || 'full',
+                        skillRoute: s.skillRoute || [],
                     }
+                    // 厂商变更检测: session runtimeEnv 已刷新，携带最新 baseUrl/apiKey 避免回退到 cliS.env
+                    if (s.runtimeEnv?.ANTHROPIC_BASE_URL) bodyOverride.baseUrl = s.runtimeEnv.ANTHROPIC_BASE_URL
+                    if (s.runtimeEnv?.ANTHROPIC_AUTH_TOKEN) bodyOverride.apiKey = s.runtimeEnv.ANTHROPIC_AUTH_TOKEN
+                    const opts = await makeQueryOptions(bodyOverride, s.workDir, cliS, {}, sessionId)
+                    // stop 或更新的 rebuild 已使本代际失效，禁止重新创建后台 query。
+                    if (s._rebuildId !== myRebuildId || s.pushStream !== rebuildPushStream) return
+                    if (bodyOverride.resume) opts.resume = bodyOverride.resume
+                    s.query = query({prompt: rebuildPushStream, options: opts})
+                    s.runtimeEnv = opts.runtimeEnv  // 模型变更重建后刷新 runtimeEnv
+                    s.queryOpts = opts
+                    startStreamPump(sessionId)
+
+                    const pending = s._pendingMessages || []
+                    s._pendingMessages = null
+                    for (const content of pending) {
+                        rebuildPushStream.push({
+                            type: 'user', session_id: sessionId,
+                            message: {role: 'user', content: [{type: 'text', text: content}]},
+                            parent_tool_use_id: null
+                        })
+                        s.hasUserTurns = true
+                    }
+                    s._rebuildPromise = null
+                    s._rebuildId = null
                 })().catch(e => {
+                    if (s._rebuildId !== myRebuildId) {
+                        log.debug({err: e, sessionId: sessionId?.slice(0, 8)}, '已过期 rebuild 失败，忽略其状态清理')
+                        return
+                    }
                     log.error({err: e, sessionId: sessionId?.slice(0, 8)}, 'rebuild 失败')
                     s._rebuildPromise = null
+                    s._rebuildId = null
                     s._pendingMessages = null
+                    failPendingSessionInputs(sessionId, s, e)
                 })
                 if (!msg._noWorkflow) autoTriggerWorkflow(sessionId, msg.content).catch(e => {
                     log.warn({err: e, sessionId: sessionId?.slice(0, 8)}, 'autoTriggerWorkflow 异常')
                 })
+                acceptedInput = null
             } else {
                 s.pushStream.push({
                     type: 'user',
                     session_id: sessionId,
-                    message: {role: 'user', content: [{type: 'text', text: msg.content}]},
+                        message: {role: 'user', content: [{type: 'text', text: sdkInputContent}]},
                     parent_tool_use_id: null
                 })
+                s.hasUserTurns = true
+                acceptedInput = null
                 if (!msg._noWorkflow) {
                     autoTriggerWorkflow(sessionId, msg.content).catch(e => {
                         log.warn({err: e, sessionId: sessionId?.slice(0, 8)}, 'autoTriggerWorkflow 异常')
@@ -5896,6 +7737,20 @@ wss.on('connection', (ws, req) => {
                 }
             }
         }
+        })().catch(error => {
+            if (acceptedInput && rollbackSessionInput(s, acceptedInput)) {
+                const sourceIndex = s._pendingSources?.lastIndexOf(ws._source) ?? -1
+                if (sourceIndex >= 0) s._pendingSources.splice(sourceIndex, 1)
+            }
+            log.error({err: error, sessionId: sessionId?.slice(0, 8), source: ws._source}, 'WebSocket 消息处理异常')
+            if (ws.readyState === 1) {
+                try {
+                    ws.send(JSON.stringify({type: 'error', code: 'message_handler_failed', message: '消息处理失败，请稍后重试'}))
+                } catch (sendError) {
+                    log.debug({err: sendError, sessionId: sessionId?.slice(0, 8)}, 'WebSocket 错误响应发送失败')
+                }
+            }
+        })
     })
 
     // 注册 pong 处理器更新心跳时间戳（仅 session 连接）
@@ -5909,69 +7764,159 @@ wss.on('connection', (ws, req) => {
 })
 
 // ---- Start ----
-process.on('uncaughtException', (e) => {
-    log.fatal({err: e}, 'uncaughtException')
-})
-process.on('unhandledRejection', (reason) => {
-    log.error({err: reason}, 'unhandledRejection')
-})
-
-// 启动前杀死占用端口的旧进程（上次非正常退出残留）
-try {
-    const portNum = parseInt(PORT, 10)
-    if (isNaN(portNum) || portNum < 1 || portNum > 65535) {
-        log.warn({PORT}, '端口号非法，跳过旧进程清理')
-    } else if (process.platform === 'win32') {
-        const o = execSync(`netstat -ano | findstr :${portNum}`, {encoding: 'utf8', timeout: 3000})
-        const seen = new Set()
-        for (const m of o.matchAll(/\d+\s*$/gm)) {
-            const pid = m[0].trim()
-            if (seen.has(pid) || pid === String(process.pid)) continue
-            seen.add(pid)
-            try {
-                execSync(`taskkill /PID ${pid} /F`, {timeout: 3000, windowsHide: true})
-            } catch {
-            }
-        }
-    } else if (process.platform === 'darwin') {
-        // macOS 没有 fuser，用 lsof 查找占用端口的进程
-        try {
-            execSync(`lsof -ti :${portNum} | xargs kill -9`, {timeout: 3000})
-        } catch {
-        }
-    } else {
-        try {
-            execSync(`fuser -k ${portNum}/tcp`, {timeout: 3000})
-        } catch {
+let shuttingDown = false
+async function shutdownGateway(reason, exitCode = 0) {
+    if (shuttingDown) return
+    shuttingDown = true
+    log.info({reason}, 'Gateway 开始关闭')
+    const closers = []
+    for (const platform of ADAPTER_PLATFORMS) stopAdapter(platform)
+    for (const taskId of [...cronJobs.keys()]) destroyScheduledJob(taskId)
+    for (const taskId of [...scheduledRuns.keys()]) finishScheduledRun(taskId)
+    clearInterval(wsPingTimer)
+    for (const ws of wss.clients) {
+        try { ws.close(1001, 'gateway shutting down') } catch (error) {
+            log.debug({err: error}, '关闭 WebSocket 失败')
         }
     }
-} catch {
+    for (const [sessionId, session] of sessions) {
+        for (const requestId of [...(session.pending?.keys() || [])]) {
+            settlePending(sessionId, requestId, {behavior: 'deny', message: 'Gateway 正在关闭', interrupt: true}, 'shutdown')
+        }
+        try { session.pushStream?.close() } catch (error) {
+            log.debug({err: error, sessionId: sessionId?.slice(0, 8)}, '关闭 Session 输入流失败')
+        }
+        try {
+            const closing = session.query?.return?.()
+            if (closing && typeof closing.then === 'function') closers.push(closing)
+        } catch (error) {
+            log.debug({err: error, sessionId: sessionId?.slice(0, 8)}, '关闭 Session query 失败')
+        }
+    }
+    try {
+        const closing = stopDeepSeekProxy()
+        if (closing && typeof closing.then === 'function') closers.push(closing)
+    } catch (error) {
+        log.debug({err: error}, '关闭 DeepSeek proxy 失败')
+    }
+    try { stopOpenCodeProxy() } catch (error) { log.debug({err: error}, '关闭 OpenCode proxy 失败') }
+    try {
+        const closing = stopCodexRelayProxy()
+        if (closing && typeof closing.then === 'function') closers.push(closing)
+    } catch (error) { log.debug({err: error}, '关闭 Codex Relay proxy 失败') }
+    const serverClosed = new Promise(resolve => {
+        if (!httpServer.listening) { resolve(); return }
+        httpServer.close(() => resolve())
+    })
+    await Promise.race([
+        Promise.allSettled([...closers, serverClosed]),
+        new Promise(resolve => setTimeout(resolve, 2200)),
+    ])
+    log.info({reason}, 'Gateway 已关闭')
+    process.exit(exitCode)
 }
-// Hook 脚本存在性校验 —— 剔除 settings.json 中脚本缺失的 hooks，防止 CLI ZodError
-validateHooks()
-// Caveman skill 安装（首次/升级后自动写入 ~/.claude/skills/caveman/SKILL.md）
-ensureCavemanSkill()
-// Caveman 版本检查（每次启动检测 GitHub 是否有新版本）
-checkCavemanUpdate().catch(e => log.warn({err: e}, 'Caveman 版本检查异常'))
-// RTK 版本检查（每次启动检测 GitHub 是否有新版本）
-checkRtkUpdate().catch(e => log.warn({err: e}, 'RTK 版本检查异常'))
-// 注册所有 IM 适配器 hooks（在 server listen 之前注册，确保首批请求即可用 mirror/确认功能）
-;[
-    {fn: startWeChatAdapter, platform: 'wechat'},
-    {fn: startFeishuAdapter, platform: 'feishu'},
-    {fn: startDingTalkAdapter, platform: 'dingtalk'},
-].forEach(({fn, platform}) => {
-    const hooks = fn(BRIDGE_TOKEN)
-    if (hooks) confirmHooks.push({...hooks, platform})
+
+function requestGatewayShutdown(reason, exitCode = 0) {
+    shutdownGateway(reason, exitCode).catch(error => {
+        log.fatal({err: error, reason}, 'Gateway 关闭失败')
+        process.exit(exitCode || 1)
+    })
+}
+
+process.on('uncaughtException', (e) => {
+    log.fatal({err: e}, 'uncaughtException')
+    requestGatewayShutdown('uncaughtException', 1)
 })
-httpServer.listen(PORT, '127.0.0.1', () => {
-    log.info({port: PORT}, `Gateway 已启动`)
-    resumeScheduledTasks()
-    // 启动时清理上次崩溃残留的幽灵 session 目录
-    cleanupOrphanSessionDirs()
-    // 启动时预热 DeepSeek 代理端口，供 settings.json ANTHROPIC_BASE_URL 引用
-    startDeepSeekProxy('https://api.deepseek.com/anthropic').catch(e => log.warn({err: e}, 'proxy boot 启动失败'))
-    startOpenCodeProxy().catch(e => log.warn({err: e}, 'opencode proxy boot 启动失败'))
+process.on('unhandledRejection', (reason) => {
+    log.fatal({err: reason}, 'unhandledRejection')
+    requestGatewayShutdown('unhandledRejection', 1)
+})
+process.once('SIGINT', () => requestGatewayShutdown('SIGINT'))
+process.once('SIGTERM', () => requestGatewayShutdown('SIGTERM'))
+process.on('message', message => {
+    if (message?.type === 'shutdown') requestGatewayShutdown('ipc')
+})
+
+async function initializeSecurePayloadKey() {
+    const environmentKey = process.env.BRIDGE_SECURE_PAYLOAD_KEY
+    if (environmentKey) {
+        try {
+            configureSecurePayloadMasterKey(environmentKey)
+            delete process.env.BRIDGE_SECURE_PAYLOAD_KEY
+            return true
+        } catch (error) {
+            delete process.env.BRIDGE_SECURE_PAYLOAD_KEY
+            log.error({err: error}, '环境变量中的安全存储密钥无效')
+            return false
+        }
+    }
+    if (typeof process.send !== 'function') return false
+    return new Promise(resolve => {
+        let settled = false
+        const finish = configured => {
+            if (settled) return
+            settled = true
+            clearTimeout(timer)
+            process.off('message', onMessage)
+            resolve(configured)
+        }
+        const onMessage = message => {
+            if (message?.type !== 'bridge:init') return
+            try {
+                configureSecurePayloadMasterKey(message.securePayloadKey)
+                finish(true)
+            } catch (error) {
+                log.error({err: error}, 'Electron 注入的安全存储密钥无效')
+                finish(false)
+            }
+        }
+        const timer = setTimeout(() => finish(false), 5000)
+        timer.unref?.()
+        process.on('message', onMessage)
+        process.send({type: 'bridge:init-request'})
+    })
+}
+
+async function bootGateway() {
+    const injected = await initializeSecurePayloadKey()
+    if (typeof process.send === 'function' && !injected) {
+        log.warn('未收到 Electron 安全存储密钥，将使用受限权限本地密钥')
+    }
+    try {
+        migrateAdapterCredentials()
+    } catch (error) {
+        adapterConfigReadError = String(error?.message || error)
+        log.error({err: error}, 'IM 凭据加密迁移失败，适配器将保持停止')
+    }
+    // Hook 启动检查只读，不修改用户全局配置。
+    validateHooks()
+    httpServer.on('error', error => {
+        log.fatal({err: error, port: PORT}, 'Gateway 监听失败')
+        requestGatewayShutdown('listen_error', 1)
+    })
+    httpServer.listen(PORT, '127.0.0.1', () => {
+        try {
+            persistBridgeToken()
+        } catch (error) {
+            log.fatal({err: error, path: BRIDGE_TOKEN_PATH}, 'Gateway token 写入失败，无法安全启动')
+            requestGatewayShutdown('token_persist_failed', 1)
+            return
+        }
+        for (const platform of ADAPTER_PLATFORMS) startAdapter(platform)
+        log.info({port: PORT}, `Gateway 已启动`)
+        // 版本检查在端口绑定成功后执行，避免启动失败时仍产生外部网络请求。
+        checkCavemanUpdate().catch(e => log.warn({err: e}, 'Caveman 版本检查异常'))
+        checkRtkUpdate().catch(e => log.warn({err: e}, 'RTK 版本检查异常'))
+        resumeScheduledTasks()
+        cleanupOrphanSessionDirs()
+        startDeepSeekProxy('https://api.deepseek.com/anthropic').catch(e => log.warn({err: e}, 'proxy boot 启动失败'))
+        startOpenCodeProxy().catch(e => log.warn({err: e}, 'opencode proxy boot 启动失败'))
+    })
+}
+
+bootGateway().catch(error => {
+    log.fatal({err: error}, 'Gateway 启动失败')
+    requestGatewayShutdown('boot_failed', 1)
 })
 
 // 只读文件头 N 字节，按行切分，丢弃可能截断的最后一行
@@ -6000,7 +7945,7 @@ function cleanupOrphanSessionDirs() {
                 if (!statSync(projectDir).isDirectory()) continue
                 for (const entry of readdirSync(projectDir)) {
                     if (entry.endsWith('.jsonl') || entry.startsWith('.trash-') || entry === 'bridge-session-map.json'
-                        || entry === 'bridge-snapshot' || entry === 'bridge-checkpoints'
+                        || entry === 'bridge-snapshot' || entry === 'bridge-checkpoints' || entry === 'bridge-task-state'
                         || entry === 'bridge-deleted-sessions.json' || entry === 'bridge-scheduled-tasks.json'
                         || entry === 'bridge-workflow-history.jsonl' || entry === 'bridge-config.json') continue
                     const entryPath = join(projectDir, entry)
@@ -6012,14 +7957,24 @@ function cleanupOrphanSessionDirs() {
                             rmSync(entryPath, {recursive: true, force: true})
                             // 同时清理可能的 .trash- 残余
                             const trashJsonl = join(projectDir, '.trash-' + entry + '.jsonl')
-                            try { if (existsSync(trashJsonl)) unlinkSync(trashJsonl) } catch {}
+                            try {
+                                if (existsSync(trashJsonl)) unlinkSync(trashJsonl)
+                            } catch (error) {
+                                log.debug({err: error, path: trashJsonl}, '清理幽灵 Session trash 文件失败')
+                            }
                             cleaned++
                         }
-                    } catch {}
+                    } catch (error) {
+                        log.debug({err: error, path: entryPath}, '检查幽灵 Session 目录失败')
+                    }
                 }
-            } catch {}
+            } catch (error) {
+                log.debug({err: error, projectDir}, '扫描项目 Session 目录失败')
+            }
         }
-    } catch {}
+    } catch (error) {
+        if (error?.code !== 'ENOENT') log.warn({err: error, projectsDir}, '启动时扫描幽灵 Session 失败')
+    }
     if (cleaned > 0) log.info({cleaned}, '启动时清理幽灵 session 目录')
 }
 
@@ -6045,10 +8000,13 @@ try {
             if (expiresAt > now) _deletedSessionIds.set(sid, expiresAt)
         }
     }
-} catch {}
+} catch (error) {
+    log.warn({err: error, path: DELETED_SESSIONS_FILE}, '恢复已删除 Session 标记失败')
+}
 
 let _deletedDirty = false
 let _deletedPersistScheduled = false
+let _deletedPersistRetryCount = 0
 function _schedulePersistDeleted() {
     _deletedDirty = true
     if (!_deletedPersistScheduled) {
@@ -6059,7 +8017,15 @@ function _schedulePersistDeleted() {
                 _deletedDirty = false
                 try {
                     writeFileSync(DELETED_SESSIONS_FILE, JSON.stringify([..._deletedSessionIds], null, 2))
-                } catch {}
+                    _deletedPersistRetryCount = 0
+                } catch (error) {
+                    _deletedDirty = true
+                    _deletedPersistRetryCount++
+                    log.warn({err: error, path: DELETED_SESSIONS_FILE}, '保存已删除 Session 标记失败')
+                    const retryDelay = Math.min(30_000, 1000 * 2 ** Math.min(_deletedPersistRetryCount - 1, 5))
+                    const retryTimer = setTimeout(() => _schedulePersistDeleted(), retryDelay)
+                    retryTimer.unref?.()
+                }
             }
         })
     }
@@ -6081,12 +8047,10 @@ function filterDeletedSessions(projects) {
     if (dirty) _schedulePersistDeleted()
     if (_deletedSessionIds.size === 0 && !dirty) return projects
     for (const p of projects) {
-        const before = p.sessions.length
-        p.sessions = p.sessions.filter(s => !_deletedSessionIds.has(s.id))
-        if (p.sessions.length !== before) {
+        const removedIds = p.sessions.filter(session => _deletedSessionIds.has(session.id)).map(session => session.id)
+        if (removedIds.length > 0) {
+            p.sessions = p.sessions.filter(session => !_deletedSessionIds.has(session.id))
             p.sessionCount = p.sessions.length
-            // fire-and-forget 重试清理残留文件（SDK 进程此时可能已退出，句柄已释放）
-            deleteSessionFiles(s.id).catch(() => {})
         }
     }
     return projects.filter(p => p.sessionCount > 0)
@@ -6123,7 +8087,9 @@ async function scanProjects() {
                         }
                     }
                 }
-            } catch {}
+            } catch (error) {
+                log.warn({err: error, projectDir: full}, '读取项目 Session 映射失败，回退内容识别')
+            }
             // 内存中活跃 session 的 SDK ID 也加入白名单
             for (const [gwSid, sess] of sessions) {
                 if (sess.lastSessionId) {
@@ -6132,41 +8098,30 @@ async function scanProjects() {
                 }
             }
 
-            const agentCleanupQueue = []  // 扫描到的 agent transcript，触发后台清理
             const files = readdirSync(full).filter(f => {
                 if (!f.endsWith('.jsonl')) return false
                 if (f.startsWith('.trash-')) return false
                 const sid = f.replace('.jsonl', '')
                 // 已标记删除的会话：尝试再次清理残留文件，跳过展示
                 if (_deletedSessionIds.has(sid)) {
-                    const trashPath = join(full, `.trash-${Date.now()}-${sid}.jsonl`)
-                    try { renameSync(join(full, f), trashPath) } catch {}
-                    const ghostDir = join(full, sid)
-                    try { if (existsSync(ghostDir)) rmSync(ghostDir, {recursive: true, force: true}) } catch {}
                     return false
                 }
                 // agent-/wf-agent- 前缀: 直接过滤并加入后台清理队列
                 if (sid.startsWith('agent-') || sid.startsWith('wf-agent-')) {
-                    agentCleanupQueue.push(sid)
                     return false
                 }
                 // 白名单中的主 session → 展示
                 if (mainSdkIds && mainSdkIds.has(sid)) return true
                 // session-map 已知的 agent SDK ID → 过滤 + 清理
                 if (agentSdkIds.has(sid)) {
-                    agentCleanupQueue.push(sid)
                     return false
                 }
-                // 不在白名单也不在 agent 列表:
-                // session-map 存在 → 未知文件，大概率是 agent/workflow 残留，过滤 + 清理
-                // session-map 不存在 → 兜底内容检测
+                // 未知 UUID 必须按内容做 fail-open 判断，不能因 session-map 缺失而删除主会话。
                 if (mainSdkIds !== null) {
-                    agentCleanupQueue.push(sid)
-                    return false
+                    return !isAgentTranscriptByContent(join(full, f))
                 }
                 // 兜底: session-map 不存在，内容检测排除 agent transcript
                 if (isAgentTranscriptByContent(join(full, f))) {
-                    agentCleanupQueue.push(sid)
                     return false
                 }
                 return true
@@ -6174,40 +8129,6 @@ async function scanProjects() {
                 .map(f => ({name: f, mtime: statSync(join(full, f)).mtimeMs}))
                 .sort((a, b) => b.mtime - a.mtime)
                 .map(f => f.name);
-
-            // 后台清理发现的 agent transcript
-            for (const agentSid of agentCleanupQueue) {
-                try {
-                    const agentJsonl = join(full, agentSid + '.jsonl')
-                    const trashPath = join(full, `.trash-${Date.now()}-${agentSid}.jsonl`)
-                    if (existsSync(agentJsonl)) {
-                        try { renameSync(agentJsonl, trashPath) } catch {}
-                    }
-                    const ghostDir = join(full, agentSid)
-                    try { if (existsSync(ghostDir)) rmSync(ghostDir, {recursive: true, force: true}) } catch {}
-                } catch {}
-            }
-
-            // 清理幽灵目录: 项目目录下 {uuid}/subagents/ 无对应主 .jsonl 的孤儿残留
-            try {
-                for (const entry of readdirSync(full)) {
-                    if (entry.startsWith('.trash-')) continue
-                    if (entry.endsWith('.jsonl')) continue
-                    const entryPath = join(full, entry)
-                    try {
-                        if (!statSync(entryPath).isDirectory()) continue
-                        const subagentsDir = join(entryPath, 'subagents')
-                        const mainJsonl = join(full, entry + '.jsonl')
-                        const trashJsonl = join(full, '.trash-' + entry + '.jsonl')
-                        if (existsSync(subagentsDir) && !existsSync(mainJsonl)) {
-                            rmSync(entryPath, {recursive: true, force: true})
-                            if (existsSync(trashJsonl)) {
-                                try { unlinkSync(trashJsonl) } catch {}
-                            }
-                        }
-                    } catch {}
-                }
-            } catch {}
 
             if (!files.length) continue
             // 遍历所有 jsonl 找 cwd，不只看最新的（删除后最新文件可能缺 cwd）
@@ -6218,8 +8139,7 @@ async function scanProjects() {
                     const c = head.join('\n');
                     const m = c.match(/"cwd":\s*"([^"]+)"/);
                     if (m) { wd = normalizeWorkDir(m[1]); break }
-                } catch {
-                }
+                } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
             }
             if (!wd) {
                 wd = decodeProjectName(name) || name
@@ -6239,10 +8159,9 @@ async function scanProjects() {
                             break
                         }
                     }
-                } catch {
-                }
+                } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
                 ;
-                return {id, title: t, size: statSync(join(full, f)).size}
+                return {id, title: t, size: statSync(join(full, f)).size, encodedDir: name}
             })
             const ex = results.find(r => r.workDir === wd)
             if (ex) {
@@ -6262,8 +8181,7 @@ async function scanProjects() {
                 lastActive: await getLastModified(full, files)
             })
         }
-    } catch {
-    }
+    } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
         ;results.sort((a, b) => (b.lastActive || 0) - (a.lastActive || 0));
         const filtered = filterDeletedSessions(results)
         _projectsCache = filtered; _projectsCacheTs = Date.now()
@@ -6277,108 +8195,125 @@ async function scanProjects() {
  * 导致 unlinkSync 报 EBUSY。策略：先重试 unlinkSync（指数退避），仍失败则 rename
  * 为 .trash- 前缀让 scanProjects 自动跳过，后台残留进程最终退出后文件自然清理。
  */
-async function deleteSessionFiles(sessionId) {
-    // 文件删除交给 SDK deleteSession，保证 .jsonl + subagents/ 子目录全清
+async function removeSessionArtifact(path, {recursive = false} = {}) {
+    const retryDelays = [0, 100, 300, 1000, 3000]
+    let lastError = null
+    for (const delayMs of retryDelays) {
+        if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs))
+        try {
+            rmSync(path, {recursive, force: true})
+            return
+        } catch (error) {
+            if (error?.code === 'ENOENT') return
+            lastError = error
+        }
+    }
+    if (!existsSync(path)) return
+    const trashPath = join(dirname(path), `.trash-${Date.now()}-${basename(path)}`)
+    try {
+        renameSync(path, trashPath)
+    } catch (error) {
+        throw lastError || error
+    }
+}
+
+async function deleteSessionFiles(sessionId, relatedSessionIds = []) {
     const projectsDir = join(CLAUDE_HOME, 'projects')
     let entries
-    try { entries = readdirSync(projectsDir) } catch { return }
-    for (const e of entries) {
-        try {
-            const wd = decodeProjectName(e)
-            if (!wd) continue
-            const sdkDir = join(projectsDir, e)
-            try { await deleteSession(sessionId, {dir: sdkDir}) } catch {}
-        } catch {}
+    try {
+        entries = readdirSync(projectsDir)
+    } catch (error) {
+        if (error?.code === 'ENOENT') return
+        throw error
     }
-    // 清理 bridge-session-map 中的映射条目，防止映射文件无限增长
-    for (const e of entries) {
-        try {
-            const wd = decodeProjectName(e)
-            if (!wd) continue
-            const map = loadSessionMap(wd)
-            let dirty = false
-            // 正向: gatewayUUID → sdkId
-            if (map[sessionId] !== undefined) { delete map[sessionId]; dirty = true }
-            // 反向: @rev:sdkId → gatewayUUID
-            const rk = '@rev:' + sessionId
-            if (map[rk] !== undefined) { delete map[rk]; dirty = true }
-            // sessionId 本身可能是 SDK ID，查找以它为 value 的正向条目
-            for (const [k, v] of Object.entries(map)) {
-                if (v === sessionId && !k.startsWith('@rev:')) {
-                    const revK = '@rev:' + v
-                    if (map[revK] !== undefined) { delete map[revK]; dirty = true }
-                    delete map[k]; dirty = true
+
+    const targetIds = new Set([sessionId, ...relatedSessionIds].filter(Boolean))
+    const projects = []
+    for (const entry of entries) {
+        const workDir = decodeProjectName(entry)
+        if (!workDir) continue
+        const sdkDir = join(projectsDir, entry)
+        const map = loadSessionMap(workDir)
+        projects.push({workDir, sdkDir, map})
+        let expanded = true
+        while (expanded) {
+            expanded = false
+            for (const [key, value] of Object.entries(map)) {
+                const gatewayId = key.startsWith('@rev:') ? value : key
+                const sdkId = key.startsWith('@rev:') ? key.slice(5) : value
+                if (!targetIds.has(gatewayId) && !targetIds.has(sdkId)) continue
+                if (gatewayId && !targetIds.has(gatewayId)) { targetIds.add(gatewayId); expanded = true }
+                if (sdkId && !targetIds.has(sdkId)) { targetIds.add(sdkId); expanded = true }
+            }
+        }
+    }
+
+    const failures = []
+    for (const {sdkDir} of projects) {
+        for (const targetId of targetIds) {
+            const transcriptPath = join(sdkDir, targetId + '.jsonl')
+            const sessionDir = join(sdkDir, targetId)
+            if (!existsSync(transcriptPath) && !existsSync(sessionDir)) continue
+            try {
+                await deleteSession(targetId, {dir: sdkDir})
+            } catch (error) {
+                log.debug({err: error, sessionId: targetId?.slice(0, 8), sdkDir}, 'SDK 删除 Session 文件失败，执行本地兜底清理')
+            }
+            for (const [path, recursive] of [[transcriptPath, false], [sessionDir, true]]) {
+                if (!existsSync(path)) continue
+                try {
+                    await removeSessionArtifact(path, {recursive})
+                } catch (error) {
+                    failures.push(error)
+                    log.warn({err: error, sessionId: targetId?.slice(0, 8), path}, '清理 Session 残留失败')
                 }
             }
-            if (dirty) saveSessionMap(wd, map)
-        } catch {}
+        }
     }
-    // 清理基线快照 (bridge-snapshot/{gwSid}.json)
-    // 需要同时尝试 sessionId 本身和 session-map 反查到的 gatewayUUID
-    for (const e of entries) {
-        const sp1 = join(projectsDir, e, 'bridge-snapshot', sessionId + '.json')
-        try { if (existsSync(sp1)) unlinkSync(sp1) } catch {}
-        try {
-            const wd = decodeProjectName(e)
-            if (wd) {
-                const map = loadSessionMap(wd)
-                const gw = map['@rev:' + sessionId]
-                if (gw) {
-                    const sp2 = join(projectsDir, e, 'bridge-snapshot', gw + '.json')
-                    try { if (existsSync(sp2)) unlinkSync(sp2) } catch {}
+
+    for (const {workDir, sdkDir, map} of projects) {
+        let dirty = false
+        for (const [key, value] of Object.entries(map)) {
+            const sdkId = key.startsWith('@rev:') ? key.slice(5) : value
+            if (!targetIds.has(key) && !targetIds.has(value) && !targetIds.has(sdkId)) continue
+            delete map[key]
+            dirty = true
+        }
+        if (dirty) {
+            if (!saveSessionMap(workDir, map)) {
+                const error = new Error(`保存清理后的 Session 映射失败: ${workDir}`)
+                failures.push(error)
+                log.warn({err: error, workDir}, '保存清理后的 Session 映射失败')
+            }
+        }
+
+        for (const targetId of targetIds) {
+            const artifacts = [
+                join(sdkDir, 'bridge-snapshot', targetId + '.json'),
+                join(sdkDir, 'bridge-checkpoints', targetId + '.json'),
+                join(sdkDir, 'bridge-task-state', targetId + '.json'),
+            ]
+            for (const artifact of artifacts) {
+                if (!existsSync(artifact)) continue
+                try {
+                    await removeSessionArtifact(artifact)
+                } catch (error) {
+                    failures.push(error)
+                    log.warn({err: error, sessionId: targetId?.slice(0, 8), path: artifact}, '清理 Session 元数据失败')
                 }
             }
-        } catch {}
+        }
     }
-    // 清理记录点 (bridge-checkpoints/{gwSid}.json)
-    for (const e of entries) {
-        const cp1 = join(projectsDir, e, 'bridge-checkpoints', sessionId + '.json')
-        try { if (existsSync(cp1)) unlinkSync(cp1) } catch {}
-        try {
-            const wd = decodeProjectName(e)
-            if (wd) {
-                const map = loadSessionMap(wd)
-                const gw = map['@rev:' + sessionId]
-                if (gw) {
-                    const cp2 = join(projectsDir, e, 'bridge-checkpoints', gw + '.json')
-                    try { if (existsSync(cp2)) unlinkSync(cp2) } catch {}
-                }
-            }
-        } catch {}
-    }
-    // 清理幽灵目录: SDK Task tool 子 agent 生成的 {sessionId}/subagents/ 目录
-    // SDK deleteSession 在主 .jsonl 被 rename 为 .trash- 后找不到文件，可能 skip 清理
-    for (const e of entries) {
-        const ghostDir = join(projectsDir, e, sessionId)
-        try {
-            if (existsSync(ghostDir) && statSync(ghostDir).isDirectory()) {
-                rmSync(ghostDir, {recursive: true, force: true})
-            }
-        } catch {}
+
+    if (failures.length > 0) {
+        throw new AggregateError(failures, `清理 Session 文件失败: ${failures.length} 项`)
     }
 }
 function invalidateProjectsCache() { _projectsCache = null }
 
-// 通过内容检测判断 transcript 是否为 SDK subagent (Task tool 子 agent)
-// 检查前 5 条可解析 JSON 行中是否存在 isSidechain 或 agentId+parentUuid 标记
-// 注意: 首行可能是 system/init (不含 agent 标记)，需扫描多行覆盖
+// 通过内容检测判断 transcript 是否为 SDK subagent。只有明确的 sidechain 标记才允许过滤。
 function isAgentTranscriptByContent(filePath) {
-    try {
-        const hd = readFileHeadLines(filePath, 2048)
-        let scanned = 0
-        for (const line of hd) {
-            if (!line.trim()) continue
-            try {
-                const obj = JSON.parse(line)
-                if (obj.isSidechain === true) return true
-                // agentId + parentUuid 是 SDK subagent 的特征字段组合
-                if (obj.agentId && obj.parentUuid !== undefined) return true
-                scanned++
-                if (scanned >= 5) break
-            } catch {}
-        }
-    } catch {}
-    return false
+    return classifyTranscriptFile(filePath) === 'agent'
 }
 
 async function listProjectSessions(ed) {
@@ -6400,7 +8335,9 @@ async function listProjectSessions(ed) {
                 }
             }
         }
-    } catch {}
+    } catch (error) {
+        log.warn({err: error, projectDir: base}, '读取项目 Session 映射失败')
+    }
     for (const [, sess] of sessions) {
         if (sess.lastSessionId) {
             if (!mainSdkIds) mainSdkIds = new Set()
@@ -6416,8 +8353,7 @@ async function listProjectSessions(ed) {
             if (mainSdkIds !== null) {
                 if (mainSdkIds.has(id)) { /* 主 session，放行 */ }
                 else if (agentSdkIds.has(id)) continue  // 已知 agent → 跳过
-                // 不在任何列表 → session-map 存在时大概率是 agent/workflow 残留，跳过
-                else continue
+                else if (isAgentTranscriptByContent(filePath)) continue
             } else {
                 // 兜底: session-map 不存在，内容检测排除 agent transcript
                 if (isAgentTranscriptByContent(filePath)) continue
@@ -6436,46 +8372,12 @@ async function listProjectSessions(ed) {
                         break
                     }
                 }
-            } catch {
-            }
-            ;r.push({id, title: t, size: st.size, mtime: st.mtimeMs})
+            } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
+            ;r.push({id, title: t, size: st.size, mtime: st.mtimeMs, encodedDir: ed})
         }
-    } catch {
-    }
+    } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
     r.sort((a, b) => b.mtime - a.mtime);
     return r
-}
-
-async function loadMessages(ed, sessionId) {
-    const fp = join(CLAUDE_HOME, 'projects', ed, sessionId + '.jsonl');
-    const m = []
-    try {
-        const d = readFileSync(fp, 'utf8');
-        for (const l of d.split('\n')) {
-            if (!l.trim()) continue;
-            try {
-                const e = JSON.parse(l);
-                if (e.type === 'user' && e.message?.content) {
-                    const t = typeof e.message.content === 'string' ? e.message.content : e.message.content.map(b => b.type === 'text' ? b.text : '').join(' ').trim();
-                    if (t) m.push({role: 'user', text: t, time: e.timestamp})
-                } else if (e.type === 'assistant' && e.message?.content) {
-                    for (const b of Array.isArray(e.message.content) ? e.message.content : [e.message.content]) {
-                        if (b?.type === 'text' && b.text) m.push({
-                            role: 'assistant',
-                            text: b.text,
-                            time: e.timestamp
-                        })
-                    }
-                }
-            } catch {
-                // JSONL 行 JSON 解析失败（可能为写入中间态），跳过错行
-            }
-        }
-    } catch (e) {
-        log.warn({err: e, sessionId}, '读取会话历史失败')
-        return m
-    }
-    return m
 }
 
 async function getLastModified(dir, files) {
@@ -6484,8 +8386,7 @@ async function getLastModified(dir, files) {
         try {
             const s = statSync(join(dir, f));
             if (s.mtimeMs > l) l = s.mtimeMs
-        } catch {
-        }
+        } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
     }
     ;
     return l
@@ -6500,35 +8401,10 @@ function isBinaryPath(p) {
     return BINARY_EXTS.has(p.slice(dot).toLowerCase())
 }
 
-// 规范化路径：统一用正斜杠 + 折叠多余斜杠（workDir 可能含 // 双斜杠）
-function normPath(p) {
-    return String(p).replace(/\\/g, '/').replace(/\/+/g, '/')
-}
-
 // 安全解析：把相对路径拼到 workDir 下，拒绝越权（.. / 绝对路径）
 // 返回绝对路径；非法返回 null
 function resolveSafe(workDir, relPath) {
-    if (!relPath || typeof relPath !== 'string') return null
-    // 统一分隔符，拒绝绝对路径与 .. 段
-    const norm = relPath.replace(/\\/g, '/')
-    if (norm.startsWith('/') || /^[a-zA-Z]:/.test(norm)) return null
-    if (norm.split('/').some(seg => seg === '..')) return null
-    const abs = join(workDir, norm)
-    // 二次校验：解析后仍须在 workDir 内（两边都规范化，兼容 // 双斜杠）
-    const wdNorm = normPath(workDir).replace(/\/$/, '')
-    const absNorm = normPath(abs)
-    if (absNorm !== wdNorm && !absNorm.startsWith(wdNorm + '/')) return null
-    // 三次校验：解析符号链接后再验证，防止 symlink 绕过目录穿越防护
-    try {
-        if (existsSync(abs)) {
-            const realAbs = realpathSync(abs)
-            const realWk = realpathSync(workDir)
-            if (realAbs !== realWk && !realAbs.startsWith(realWk + sep)) return null
-        }
-    } catch {
-        // realpathSync 失败（文件不存在 / 权限不足等），保持原路径的校验结果
-    }
-    return abs
+    return safeChildPath(workDir, relPath, {allowNested: true})
 }
 
 // 栈式递归扫描工作目录，跳过排除目录。返回扁平相对路径列表。
@@ -6571,8 +8447,7 @@ function scanWorkdirFiles(workDir) {
                     const s = statSync(full)
                     size = s.size
                     mtimeMs = s.mtimeMs
-                } catch {
-                }
+                } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
                 // relative() 规范化两边，兼容 workDir 里的 // 双斜杠
                 const rel = relative(workDir, full).replace(/\\/g, '/')
                 files.push({path: rel, size, mtimeMs, binary: isBinaryPath(rel)})
@@ -6840,8 +8715,7 @@ function diffSnapshotVsCurrent(snapshot, currentFiles, workDir) {
         let cur = null
         try {
             if (f.size <= MAX_SNAP_FILE_BYTES) cur = readFileSync(join(workDir, f.path), 'utf8')
-        } catch {
-        }
+        } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
         if (cur == null) {
             const changed = snap.size !== f.size
             result.set(f.path, {status: changed ? 'modified' : 'unchanged', binary: false, added: null, removed: null})
@@ -6879,20 +8753,17 @@ function loadSessionMap(workDir) {
 function saveSessionMap(workDir, map) {
     try {
         const fp = sessionMapPath(workDir)
-        if (!existsSync(dirname(fp))) mkdirSync(dirname(fp), {recursive: true})
-        writeFileSync(fp, JSON.stringify(map), 'utf8')
+        writeJSON(fp, map)
+        return true
     } catch (e) {
         log.warn({err: e}, 'session-map 保存失败')
+        return false
     }
 }
 
 function persistSdkSessionId(workDir, gatewaySessionId, sdkSessionId) {
-    const map = loadSessionMap(workDir)
-    map[gatewaySessionId] = sdkSessionId
-    // 反向映射: SDK conversation ID → gateway sessionId
-    // 侧栏点 session 传的是 .jsonl 文件名(=SDK ID)，需要反查找到正确的 gateway 会话键
-    map['@rev:' + sdkSessionId] = gatewaySessionId
-    saveSessionMap(workDir, map)
+    const map = updateSessionMap(loadSessionMap(workDir), gatewaySessionId, sdkSessionId)
+    return saveSessionMap(workDir, map)
 }
 
 function lookupSdkSessionId(workDir, gatewaySessionId) {
@@ -6903,7 +8774,7 @@ function lookupSdkSessionId(workDir, gatewaySessionId) {
 // 通过 SDK conversation ID 反向查找 gateway sessionId（侧栏 resume 用）
 function lookupGatewaySessionId(workDir, sdkSessionId) {
     const map = loadSessionMap(workDir)
-    return map['@rev:' + sdkSessionId] || null
+    return resolveMappedGatewaySessionId(map, sdkSessionId)
 }
 
 // 兜底搜索：path 编码不一致时，跨所有项目目录查找指定 .jsonl
@@ -6923,12 +8794,16 @@ function findSessionJsonl(sessionId, workDir) {
                 const head = readFileHeadLines(jlPath, 4096).join('\n')
                 const m = head.match(/"cwd":\s*"([^"]+)"/)
                 if (m && normalizeWorkDir(m[1]).toLowerCase() === normWd) return true
-            } catch {}
+            } catch (error) {
+                log.debug({err: error, path: jlPath}, '读取 Session transcript cwd 失败')
+            }
             // 兜底：decodeProjectName 从目录名还原比较
             const decoded = decodeProjectName(entry)
             if (decoded && normalizeWorkDir(decoded).toLowerCase() === normWd) return true
         }
-    } catch {}
+    } catch (error) {
+        log.debug({err: error, sessionId: sessionId?.slice(0, 8), projectsDir}, '跨项目查找 Session transcript 失败')
+    }
     return false
 }
 
@@ -6940,9 +8815,8 @@ function snapshotStorePath(workDir, sessionId) {
 
 function saveSnapshot(s, sessionId) {
     try {
-        if (!s?.snapshot) return
+        if (!s?.snapshot) return true
         const fp = snapshotStorePath(s.workDir, sessionId)
-        if (!existsSync(dirname(fp))) mkdirSync(dirname(fp), {recursive: true})
         // Map 不能直接 JSON，转 entries 数组
         const obj = {
             takenAt: s.snapshot.takenAt,
@@ -6950,9 +8824,11 @@ function saveSnapshot(s, sessionId) {
             gitHead: s.snapshot.gitHead || undefined,
             files: [...s.snapshot.files.entries()]
         }
-        writeFileSync(fp, JSON.stringify(obj), 'utf8')
+        writeJSON(fp, obj)
+        return true
     } catch (e) {
         log.warn({err: e}, 'snapshot 保存失败')
+        return false
     }
 }
 
@@ -6978,10 +8854,11 @@ function loadCheckpoints(workDir, sessionId) {
 function saveCheckpoints(s, sessionId) {
     try {
         const fp = checkpointStorePath(s.workDir, sessionId)
-        if (!existsSync(dirname(fp))) mkdirSync(dirname(fp), {recursive: true})
-        writeFileSync(fp, JSON.stringify({workDir: s.workDir, checkpoints: s.checkpoints || []}), 'utf8')
+        writeJSON(fp, {workDir: s.workDir, checkpoints: s.checkpoints || []})
+        return true
     } catch (e) {
         log.warn({err: e}, 'checkpoint 保存失败')
+        return false
     }
 }
 
@@ -6999,12 +8876,18 @@ function beginTurn(sessionId, prompt) {
     if (!s) return
     // 同步占位：prompt + time + _turnId 先落盘，消息立即入队 SDK 不受阻
     const turnId = Symbol('turn')
-    s.pendingTurn = {
+    const turn = {
         prompt: String(prompt || '').slice(0, 500),
         preSnapshot: null,
         time: Date.now(),
         _turnId: turnId
     }
+    if (s.pendingTurn) {
+        if (!Array.isArray(s._pendingTurns)) s._pendingTurns = []
+        s._pendingTurns.push(turn)
+        return
+    }
+    s.pendingTurn = turn
     // 异步构建快照：增量以 s.snapshot 为 baseline，只重读 mtime/size 变动的文件
     // 用 setImmediate 推迟到当前事件循环 tick 结束后执行，保证消息先入队
     // CAS 守护 _turnId: stop 后立即新消息时，旧 setImmediate 看到 _turnId 不匹配则跳过
@@ -7017,7 +8900,7 @@ function beginTurn(sessionId, prompt) {
         } catch (e) {
             log.warn({err: e}, 'beginTurn snapshot 失败');
             if (snapSession.pendingTurn && snapSession.pendingTurn._turnId === turnId) {
-                snapSession.pendingTurn = null
+                advancePendingTurn(sessionId, snapSession)
             }
         }
     })
@@ -7034,6 +8917,26 @@ function beginTurn(sessionId, prompt) {
 //   5. checkpointSeq 递增生成唯一 ID (cp-{seq})
 //   6. 同步更新 session.snapshot 为当前状态（作为新一轮的基线）
 // SIDE_EFFECT: mutates session.checkpoints/snapshot/pendingTurn + 落盘 bridge-checkpoints/<sessionId>.json
+function schedulePendingTurnSnapshot(sessionId, snapSession, turn) {
+    setImmediate(() => {
+        try {
+            if (snapSession.pendingTurn?._turnId !== turn._turnId) return
+            turn.preSnapshot = buildFileSnapshot(snapSession.workDir, snapSession.snapshot)
+        } catch (e) {
+            log.warn({err: e, sessionId: sessionId?.slice(0, 8)}, 'queued turn snapshot failed')
+            if (snapSession.pendingTurn?._turnId === turn._turnId) {
+                advancePendingTurn(sessionId, snapSession)
+            }
+        }
+    })
+}
+
+function advancePendingTurn(sessionId, session) {
+    session.pendingTurn = session._pendingTurns?.shift() || null
+    if (session.pendingTurn) schedulePendingTurnSnapshot(sessionId, session, session.pendingTurn)
+    return session.pendingTurn
+}
+
 function finalizeCheckpoint(sessionId) {
     const s = sessions.get(sessionId);
     if (!s || !s.pendingTurn) { log.info({sessionId: sessionId?.slice(0,8), hasSession: !!s, hasPendingTurn: !!s?.pendingTurn}, '[ckpt] 跳过: 无会话或无 pendingTurn'); return }
@@ -7043,14 +8946,15 @@ function finalizeCheckpoint(sessionId) {
             log.info({sessionId: sessionId?.slice(0,8), gitHead: !!s.pendingTurn.preSnapshot?.gitHead}, '[ckpt] 降级同步构建快照')
         } catch (e) {
             log.warn({err: e}, 'finalizeCheckpoint snapshot 降级构建失败');
-            s.pendingTurn = null
+            advancePendingTurn(sessionId, s)
             return
         }
     }
-    const pre = s.pendingTurn.preSnapshot;
-    const prompt = s.pendingTurn.prompt;
-    const time = s.pendingTurn.time
-    s.pendingTurn = null
+    const currentTurn = s.pendingTurn
+    const pre = currentTurn.preSnapshot;
+    const prompt = currentTurn.prompt;
+    const time = currentTurn.time
+    advancePendingTurn(sessionId, s)
     if (!pre) { log.info({sessionId: sessionId?.slice(0,8)}, '[ckpt] 跳过: preSnapshot 为空'); return }
     const scan = currentFileScan(s.workDir, pre)
     if (scan.missing) { log.info({sessionId: sessionId?.slice(0,8)}, '[ckpt] 跳过: 工作目录不存在'); return }
@@ -7083,7 +8987,9 @@ function finalizeCheckpoint(sessionId) {
     // 异步落盘：in-memory checkpoints 已更新，API 立即可见；磁盘 I/O 不阻塞 result 广播
     const cpSession = s
     setImmediate(() => {
-        try { saveCheckpoints(cpSession, sessionId) } catch {}
+        if (!saveCheckpoints(cpSession, sessionId)) {
+            log.warn({sessionId: sessionId?.slice(0, 8)}, '保存 checkpoint 失败')
+        }
     })
     // 注意：不要在这里重置 session.snapshot —— 文件面板「仅改动」依赖会话起始基线，
     // 重置会让累计改动清零导致「仅改动」空白。记录点用自己的 per-turn preSnapshot，互不影响。
@@ -7135,6 +9041,8 @@ function rewindToCheckpoint(sessionId, checkpointId, dryRun) {
     if (dryRun) return {ok: true, dryRun: true, files: [...affected], blocked}
     // 截断记录点到 idx 之前 + 落盘（不动 session.snapshot：回退后仍以会话起始为基线对比）
     s.checkpoints = cps.slice(0, idx)
-    saveCheckpoints(s, sessionId)
+    if (!saveCheckpoints(s, sessionId)) {
+        return {ok: false, code: 'persist_failed', error: 'checkpoint 持久化失败', reverted: [...affected], blocked}
+    }
     return {ok: true, reverted: [...affected], blocked, remaining: s.checkpoints.length}
 }

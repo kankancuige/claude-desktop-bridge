@@ -28,7 +28,32 @@ import * as monaco from 'monaco-editor'
 import {useRouter} from 'vue-router'
 import {t, setLocale} from '../i18n'
 import {useResizeHandle} from '../composables/useResizeHandle'
-import {apiFetch, wsUrl} from '../api'
+import {apiFetch, createGatewayWebSocket} from '../api'
+import {readWorkspaceShell, writeWorkspaceShell} from '../workspace-persistence'
+import {findSessionTab, sessionTabIdentityKey} from '../session-tab'
+import {
+  classifyBridgeFailure,
+  dispatchBridgeNotice,
+} from '../bridge-errors'
+import {
+  getSessionDraft,
+  readSessionDraftStore,
+  removeSessionDraft,
+  SESSION_DRAFTS_STORAGE_KEY,
+  sessionDraftKey,
+  upsertSessionDraft,
+  writeSessionDraftStore,
+} from '../session-drafts'
+import {classifySessionExistsResponse, isSameSessionSelection, resolveExistingSessionTarget, runtimeSessionMatchesHistory, shouldCloseSocketBeforeConnect, shouldReuseConnectedSession, shouldValidateSessionRuntime} from '../session-selection'
+import {upsertProjectSession} from '../project-sessions'
+import {buildSessionCreateRequest} from '../session-create-mode'
+import {attachmentKindLabel} from '../attachment-description'
+import {formatCompactSummary, normalizeContextUiState} from '../context-usage'
+import {
+  buildContinuationPrompt,
+  normalizeTaskResult,
+  type ContinuationReason,
+} from '../task-result-outcome'
 import DOMPurify from 'dompurify'
 const PhaserPet = defineAsyncComponent(() => import('./PhaserPet.vue'))
 const GlobalToast = defineAsyncComponent(() => import('../components/GlobalToast.vue'))
@@ -46,7 +71,7 @@ interface Project {
   encodedDir: string
   sessionCount: number
   lastActive: number
-  sessions: { id: string; title?: string; size: number }[]
+  sessions: { id: string; title?: string; size: number; encodedDir?: string }[]
 }
 
 // 工具调用记录：AI 在一次回复中调用的单个工具（Edit/Write/Bash 等）
@@ -79,6 +104,43 @@ interface Message {
   tokens?: number
   /** 本条消息估算费用（CNY） */
   cost?: number
+  /** 用户消息附件的可序列化发送状态，不包含 File/dataUrl。 */
+  attachments?: MessageAttachment[]
+  compact?: {
+    trigger?: 'manual' | 'auto'
+    preTokens?: number
+    postTokens?: number
+    durationMs?: number
+    summary?: string
+    summaryExpanded?: boolean
+  }
+  taskResult?: {
+    outcome: 'succeeded' | 'incomplete' | 'failed'
+    continuationReason: ContinuationReason
+    resumable: boolean
+    originalTask: string
+  }
+}
+
+interface PersistedTaskState {
+  status: 'idle' | 'running' | 'succeeded' | 'incomplete' | 'failed' | 'stopped' | 'interrupted'
+  outcome: 'succeeded' | 'incomplete' | 'failed' | null
+  continuationReason: ContinuationReason | 'stopped' | null
+  resumable: boolean
+  subtype?: string | null
+  numTurns?: number
+  detail?: string
+  updatedAt?: number
+}
+
+interface MessageAttachment {
+  name: string
+  size: number
+  type: string
+  uploadedPath: string
+  attachmentKind?: string
+  contentType?: string
+  status: 'sending' | 'sent' | 'failed'
 }
 
 // ── 文件快照 Diff ──
@@ -211,9 +273,9 @@ async function confirmBatchDelete() {
     const data = await res.json()
     // 清理 localStorage + 本地项目列表
     for (const sid of ids) {
-      try { localStorage.removeItem(usageKey(sid)) } catch {}
+      try { localStorage.removeItem(usageKey(sid)) } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
       if (sessionId.value && sessionId.value !== sid) {
-        try { localStorage.removeItem(usageKey(sessionId.value)) } catch {}
+        try { localStorage.removeItem(usageKey(sessionId.value)) } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
       }
     }
     // 清理 activeSessionId
@@ -226,7 +288,7 @@ async function confirmBatchDelete() {
     for (const dt of deadTabs) {
       if (dt.websocket) {
         dt.websocket.onclose = null; dt.websocket.onerror = null
-        try { dt.websocket.close() } catch {}
+        try { dt.websocket.close() } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
       }
     }
     if (deadTabs.length) {
@@ -242,7 +304,7 @@ async function confirmBatchDelete() {
     if (sessionId.value && ids.includes(sessionId.value)) {
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.onclose = null; ws.onerror = null
-        try { ws.close() } catch {}
+        try { ws.close() } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
       }
       ws = null; sessionId.value = null
       connected.value = false; status.value = 'idle'
@@ -258,6 +320,7 @@ async function confirmBatchDelete() {
     // 退出批量模式
     batchMode.value = false
     selectedSessionIds.value = new Set()
+    persistWorkspaceShell()
     showToast(t('common.delete') + ` (${data.deleted})`)
   } catch (e: any) {
     console.error('batchDelete:', e)
@@ -314,6 +377,7 @@ function hideProject(workDir: string) {
     activeProject.value = null
     sessionId.value = null
   }
+  persistWorkspaceShell()
 }
 
 /** 显示项目：从 hiddenProjects 移除 */
@@ -334,10 +398,36 @@ const pendingDelete = ref<{ sid: string } | null>(null)
 /** 待确认关闭的标签页 ID（null 表示无待确认项） */
 const pendingCloseTabId = ref<string | null>(null)
 /** 确认关闭待关闭的标签页 */
-function confirmCloseTab() {
-  if (!pendingCloseTabId.value) return
-  doCloseTab(pendingCloseTabId.value)
+async function confirmCloseTab() {
+  const tabId = pendingCloseTabId.value
+  if (!tabId) return
+  const tab = tabSessions.value.find(item => item.id === tabId)
+  const tabStatus = tab?.id === activeTabId.value ? status.value : tab?.state.status
+  const tabSessionId = tab?.id === activeTabId.value ? sessionId.value : tab?.state.sessionId
+  if (tabSessionId && tabStatus === 'thinking') {
+    const stopped = await requestStopSession(tabSessionId)
+    if (!stopped) return
+  }
+  doCloseTab(tabId)
   pendingCloseTabId.value = null
+}
+
+async function requestStopSession(sid: string): Promise<boolean> {
+  try {
+    const response = await apiFetch(`${GW}/api/sessions/${encodeURIComponent(sid)}/stop`, {method: 'POST'})
+    if (response.ok) return true
+    if (response.status === 404) return true
+    let message = `停止会话失败（HTTP ${response.status}）`
+    try {
+      const body = await response.json()
+      if (body?.error) message = String(body.error)
+    } catch (error) { console.debug('读取停止会话错误响应失败', error) }
+    showToast(message, 6000)
+    return false
+  } catch (error: any) {
+    showToast(`停止会话失败：${error?.message || 'Gateway 不可用'}`, 6000)
+    return false
+  }
 }
 
 /** 确认删除会话：调用 Gateway DELETE API，清理 localStorage 缓存的 token/费用数据，并清理当前活跃 session 状态 */
@@ -352,9 +442,9 @@ async function confirmDelete() {
       return
     }
     // 清理 localStorage（SDK ID + gateway UUID，两种都尝试）
-    try { localStorage.removeItem(usageKey(sid)) } catch {}
+    try { localStorage.removeItem(usageKey(sid)) } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
     if (sessionId.value && sessionId.value !== sid) {
-      try { localStorage.removeItem(usageKey(sessionId.value)) } catch {}
+      try { localStorage.removeItem(usageKey(sessionId.value)) } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
     }
     // 清理 activeSessionId（侧栏高亮）
     if (activeSessionId.value === sid) activeSessionId.value = null
@@ -366,7 +456,7 @@ async function confirmDelete() {
     for (const dt of deadTabs) {
       if (dt.websocket) {
         dt.websocket.onclose = null; dt.websocket.onerror = null
-        try { dt.websocket.close() } catch {}
+        try { dt.websocket.close() } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
       }
     }
     if (deadTabs.length) {
@@ -386,7 +476,7 @@ async function confirmDelete() {
     )) {
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.onclose = null; ws.onerror = null
-        try { ws.close() } catch {}
+        try { ws.close() } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
       }
       ws = null
       sessionId.value = null
@@ -405,6 +495,7 @@ async function confirmDelete() {
         break
       }
     }
+    persistWorkspaceShell()
   } catch (e: any) {
     console.error('confirmDelete:', e)
     showToast(t('ws.deleteFailed'))
@@ -453,6 +544,7 @@ function stopTaskDurationTimer() {
 }
 /** 当前 Claude 状态：'idle' 空闲 / 'thinking' 思考中 */
 const status = ref('idle')
+const tabTaskState = ref<PersistedTaskState | null>(null)
 /** 当前会话的消息列表（按时间序追加） */
 const messages = ref<Message[]>([])
 
@@ -467,8 +559,12 @@ interface TabState {
   usage: { input: number; output: number; thinking: number; total: number }
   costTotal: number
   contextPercent: number
+  contextPercentKnown: boolean
+  rawMaxTokens: number
+  contextCompacting: boolean
   agentRuns: any[]
-  msgQueue: any[]
+  msgQueue: QItem[]
+  pendingAttachments: PendingAttachment[]
   pendingTools: any[]
   pendingPermission: any
   pendingChoice: any
@@ -481,6 +577,7 @@ interface TabState {
   lastUserMessage: string
   mirrorState: Record<string, boolean>
   turnCompleted: boolean
+  taskState: PersistedTaskState | null
 }
 
 /** 创建初始标签页状态（所有字段有默认值） */
@@ -494,20 +591,25 @@ function initialTabState(): TabState {
     usage: { input: 0, output: 0, thinking: 0, total: 0 },
     costTotal: 0,
     contextPercent: 0,
+    contextPercentKnown: false,
+    rawMaxTokens: 0,
+    contextCompacting: false,
     agentRuns: [],
     msgQueue: [],
+    pendingAttachments: [],
     pendingTools: [],
     pendingPermission: null,
     pendingChoice: null,
     thinkingLevel: 'auto',
     permissionMode: 'default',
     model: model.value,
-    maxTokens: maxTokens.value,
+    maxTokens: 0,
     pricing: pricing.value,
     turnThinkingText: '',
     lastUserMessage: '',
     mirrorState: { wechat: false, feishu: false, dingtalk: false },
     turnCompleted: false,
+    taskState: null,
   }
 }
 
@@ -522,8 +624,12 @@ function snapshotTabState(): TabState {
     usage: { ...usage.value },
     costTotal: costTotal.value,
     contextPercent: contextPercent.value,
+    contextPercentKnown: contextPercentKnown.value,
+    rawMaxTokens: rawMaxTokens.value,
+    contextCompacting: contextCompacting.value,
     agentRuns: [...agentRuns.value],
     msgQueue: [...msgQueue.value],
+    pendingAttachments: [...pendingAttachments.value],
     pendingTools: [...pendingTools.value],
     pendingPermission: pendingPermission.value,
     pendingChoice: pendingChoice.value,
@@ -536,6 +642,7 @@ function snapshotTabState(): TabState {
     lastUserMessage,
     mirrorState: { ...mirrorState.value },
     turnCompleted: _turnCompleted,
+    taskState: tabTaskState.value,
   }
 }
 
@@ -549,8 +656,12 @@ function restoreTabState(s: TabState) {
   usage.value = { ...s.usage }
   costTotal.value = s.costTotal
   contextPercent.value = s.contextPercent
+  contextPercentKnown.value = s.contextPercentKnown
+  rawMaxTokens.value = s.rawMaxTokens
+  contextCompacting.value = s.contextCompacting
   agentRuns.value = s.agentRuns
   msgQueue.value = s.msgQueue
+  pendingAttachments.value = s.pendingAttachments
   pendingTools.value = s.pendingTools
   pendingPermission.value = s.pendingPermission
   pendingChoice.value = s.pendingChoice
@@ -563,18 +674,81 @@ function restoreTabState(s: TabState) {
   lastUserMessage = s.lastUserMessage
   mirrorState.value = { ...s.mirrorState }
   _turnCompleted = s.turnCompleted
+  tabTaskState.value = s.taskState || null
 }
 
 interface TabSession {
   id: string          // uuid
   projectPath: string // workDir
   label: string       // 显示文字(项目名)
+  historySessionId: string | null // Claude SDK conversation ID，用于 Gateway 重启后恢复
   websocket: WebSocket | null
   state: TabState     // 运行时状态快照
 }
 const tabSessions = ref<TabSession[]>([])
 const activeTabId = ref<string | null>(null)
 const activeTab = computed(() => tabSessions.value.find(t => t.id === activeTabId.value) || null)
+const STORAGE_KEY_WORKSPACE = 'bridge-workspace-shell-v1'
+let workspacePersistTimer: ReturnType<typeof setTimeout> | null = null
+
+let sessionDraftStore = readSessionDraftStore(localStorage)
+
+function draftIdentity(tab: TabSession) {
+  return {
+    historySessionId: tab.historySessionId,
+    workDir: tab.projectPath,
+    gatewaySessionId: tab.state.sessionId,
+  }
+}
+
+function persistDraftStore(next: typeof sessionDraftStore) {
+  try {
+    writeSessionDraftStore(localStorage, next)
+    sessionDraftStore = next
+  } catch (error) {
+    dispatchBridgeNotice(classifyBridgeFailure({error, source: 'storage', path: SESSION_DRAFTS_STORAGE_KEY}))
+  }
+}
+
+function saveDraftForTab(tab: TabSession | null | undefined, text: string, interrupted: boolean) {
+  if (!tab || !String(text || '').trim()) return
+  const key = sessionDraftKey(draftIdentity(tab))
+  if (!key) return
+  persistDraftStore(upsertSessionDraft(sessionDraftStore, key, text, {interrupted}))
+}
+
+function clearDraftForTab(tab: TabSession | null | undefined) {
+  if (!tab) return
+  const key = sessionDraftKey(draftIdentity(tab))
+  if (!key) return
+  persistDraftStore(removeSessionDraft(sessionDraftStore, key))
+}
+
+function migrateGatewayDraftToSdk(tab: TabSession) {
+  if (!tab.historySessionId || !tab.state.sessionId) return
+  const oldKey = sessionDraftKey({workDir: tab.projectPath, gatewaySessionId: tab.state.sessionId})
+  const newKey = sessionDraftKey(draftIdentity(tab))
+  if (!oldKey || !newKey || oldKey === newKey) return
+  const oldDraft = getSessionDraft(sessionDraftStore, oldKey)
+  if (!oldDraft) return
+  let next = upsertSessionDraft(sessionDraftStore, newKey, oldDraft.text, {
+    now: oldDraft.updatedAt,
+    interrupted: oldDraft.interrupted,
+  })
+  next = removeSessionDraft(next, oldKey)
+  persistDraftStore(next)
+}
+
+function restoreDraftForTab(tab: TabSession): boolean {
+  const key = sessionDraftKey(draftIdentity(tab))
+  const draft = key ? getSessionDraft(sessionDraftStore, key) : null
+  if (!draft || !draft.text.trim() || inputText.value.trim()) return false
+  inputText.value = draft.text
+  if (draft.interrupted) {
+    messages.value.push({role: 'system', text: '上次任务在这里中断，已恢复未发送内容。请确认后继续发送。', time: Date.now()})
+  }
+  return true
+}
 
 
 function createTabSession(workDir: string): TabSession {
@@ -582,34 +756,176 @@ function createTabSession(workDir: string): TabSession {
     id: crypto.randomUUID(),
     projectPath: workDir,
     label: workDir.replace(/\\/g, '/').split('/').pop() || workDir,
+    historySessionId: null,
     websocket: null,
     state: initialTabState(),
   }
 }
 
-async function switchToTab(tabId: string) {
-  if (activeTabId.value === tabId) return
+function refreshTabLabel(tab: TabSession) {
+  const projectLabel = tab.projectPath.replace(/\\/g, '/').split('/').pop() || tab.projectPath
+  tab.label = tab.historySessionId ? `${projectLabel} · ${tab.historySessionId.slice(0, 8)}` : projectLabel
+}
+
+function writeWorkspaceShellNow() {
+  try {
+    const tabShells = tabSessions.value.map(tab => {
+      const state = tab.id === activeTabId.value ? snapshotTabState() : tab.state
+      return {
+        id: tab.id,
+        projectPath: tab.projectPath,
+        label: tab.label,
+        sessionId: state.sessionId,
+        historySessionId: tab.historySessionId,
+      }
+    })
+    writeWorkspaceShell(localStorage, STORAGE_KEY_WORKSPACE, {
+      projects: projects.value.map(project => project.workDir),
+      tabs: tabShells,
+      activeTabId: activeTabId.value,
+      activeProject: activeProject.value,
+    })
+  } catch (error) {
+    dispatchBridgeNotice(classifyBridgeFailure({error, source: 'storage', path: STORAGE_KEY_WORKSPACE}))
+  }
+}
+
+function persistWorkspaceShell() {
+  if (workspacePersistTimer) clearTimeout(workspacePersistTimer)
+  workspacePersistTimer = setTimeout(() => {
+    workspacePersistTimer = null
+    writeWorkspaceShellNow()
+  }, 100)
+}
+
+async function restoreWorkspaceShell() {
+  const shell = readWorkspaceShell(localStorage, STORAGE_KEY_WORKSPACE)
+  const knownProjects = new Set(projects.value.map(project => project.workDir.toLowerCase()))
+  for (const workDir of shell.projects) {
+    if (knownProjects.has(workDir.toLowerCase())) continue
+    projects.value.push({
+      workDir,
+      encodedDir: encodeProjectName(workDir),
+      sessionCount: 0,
+      sessions: [],
+      lastActive: 0,
+    })
+    knownProjects.add(workDir.toLowerCase())
+  }
+
+  const seenTabIds = new Set<string>()
+  const seenSessionTabs = new Set<string>()
+  for (const saved of shell.tabs) {
+    if (seenTabIds.has(saved.id)) continue
+    const identityKey = sessionTabIdentityKey({
+      projectPath: saved.projectPath,
+      historySessionId: saved.historySessionId,
+      gatewaySessionId: saved.sessionId,
+    })
+    if (identityKey && seenSessionTabs.has(identityKey)) continue
+    seenTabIds.add(saved.id)
+    if (identityKey) seenSessionTabs.add(identityKey)
+    const tab = createTabSession(saved.projectPath)
+    tab.id = saved.id
+    tab.historySessionId = saved.historySessionId
+    tab.state.sessionId = saved.sessionId
+    refreshTabLabel(tab)
+    tabSessions.value.push(tab)
+  }
+  activeProject.value = shell.activeProject
+  const target = shell.activeTabId && tabSessions.value.some(tab => tab.id === shell.activeTabId)
+    ? shell.activeTabId
+    : tabSessions.value.find(tab => tab.state.sessionId)?.id || tabSessions.value[0]?.id || null
+  if (target) {
+    activeTabId.value = null
+    await switchToTab(target)
+  }
+}
+
+async function switchToTab(tabId: string, validateCurrentRuntime = false) {
+  if (activeTabId.value === tabId && !validateCurrentRuntime) return
   syncCurrentTabState()
   activeTabId.value = tabId
   const tab = tabSessions.value.find(t => t.id === tabId)
   if (!tab) return
 
   // 有 sessionId 但没 websocket（重启恢复）→ 先恢复状态再 resume
-  if (tab.state.sessionId && !tab.websocket) {
+  const tabSocketActive = !!tab.websocket && (tab.websocket.readyState === WebSocket.OPEN || tab.websocket.readyState === WebSocket.CONNECTING)
+  if (tab.state.sessionId && !tabSocketActive) {
     restoreTabState(tab.state)
     activeProject.value = tab.projectPath
     ws = null  // 切断旧 tab 的 ws 引用，防止 connectWS 误关
     // 校验 session 是否仍存在，避免用已删除的 gatewayUUID resume 导致"一变二"
+    let sessionMissing = false
     try {
       const check = await apiFetch(`${GW}/api/sessions/${tab.state.sessionId}/exists`)
-      if (!check.ok) throw new Error('gone')
-    } catch {
-      sessionId.value = null
-      connected.value = false; status.value = 'idle'
-      messages.value = []; inputText.value = ''
+      if (activeTabId.value !== tab.id) return
+      const existsStatus = classifySessionExistsResponse(check.ok, check.status)
+      if (existsStatus === 'unavailable') throw new Error(`Gateway 会话状态不可用（HTTP ${check.status}）`)
+      sessionMissing = existsStatus === 'missing'
+      const checkData = check.ok ? await check.json() : null
+      if (activeTabId.value !== tab.id) return
+      if (!runtimeSessionMatchesHistory(tab.historySessionId, checkData?.historySessionId)) {
+        // 当前 tab 保存的 Gateway UUID 已绑定到另一个 SDK conversation，不能覆盖用户选中的历史会话。
+        sessionMissing = true
+        throw new Error('Gateway 会话与历史会话不匹配')
+      }
+      const existingSessionId = resolveExistingSessionTarget(checkData, tab.state.sessionId)
+      if (!existingSessionId) throw new Error('gone')
+      const wasInterrupted = tab.state.status === 'thinking'
+      tab.state.sessionId = existingSessionId
+      if (checkData.historySessionId) {
+        tab.historySessionId = checkData.historySessionId
+        refreshTabLabel(tab)
+      }
+      sessionId.value = existingSessionId
+      activeSessionId.value = tab.historySessionId || null
+      restoreTabState(tab.state)
+      const needsHistory = tab.historySessionId && (
+        tab.state.messages.length === 0 || (wasInterrupted && checkData.generating === false)
+      )
+      if (needsHistory && tab.historySessionId) {
+        await loadHistory(
+          encodeProjectName(tab.projectPath),
+          tab.historySessionId,
+          wasInterrupted ? 'replace' : 'append',
+        )
+        if (activeTabId.value !== tab.id) return
+        restoreDraftForTab(tab)
+      }
+      status.value = checkData.generating === true ? 'thinking' : (wasInterrupted ? 'idle' : status.value)
+      tab.state.status = status.value
+      await connectWS(existingSessionId, true)
+      if (activeTabId.value !== tab.id) return
+      syncCurrentTabState()
+      void focusSessionForIm(existingSessionId)
+      return
+    } catch (error: any) {
+      if (tab.historySessionId && sessionMissing) {
+        if (tab.websocket) {
+          tab.websocket.onclose = null
+          tab.websocket.onerror = null
+          try { tab.websocket.close() } catch (closeError) { console.debug('关闭失效 Session WebSocket 失败', closeError) }
+          tab.websocket = null
+        }
+        tab.state.sessionId = null
+        tab.state.connected = false
+        sessionId.value = null
+        connected.value = false
+        ws = null
+        status.value = 'idle'
+        // 可能由同一个 pending create 链进入，不能递归等待自身。
+        await _doHandleNewSession(tab.projectPath, encodeProjectName(tab.projectPath), tab.historySessionId, tab.state.messages.length > 0)
+      } else {
+        connected.value = false
+        status.value = 'idle'
+        if (tab.state.sessionId) scheduleSessionReconnect(tab.id, tab.state.sessionId, true)
+        messages.value.push({role: 'error', text: `会话恢复检查失败：${error?.message || 'Gateway 暂不可用'}，已保留原会话并将在连接恢复后重试。`, time: Date.now()})
+        showToast('Gateway 暂不可用，未创建重复会话；正在重试连接', 6000)
+        return
+      }
       return
     }
-    handleNewSession(tab.projectPath, encodeProjectName(tab.projectPath), tab.state.sessionId)
     return
   }
 
@@ -619,32 +935,51 @@ async function switchToTab(tabId: string) {
     sessionId.value = null
     connected.value = false; status.value = 'idle'
     messages.value = []; inputText.value = ''
+    persistWorkspaceShell()
     return
   }
 
   // 恢复保存的状态快照到全局
   restoreTabState(tab.state)
   activeProject.value = tab.projectPath
+  activeSessionId.value = tab.historySessionId
   ws = tab.websocket
   nextTick(() => scrollDown())
+  if (ws?.readyState === WebSocket.OPEN && status.value === 'idle' && msgQueue.value.length > 0) {
+    void flushMsgQueue()
+  }
   // 通知 Gateway 切换 IM 消息注入目标 + 同步镜像开关
   if (tab.state.sessionId) {
-    apiFetch(`${GW}/api/sessions/${tab.state.sessionId}/focus`, {method: 'POST'}).catch(() => {})
+    void focusSessionForIm(tab.state.sessionId)
     loadSessionMirrors()
+  }
+  persistWorkspaceShell()
+}
+
+async function focusSessionForIm(targetSessionId: string) {
+  try {
+    const response = await apiFetch(`${GW}/api/sessions/${targetSessionId}/focus`, {method: 'POST'})
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  } catch (error) {
+    console.error('同步 IM 注入目标失败', error)
+    showToast('会话已切换，但 IM 注入目标同步失败，请检查 Gateway')
   }
 }
 
 function syncCurrentTabState() {
   const tab = activeTab.value
   if (!tab) return
+  saveDraftForTab(tab, inputText.value, status.value === 'thinking')
   tab.state = snapshotTabState()
   tab.websocket = ws
+  persistWorkspaceShell()
 }
 
 function closeTab(tabId: string) {
   const tab = tabSessions.value.find(t => t.id === tabId)
+  const tabConnected = tab?.id === activeTabId.value ? connected.value : tab?.state.connected
   // 活跃会话需二次确认，避免误关闭丢失未提交工作
-  if (tab?.state.sessionId && tab.state.connected) {
+  if (tab?.state.sessionId && tabConnected) {
     pendingCloseTabId.value = tabId
     return
   }
@@ -653,6 +988,13 @@ function closeTab(tabId: string) {
 
 function doCloseTab(tabId: string) {
   const tab = tabSessions.value.find(t => t.id === tabId)
+  if (tab) {
+    const isActive = tab.id === activeTabId.value
+    const tabStatus = isActive ? status.value : tab.state.status
+    const text = isActive ? inputText.value : tab.state.inputText
+    saveDraftForTab(tab, text || (tabStatus === 'thinking' ? (isActive ? lastUserMessage : tab.state.lastUserMessage) : ''), tabStatus === 'thinking')
+  }
+  cancelSessionReconnect(tabId)
   if (tab?.websocket) {
     tab.websocket.onclose = null   // 阻止异步 onclose 污染其他 tab 的全局状态
     tab.websocket.onerror = null
@@ -668,6 +1010,7 @@ function doCloseTab(tabId: string) {
       connected.value = false; ws = null
     }
   }
+  persistWorkspaceShell()
 }
 // ── 宠物状态（Gateway settings.json 为数据源，localStorage 为快速缓存）──
 const petEnabledGlob = ref(localStorage.getItem('claude-bridge-pet-enabled') !== 'false')
@@ -692,7 +1035,7 @@ function persistPetToGateway() {
           body: JSON.stringify(s),
         })
       })
-      .catch(() => {})
+      .catch(error => console.warn('保存宠物设置失败', error))
   }, 300)
 }
 // 右键切换或设置页改了 pet → 本地更新 + 持久化
@@ -882,6 +1225,15 @@ function doExport(format: 'md' | 'json' | 'jsonl') {
 }
 /** 输入框文本（双向绑定） */
 const inputText = ref('')
+let draftPersistTimer: ReturnType<typeof setTimeout> | null = null
+watch(inputText, (value) => {
+  if (draftPersistTimer) clearTimeout(draftPersistTimer)
+  if (!value.trim()) return
+  draftPersistTimer = setTimeout(() => {
+    draftPersistTimer = null
+    saveDraftForTab(activeTab.value, value, status.value === 'thinking')
+  }, 250)
+})
 // ── 图片附件 ──
 interface PendingAttachment {
   id: number
@@ -889,9 +1241,20 @@ interface PendingAttachment {
   dataUrl: string
   uploading: boolean
   uploadedPath?: string
+  uploadedName?: string
+  attachmentKind?: string
+  contentType?: string
+  uploadPromise?: Promise<boolean>
 }
 const pendingAttachments = ref<PendingAttachment[]>([])
 let attachmentIdCounter = 0
+
+function formatAttachmentSize(size: number): string {
+  if (!Number.isFinite(size) || size <= 0) return '0 B'
+  if (size < 1024) return `${size} B`
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(size < 10 * 1024 ? 1 : 0)} KB`
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`
+}
 const fileInputRef = ref<HTMLInputElement | null>(null)
 
 /** 从 File 对象创建附件并加入待发送列表（粘贴和文件选择共用） */
@@ -935,23 +1298,39 @@ function removeAttachment(id: number) {
 }
 
 /** 上传附件到 Gateway 并获取路径（含多模态路由处理） */
-async function uploadAttachment(att: PendingAttachment, sessionId: string) {
-  att.uploading = true
-  try {
-    const form = new FormData()
-    form.append('file', att.file)
-    const res = await apiFetch(`${GW}/api/sessions/${sessionId}/upload`, {
-      method: 'POST',
-      body: form,
-    })
-    if (res.ok) {
+async function uploadAttachment(att: PendingAttachment, sessionId: string): Promise<boolean> {
+  if (att.uploadedPath) return true
+  if (att.uploading && att.uploadPromise) return att.uploadPromise
+
+  const task = (async () => {
+    att.uploading = true
+    try {
+      const form = new FormData()
+      form.append('file', att.file)
+      const res = await apiFetch(`${GW}/api/sessions/${sessionId}/upload`, {
+        method: 'POST',
+        body: form,
+      })
+      if (!res.ok) return false
       const d = await res.json()
+      if (typeof d.path !== 'string' || !d.path) return false
       att.uploadedPath = d.path
+      att.uploadedName = typeof d.name === 'string' ? d.name : att.file.name
+      att.attachmentKind = typeof d.kind === 'string' ? d.kind : 'binary'
+      att.contentType = typeof d.contentType === 'string' ? d.contentType : att.file.type
       if (d.ocrText) (att as any).ocrText = d.ocrText
       if (d.multimodal) (att as any).multimodal = true
+      return true
+    } catch (e) {
+      console.error(e)
+      return false
+    } finally {
+      att.uploading = false
+      att.uploadPromise = undefined
     }
-  } catch (e) { console.error(e) }
-  att.uploading = false
+  })()
+  att.uploadPromise = task
+  return task
 }
 /** 正在创建新会话中（防止重复点击） */
 const connecting = ref(false)
@@ -1085,6 +1464,10 @@ interface AgentRun {
   id: string;
   agentType: string;
   description: string
+  purpose?: string
+  task?: string
+  scope?: string
+  descriptionSource?: string
   status: 'spawning' | 'running' | 'done' | 'error'
   spawnTime: number;
   startTime: number;
@@ -1095,7 +1478,9 @@ interface AgentRun {
   expanded?: boolean
   /** 子 agent 当前执行中的工具名/进度描述 */
   currentTool: string;
+  currentAction?: string
   currentToolElapsed: number
+  toolUseId?: string
 }
 
 /** 本轮对话中产生的所有 agent 运行记录（内联卡片数据源） */
@@ -1235,10 +1620,21 @@ interface QItem {
   id: number;
   text: string;
   time: number
+  attachments?: PendingAttachment[]
+}
+
+interface PendingInput {
+  text: string
+  sessionId: string
+  payload: Record<string, unknown>
+  attachments?: PendingAttachment[]
+  message: Message
+  createdAt: number
 }
 
 /** 排队中的消息列表 */
 const msgQueue = ref<QItem[]>([])
+const pendingInputTexts = new Map<string, PendingInput>()
 /** 最近一次 sendMessage 的用户原文，取消任务时回填到输入框 */
 let lastUserMessage = ''
 /** 队列自增 ID 计数器 */
@@ -1281,14 +1677,16 @@ async function loadProviderModels() {
     const curModel = sBody?.model || ''  // 每次实时读取，不用模块级缓存
 
     const pr = await fetch(`${GW}/api/config/providers`)
-    if (!pr.ok) return
+    if (!pr.ok) throw new Error(`供应商列表加载失败（HTTP ${pr.status}）`)
     const {providers: plist} = await pr.json()
     providers.value = plist
 
     let provider = null
     const inputUrl = baseUrl.toLowerCase()
     if (inputUrl) {
-      for (const p of plist) {
+      const relayProvider = plist.find((p: any) => p.id === 'codex-relay')
+      if (inputUrl.includes('/api/codex/backend-api/codex') && relayProvider) provider = relayProvider
+      for (const p of provider ? [] : plist) {
         const pUrl = (p.baseUrl || '').toLowerCase()
         if (pUrl && (inputUrl.includes(p.id) || inputUrl.includes(pUrl.replace(/\/v\d+.*$/, '').replace('https://', '')))) {
           provider = p; break
@@ -1300,7 +1698,8 @@ async function loadProviderModels() {
       if (p.id === 'opencode' && baseUrl.includes('opencode')) return true;
       if (p.id === 'minimax' && baseUrl.includes('minimax')) return true;
       if (p.id === 'anthropic' && baseUrl.includes('anthropic')) return true;
-      if (p.id === 'codex' && (baseUrl.includes('openai') || baseUrl.includes('codex'))) return true;
+       if (p.id === 'codex-relay' && baseUrl.includes('/api/codex/backend-api/codex')) return true;
+       if (p.id === 'codex' && (baseUrl.includes('openai') || baseUrl.includes('codex'))) return true;
       if (p.id === 'openrouter' && baseUrl.includes('openrouter')) return true;
       if (p.id === 'ollama' && baseUrl.includes('ollama')) return true;
       if (p.id === 'zhipu' && baseUrl.includes('bigmodel')) return true;
@@ -1346,15 +1745,16 @@ async function loadProviderModels() {
           else if (!model.value) model.value = models.value[0]?.id || ''
         }
       }
-    } catch {
-    }
+    } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
 
     // settings 里存了模型 ID 但不在模型列表中 → 追加到列表末尾（不丢失动态列表）
     if (curModel && !models.value.find(m => m.id === curModel)) {
       models.value.push({id: curModel, name: curModel, contextWindow: undefined})
     }
     if (!model.value && models.value.length) model.value = models.value[0]!.id
-  } catch {
+  } catch (error: any) {
+    console.warn('供应商和模型加载失败', error)
+    showToast(error?.message || '供应商和模型加载失败', 6000)
   } finally {
     _loadingProviderModels = false
   }
@@ -1377,6 +1777,7 @@ onMounted(async () => {
       if (s.model) settingsModel = s.model
       if (typeof s.costLimitPercent === 'number') costLimitPercent.value = s.costLimitPercent
       if (typeof s.fileInjectLimitKB === 'number') fileInjectLimitKB.value = s.fileInjectLimitKB
+      if (typeof s.maxContextTokens === 'number' && s.maxContextTokens > 0) contextSafetyCap.value = s.maxContextTokens
       if (s.language) setLocale(s.language)  // 应用已保存的语言
       // 从 Gateway 恢复 pet 设置
       if (s.petEnabled !== undefined) {
@@ -1388,11 +1789,14 @@ onMounted(async () => {
         localStorage.setItem('claude-bridge-pet', s.pet)
       }
     }
-  } catch {
+  } catch (error: any) {
+    console.warn('项目列表加载失败', error)
+    showToast(`项目列表加载失败：${error?.message || '未知错误'}`, 6000)
   }
   // 获取 Gateway 版本号
   try { const vr = await fetch(`${GW}/api/version`); if (vr.ok) gatewayVersion.value = (await vr.json()).version } catch (e) { console.error(e) }
   await Promise.all([loadProjects(), loadBalance(), loadProviderModels(), loadSlashCommands(), loadIMStatus()])
+  await restoreWorkspaceShell()
   // Esc 关闭 diff/文件 modal
   window.addEventListener('keydown', onGlobalKeydown)
   // 建立控制通道 WS：独立于 session，启动即连，接收 IM nudge 事件
@@ -1451,8 +1855,7 @@ async function loadBalance() {
   try {
     const res = await fetch(`${GW}/api/balance`)
     if (res.ok) balance.value = await res.json()
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
 }
 
 /**
@@ -1464,9 +1867,13 @@ async function loadProjects(reorder = false) {
   try {
     const myEpoch = _projectsEpoch  // 快照：await 期间若本地有编辑则 epoch 会递增
     const res = await fetch(`${GW}/api/projects`)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const data = await res.json()
+    if (!Array.isArray(data.projects)) throw new Error('invalid projects response')
     if (!reorder && _projectsEpoch !== myEpoch) return  // 本地已有编辑，丢弃服务端数据
     const incoming: Project[] = data.projects || []
+    // Gateway 扫描可能在 SDK 写入或文件锁定期间短暂返回空列表；刷新不能因此清空本地项目。
+    if (incoming.length === 0 && projects.value.length > 0) return
     if (reorder || projects.value.length === 0) {
       projects.value = incoming.sort((a, b) => (b.lastActive || 0) - (a.lastActive || 0))
       if (reorder) _projectsEpoch = 0  // 显式刷新，重置 epoch
@@ -1487,8 +1894,7 @@ async function loadProjects(reorder = false) {
       byKey.delete(p.workDir)
     }
     projects.value = kept
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
 }
 
 /**
@@ -1544,25 +1950,61 @@ async function addProject() {
   }
   projectSearch.value = ''      // 清空搜索，确保新项目可见
   activeProject.value = wd
+  persistWorkspaceShell()
 }
 
 /**
  * 创建/恢复会话的核心入口：
  * - 全新会话：workDir 必填，其他参数为空
  * - 恢复历史会话：额外传入 encodedDir + histSessionId，Gateway resume 复用原 sessionId
- * 创建前先重置所有对话状态（消息列表、token 计数、费用累计），
+ * 新建或从侧栏恢复历史时重置对话状态；标签页断线恢复则保留已有快照，
  * 然后调用 Gateway POST /api/sessions 创建/恢复，成功后建立 WebSocket 连接。
  * 并发防护：同一 (workDir, histSessionId) 组合只允许一个进行中的创建，防止快速双击产生重复 session。
  */
 const _pendingCreates = new Map<string, Promise<void>>()
 
-async function handleNewSession(workDir: string, encodedDir?: string, histSessionId?: string) {
+async function handleNewSession(workDir: string, encodedDir?: string, histSessionId?: string, preserveExistingState = false) {
   // 规范化 workDir 消除编码歧义，与 Gateway 保持一致
   workDir = normW(workDir)
+  const currentTab = activeTab.value
+  const currentSocket = currentTab?.websocket || ws
+  const selection = {
+    requestedWorkDir: workDir,
+    requestedHistorySessionId: histSessionId,
+    activeTabId: activeTabId.value,
+    tabId: currentTab?.id,
+    tabProjectPath: currentTab?.projectPath,
+    activeProjectPath: activeProject.value,
+    activeHistorySessionId: activeSessionId.value,
+    tabHistorySessionId: currentTab?.historySessionId,
+    activeGatewaySessionId: sessionId.value,
+    tabGatewaySessionId: currentTab?.state.sessionId,
+    socketReadyState: currentSocket?.readyState,
+    connected: connected.value,
+  }
+  if (isSameSessionSelection(selection)) {
+    // SIDE_EFFECT: 同一会话只恢复连接或同步 IM 目标，绝不清空气泡。
+    if (shouldReuseConnectedSession(selection)) {
+      void focusSessionForIm(sessionId.value!)
+      loadSessionMirrors()
+    } else if (shouldValidateSessionRuntime(selection) && currentTab) {
+      connecting.value = true
+      try {
+        await switchToTab(currentTab.id, true)
+      } catch (error) {
+        console.error('[workspaceWS] 验证并恢复当前会话失败:', error)
+        showToast('当前会话恢复失败，请检查 Gateway', 6000)
+      } finally {
+        connecting.value = false
+      }
+    }
+    nextTick(() => scrollDown())
+    return
+  }
   const key = (encodedDir || workDir) + '|' + (histSessionId || '__new__')
   if (_pendingCreates.has(key)) return _pendingCreates.get(key)
 
-  const promise = _doHandleNewSession(workDir, encodedDir, histSessionId)
+  const promise = _doHandleNewSession(workDir, encodedDir, histSessionId, preserveExistingState)
   _pendingCreates.set(key, promise)
   promise.finally(() => {
     if (_pendingCreates.get(key) === promise) _pendingCreates.delete(key)
@@ -1570,32 +2012,72 @@ async function handleNewSession(workDir: string, encodedDir?: string, histSessio
   return promise
 }
 
-async function _doHandleNewSession(workDir: string, encodedDir?: string, histSessionId?: string) {
+/** 从已有 SDK conversation 创建独立分支；源 tab 和源 WebSocket 保持不变。 */
+async function handleForkSession(workDir: string, encodedDir: string, sourceSessionId: string) {
+  workDir = normW(workDir)
+  const key = `${encodedDir || workDir}|fork:${sourceSessionId}`
+  if (_pendingCreates.has(key)) return _pendingCreates.get(key)
+  const promise = _doHandleNewSession(workDir, encodedDir, undefined, false, sourceSessionId)
+  _pendingCreates.set(key, promise)
+  promise.finally(() => {
+    if (_pendingCreates.get(key) === promise) _pendingCreates.delete(key)
+  })
+  return promise
+}
+
+async function _doHandleNewSession(workDir: string, encodedDir?: string, histSessionId?: string, preserveExistingState = false, forkFrom?: string) {
   syncCurrentTabState()
 
-  let tab = tabSessions.value.find(t => t.projectPath === workDir)
+  const existingTab = forkFrom ? undefined : findSessionTab(
+    tabSessions.value.map(item => ({
+      ...item,
+      gatewaySessionId: item.state.sessionId,
+    })),
+    workDir,
+    histSessionId,
+  )
+  let tab = existingTab ? tabSessions.value.find(item => item.id === existingTab.id) : undefined
+  const alreadyBoundToHistory = !!histSessionId && !!tab?.state.sessionId
   if (!tab) {
     tab = createTabSession(workDir)
     tabSessions.value.push(tab)
   }
-  if (activeTabId.value !== tab.id) switchToTab(tab.id)
+  if (activeTabId.value !== tab.id) await switchToTab(tab.id)
+  if (activeTabId.value !== tab.id) return
+  if (alreadyBoundToHistory) return
+  const previousState = snapshotTabState()
+  const previousHistorySessionId = tab.historySessionId
+  let sessionCreated = false
+  if (!histSessionId) tab.historySessionId = null
+  else {
+    tab.historySessionId = histSessionId
+    refreshTabLabel(tab)
+  }
 
   connecting.value = true
   activeProject.value = workDir
   activeSessionId.value = histSessionId || null
-  // 重置对话状态：清空消息、token 计数、费用
-  messages.value = []
-  _loadedHistoryTexts = null
-  usage.value = {input: 0, output: 0, thinking: 0, total: 0}
-  turnThinkingText = ''
-  costTotal.value = 0
-  costWarned.value = false
-  contextPercent.value = 0
-  clearAgentRuns()
+  // 切换标签页时若已有内存快照，只恢复连接，不清空用户已经看到的气泡。
+  // 应用重启或真正新建/侧栏切换历史会话时没有快照，仍按原流程重置并加载磁盘历史。
+  if (!preserveExistingState) {
+    messages.value = []
+    _loadedHistoryTexts = null
+    usage.value = {input: 0, output: 0, thinking: 0, total: 0}
+    turnThinkingText = ''
+    costTotal.value = 0
+    costWarned.value = false
+    contextPercent.value = 0
+    contextPercentKnown.value = false
+    contextCompacting.value = false
+    rawMaxTokens.value = 0
+    clearAgentRuns()
+  }
 
   // 恢复历史会话时先加载历史消息展示给用户
-  if (encodedDir && histSessionId) {
+  if (encodedDir && histSessionId && !preserveExistingState) {
+    tab.historySessionId = histSessionId
     await loadHistory(encodedDir, histSessionId)
+    restoreDraftForTab(tab)
   }
   syncCurrentTabState()
 
@@ -1603,16 +2085,15 @@ async function _doHandleNewSession(workDir: string, encodedDir?: string, histSes
     const curModelInfo = models.value.find(m => m.id === model.value)
     const curProvider = providers.value.find((p: any) => p.id === providerId.value)
     const body: any = {
-      workDir,
+      ...buildSessionCreateRequest({workDir, resume: histSessionId, forkFrom}),
       model: model.value,
       permissionMode: permissionMode.value,
       thinkingLevel: thinkingLevel.value,
       baseUrl: curProvider?.baseUrl || '',
       apiKey: savedApiKey.value || '',
+      maxContextTokens: contextSafetyCap.value || undefined,
       modelMeta: curModelInfo ? {contextWindow: curModelInfo.contextWindow, pricing: pricing.value} : null
     }
-    if (encodedDir && histSessionId) body.resume = histSessionId
-
     const res = await apiFetch(`${GW}/api/sessions`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
@@ -1620,15 +2101,29 @@ async function _doHandleNewSession(workDir: string, encodedDir?: string, histSes
     })
     const data = await res.json()
     if (!res.ok) throw new Error(data.error)
+    sessionCreated = true
+    tabTaskState.value = data.taskState || null
     sessionId.value = data.sessionId
+    tab.state.sessionId = data.sessionId
+    if (typeof data.historySessionId === 'string' && data.historySessionId) {
+      tab.historySessionId = data.historySessionId
+      activeSessionId.value = data.historySessionId
+      refreshTabLabel(tab)
+      migrateGatewayDraftToSdk(tab)
+    }
+    if (forkFrom && encodedDir && tab.historySessionId) {
+      await loadHistory(encodedDir, tab.historySessionId, 'replace')
+    }
     gitInfo.value = data.gitInfo || null
     sessionStartTime.value = Date.now()
     startSessionDurationTimer()
     loadUsage(data.sessionId)  // resume 时恢复已记忆的 token/费用
-    connectWS(data.sessionId)
+    await connectWS(data.sessionId)
+    restoreDraftForTab(tab)
     syncCurrentTabState()  // 将会话 ID + WebSocket 写回 tab
+    persistWorkspaceShell()
     // 通知 Gateway 聚焦当前会话（IM 消息注入目标）
-    apiFetch(`${GW}/api/sessions/${data.sessionId}/focus`, {method: 'POST'}).catch(() => {})
+    void focusSessionForIm(data.sessionId)
     loadSessionMirrors()
     setTimeout(loadSlashCommands, 1500)  // 会话起来后拉一次实时命令列表
     loadMentionFiles()                   // 预加载文件列表供 # 引用
@@ -1636,9 +2131,19 @@ async function _doHandleNewSession(workDir: string, encodedDir?: string, histSes
     loadCheckpoints()                    // 预加载记录点，count badge 初始就能显示
     // 仅新建会话时刷新项目列表（新 .jsonl 需要出现在侧栏）；resume 已有会话时不刷，
     // 否则 scanProjects 按 mtime 重排会导致被点击的 session 跳到第一位
-    if (!histSessionId) await loadProjects()
+    if (!histSessionId || forkFrom) await loadProjects()
   } catch (e: any) {
     const msg = e.message || String(e)
+    if (!sessionCreated) {
+      tab.historySessionId = previousHistorySessionId
+      refreshTabLabel(tab)
+      tab.state = previousState
+      restoreTabState(previousState)
+      ws = tab.websocket
+    } else {
+      connected.value = false
+      status.value = 'idle'
+    }
     if (msg === 'Failed to fetch') {
       messages.value.push({role: 'error', text: t('ws.gatewayDown'), time: Date.now()})
     } else if (msg.includes('API Key') || msg.includes('Claude CLI')) {
@@ -1646,6 +2151,7 @@ async function _doHandleNewSession(workDir: string, encodedDir?: string, histSes
     } else {
       messages.value.push({role: 'error', text: t('err.connectFail', {msg}), time: Date.now()})
     }
+    showToast(`会话打开失败：${msg}`, 7000)
   } finally {
     connecting.value = false
   }
@@ -1689,7 +2195,9 @@ async function handleNudge(msg: any) {
         }
         if (!resolvedPath) { showToast(`项目 "${projectName || ''}" 未找到`); break }
         // 检查是否已有活跃标签页 → 直接切换，不创建新 session
-        const existingTab = tabSessions.value.find(t => t.projectPath === resolvedPath && t.websocket && t.websocket.readyState === WebSocket.OPEN)
+        const existingTab = !sessionId && !sessionIndex
+          ? tabSessions.value.find(t => t.projectPath === resolvedPath && t.websocket && t.websocket.readyState === WebSocket.OPEN)
+          : null
         if (existingTab) {
           expandedProjects.value.add(resolvedPath)
           activeProject.value = resolvedPath
@@ -1791,9 +2299,10 @@ async function handleNudge(msg: any) {
       case 'stop': {
         // 停止当前活跃标签页的 agent
         const tab = tabSessions.value.find(t => t.id === activeTabId.value)
-        if (tab?.websocket && tab.websocket.readyState === WebSocket.OPEN) {
-          tab.websocket.send(JSON.stringify({ type: 'stop_generation' }))
+        if (sendSessionPayload({type: 'stop_generation'}, tab?.websocket || null)) {
           showToast('已发送停止指令')
+        } else {
+          showToast(t('ws.notConnected'))
         }
         break
       }
@@ -1808,32 +2317,59 @@ async function handleNudge(msg: any) {
       }
     }
   } catch (e) {
-    // 静默：nudge 操作失败不阻塞
+    console.debug('nudge 操作失败，已保持当前 UI 状态', e)
   }
 }
 
 /** 加载历史会话的消息记录（恢复会话时展示，仅文本角色，不含思考/工具） */
 let _loadHistorySeq = 0
-async function loadHistory(encodedDir: string, sId: string) {
+async function loadHistory(encodedDir: string, sId: string, mode: 'append' | 'replace' = 'append'): Promise<boolean> {
   const seq = ++_loadHistorySeq
+  const ownerTabId = activeTabId.value
   try {
     const res = await fetch(`${GW}/api/projects/${encodedDir}/sessions/${sId}/messages`)
-    if (seq !== _loadHistorySeq) return  // 已有更新的请求，丢弃旧响应
+    if (seq !== _loadHistorySeq || activeTabId.value !== ownerTabId) return false  // 已有更新的请求或已切换 tab
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const data = await res.json()
+    if (seq !== _loadHistorySeq || activeTabId.value !== ownerTabId) return false
     if (data.messages?.length) {
       _loadedHistoryTexts = new Set()
-      messages.value.push({role: 'system', text: t('sys.history', {n: data.messages.length}), time: Date.now()})
+      const loadedMessages: Message[] = [
+        {role: 'system', text: t('sys.history', {n: data.messages.length}), time: Date.now()},
+      ]
       for (const m of data.messages) {
         _loadedHistoryTexts.add(m.text)
-        messages.value.push({role: m.role, text: m.text, time: new Date(m.time).getTime()})
+        loadedMessages.push({
+          role: m.role,
+          text: m.text,
+          time: new Date(m.time).getTime(),
+          thinkingContent: m.thinkingContent,
+          tools: Array.isArray(m.tools) ? m.tools : undefined,
+          expanded: m.role === 'thinking' ? false : undefined,
+        })
       }
+      if (mode === 'replace') messages.value = loadedMessages
+      else messages.value.push(...loadedMessages)
+      scrollDown()
+      return true
     }
   } catch (e) {
-    if (seq !== _loadHistorySeq) return
+    if (seq !== _loadHistorySeq || activeTabId.value !== ownerTabId) return false
     console.error('[loadHistory] 请求历史消息失败:', e)
     messages.value.push({role: 'error', text: t('err.historyLoad'), time: Date.now()})
   }
   scrollDown()
+  return false
+}
+
+async function reconcileFinishedSession(tab: TabSession, targetSessionId: string) {
+  if (!tab.historySessionId || activeTabId.value !== tab.id || sessionId.value !== targetSessionId) return
+  const loaded = await loadHistory(encodeProjectName(tab.projectPath), tab.historySessionId, 'replace')
+  if (!loaded || activeTabId.value !== tab.id || sessionId.value !== targetSessionId) return
+  status.value = 'idle'
+  pendingTools.value = []
+  stopTaskDurationTimer()
+  syncCurrentTabState()
 }
 
 /** 控制通道 WebSocket：不绑定 session，启动即连，接收 IM nudge 事件 */
@@ -1842,31 +2378,68 @@ let _ctrlReconnectDelay = 5000
 const _CTRL_MAX_RETRIES = 10
 let _ctrlRetryCount = 0
 let _controlWSStopped = false
+let _ctrlReconnectTimer: ReturnType<typeof setTimeout> | null = null
 
-async function connectControlWS() {
+async function connectControlWS(forceRefresh = false) {
   if (_controlWSStopped) return
-  if (controlWS && controlWS.readyState === WebSocket.OPEN) return
+  if (controlWS && (controlWS.readyState === WebSocket.OPEN || controlWS.readyState === WebSocket.CONNECTING)) return
   if (_ctrlRetryCount >= _CTRL_MAX_RETRIES) {
     console.warn('[controlWS] 已达最大重试次数，停止重连')
+    showToast('消息注入控制通道连接失败，请检查 Gateway 后刷新页面。', 8000)
     return
   }
-  const ctrlUrl = await wsUrl('/ws/control')
-  controlWS = new WebSocket(ctrlUrl)
-  controlWS.onmessage = (e) => {
+  if (_ctrlReconnectTimer) {
+    clearTimeout(_ctrlReconnectTimer)
+    _ctrlReconnectTimer = null
+  }
+  if (_controlWSStopped) return
+  let thisWs: WebSocket
+  try {
+    thisWs = await createGatewayWebSocket('/ws/control', forceRefresh)
+  } catch (error) {
+    _ctrlRetryCount++
+    console.error('[controlWS] 创建连接失败:', error)
+    showToast('消息注入控制通道不可用，正在重试...', 5000)
+    _ctrlReconnectTimer = setTimeout(() => {
+      _ctrlReconnectTimer = null
+      void connectControlWS(forceRefresh)
+    }, _ctrlReconnectDelay)
+    _ctrlReconnectDelay = Math.min(_ctrlReconnectDelay * 2, 60000)
+    return
+  }
+  controlWS = thisWs
+  thisWs.onmessage = (e) => {
     try {
       const msg = JSON.parse(e.data)
       if (msg.type === 'nudge') handleNudge(msg)
     } catch (e) { console.error(e) }
   }
-  controlWS.onopen = () => { _ctrlReconnectDelay = 5000; _ctrlRetryCount = 0 }
-  controlWS.onclose = () => {
-    controlWS = null
-    _ctrlRetryCount++
-    setTimeout(connectControlWS, _ctrlReconnectDelay)
-    // 指数退避: 5s → 10s → 20s → ... → 上限 60s
-    _ctrlReconnectDelay = Math.min(_ctrlReconnectDelay * 2, 60000)
+  thisWs.onopen = () => {
+    if (_ctrlRetryCount > 0) showToast('消息注入控制通道已恢复')
+    _ctrlReconnectDelay = 5000
+    _ctrlRetryCount = 0
   }
-  controlWS.onerror = () => { controlWS?.close() }
+  thisWs.onclose = (event) => {
+    if (controlWS !== thisWs) return
+    controlWS = null
+    if (_controlWSStopped) return
+    _ctrlRetryCount++
+    showToast('消息注入控制通道已断开，正在重连...', 5000)
+    const authFailed = event.code === 4003 || event.code === 1006
+    const retryDelay = authFailed ? 250 : _ctrlReconnectDelay
+    _ctrlReconnectTimer = setTimeout(() => {
+      _ctrlReconnectTimer = null
+      void connectControlWS(authFailed).catch(error => {
+        console.error('[controlWS] 重连失败:', error)
+      })
+    }, retryDelay)
+    // 指数退避: 5s → 10s → 20s → ... → 上限 60s
+    if (!authFailed) _ctrlReconnectDelay = Math.min(_ctrlReconnectDelay * 2, 60000)
+  }
+  thisWs.onerror = () => {
+    dispatchBridgeNotice(classifyBridgeFailure({source: 'websocket', path: '/ws/control', serverCode: 'CONTROL_CHANNEL_ERROR'}))
+    thisWs.close()
+  }
 }
 
 /**
@@ -1875,30 +2448,95 @@ async function connectControlWS() {
  * WebSocket 生命周期：onopen 标记 connected，onmessage 分发到各 type 处理分支，onclose/onerror 重置状态。
  * 注意：ws 是模块级非响应式变量（let），避免 Vue Proxy 干扰 WebSocket 原生事件。
  */
-async function connectWS(sid: string, resumed = false) {
-  if (ws) {
+function resendPendingInputs(socket: WebSocket, targetSessionId: string): number {
+  const pending = [...pendingInputTexts.values()]
+    .filter(item => item.sessionId === targetSessionId)
+    .sort((a, b) => a.createdAt - b.createdAt)
+  let sent = 0
+  for (const item of pending) {
+    try {
+      socket.send(JSON.stringify(item.payload))
+      sent++
+    } catch (error) {
+      console.warn('重发未确认消息失败，保留到下次重连', error)
+      break
+    }
+  }
+  return sent
+}
+
+interface SessionReconnectState {
+  timer: ReturnType<typeof setTimeout> | null
+  delay: number
+  attempts: number
+}
+const sessionReconnectStates = new Map<string, SessionReconnectState>()
+
+function cancelSessionReconnect(tabId: string) {
+  const state = sessionReconnectStates.get(tabId)
+  if (state?.timer) clearTimeout(state.timer)
+  sessionReconnectStates.delete(tabId)
+}
+
+function scheduleSessionReconnect(tabId: string, sid: string, forceRefresh = false) {
+  const state = sessionReconnectStates.get(tabId) || {timer: null, delay: 1000, attempts: 0}
+  if (state.timer) return
+  if (state.attempts >= 10) {
+    if (activeTabId.value === tabId) {
+      const text = '会话连接连续重试失败，请检查 Gateway 后手动重新打开该会话。'
+      messages.value.push({role: 'error', text, time: Date.now()})
+      showToast(text, 8000)
+    }
+    sessionReconnectStates.delete(tabId)
+    return
+  }
+  const delay = forceRefresh ? 250 : state.delay
+  state.timer = setTimeout(() => {
+    state.timer = null
+    if (activeTabId.value !== tabId || sessionId.value !== sid) return
+    state.attempts++
+    void connectWS(sid, true, forceRefresh).catch(error => {
+      console.error('[workspaceWS] 重连失败:', error)
+      scheduleSessionReconnect(tabId, sid, forceRefresh)
+    })
+  }, delay)
+  state.delay = forceRefresh ? 1000 : Math.min(state.delay * 2, 30_000)
+  sessionReconnectStates.set(tabId, state)
+}
+
+async function connectWS(sid: string, resumed = false, forceRefresh = false) {
+  // 在 await 前捕获归属，防止 token 读取期间切换标签页后连接被绑定到错误会话。
+  const mySid = sid
+  const myTabId = activeTabId.value
+  const myProject = activeTab.value?.label || ''
+  if (ws && shouldCloseSocketBeforeConnect(sessionId.value, mySid, ws.readyState)) {
     ws.onclose = null   // 先解除回调再关闭，防止旧 onclose 异步触发污染新连接状态
     ws.onerror = null
     ws.close()
   }
-  const wsConnectUrl = await wsUrl(`/ws/${sid}`)
-  ws = new WebSocket(wsConnectUrl)
-
-  // 闭包捕获: 此 WS 所属的 tab 标识，防止异步回调污染其他 tab
-  const mySid = sid
-  const myTabId = activeTabId.value
-  const myProject = activeTab.value?.label || ''
+  const thisWs = await createGatewayWebSocket(`/ws/${sid}`, forceRefresh)
+  const ownerTab = tabSessions.value.find(t => t.id === myTabId)
+  if (ownerTab) ownerTab.websocket = thisWs
+  if (activeTabId.value === myTabId) ws = thisWs
 
   /** 判断此 WS 的 tab 是否当前前台 */
   const isFg = () => sessionId.value === mySid
 
-  ws.onopen = () => {
+  thisWs.onopen = () => {
     const tab = tabSessions.value.find(t => t.id === myTabId)
     if (tab) tab.state.connected = true
+    const reconnectState = myTabId ? sessionReconnectStates.get(myTabId) : null
+    if (reconnectState?.timer) clearTimeout(reconnectState.timer)
+    const reconnectAttempts = reconnectState?.attempts || 0
+    if (myTabId) sessionReconnectStates.set(myTabId, {timer: null, delay: 1000, attempts: 0})
+    const resent = resendPendingInputs(thisWs, mySid)
+    if (resent > 0 && tab) tab.state.status = 'thinking'
     // 重连后自动恢复队列中的消息发送（flush 中途断连时回填了队列）
-    if (msgQueue.value.length > 0) flushMsgQueue()
+    if (isFg() && msgQueue.value.length > 0) void flushMsgQueue()
     if (isFg()) {
       connected.value = true
+      if (reconnectAttempts > 0) showToast('会话连接已恢复')
+      if (resent > 0) status.value = 'thinking'
       syncPetState('connected', { message: 'Connected', bubble: petPick(BUBBLE_CONNECTED, myProject) })
       const label = resumed
           ? t('sys.connectedResume', {id: sid.slice(0, 8)})
@@ -1908,7 +2546,7 @@ async function connectWS(sid: string, resumed = false) {
     }
   }
 
-  ws.onmessage = (e) => {
+  thisWs.onmessage = (e) => {
     let _saved: TabState | null = null
     try {
       const tab = tabSessions.value.find(t => t.id === myTabId)
@@ -1934,16 +2572,183 @@ async function connectWS(sid: string, resumed = false) {
         msg = JSON.parse(e.data)
       } catch {
         // 无法解析的消息静默丢弃；若已交换后台 tab 状态则先恢复前台
-        if (_saved) { try { restoreTabState(_saved!) } catch {} }
+        if (_saved) { try { restoreTabState(_saved!) } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) } }
         return
       }
       switch (msg.type) {
-      case 'system_init':
+      case 'session_state_snapshot': {
+        const wasThinking = status.value === 'thinking'
+        status.value = msg.generating === true ? 'thinking' : 'idle'
+        if (msg.taskState && typeof msg.taskState === 'object') tabTaskState.value = msg.taskState as PersistedTaskState
+        if (msg.taskState?.status === 'interrupted' && msg.taskState?.resumable && fg && !wasThinking
+            && !messages.value.some(item => item.taskResult?.resumable && item.taskResult.continuationReason === 'execution_error')) {
+          const draftKey = sessionDraftKey(draftIdentity(tab))
+          const originalTask = (draftKey ? getSessionDraft(sessionDraftStore, draftKey)?.text : '')
+            || lastUserMessage
+            || [...messages.value].reverse().find(item => item.role === 'user')?.text
+            || ''
+          messages.value.push({
+            role: 'system',
+            text: t('sys.taskInterruptedAfterRestart'),
+            time: Date.now(),
+            taskResult: {
+              outcome: 'failed',
+              continuationReason: 'execution_error',
+              resumable: true,
+              originalTask,
+            },
+          })
+        }
+        if (fg && wasThinking && msg.generating !== true) {
+          void reconcileFinishedSession(tab, mySid)
+        }
+        break
+      }
+
+      case 'message_accepted': {
+        const messageId = String(msg.messageId || '')
+        const acceptedInput = pendingInputTexts.get(messageId)
+        for (const attachment of acceptedInput?.message.attachments || []) attachment.status = 'sent'
+        if (messageId) pendingInputTexts.delete(messageId)
+        if (acceptedInput && (!inputText.value.trim() || inputText.value.trim() === acceptedInput.text.trim())) clearDraftForTab(tab)
+        if (Number(msg.queuePosition || 0) > 0 && fg) {
+          showToast(`消息已排队，前面还有 ${msg.queuePosition} 条`)
+        }
+        break
+      }
+
+      case 'message_duplicate': {
+        const messageId = String(msg.messageId || '')
+        const duplicateInput = pendingInputTexts.get(messageId)
+        for (const attachment of duplicateInput?.message.attachments || []) attachment.status = 'sent'
+        if (messageId) pendingInputTexts.delete(messageId)
+        if (duplicateInput && (!inputText.value.trim() || inputText.value.trim() === duplicateInput.text.trim())) clearDraftForTab(tab)
+        if (fg) showToast('消息已处理，已忽略重复提交')
+        break
+      }
+
+      case 'message_rejected': {
+        const messageId = String(msg.messageId || '')
+        const rejectedInput = pendingInputTexts.get(messageId)
+        for (const attachment of rejectedInput?.message.attachments || []) attachment.status = 'failed'
+        if (messageId) pendingInputTexts.delete(messageId)
+        if (rejectedInput?.text && !inputText.value) inputText.value = rejectedInput.text
+        if (rejectedInput?.text) saveDraftForTab(tab, rejectedInput.text, true)
+        if (rejectedInput?.attachments?.length) {
+          const merged = new Map(pendingAttachments.value.map(a => [a.id, a]))
+          for (const attachment of rejectedInput.attachments) merged.set(attachment.id, attachment)
+          pendingAttachments.value = [...merged.values()]
+        }
+        status.value = 'idle'
+        stopTaskDurationTimer()
+        pendingTools.value = []
+        const reason = msg.code === 'input_queue_full'
+            ? '当前会话队列已满，请稍后重试'
+            : `消息未接受${msg.code ? `（${msg.code}）` : ''}`
+        messages.value.push({role: 'error', text: reason, time: Date.now()})
+        if (fg) showToast(reason)
+        break
+      }
+
+      case 'system_init': {
         // 模型初始化信息：显示当前使用的模型和工作目录，同时捕获 contextWindow 和定价
         messages.value.push({role: 'system', text: t('sys.model', {model: msg.model, cwd: msg.cwd}), time: Date.now()})
-        if (msg.contextWindow) maxTokens.value = msg.contextWindow
+        const historySessionId = typeof msg.historySessionId === 'string' ? msg.historySessionId.trim() : ''
+        if (historySessionId) {
+          tab.historySessionId = historySessionId
+          refreshTabLabel(tab)
+          migrateGatewayDraftToSdk(tab)
+          restoreDraftForTab(tab)
+          if (fg) activeSessionId.value = historySessionId
+
+          // SIDE_EFFECT: SDK 会话 ID 只有在 init 事件到达后才确定，此时立即写入侧栏，
+          // 避免等待下一次磁盘扫描或用户手动刷新。
+          _projectsEpoch++
+          projects.value = upsertProjectSession(projects.value, {
+            workDir: tab.projectPath,
+            encodedDir: encodeProjectName(tab.projectPath),
+            sessionId: historySessionId,
+          })
+          expandedProjects.value = new Set([...expandedProjects.value, tab.projectPath])
+          persistWorkspaceShell()
+        }
+        if (msg.contextWindow) {
+          const provisional = normalizeContextUiState({
+            totalTokens: usage.value.total,
+            maxTokens: msg.contextWindow,
+            rawMaxTokens: msg.contextWindow,
+            configuredSafetyCap: contextSafetyCap.value,
+          })
+          maxTokens.value = provisional.maxTokens || 0
+          rawMaxTokens.value = provisional.rawMaxTokens || 0
+        }
         if (msg.pricing) pricing.value = msg.pricing
         break
+      }
+
+      case 'context_usage': {
+        const normalized = normalizeContextUiState({...msg, configuredSafetyCap: contextSafetyCap.value})
+        usage.value.total = normalized.totalTokens
+        maxTokens.value = normalized.maxTokens || 0
+        rawMaxTokens.value = normalized.rawMaxTokens || normalized.maxTokens || 0
+        contextPercent.value = normalized.percentage || 0
+        contextPercentKnown.value = normalized.percentage !== null
+        if (normalized.percentage !== null && normalized.percentage >= 80 && normalized.percentage < 90 && contextWarningLevel < 80) {
+          contextWarningLevel = 80
+          messages.value.push({role: 'system', text: `上下文已使用 ${normalized.percentage}%，接近自动压缩阈值。`, time: Date.now()})
+        }
+        saveUsage()
+        break
+      }
+
+      case 'context_compacting': {
+        contextCompacting.value = true
+        status.value = 'thinking'
+        const current = [...messages.value].reverse().find(item => item.compact && !item.compact.preTokens)
+        if (!current) {
+          messages.value.push({
+            role: 'system',
+            text: msg.trigger === 'manual' ? '正在压缩上下文' : '上下文达到阈值，正在自动压缩',
+            time: Date.now(),
+            compact: {trigger: msg.trigger || 'auto'},
+          })
+        }
+        break
+      }
+
+      case 'context_compaction_summary': {
+        pendingCompactSummary = typeof msg.summary === 'string' ? msg.summary : ''
+        const notice = [...messages.value].reverse().find(item => item.compact)
+        if (notice?.compact) notice.compact.summary = pendingCompactSummary
+        break
+      }
+
+      case 'context_compacted': {
+        contextCompacting.value = false
+        contextWarningLevel = 0
+        if (typeof msg.postTokens === 'number') usage.value.total = msg.postTokens
+        if (maxTokens.value > 0) {
+          contextPercent.value = Math.min(100, Math.round(usage.value.total / maxTokens.value * 100))
+          contextPercentKnown.value = true
+        }
+        let notice = [...messages.value].reverse().find(item => item.compact && !item.compact.preTokens)
+        if (!notice) {
+          notice = {role: 'system', text: '上下文已压缩', time: Date.now(), compact: {}}
+          messages.value.push(notice)
+        }
+        notice.text = '上下文已压缩'
+        notice.compact = {
+          trigger: msg.trigger || notice.compact?.trigger || 'auto',
+          preTokens: msg.preTokens || 0,
+          postTokens: msg.postTokens || 0,
+          durationMs: msg.durationMs || 0,
+          summary: notice.compact?.summary || pendingCompactSummary,
+          summaryExpanded: false,
+        }
+        pendingCompactSummary = ''
+        saveUsage()
+        break
+      }
 
       case 'assistant_message': {
         // AI 回复：遍历 content 数组，text 块渲染为 assistant 气泡，
@@ -2039,11 +2844,13 @@ async function connectWS(sid: string, resumed = false) {
       }
 
       case 'user_message_echo': {
+        if (msg.message?.isCompactSummary || msg.message?.isVisibleInTranscriptOnly) break
         // resume 时 SDK 重放历史用户消息，若 loadHistory 已加载则跳过
         const text = typeof msg.message?.content === 'string'
             ? msg.message.content
             : msg.message?.content?.map((b: any) => b.type === 'text' ? b.text : '').join(' ') || ''
         const trimmed = text.trim()
+        if (/^This session is being continued\.\.\./i.test(trimmed)) break
         if (trimmed) {
           if (_loadedHistoryTexts?.has(trimmed)) break
           const ts = msg.timestamp ? new Date(msg.timestamp).getTime() : Date.now()
@@ -2075,13 +2882,7 @@ async function connectWS(sid: string, resumed = false) {
         break
 
       case 'message_start':
-        // resume 时捕获初始上下文 token 数（只有第一轮 total===0 时记录，避免重复覆盖）
-        if (msg.usage?.input_tokens && usage.value.total === 0) {
-          usage.value.input = msg.usage.input_tokens
-          usage.value.total = msg.usage.input_tokens
-          contextPercent.value = Math.min(100, Math.round(usage.value.total / (maxTokens.value / 100)))
-          saveUsage()
-        }
+        // message_start 只是单次 API usage，真实会话上下文由 SDK getContextUsage() 提供。
         break
 
       case 'remote_user_message':
@@ -2133,17 +2934,56 @@ async function connectWS(sid: string, resumed = false) {
         // 思考 token: SDK 不单独拆分, 用本轮思考文本估算; 纯输出 = 总输出 - 思考(下限 0)
         const think = Math.min(rawOut, estimateTokens(turnThinkingText))
         const pureOut = Math.max(0, rawOut - think)
-        messages.value.push({
-          role: 'system',
-          text: t('sys.done', {turns: msg.num_turns, ms: msg.duration_ms, in: inp, think, out: pureOut}),
+        const resultModelUsage = msg.modelUsage && typeof msg.modelUsage === 'object'
+          ? (msg.modelUsage[model.value] || Object.values(msg.modelUsage)[0]) as any
+          : null
+        if (resultModelUsage?.contextWindow) {
+          const resolved = normalizeContextUiState({
+            totalTokens: usage.value.total,
+            maxTokens: resultModelUsage.contextWindow,
+            rawMaxTokens: resultModelUsage.contextWindow,
+            configuredSafetyCap: contextSafetyCap.value,
+          })
+          maxTokens.value = resolved.maxTokens || 0
+          rawMaxTokens.value = resolved.rawMaxTokens || 0
+        }
+        const taskResult = normalizeTaskResult(msg)
+        tabTaskState.value = {
+          status: taskResult.outcome === 'succeeded' ? 'succeeded' : taskResult.outcome === 'incomplete' ? 'incomplete' : 'failed',
+          outcome: taskResult.outcome,
+          continuationReason: taskResult.continuationReason,
+          resumable: taskResult.resumable,
+          subtype: msg.subtype || null,
+          numTurns: msg.num_turns || 0,
+          detail: String(msg.result || '').trim(),
+          updatedAt: Date.now(),
+        }
+        const resultText = taskResult.messageKey === 'sys.done'
+          ? t('sys.done', {turns: msg.num_turns, ms: msg.duration_ms, in: inp, think, out: pureOut})
+          : t(taskResult.messageKey, {
+              turns: msg.num_turns,
+              detail: String(msg.result || '').trim() || t('sys.noErrorDetail'),
+            })
+        const originalTask = lastUserMessage || [...messages.value].reverse().find(item => item.role === 'user')?.text || ''
+        const resultMessage: Message = {
+          role: taskResult.tone === 'error' ? 'error' : 'system',
+          text: resultText,
           time: Date.now(),
-        })
+          taskResult: {
+            outcome: taskResult.outcome,
+            continuationReason: taskResult.continuationReason,
+            resumable: taskResult.resumable,
+            originalTask,
+          },
+        }
+        messages.value.push(resultMessage)
+        if (taskResult.outcome !== 'succeeded' && originalTask) {
+          saveDraftForTab(activeTab.value, originalTask, true)
+        }
         if (msg.usage) {
           usage.value.input = inp
           usage.value.thinking = think
           usage.value.output = pureOut
-          usage.value.total = inp + rawOut  // context 占用按真实总量(含思考)
-          contextPercent.value = Math.min(100, Math.round(usage.value.total / (maxTokens.value / 100)))
           const pi = pricing.value?.inputPrice || 0
           const po = pricing.value?.outputPrice || 0
           const cost = (inp / 1e6) * pi + (rawOut / 1e6) * po
@@ -2159,25 +2999,45 @@ async function connectWS(sid: string, resumed = false) {
           _turnCompleted = true
         } else {
           status.value = 'idle'
-          flushMsgQueue()
+          if (fg) void flushMsgQueue()
         }
-        if (fg) {
+        if (fg && runningAgentTotal.value === 0 && taskResult.outcome === 'succeeded') {
           syncPetState('success', { message: 'Done!', bubble: petPick(BUBBLE_SUCCESS, myProject) })
           setTimeout(() => { syncPetState('idle'); petBubble.value = '' }, 3000)
           // AI 改完文件后即时刷新：记录点始终刷新，文件树仅面板打开时（节省请求）
           loadCheckpoints()
           if (showFilePanel.value) loadFileTree()
         }
+        if (fg && runningAgentTotal.value === 0 && taskResult.outcome !== 'succeeded') {
+          const message = taskResult.outcome === 'incomplete' ? t('sys.taskIncompleteShort') : resultText
+          syncPetState('error', {message: message.slice(0, 40), bubble: message.slice(0, 80)})
+          setTimeout(() => { syncPetState('idle'); petBubble.value = '' }, 3000)
+        }
+        // SDK transcript 已在本轮结束时落盘，刷新侧栏中的真实标题和文件大小。
+        void loadProjects()
         break
       }
+
+      case 'generation_stopped':
+        if (msg.taskState && typeof msg.taskState === 'object') tabTaskState.value = msg.taskState as PersistedTaskState
+        status.value = 'idle'
+        break
 
       case 'error':
         // SDK 错误：清空待处理工具，显示错误消息。同时清理 agent 追踪、turn 标记。
         pendingTools.value = []
         _turnCompleted = false
         messages.value.push({role: 'error', text: msg.message, time: Date.now()})
+        tabTaskState.value = {
+          status: 'interrupted',
+          outcome: 'failed',
+          continuationReason: 'execution_error',
+          resumable: Boolean(tab.historySessionId),
+          detail: String(msg.message || ''),
+          updatedAt: Date.now(),
+        }
         status.value = 'idle'
-        flushMsgQueue()
+        if (fg) void flushMsgQueue()
         if (fg) {
           syncPetState('error', { message: msg.message?.slice(0, 40), bubble: petPick(BUBBLE_ERROR_SDK, myProject) + (msg.message?.slice(0, 50) || '') })
           setTimeout(() => { syncPetState('idle'); petBubble.value = '' }, 3000)
@@ -2187,9 +3047,13 @@ async function connectWS(sid: string, resumed = false) {
         // ── 子 Agent 事件（内联卡片追踪）──
       case 'subagent_spawning': {
         agentRuns.value.push({
-          id: msg.agentType || 'unknown',
+          id: msg.toolUseId || msg.requestId || `${msg.agentType || 'unknown'}-${msg.ts || Date.now()}`,
           agentType: msg.agentType || 'unknown',
           description: msg.description || '',
+          purpose: msg.purpose || '',
+          task: msg.task || msg.description || '',
+          scope: msg.scope || '',
+          descriptionSource: msg.descriptionSource || 'builtin',
           status: 'spawning',
           spawnTime: msg.ts || Date.now(),
           startTime: 0, doneTime: 0,
@@ -2197,17 +3061,31 @@ async function connectWS(sid: string, resumed = false) {
           source: 'native',
           currentTool: '',
           currentToolElapsed: 0,
+          toolUseId: msg.toolUseId || '',
+        })
+        if (fg) syncPetState('thinking', {
+          message: msg.description || msg.agentType || 'Agent',
+          bubble: `${petPick(BUBBLE_TOOL_GENERIC, myProject)}，${msg.description || `启动 ${msg.agentType || 'Agent'} 任务`}`,
         })
         break
       }
 
       case 'subagent_start': {
         const tgt = msg.agentType || msg.agentId
+        const startDescription = typeof msg.description === 'string' ? msg.description.trim() : ''
         let found = false
         for (const ag of agentRuns.value) {
-          if (ag.agentType === tgt && ag.status === 'spawning') {
-            ag.status = 'running';
-            ag.startTime = msg.ts || Date.now()
+          const exactIdentity = (msg.toolUseId && ag.toolUseId === msg.toolUseId) || (msg.agentId && ag.id === msg.agentId)
+          const pendingFallback = !msg.toolUseId && ag.agentType === tgt && ag.status === 'spawning'
+          if (exactIdentity || pendingFallback) {
+            ag.status = 'running'
+            ag.startTime = ag.startTime || msg.ts || Date.now()
+            if (startDescription && !ag.task) ag.task = startDescription
+            if (startDescription && !ag.description) ag.description = startDescription
+            if (msg.purpose) ag.purpose = msg.purpose
+            if (msg.task) ag.task = msg.task
+            if (msg.scope) ag.scope = msg.scope
+            if (msg.descriptionSource) ag.descriptionSource = msg.descriptionSource
             if (msg.agentId) ag.id = msg.agentId
             found = true;
             break
@@ -2218,7 +3096,11 @@ async function connectWS(sid: string, resumed = false) {
           agentRuns.value.push({
             id: msg.agentId || tgt,
             agentType: tgt,
-            description: msg.description || '',
+            description: startDescription,
+            purpose: msg.purpose || '',
+            task: msg.task || startDescription,
+            scope: msg.scope || '',
+            descriptionSource: msg.descriptionSource || 'builtin',
             status: 'running',
             spawnTime: msg.ts || Date.now(),
             startTime: msg.ts || Date.now(),
@@ -2227,7 +3109,21 @@ async function connectWS(sid: string, resumed = false) {
             source: 'native',
             currentTool: '',
             currentToolElapsed: 0,
+            toolUseId: msg.toolUseId || '',
           })
+        }
+        if (fg) syncPetState('thinking', {
+          message: msg.agentType || msg.agentId || 'Agent',
+          bubble: `${petPick(BUBBLE_TOOL_GENERIC, myProject)}，Agent 已开始执行${msg.agentType ? `：${msg.agentType}` : ''}`,
+        })
+        break
+      }
+
+      case 'subagent_progress': {
+        const run = agentRuns.value.find(ag => (msg.toolUseId && ag.toolUseId === msg.toolUseId) || (msg.agentId && ag.id === msg.agentId))
+        if (run) {
+          run.currentTool = msg.currentAction || run.currentTool
+          run.progress = msg.progress || msg.currentAction || run.progress
         }
         break
       }
@@ -2235,7 +3131,11 @@ async function connectWS(sid: string, resumed = false) {
       case 'subagent_done': {
         const tgt = msg.agentType || msg.agentId
         for (const ag of agentRuns.value) {
-          if (ag.source === 'native' && ag.status === 'running' && (ag.id === tgt || ag.agentType === tgt)) {
+          if (ag.source === 'native' && (ag.status === 'running' || ag.status === 'spawning') && (
+            (msg.toolUseId && ag.toolUseId === msg.toolUseId) ||
+            (msg.agentId && ag.id === msg.agentId) ||
+            (!msg.toolUseId && !msg.agentId && ag.agentType === tgt)
+          )) {
             ag.status = 'done';
             ag.doneTime = msg.ts || Date.now()
             if (msg.transcriptPath) ag.transcriptPath = msg.transcriptPath
@@ -2243,10 +3143,18 @@ async function connectWS(sid: string, resumed = false) {
           }
         }
         // 最后一个子 Agent 完成且回合已结束时，切 idle 并清队列
-        if (_turnCompleted && runningAgentTotal.value === 0) {
+        const completedTurn = _turnCompleted && runningAgentTotal.value === 0
+        if (completedTurn) {
           _turnCompleted = false
           status.value = 'idle'
-          flushMsgQueue()
+          if (fg) void flushMsgQueue()
+        }
+        if (fg) {
+          if (completedTurn) {
+            syncPetState('success', {message: 'Done!', bubble: petPick(BUBBLE_SUCCESS, myProject)})
+          } else {
+            syncPetState('thinking', {message: 'Agent running', bubble: `${myProject} 还有 Agent 正在执行`})
+          }
         }
         break
       }
@@ -2379,7 +3287,7 @@ async function connectWS(sid: string, resumed = false) {
         if (_turnCompleted && runningAgentTotal.value === 0) {
           _turnCompleted = false
           status.value = 'idle'
-          flushMsgQueue()
+          if (fg) void flushMsgQueue()
         }
         break
 
@@ -2418,7 +3326,7 @@ async function connectWS(sid: string, resumed = false) {
         if (_turnCompleted && runningAgentTotal.value === 0) {
           _turnCompleted = false
           status.value = 'idle'
-          flushMsgQueue()
+          if (fg) void flushMsgQueue()
         }
         break
 
@@ -2452,7 +3360,7 @@ async function connectWS(sid: string, resumed = false) {
       // 安全前提: snapshotTabState/restoreTabState 必须同步执行，不可加 await
       if (mySeq === _handlerSeq) {
         tab.state = snapshotTabState()
-        try { restoreTabState(_saved!) } catch {}
+        try { restoreTabState(_saved!) } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
       }
     } else {
       nextTick(() => scrollDown())
@@ -2462,18 +3370,34 @@ async function connectWS(sid: string, resumed = false) {
     }
   }
 
-  ws.onclose = () => {
+  thisWs.onclose = (event) => {
     const tab = tabSessions.value.find(t => t.id === myTabId)
+    const ownsTabSocket = tab?.websocket === thisWs
+    const ownsForegroundSocket = ws === thisWs
+    if (!ownsTabSocket && !ownsForegroundSocket) return
+    if (ownsTabSocket && tab) tab.websocket = null
+    if (ownsForegroundSocket) ws = null
     if (tab) tab.state.connected = false
+    const wasThinking = tab?.state.status === 'thinking' || (isFg() && status.value === 'thinking')
+    if (wasThinking && tab) saveDraftForTab(tab, tab.state.lastUserMessage || lastUserMessage || inputText.value, true)
     if (isFg()) {
       connected.value = false; status.value = 'idle'
       syncPetState('disconnected', { bubble: petPick(BUBBLE_DISCONNECTED, myProject) })
     }
+    const reconnectable = event.code === 4003 || event.code === 1001 || event.code === 1006
+        || event.code === 1011 || event.code === 1012 || event.code === 1013
+    if (reconnectable && isFg() && myTabId) {
+      showToast('会话连接已断开，正在自动重连...', 5000)
+      scheduleSessionReconnect(myTabId, mySid, event.code === 4003)
+    } else if (isFg()) {
+      showToast(`会话连接已关闭（${event.code || 1006}）`, 6000)
+    }
   }
-  ws.onerror = () => {
+  thisWs.onerror = () => {
     const tab = tabSessions.value.find(t => t.id === myTabId)
     if (tab) tab.state.connected = false
     if (isFg()) {
+      dispatchBridgeNotice(classifyBridgeFailure({source: 'websocket', path: `/ws/${mySid}`, serverCode: 'SESSION_CHANNEL_ERROR'}))
       connected.value = false
       syncPetState('error', { message: 'Connection error', bubble: petPick(BUBBLE_ERROR_CONN, myProject) })
       setTimeout(() => syncPetState('disconnected'), 3000)
@@ -2532,8 +3456,7 @@ async function copyBubble(text: string, i: number) {
     setTimeout(() => {
       if (copiedIndex.value === i) copiedIndex.value = -1
     }, 1200)
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
 }
 
 /** 将消息文本回填到输入框，并自动聚焦和调整 textarea 高度 */
@@ -2594,8 +3517,7 @@ async function loadIMStatus() {
         imBound.value[p.id] = p.hasAccount === true
       }
     }
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
 }
 
 /** 从 Gateway 加载当前 session 的镜像开关状态 */
@@ -2603,35 +3525,50 @@ async function loadSessionMirrors() {
   if (!sessionId.value) return
   try {
     const r = await fetch(`${GW}/api/sessions/${sessionId.value}/mirror`)
-    if (r.ok) {
-      const d = await r.json()
-      if (d.mirrors) {
-        for (const p of IM_PLATFORMS) {
-          if (typeof d.mirrors[p.id] === 'boolean') mirrorState.value[p.id] = d.mirrors[p.id]
-        }
+    if (!r.ok) throw new Error(`HTTP ${r.status}`)
+    const d = await r.json()
+    if (d.mirrors) {
+      for (const p of IM_PLATFORMS) {
+        if (typeof d.mirrors[p.id] === 'boolean') mirrorState.value[p.id] = d.mirrors[p.id]
       }
     }
-  } catch (e) { console.error(e) }
+  } catch (error: any) {
+    console.warn('镜像状态加载失败', error)
+    showToast(`微信/飞书/钉钉通知状态加载失败：${error?.message || '未知错误'}`, 6000)
+  }
 }
 
 /** 通知 Gateway 设置指定平台的镜像开关（session 级标志） */
-async function setMirror(platform: string, enabled: boolean) {
-  if (!sessionId.value) return
+async function setMirror(platform: string, enabled: boolean): Promise<boolean> {
+  if (!sessionId.value) return false
   try {
-    await apiFetch(`${GW}/api/sessions/${sessionId.value}/mirror`, {
+    const response = await apiFetch(`${GW}/api/sessions/${sessionId.value}/mirror`, {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({platform, enabled}),
     })
-  } catch (e) { console.error(e) }
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    return true
+  } catch (error: any) {
+    console.warn('镜像开关保存失败', error)
+    showToast(`通知开关保存失败：${error?.message || 'Gateway 不可用'}`, 6000)
+    return false
+  }
 }
 
 /** 切换镜像开关：更新本地状态 → Gateway → toast 提示 */
-function toggleMirror(platform: string) {
+async function toggleMirror(platform: string) {
   if (!imBound.value[platform]) return
-  mirrorState.value[platform] = !mirrorState.value[platform]
-  try { localStorage.setItem(`bridge-mirror-${platform}`, mirrorState.value[platform] ? '1' : '0') } catch (e) { console.error(e) }
-  setMirror(platform, mirrorState.value[platform])
-  showToast(mirrorState.value[platform] ? t('ws.mirrorOnToast') : t('ws.mirrorOffToast'))
+  const previous = mirrorState.value[platform]
+  const enabled = !previous
+  mirrorState.value[platform] = enabled
+  if (!(await setMirror(platform, enabled))) {
+    mirrorState.value[platform] = previous
+    return
+  }
+  try { localStorage.setItem(`bridge-mirror-${platform}`, enabled ? '1' : '0') } catch (error) {
+    dispatchBridgeNotice(classifyBridgeFailure({error, source: 'storage', path: `bridge-mirror-${platform}`}))
+  }
+  showToast(enabled ? t('ws.mirrorOnToast') : t('ws.mirrorOffToast'))
 }
 
 /** 判断指定平台镜像是否已激活（用于按钮高亮样式） */
@@ -2660,7 +3597,7 @@ function runCompact() {
     showToast(t('ws.thinkingWait'));
     return
   }
-  doSend('/compact')
+  if (!doSend('/compact')) showToast(t('ws.notConnected'))
 }
 
 /**
@@ -2670,24 +3607,34 @@ function runCompact() {
  */
 async function sendMessage() {
   const text = inputText.value.trim()
-  if (!text) return
-  if (!ws || ws.readyState !== 1) return
+  const attachments = pendingAttachments.value.length > 0 ? [...pendingAttachments.value] : undefined
+  if (!text && !attachments?.length) return
+  if (!ws || ws.readyState !== 1) {
+    showToast(t('ws.notConnected'))
+    return
+  }
 
   if (status.value === 'thinking' || _flushingQueue || runningAgentTotal.value > 0) {
     // thinking/队列清空中/子Agent还在跑: 新消息进入排队，避免打断正在执行的 Agent
     queueId++
-    msgQueue.value.push({id: queueId, text, time: Date.now()})
+    msgQueue.value.push({id: queueId, text, time: Date.now(), attachments})
+    saveDraftForTab(activeTab.value, text, true)
+    // 附件归属当前队列项，避免下一条消息误带上本条附件。
+    if (attachments) pendingAttachments.value = []
     inputText.value = ''
     nextTick(() => scrollDown(true))
     return
   }
 
-  // 上传所有未上传的附件
-  if (pendingAttachments.value.length > 0 && sessionId.value) {
-    await Promise.all(pendingAttachments.value.map(a => uploadAttachment(a, sessionId.value!)))
+  try {
+    const sent = await dispatch(text, attachments)
+    if (sent) inputText.value = ''
+    else showToast(t('ws.notConnected'))
+  } catch (error) {
+    console.error(error)
+    saveDraftForTab(activeTab.value, text, true)
+    showToast(t('ws.attachmentUploadFailed'))
   }
-  inputText.value = ''
-  await dispatch(text)
 }
 
 // ── Prompt 模板库 ──
@@ -2711,27 +3658,24 @@ function applyTemplate(template: typeof promptTemplates.value[number]) {
 }
 
 /** 附件路径注入前缀（在 buildWireText 中复用） */
-async function buildAttachmentPrefix(): Promise<string> {
-  if (pendingAttachments.value.length === 0 || !sessionId.value) return ''
-  // 等待上传完成
-  await Promise.all(pendingAttachments.value.map(a => {
-    if (!a.uploadedPath && !a.uploading) return uploadAttachment(a, sessionId.value!)
-    return null
-  }))
-  const uploaded = pendingAttachments.value.filter(a => a.uploadedPath)
+async function buildAttachmentPrefix(attachments: PendingAttachment[] = pendingAttachments.value): Promise<string> {
+  if (attachments.length === 0 || !sessionId.value) return ''
+  // 等待所有上传完成；失败时保留附件，避免用户以为已发送而丢失内容。
+  const results = await Promise.all(attachments.map(a => uploadAttachment(a, sessionId.value!)))
+  if (results.some(ok => !ok)) throw new Error('attachment upload failed')
+  const uploaded = attachments.filter(a => a.uploadedPath)
   const withOcr = uploaded.filter(a => (a as any).ocrText)
   const pathsOnly = uploaded.filter(a => !(a as any).ocrText)
-  pendingAttachments.value = []
 
   let prefix = ''
   if (withOcr.length) {
-    prefix += `[系统] 用户粘贴了 ${withOcr.length} 张截图，已通过 OCR 识别内容如下:\n\n`
+    prefix += `[系统] 用户发送了 ${withOcr.length} 个图片附件，已通过 OCR 识别内容如下：\n\n`
     for (const a of withOcr) {
-      prefix += `===== 截图: ${a.uploadedPath} =====\n${(a as any).ocrText}\n\n`
+      prefix += `===== 图片: ${a.uploadedName || a.file.name} (${a.uploadedPath}) =====\n${(a as any).ocrText}\n\n`
     }
   }
   if (pathsOnly.length) {
-    prefix += `[系统] 用户发送了 ${pathsOnly.length} 个附件:\n${pathsOnly.map(a => `- ${a.uploadedPath}`).join('\n')}\n\n`
+    prefix += `[系统] 用户发送了 ${pathsOnly.length} 个附件。请按文件扩展名和类型处理，不要把非图片附件当作图片：\n${pathsOnly.map(a => `- ${a.uploadedName || a.file.name} | 类型: ${attachmentKindLabel(a.attachmentKind, a.file.name)} | 路径: ${a.uploadedPath}`).join('\n')}\n\n`
   }
   return prefix
 }
@@ -2743,7 +3687,7 @@ async function buildAttachmentPrefix(): Promise<string> {
  * - 文件注入有总量上限（fileInjectLimitKB），超限截断并提示
  * 如果没有引用，直接返回原文。
  */
-async function buildWireText(text: string): Promise<string> {
+async function buildWireText(text: string, attachments?: PendingAttachment[]): Promise<string> {
   if (!sessionId.value) return text
   // @agent 引用：要求模型用 Task 工具调对应 subagent（@ 可紧跟文字）
   const agentRefs = [...new Set([...text.matchAll(/@([a-zA-Z0-9_-]+)/g)].map(m => m[1]))]
@@ -2752,7 +3696,7 @@ async function buildWireText(text: string): Promise<string> {
 
   let prefix = ''
   // ── 附件前缀 ──
-  const attachmentPrefix = await buildAttachmentPrefix()
+  const attachmentPrefix = await buildAttachmentPrefix(attachments)
   if (attachmentPrefix) prefix += attachmentPrefix
   if (agentRefs.length) {
     prefix += `请使用以下子代理(subagent)来完成本次任务（通过 Task 工具，subagent_type 取对应名称）：${agentRefs.join(', ')}\n\n`
@@ -2778,8 +3722,7 @@ async function buildWireText(text: string): Promise<string> {
         }
         injected += content.length
         blocks.push(`===== 引用文件: ${p} =====\n${content}`)
-      } catch {
-      }
+      } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
     }
     if (blocks.length) {
       const note = skipped > 0 ? `（另有 ${skipped} 个引用文件因总量超限未注入，请按需用 Read 工具读取）\n\n` : ''
@@ -2794,21 +3737,43 @@ async function buildWireText(text: string): Promise<string> {
  * 消息分发：构建 wire text（含文件引用内容），界面显示用户原文，实际发送 wire 版本。
  * 这样用户在界面上看到的是简洁的 `#文件名` 引用，但模型收到的是含文件内容的完整消息。
  */
-async function dispatch(text: string) {
+async function dispatch(text: string, attachments?: PendingAttachment[]): Promise<boolean> {
   // 捕获当前 sessionId，防止 await 期间切换会话导致跨会话发送
   const mySid = sessionId.value
-  const wire = await buildWireText(text)
-  if (sessionId.value !== mySid) return  // 会话已切换，丢弃消息
-  doSend(text, wire)
+  const selectedAttachments = attachments ?? (pendingAttachments.value.length > 0 ? [...pendingAttachments.value] : undefined)
+  const wire = await buildWireText(text, selectedAttachments)
+  if (sessionId.value !== mySid) return false
+  const sent = doSend(text, wire, selectedAttachments)
+  if (sent && selectedAttachments) {
+    pendingAttachments.value = pendingAttachments.value.filter(a => !selectedAttachments.includes(a))
+  }
+  return sent
 }
 
 /**
  * 底层 WebSocket 发送：标记 thinking 状态，记录用户原文（用于取消时回填），推送消息。
  * wire 为注入引用文件内容后的版本，若未提供则直接用原文。
  */
-function doSend(text: string, wire?: string) {
+function doSend(text: string, wire?: string, attachments?: PendingAttachment[]): boolean {
   // buildWireText 等异步操作期间 WS 可能已断开，再次检查防止 ! 崩溃
-  if (!ws || ws.readyState !== 1) return
+  const socket = ws
+  const inputSessionId = sessionId.value
+  if (!socket || socket.readyState !== 1 || !inputSessionId) return false
+  const curModelMeta = models.value.find(m => m.id === model.value)
+  const messageId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  const payload = {
+    type: 'user_message',
+    content: wire ?? text,
+    messageId,
+    permissionMode: permissionMode.value,
+    thinkingLevel: thinkingLevel.value,
+    model: model.value,
+    maxContextTokens: contextSafetyCap.value || undefined,
+    modelMeta: curModelMeta ? {contextWindow: curModelMeta.contextWindow, pricing: pricing.value} : null
+  }
+  if (!sendSessionPayload(payload, socket)) return false
+
+  // SIDE_EFFECT: 只有 WebSocket 接受消息后才提交本地回合状态。
   status.value = 'thinking'
   _turnCompleted = false  // 新一轮开始: 重置回合完成标记
   startTaskDurationTimer()
@@ -2816,35 +3781,113 @@ function doSend(text: string, wire?: string) {
   turnThinkingText = ''  // 新一轮开始: 清空本轮思考文本累计，result 时重新估算
   clearAgentRuns()       // 新一轮开始: 清空上一轮的 agent 运行卡片
   // resume 走 SDK，claude.exe 自带完整历史，无需前端手动注入 <context>
-  messages.value.push({role: 'user', text, time: Date.now()})  // 界面显示用户原文
-  const curModelMeta = models.value.find(m => m.id === model.value)
-  ws.send(JSON.stringify({
-    type: 'user_message',
-    content: wire ?? text,
-    permissionMode: permissionMode.value,
-    thinkingLevel: thinkingLevel.value,
-    model: model.value,
-    modelMeta: curModelMeta ? {contextWindow: curModelMeta.contextWindow, pricing: pricing.value} : null
-  }))
+  const userMessage: Message = {
+    role: 'user',
+    text,
+    time: Date.now(),
+    attachments: attachments?.map(attachment => ({
+      name: attachment.file.name,
+      size: attachment.file.size,
+      type: attachment.file.type,
+      uploadedPath: attachment.uploadedPath || '',
+      attachmentKind: attachment.attachmentKind || attachmentKindLabel(undefined, attachment.file.name),
+      contentType: attachment.contentType || attachment.file.type,
+      status: 'sending',
+    })),
+  }
+  messages.value.push(userMessage)  // 界面显示用户原文和附件发送状态
+  pendingInputTexts.set(messageId, {
+    text,
+    sessionId: inputSessionId,
+    payload,
+    attachments,
+    message: userMessage,
+    createdAt: Date.now(),
+  })
+  saveDraftForTab(activeTab.value, text, true)
+  while (pendingInputTexts.size > 64) pendingInputTexts.delete(pendingInputTexts.keys().next().value!)
   nextTick(() => scrollDown(true))
+  return true
+}
+
+function sendSessionPayload(payload: Record<string, unknown>, socket: WebSocket | null = ws): boolean {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return false
+  try {
+    socket.send(JSON.stringify(payload))
+    return true
+  } catch (error) {
+    console.warn('WebSocket 发送失败，保留待发送操作', error)
+    return false
+  }
+}
+
+async function continueIncompleteTask(message: Message) {
+  const result = message.taskResult
+  if (!result?.resumable || status.value === 'thinking') return
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    showToast(t('ws.notConnected'))
+    return
+  }
+  const prompt = buildContinuationPrompt({
+    originalTask: result.originalTask,
+    reason: result.continuationReason,
+  })
+  if (!doSend(t('ws.continueTask'), prompt)) {
+    showToast(t('ws.notConnected'))
+    return
+  }
+  result.resumable = false
 }
 
 /**
  * 取消当前任务：发送 stop_generation 指令，重置状态，回填用户原文到输入框。
  * 这样用户无需重新输入即可调整后重试。
  */
-function cancelTask() {
-  if (ws && ws.readyState === 1) {
-    ws.send(JSON.stringify({type: 'stop_generation'}))
+const stoppingTask = ref(false)
+async function cancelTask() {
+  if (stoppingTask.value || !sessionId.value) return
+  stoppingTask.value = true
+  const sid = sessionId.value
+  const stopped = await requestStopSession(sid)
+  if (!stopped) {
+    stoppingTask.value = false
+    return
+  }
+  if (sessionId.value) {
+    const restoredAttachments = new Map(pendingAttachments.value.map(a => [a.id, a]))
+    const restoredTexts = [
+      lastUserMessage,
+      ...msgQueue.value.map(item => item.text),
+      ...[...pendingInputTexts.values()]
+        .filter(item => item.sessionId === sessionId.value)
+        .map(item => item.text),
+    ].map(text => String(text || '').trim()).filter(Boolean)
+    for (const item of msgQueue.value) {
+      for (const attachment of item.attachments || []) restoredAttachments.set(attachment.id, attachment)
+    }
+    msgQueue.value = []
+    for (const [messageId, pending] of pendingInputTexts) {
+      if (pending.sessionId !== sessionId.value) continue
+      for (const attachment of pending.message.attachments || []) attachment.status = 'failed'
+      for (const attachment of pending.attachments || []) restoredAttachments.set(attachment.id, attachment)
+      pendingInputTexts.delete(messageId)
+    }
+    pendingAttachments.value = [...restoredAttachments.values()]
+    const draftText = [...new Set(restoredTexts)].join('\n\n')
+    if (draftText) {
+      inputText.value = draftText
+      saveDraftForTab(activeTab.value, draftText, true)
+    }
   }
   status.value = 'idle'
   _turnCompleted = false  // 取消任务: 重置回合完成标记
-  if (lastUserMessage) {
+  if (lastUserMessage && !inputText.value.trim()) {
     inputText.value = lastUserMessage
-    lastUserMessage = ''
   }
+  lastUserMessage = ''
   messages.value.push({role: 'system', text: t('ws.taskCanceled'), time: Date.now()})
   nextTick(() => scrollDown(true))
+  stoppingTask.value = false
 }
 
 // ── 双通道权限确认响应 ──
@@ -2852,11 +3895,14 @@ function cancelTask() {
 function respondPermission(decision: 'allow' | 'deny') {
   const p = pendingPermission.value;
   if (!p) return
-  if (ws && ws.readyState === 1) ws.send(JSON.stringify({
+  if (!sendSessionPayload({
     type: 'permission_response',
     requestId: p.requestId,
     decision
-  }))
+  })) {
+    showToast(t('ws.notConnected'))
+    return
+  }
   messages.value.push({
     role: 'system',
     text: decision === 'allow' ? t('ws.allowed', {tool: p.toolName}) : t('ws.denied', {tool: p.toolName}),
@@ -2870,12 +3916,15 @@ function respondPermission(decision: 'allow' | 'deny') {
 function respondChoice(optionIndex: number) {
   const c = pendingChoice.value;
   if (!c) return
-  if (ws && ws.readyState === 1) ws.send(JSON.stringify({
+  if (!sendSessionPayload({
     type: 'choice_response',
     requestId: c.requestId,
     questionIndex: 0,
     optionIndex
-  }))
+  })) {
+    showToast(t('ws.notConnected'))
+    return
+  }
   messages.value.push({
     role: 'system',
     text: t('ws.chose', {label: c.options[optionIndex]?.label || optionIndex}),
@@ -2891,13 +3940,16 @@ function respondChoiceCustom() {
   if (!c) return
   const text = c.customInputText.trim()
   if (!text) return
-  if (ws && ws.readyState === 1) ws.send(JSON.stringify({
+  if (!sendSessionPayload({
     type: 'choice_response',
     requestId: c.requestId,
     questionIndex: 0,
     optionIndex: -1,
     customText: text
-  }))
+  })) {
+    showToast(t('ws.notConnected'))
+    return
+  }
   messages.value.push({
     role: 'system',
     text: t('ws.chose', {label: text}),
@@ -2909,10 +3961,41 @@ function respondChoiceCustom() {
 
 // ── 消息队列操作 ──
 /** 发送排队消息：从队列移除后正常 dispatch（此时 status 已变为 idle） */
-function sendQueued(item: QItem) {
+async function sendQueued(item: QItem) {
+  const ownerTabId = activeTabId.value
   msgQueue.value = msgQueue.value.filter(q => q.id !== item.id)
-  if (!ws || ws.readyState !== 1) return
-  dispatch(item.text)
+  if (!ws || ws.readyState !== 1) {
+    restoreQueueItems([item], ownerTabId)
+    showToast(t('ws.notConnected'))
+    return
+  }
+  try {
+    if (!(await dispatch(item.text, item.attachments))) {
+      restoreQueueItems([item], ownerTabId)
+      showToast(t('ws.notConnected'))
+    }
+  } catch (error) {
+    console.error(error)
+    restoreQueueItems([item], ownerTabId)
+    showToast(t('ws.attachmentUploadFailed'))
+  }
+}
+
+/** 将未成功发送的消息按原始 id 合并回队列，避免重复入队并保持 FIFO。 */
+function mergeQueueItems(current: QItem[], items: QItem[]): QItem[] {
+  const merged = new Map<number, QItem>()
+  for (const item of current) merged.set(item.id, item)
+  for (const item of items) merged.set(item.id, item)
+  return [...merged.values()].sort((a, b) => a.id - b.id)
+}
+
+function restoreQueueItems(items: QItem[], ownerTabId: string | null = activeTabId.value) {
+  if (ownerTabId && activeTabId.value !== ownerTabId) {
+    const owner = tabSessions.value.find(tab => tab.id === ownerTabId)
+    if (owner) owner.state.msgQueue = mergeQueueItems(owner.state.msgQueue, items)
+    return
+  }
+  msgQueue.value = mergeQueueItems(msgQueue.value, items)
 }
 
 /** 从队列中移除某条消息（用户主动取消） */
@@ -2928,24 +4011,39 @@ let _turnCompleted = false
 /** thinking 结束后自动发送所有排队消息，逐条 dispatch 避免并发乱序 */
 async function flushMsgQueue() {
   if (_flushingQueue) return
+  const ownerTabId = activeTabId.value
+  const ownerSessionId = sessionId.value
   _flushingQueue = true
   try {
     const items = [...msgQueue.value]
     msgQueue.value = []
     for (let i = 0; i < items.length; i++) {
+      if (activeTabId.value !== ownerTabId || sessionId.value !== ownerSessionId) {
+        restoreQueueItems(items.slice(i), ownerTabId)
+        break
+      }
       if (!ws || ws.readyState !== 1) {
         // WS 断开: 剩余消息回填队列头部，等重连后再发
-        msgQueue.value.unshift(...items.slice(i))
+        restoreQueueItems(items.slice(i), ownerTabId)
         break
       }
       try {
-        await dispatch(items[i].text)
-      } catch {
-        // dispatch 异常不中断循环，继续处理剩余消息
+        if (!(await dispatch(items[i].text, items[i].attachments))) {
+          restoreQueueItems(items.slice(i), ownerTabId)
+          break
+        }
+      } catch (error) {
+        console.debug('队列消息 dispatch 失败，恢复剩余消息', error)
+        restoreQueueItems(items.slice(i), ownerTabId)
+        break
       }
     }
   } finally {
     _flushingQueue = false
+    if (activeTabId.value !== ownerTabId && ws?.readyState === WebSocket.OPEN
+        && status.value === 'idle' && msgQueue.value.length > 0) {
+      void flushMsgQueue()
+    }
   }
 }
 
@@ -2953,11 +4051,25 @@ async function flushMsgQueue() {
  * 立即注入补充指令：在 thinking 期间直接追加到当前流中。
  * SDK session.send() 支持多轮，无需等待当前回复完成即可追发。
  */
-function injectNow(item: QItem) {
+async function injectNow(item: QItem) {
+  const ownerTabId = activeTabId.value
   msgQueue.value = msgQueue.value.filter(q => q.id !== item.id)
   if (ws && ws.readyState === 1) {
-    dispatch(item.text)
-    messages.value.push({role: 'system', text: t('ws.injected'), time: Date.now()})
+    try {
+      if (!(await dispatch(item.text, item.attachments))) {
+        restoreQueueItems([item], ownerTabId)
+        showToast(t('ws.notConnected'))
+        return
+      }
+      messages.value.push({role: 'system', text: t('ws.injected'), time: Date.now()})
+    } catch (error) {
+      console.error(error)
+      restoreQueueItems([item], ownerTabId)
+      showToast(t('ws.attachmentUploadFailed'))
+    }
+  } else {
+    restoreQueueItems([item], ownerTabId)
+    showToast(t('ws.notConnected'))
   }
 }
 
@@ -2989,8 +4101,7 @@ async function loadSlashCommands() {
       const d = await res.json();
       slashCommands.value = d.commands || []
     }
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
 }
 
 /** 模糊匹配的命令列表：仅当整条输入是 `/命令名`（未输空格/参数）时匹配，最多 50 条 */
@@ -3022,6 +4133,21 @@ const fileIndex = ref(0)
 /** 文件菜单 DOM 引用 */
 const fileMenuEl = ref<HTMLElement | null>(null)
 
+const shownParserWarnings = new Set<string>()
+
+function notifyProjectCacheWarnings(raw: unknown) {
+  if (!Array.isArray(raw) || raw.length === 0) return
+  const languages = raw
+    .map((item: any) => String(item?.language || '').trim())
+    .filter(Boolean)
+    .sort()
+  if (!languages.length) return
+  const key = languages.join(',')
+  if (shownParserWarnings.has(key)) return
+  shownParserWarnings.add(key)
+  showToast(`项目解析器已降级: ${languages.join(', ')}，依赖分析可能不完整`, 6000)
+}
+
 /** 懒加载当前项目的文件列表 */
 async function loadMentionFiles() {
   if (!sessionId.value) return
@@ -3030,9 +4156,9 @@ async function loadMentionFiles() {
     if (res.ok) {
       const d = await res.json();
       mentionFiles.value = (d.files || []).map((f: any) => ({path: f.path}))
+      notifyProjectCacheWarnings(d.projectCacheWarnings)
     }
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
 }
 
 /** 模糊匹配的文件列表：匹配输入行末尾的 #路径片段，最多 50 条 */
@@ -3071,8 +4197,7 @@ async function loadMentionAgents() {
       const d = await res.json();
       mentionAgents.value = (d.agents || []).map((a: any) => ({name: a.name, description: a.description}))
     }
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
 }
 
 /** 模糊匹配的 agent 列表：匹配输入行末尾的 @名称片段，最多 50 条 */
@@ -3267,9 +4392,9 @@ async function loadFileTree() {
       gitInfo.value = d.gitInfo || null
       fileTruncated.value = !!d.truncated
       fileMissing.value = !!d.missing
+      notifyProjectCacheWarnings(d.projectCacheWarnings)
     }
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   fileTreeLoading.value = false
 }
 
@@ -3669,6 +4794,15 @@ document.addEventListener('visibilitychange', onPageVisibility)
 
 // 组件卸载时清理 Monaco 实例及外部 model
 onBeforeUnmount(() => {
+  if (draftPersistTimer) { clearTimeout(draftPersistTimer); draftPersistTimer = null }
+  const currentTab = activeTab.value
+  if (currentTab) {
+    const interrupted = status.value === 'thinking'
+    saveDraftForTab(currentTab, inputText.value || (interrupted ? lastUserMessage : ''), interrupted)
+    currentTab.state = snapshotTabState()
+  }
+  if (workspacePersistTimer) { clearTimeout(workspacePersistTimer); workspacePersistTimer = null }
+  writeWorkspaceShellNow()
   document.removeEventListener('visibilitychange', onPageVisibility)
   window.removeEventListener('keydown', onGlobalKeydown)
   if (tabAutoSyncTimer) clearInterval(tabAutoSyncTimer)
@@ -3680,6 +4814,7 @@ onBeforeUnmount(() => {
   if (longTaskBubbleTimer) clearTimeout(longTaskBubbleTimer)
   if (toastTimer) clearTimeout(toastTimer)
   if (_petPersistTimer) clearTimeout(_petPersistTimer)
+  for (const tabId of [...sessionReconnectStates.keys()]) cancelSessionReconnect(tabId)
   try {
     if (diffOriginalModel) { diffOriginalModel.dispose(); diffOriginalModel = null }
     if (diffModifiedModel) { diffModifiedModel.dispose(); diffModifiedModel = null }
@@ -3688,6 +4823,10 @@ onBeforeUnmount(() => {
   try { monacoEditor.value?.dispose() } catch (e) { console.error(e) }
   // 控制通道 WebSocket 清理（防止卸载后自动重连泄漏）
   _controlWSStopped = true
+  if (_ctrlReconnectTimer) {
+    clearTimeout(_ctrlReconnectTimer)
+    _ctrlReconnectTimer = null
+  }
   if (controlWS) {
     controlWS.onclose = null
     controlWS.onerror = null
@@ -3703,7 +4842,7 @@ onBeforeUnmount(() => {
   for (const tab of tabSessions.value) {
     if (tab.websocket) {
       tab.websocket.onclose = null; tab.websocket.onerror = null
-      try { tab.websocket.close() } catch {}
+      try { tab.websocket.close() } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
       tab.websocket = null
     }
   }
@@ -3727,8 +4866,7 @@ async function loadCheckpoints() {
       const d = await res.json();
       checkpoints.value = (d.checkpoints || []).slice().reverse()
     }  // 最新在上
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   checkpointsLoading.value = false
 }
 
@@ -3968,7 +5106,9 @@ watch(permissionMode, (newVal, oldVal) => {
   if (status.value !== 'thinking') return
   if (!ws || ws.readyState !== 1) return
   if (newVal === oldVal) return
-  ws.send(JSON.stringify({ type: 'setting_change', permissionMode: newVal }))
+  if (!sendSessionPayload({type: 'setting_change', permissionMode: newVal})) {
+    showToast(t('ws.notConnected'))
+  }
 })
 
 // ═══════════════════════════════════════════
@@ -3977,10 +5117,16 @@ watch(permissionMode, (newVal, oldVal) => {
 
 /** 上下文占用百分比（用于圆环可视化），计算公式：total / maxTokens * 100 */
 const contextPercent = ref(0)
+const contextPercentKnown = ref(false)
+const contextCompacting = ref(false)
+const contextSafetyCap = ref(0)
+const rawMaxTokens = ref(0)
+let pendingCompactSummary = ''
+let contextWarningLevel = 0
 /** 本轮 token 消耗明细：input=输入 / output=纯输出(不含思考) / thinking=思考估算 / total=总量(含思考) */
 const usage = ref({input: 0, output: 0, thinking: 0, total: 0})
-/** 模型最大上下文 token 数，由 system_init 动态设置（默认 1M 兜底） */
-const maxTokens = ref(1000000)
+/** 模型最大上下文 token 数，由 SDK/system_init 动态设置；未知时保持 0 并显示未知 */
+const maxTokens = ref(0)
 /**
  * 本轮思考文本累计 —— SDK usage 不单独拆分 thinking（含在 output_tokens 内），
  * 因此需要在每次 thinking block / thinking_delta 时累计文本，
@@ -4296,11 +5442,12 @@ function saveUsage() {
       usage: usage.value,
       costTotal: costTotal.value,
       contextPercent: contextPercent.value,
+      contextPercentKnown: contextPercentKnown.value,
       maxTokens: maxTokens.value,
+      rawMaxTokens: rawMaxTokens.value,
       pricing: pricing.value,
     }))
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
 }
 
 /** 从 localStorage 恢复指定 session 的 token 累计和费用（具有默认值兜底） */
@@ -4312,10 +5459,11 @@ function loadUsage(sid: string) {
     if (d.usage) usage.value = {input: 0, output: 0, thinking: 0, total: 0, ...d.usage}
     if (typeof d.costTotal === 'number') costTotal.value = d.costTotal
     if (typeof d.contextPercent === 'number') contextPercent.value = d.contextPercent
+    if (typeof d.contextPercentKnown === 'boolean') contextPercentKnown.value = d.contextPercentKnown
     if (typeof d.maxTokens === 'number') maxTokens.value = d.maxTokens
+    if (typeof d.rawMaxTokens === 'number') rawMaxTokens.value = d.rawMaxTokens
     if (d.pricing) pricing.value = d.pricing
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
 }
 
 /**
@@ -4333,8 +5481,9 @@ const tokenTooltip = computed(() => {
   const remaining = bal - costTotal.value
   const mt = maxTokens.value
   return {
-    used: `${(u.total / 1000).toFixed(1)}K / ${(mt / 1e6).toFixed(1)}M`,
-    pct: ((u.total / mt) * 100).toFixed(1) + '%',
+    used: mt > 0 ? `${fmtTok(u.total)} / ${fmtTok(mt)}` : `${fmtTok(u.total)} / 未知`,
+    actualMax: rawMaxTokens.value > 0 ? fmtTok(rawMaxTokens.value) : '未知',
+    pct: contextPercentKnown.value ? contextPercent.value.toFixed(1) + '%' : '未知',
     input: fmtTok(u.input),
     thinking: u.thinking > 0 ? '~' + fmtTok(u.thinking) : '—',
     output: fmtTok(u.output),
@@ -4378,6 +5527,7 @@ const tokenTooltip = computed(() => {
         @load-projects="loadProjects"
         @toggle-project="toggleProject"
         @new-session="(workDir: string, encodedDir: string, sid?: string) => handleNewSession(workDir, encodedDir, sid)"
+        @fork-session="(workDir: string, encodedDir: string, sid: string) => handleForkSession(workDir, encodedDir, sid)"
         @delete-session="deleteSession"
         @hide-project="hideProject"
         @show-project="showProject"
@@ -4523,9 +5673,28 @@ const tokenTooltip = computed(() => {
                :style="{ animationDelay: `${Math.min(i * 20, 300)}ms` }">
             <!-- 系统消息：时间 + 文本，居中显示 -->
             <template v-if="msg.role === 'system'">
-              <div class="sys-msg">
+              <div class="sys-msg" :class="{'task-incomplete': msg.taskResult?.outcome === 'incomplete'}">
                 <span class="sys-time">{{ formatTime(msg.time) }}</span>
-                <span class="sys-text">{{ msg.text }}</span>
+                <span v-if="msg.compact" class="sys-text compact-notice">
+                  <strong>{{ msg.text }}</strong>
+                  <span v-if="msg.compact.preTokens" class="compact-meta">{{ formatCompactSummary(msg.compact) }}</span>
+                  <button v-if="msg.compact.summary" class="compact-summary-toggle" @click="msg.compact.summaryExpanded = !msg.compact.summaryExpanded">
+                    {{ msg.compact.summaryExpanded ? '收起摘要' : '查看摘要' }}
+                  </button>
+                  <span v-if="msg.compact.summaryExpanded" class="compact-summary">{{ msg.compact.summary }}</span>
+                </span>
+                <span v-else class="sys-text">{{ msg.text }}</span>
+                <button
+                    v-if="msg.taskResult?.resumable"
+                    class="task-continue-btn"
+                    :disabled="status === 'thinking'"
+                    @click="continueIncompleteTask(msg)"
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <polyline points="9 18 15 12 9 6"/>
+                  </svg>
+                  {{ t('ws.continueTask') }}
+                </button>
               </div>
             </template>
             <!-- 思考块：折叠面板，summary 栏展示"思考"标签 + 预览文本 -->
@@ -4547,7 +5716,20 @@ const tokenTooltip = computed(() => {
             </template>
             <!-- 错误消息：红色背景居中显示 -->
             <template v-else-if="msg.role === 'error'">
-              <div class="err-msg">{{ msg.text }}</div>
+              <div class="err-msg task-result-error">
+                <span>{{ msg.text }}</span>
+                <button
+                    v-if="msg.taskResult?.resumable"
+                    class="task-continue-btn"
+                    :disabled="status === 'thinking'"
+                    @click="continueIncompleteTask(msg)"
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <polyline points="9 18 15 12 9 6"/>
+                  </svg>
+                  {{ t('ws.continueTask') }}
+                </button>
+              </div>
             </template>
             <!-- 用户 / AI 消息气泡（含复制/回填按钮、工具调用卡片） -->
             <template v-else>
@@ -4556,6 +5738,22 @@ const tokenTooltip = computed(() => {
                   <!-- 气泡标签：You / AI -->
                   <div class="bubble-label">{{ msg.role === 'user' ? 'You' : 'AI' }}</div>
                   <div class="bubble-text" v-html="renderMarkdown(msg.text)"></div>
+                  <div v-if="msg.role === 'user' && msg.attachments?.length" class="message-attachments">
+                    <div v-for="attachment in msg.attachments" :key="attachment.uploadedPath || attachment.name"
+                         class="message-attachment" :class="`is-${attachment.status}`">
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                           stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M21.44 11.05 12.25 20.24a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                      </svg>
+                      <span class="message-attachment-name" :title="attachment.name">{{ attachment.name }}</span>
+                      <span class="message-attachment-size">{{ formatAttachmentSize(attachment.size) }}</span>
+                      <span class="message-attachment-status">{{
+                        attachment.status === 'sent' ? t('ws.attachmentSent')
+                          : attachment.status === 'failed' ? t('ws.attachmentFailed')
+                            : t('ws.attachmentSending')
+                      }}</span>
+                    </div>
+                  </div>
                   <div class="bubble-footer">
                     <div v-if="msg.role === 'assistant' && msg.tokens" class="bubble-tokens">~{{ fmtTok(msg.tokens) }} tokens · ¥{{ msg.cost!.toFixed(4) }}</div>
                     <div class="bubble-actions">
@@ -4871,12 +6069,12 @@ const tokenTooltip = computed(() => {
             <span class="tm-item tm-out">↑ {{ fmtTok(usage.output) }}</span>
           </div>
           <!-- 上下文圆环：可点击触发 /compact，悬停显示 token 与费用详情 tooltip -->
-          <div class="context-ring" :class="{ warning: contextPercent > 70 }" :title="t('ws.ctxRingTitle')"
+          <div class="context-ring" :class="{ warning: contextPercentKnown && contextPercent >= 80, compacting: contextCompacting }" :title="t('ws.ctxRingTitle')"
                @click="runCompact">
             <svg width="40" height="40" viewBox="0 0 44 44">
               <circle cx="22" cy="22" r="18" fill="none" stroke="var(--border)" stroke-width="3.5"/>
               <circle cx="22" cy="22" r="18" fill="none" stroke-linecap="round"
-                      :stroke="contextPercent > 70 ? 'var(--warning)' : 'var(--accent-blue)'"
+                      :stroke="contextPercentKnown && contextPercent >= 80 ? 'var(--warning)' : 'var(--accent-blue)'"
                       stroke-width="3.5"
                       :stroke-dasharray="113.1"
                       :stroke-dashoffset="113.1 - (contextPercent / 100) * 113.1"
@@ -4886,12 +6084,14 @@ const tokenTooltip = computed(() => {
               />
               <text x="22" y="24" text-anchor="middle" fill="var(--text-secondary)" font-size="9"
                     font-family="var(--font-mono)" font-weight="500">
-                {{ contextPercent }}%
+                {{ contextCompacting ? '...' : contextPercentKnown ? contextPercent + '%' : '--' }}
               </text>
             </svg>
             <div class="ring-tooltip glass">
-              <div v-if="contextPercent > 70" class="tt-hint">{{ t('ws.ctxHint', {pct: contextPercent}) }}</div>
+              <div v-if="contextCompacting" class="tt-hint">正在压缩上下文，新的消息会排队</div>
+              <div v-else-if="contextPercentKnown && contextPercent >= 80" class="tt-hint">{{ t('ws.ctxHint', {pct: contextPercent}) }}</div>
               <div class="tt-row"><span>{{ t('ws.ttUsed') }}</span><span>{{ tokenTooltip.used }}</span></div>
+              <div class="tt-row"><span>模型实际窗口</span><span>{{ tokenTooltip.actualMax }}</span></div>
               <div class="tt-row"><span>{{ t('ws.ttPct') }}</span><span>{{ tokenTooltip.pct }}</span></div>
               <div class="tt-sep"></div>
               <div class="tt-row"><span>{{ t('ws.ttInput') }}</span><span>{{ tokenTooltip.input }}</span></div>
@@ -5078,6 +6278,7 @@ const tokenTooltip = computed(() => {
               <button
                   v-if="!inputText.trim() && status === 'thinking'"
                   class="send-btn stop-btn"
+                  :disabled="stoppingTask"
                   @click="cancelTask"
                   :title="t('ws.stopRefill')"
               >
@@ -5305,14 +6506,19 @@ const tokenTooltip = computed(() => {
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
               </button>
             </div>
-            <!-- 任务描述 -->
-            <div v-if="ag.description" class="ag-card-desc" :title="ag.description">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-                   style="flex-shrink:0;margin-top:2px">
-                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                <polyline points="14 2 14 8 20 8"/>
-              </svg>
-              <span>{{ ag.description }}</span>
+            <div v-if="ag.purpose || ag.description || ag.task" class="ag-card-descriptor">
+              <div v-if="ag.purpose || ag.description" class="ag-card-desc" :title="ag.purpose || ag.description">
+                <span class="ag-card-desc-label">职责</span>
+                <span>{{ ag.purpose || ag.description }}</span>
+              </div>
+              <div v-if="ag.task" class="ag-card-desc" :title="ag.task">
+                <span class="ag-card-desc-label">本次任务</span>
+                <span>{{ ag.task }}</span>
+              </div>
+              <div v-if="ag.scope" class="ag-card-desc" :title="ag.scope">
+                <span class="ag-card-desc-label">范围</span>
+                <span>{{ ag.scope }}</span>
+              </div>
             </div>
             <!-- 进度条 + 当前工具 -->
             <div v-if="ag.status === 'running' || ag.status === 'done'" class="ag-card-progress">
@@ -6691,6 +7897,81 @@ const tokenTooltip = computed(() => {
   animation: fadeIn 0.3s var(--ease-out);
 }
 
+.sys-msg.task-incomplete {
+  align-items: center;
+  flex-wrap: wrap;
+  max-width: min(760px, 88vw);
+  padding: 8px 12px;
+  border: 1px solid rgba(210, 153, 34, 0.35);
+  border-radius: var(--radius-btn);
+  background: rgba(210, 153, 34, 0.08);
+  color: var(--text-secondary);
+}
+
+.task-continue-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 28px;
+  border: 1px solid var(--border-hover);
+  border-radius: 4px;
+  padding: 4px 9px;
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.task-continue-btn:hover:not(:disabled) {
+  border-color: var(--accent-blue);
+  color: var(--accent-blue);
+}
+
+.task-continue-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.task-result-error {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  max-width: min(760px, 88vw);
+}
+
+.compact-notice {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  max-width: min(720px, 80vw);
+}
+
+.compact-meta {
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+}
+
+.compact-summary-toggle {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--accent-blue);
+  cursor: pointer;
+}
+
+.compact-summary {
+  flex-basis: 100%;
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding: 8px 10px;
+  border-left: 2px solid var(--border-hover);
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
 .sys-time {
   opacity: 0.5;
 }
@@ -7159,6 +8440,45 @@ const tokenTooltip = computed(() => {
   white-space: pre-wrap;
   word-break: break-word;
   line-height: 1.7;
+}
+
+.message-attachments {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.message-attachment {
+  display: grid;
+  grid-template-columns: 16px minmax(90px, 1fr) auto auto;
+  align-items: center;
+  gap: 7px;
+  min-height: 30px;
+  padding: 5px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.14);
+  font-size: 12px;
+}
+
+.message-attachment-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.message-attachment-size,
+.message-attachment-status {
+  white-space: nowrap;
+  color: rgba(255, 255, 255, 0.72);
+}
+
+.message-attachment.is-sending .message-attachment-status {
+  color: #ffe08a;
+}
+
+.message-attachment.is-failed .message-attachment-status {
+  color: #ffd1d8;
 }
 
 /* ── 工具调用卡片 Tool usage cards ── */
@@ -9451,6 +10771,21 @@ const tokenTooltip = computed(() => {
 
 .ag-card-desc span {
   word-break: break-word;
+}
+
+.ag-card-descriptor {
+  margin-bottom: 8px;
+}
+
+.ag-card-descriptor .ag-card-desc {
+  margin-bottom: 4px;
+  padding: 6px 8px;
+}
+
+.ag-card-desc-label {
+  flex: 0 0 56px;
+  color: var(--text-muted);
+  font-size: 11px;
 }
 
 .ag-card-progress {

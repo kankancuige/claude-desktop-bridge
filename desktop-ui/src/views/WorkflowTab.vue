@@ -25,8 +25,7 @@ async function loadWfScripts() {
       const d = await r.json();
       wfScripts.value = d.workflows || []
     }
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   wfLoading.value = false
 }
 
@@ -52,8 +51,7 @@ async function saveWfScript() {
     });
     wfSaved.value = true;
     setTimeout(() => wfSaved.value = false, 3000)
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   wfSaving.value = false
 }
 
@@ -72,8 +70,7 @@ async function createWfScript() {
     wfCreateName.value = '';
     await loadWfScripts();
     startWfEdit({name: fn})
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   wfSaving.value = false
 }
 
@@ -86,8 +83,7 @@ async function confirmDeleteWf() {
     await fetch(`${GW}/api/workflows/${encodeURIComponent(wf.name)}`, {method: 'DELETE'});
     await loadWfScripts();
     if (editingWfName.value === wf.name) editingWfName.value = ''
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   ;delTarget.value = null
 }
 
@@ -276,8 +272,7 @@ async function loadWfConfig() {
       const d = await r.json();
       wfEnabled.value = !!d.enabled
     }
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
 }
 
 async function toggleWfEnabled() {

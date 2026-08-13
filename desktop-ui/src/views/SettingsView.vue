@@ -127,8 +127,8 @@ const DEFAULT_SETTINGS = {
   theme: 'system',
   // 功能说明: 界面语言默认中文
   language: 'chinese',
-  // 功能说明: 最大上下文 token 数，默认 1M
-  maxContextTokens: 1000000,
+  // 功能说明: 上下文安全上限，默认留空并跟随模型实际窗口
+  maxContextTokens: 0,
   // 功能说明: 权限模式，默认 default（不跳过任何确认）
   permissionMode: 'default',
   // 功能说明: thinking 深度，默认 auto 由模型自动决定
@@ -155,6 +155,7 @@ const settingsLoading = ref(false)
 const settingsSaved = ref(false)
 // 功能说明: 保存失败时的错误消息文本
 const settingsError = ref('')
+const settingsLoadError = ref('')
 // 功能说明: Token 输入框显示值，支持 "1M"/"200K" 友好格式，失焦时通过 parseTokens 同步到数字值
 const tokenInput = ref('')
 
@@ -225,7 +226,13 @@ function parseTokens(v: string): number {
 // ── Token 输入框失焦处理 ──
 // 功能说明: 输入框失焦时将显示值解析为纯数字，同步到 settings.maxContextTokens
 function onTokenBlur() {
-  if (settings.value) settings.value.maxContextTokens = parseTokens(tokenInput.value) || 1000000
+  if (!settings.value) return
+  const requested = parseTokens(tokenInput.value)
+  const selected = currentModels.value.find((model: any) => model.id === settings.value.model)
+  const actualLimit = parseTokens(String(selected?.contextWindow || selected?.description || ''))
+  const effective = requested && actualLimit ? Math.min(requested, actualLimit) : requested
+  settings.value.maxContextTokens = effective
+  tokenInput.value = formatTokens(effective)
 }
 
 // ── 当前供应商 derived（计算属性）──
@@ -234,6 +241,13 @@ const currentProvider = computed(() => providers.value.find(p => p.id === provid
 // ── 当前模型列表 derived（计算属性）──
 // 功能说明: 从当前供应商取 models 数组（可能是预设列表，也可能被动态模型覆盖）
 const currentModels = computed(() => currentProvider.value?.models || [])
+// 本地代理地址属于外部代理工具（例如 CCSwitch），不是公网供应商地址；只提示来源，不覆盖用户配置。
+const localProxyNotice = computed(() => {
+  const value = String(settings.value?.env?.ANTHROPIC_BASE_URL || '')
+  return /^https?:\/\/(?:127\.0\.0\.1|localhost)(?::\d+)?(?:\/|$)/i.test(value)
+    ? '当前使用本机代理地址。若要由本项目直接连接供应商，请停止或切换外部代理后选择供应商并保存。'
+    : ''
+})
 
 // ── Workflow 模型等级: 将供应商模型映射到能力等级 ──
 const MODEL_TIERS = [
@@ -250,7 +264,7 @@ async function loadModelTiers() {
       const d = await r.json()
       modelTiers.value = d.modelTiers || {}
     }
-  } catch {}
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
 }
 
 async function saveModelTier(tier: string, modelId: string) {
@@ -267,57 +281,53 @@ async function saveModelTier(tier: string, modelId: string) {
 // ── loadSettings: GET /api/config/settings → merge defaults → 推断供应商 → 应用主题 ──
 async function loadSettings() {
   settingsLoading.value = true
+  settingsLoadError.value = ''
   try {
     const res = await fetch(`${GW}/api/config/settings`)
-    if (res.ok) {
-      const raw = await res.json()
-      if (raw && typeof raw === 'object') {
-        // Merge with defaults so nothing is undefined
-        settings.value = {
-          ...DEFAULT_SETTINGS,
-          ...raw,
-          env: {...DEFAULT_SETTINGS.env, ...(raw.env || {})},
-        }
-        const url = settings.value.env?.ANTHROPIC_BASE_URL || ''
-        // 供应商推断：按 baseUrl 特征匹配，与 WorkspaceView loadProviderModels 保持一致
-        const urlL = url.toLowerCase()
-        if (urlL.includes('deepseek')) providerId.value = 'deepseek'
-        else if (urlL.includes('opencode')) providerId.value = 'opencode'
-        else if (urlL.includes('minimax')) providerId.value = 'minimax'
-        else if (urlL.includes('anthropic')) providerId.value = 'anthropic'
-        else if (urlL.includes('openai') || urlL.includes('codex')) providerId.value = 'codex'
-        else if (urlL.includes('bigmodel')) providerId.value = 'zhipu'
-        else if (urlL.includes('moonshot') || urlL.includes('kimi')) providerId.value = 'moonshot'
-        else if (urlL.includes('aliyun')) providerId.value = 'qwen'
-        else if (urlL.includes('openrouter')) providerId.value = 'openrouter'
-        else if (urlL.includes('ollama')) providerId.value = 'ollama'
-        else if (urlL.includes('volces') || urlL.includes('volcengine')) providerId.value = 'volcengine'
-        else if (urlL.includes('googleapi')) providerId.value = 'gemini'
-        else if (urlL.includes('minimax')) providerId.value = 'minimax'
-        else if (url) providerId.value = 'custom'  // 非预设 URL → 自定义
-        manualBaseUrl.value = url
-        tokenInput.value = formatTokens(settings.value.maxContextTokens)
-      } else {
-        // settings.json doesn't exist yet — use defaults
-        settings.value = {...DEFAULT_SETTINGS, env: {...DEFAULT_SETTINGS.env}}
-        tokenInput.value = formatTokens(DEFAULT_SETTINGS.maxContextTokens)
-      }
-    } else {
-      // Gateway returned 404 — use defaults
-      settings.value = {...DEFAULT_SETTINGS, env: {...DEFAULT_SETTINGS.env}}
-      tokenInput.value = formatTokens(DEFAULT_SETTINGS.maxContextTokens)
+    if (!res.ok) {
+      let detail = `HTTP ${res.status}`
+      try {
+        const body = await res.json()
+        if (body?.error) detail = String(body.error)
+      } catch (error) { console.debug('读取设置错误响应失败', error) }
+      throw new Error(detail)
     }
-  } catch {
-    settings.value = {...DEFAULT_SETTINGS, env: {...DEFAULT_SETTINGS.env}}
-    tokenInput.value = formatTokens(DEFAULT_SETTINGS.maxContextTokens)
+    const raw = await res.json()
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('设置响应格式无效')
+    settings.value = {
+      ...DEFAULT_SETTINGS,
+      ...raw,
+      env: {...DEFAULT_SETTINGS.env, ...(raw.env || {})},
+    }
+    const url = settings.value.env?.ANTHROPIC_BASE_URL || ''
+    // 供应商推断：按 baseUrl 特征匹配，与 WorkspaceView loadProviderModels 保持一致
+    const urlL = url.toLowerCase()
+    if (urlL.includes('/api/codex/backend-api/codex')) providerId.value = 'codex-relay'
+    else if (urlL.includes('deepseek')) providerId.value = 'deepseek'
+    else if (urlL.includes('opencode')) providerId.value = 'opencode'
+    else if (urlL.includes('minimax')) providerId.value = 'minimax'
+    else if (urlL.includes('anthropic')) providerId.value = 'anthropic'
+    else if (urlL.includes('openai') || urlL.includes('codex')) providerId.value = 'codex'
+    else if (urlL.includes('bigmodel')) providerId.value = 'zhipu'
+    else if (urlL.includes('moonshot') || urlL.includes('kimi')) providerId.value = 'moonshot'
+    else if (urlL.includes('aliyun')) providerId.value = 'qwen'
+    else if (urlL.includes('openrouter')) providerId.value = 'openrouter'
+    else if (urlL.includes('ollama')) providerId.value = 'ollama'
+    else if (urlL.includes('volces') || urlL.includes('volcengine')) providerId.value = 'volcengine'
+    else if (urlL.includes('googleapi')) providerId.value = 'gemini'
+    else if (url) providerId.value = 'custom'
+    manualBaseUrl.value = url
+    tokenInput.value = formatTokens(settings.value.maxContextTokens)
+  } catch (error: any) {
+    settingsLoadError.value = `设置加载失败：${error?.message || 'Gateway 不可用'}`
   }
   settingsLoading.value = false
-  applyTheme(settings.value.theme)
+  if (settings.value) applyTheme(settings.value.theme)
   // 从 settings.json 恢复 pet 设置到 localStorage
-  if (settings.value.petEnabled !== undefined) {
+  if (settings.value?.petEnabled !== undefined) {
     petEnabled.value = settings.value.petEnabled
   }
-  if (settings.value.pet) {
+  if (settings.value?.pet) {
     petType.value = settings.value.pet
   }
   loadProviders()
@@ -335,8 +345,8 @@ async function loadProviders() {
       const data = await res.json()
       providers.value = data.providers || []
     }
-  } catch {
-    // Gateway 未就绪时保留默认 providers 列表，不阻塞 UI
+  } catch (error) {
+    console.debug('Gateway 未就绪，保留默认 providers 列表', error)
   }
   // 叠加：用 supportedModels() 动态模型覆盖当前供应商的预设列表（拿不到则保留预设）
   await overlayDynamicModels()
@@ -364,9 +374,10 @@ async function testConnection() {
     const r = await fetch(`${GW}/api/config/test-model`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({baseUrl, apiKey}),
+      body: JSON.stringify({baseUrl, apiKey, model: settings.value?.model || ''}),
     })
-    const d = await r.json()
+    const d = await r.json().catch(() => ({}))
+    if (!r.ok) throw new Error(d.error || `连接测试失败（HTTP ${r.status}）`)
     if (d.ok) {
       testState.value = 'ok';
       testMsg.value = t('gen.testOk', {n: d.count});
@@ -451,15 +462,22 @@ function selectProvider(id: string) {
 async function saveSettings() {
   settingsSaved.value = false
   settingsError.value = ''
+  if (!settings.value) {
+    settingsError.value = '设置尚未成功加载，不能保存。请先重试加载。'
+    return
+  }
   // Ensure token is parsed before save
-  if (settings.value) settings.value.maxContextTokens = parseTokens(tokenInput.value) || 1000000
+  onTokenBlur()
   try {
     const res = await fetch(`${GW}/api/config/settings`, {
       method: 'PUT',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(settings.value),
     })
-    if (!res.ok) throw new Error(t('common.saveFailed'))
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}))
+      throw new Error(body.error || `${t('common.saveFailed')}（HTTP ${res.status}）`)
+    }
     settingsSaved.value = true
     // 保存后才应用主题与语言
     applyTheme(settings.value.theme)
@@ -505,10 +523,17 @@ function persistPetSettings() {
   if (_petPersistTimer) clearTimeout(_petPersistTimer)
   _petPersistTimer = setTimeout(async () => {
     try {
+      // 宠物设置不是供应商设置；先读最新文件再合并，避免页面打开时间过长或
+      // CCSwitch 切换供应商后，旧 settings.value 把 Base URL 覆盖回旧值。
+      const latest = await fetch(`${GW}/api/config/settings`)
+      const current = latest.ok ? await latest.json() : null
+      if (!current || typeof current !== 'object' || Array.isArray(current)) return
+      current.petEnabled = petEnabled.value
+      current.pet = petType.value
       await fetch(`${GW}/api/config/settings`, {
         method: 'PUT',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(settings.value),
+        body: JSON.stringify(current),
       })
     } catch (e) { console.error(e) }
   }, 300)
@@ -522,11 +547,13 @@ const updateDownloading = ref(false)
 const updateDownloaded = ref(false)
 const updateProgress = ref(0)
 const updateError = ref('')
+const updateBlocked = ref(false)
 
 async function checkAppUpdate() {
   updateChecking.value = true
   updateError.value = ''
   updateAvailable.value = null
+  updateBlocked.value = false
   try {
     const api = (window as any).electronAPI
     if (!api?.checkForUpdates) {
@@ -539,6 +566,7 @@ async function checkAppUpdate() {
       updateAvailable.value = { version: result.version }
     } else if (result?.error) {
       updateError.value = result.error
+      updateBlocked.value = result.blocked === true
     }
   } catch (e: any) {
     updateError.value = e.message || String(e)
@@ -547,11 +575,27 @@ async function checkAppUpdate() {
   }
 }
 
-function downloadAppUpdate() {
+async function downloadAppUpdate() {
+  if (updateBlocked.value) return
   updateDownloading.value = true
   updateError.value = ''
-  const api = (window as any).electronAPI
-  api?.downloadUpdate?.()
+  try {
+    const result = await window.electronAPI?.downloadUpdate?.()
+    if (result && !result.ok) {
+      updateDownloading.value = false
+      updateError.value = result.error || '更新下载失败'
+    }
+  } catch (error: any) {
+    updateDownloading.value = false
+    updateError.value = error?.message || '更新下载失败'
+  }
+}
+
+function openReleasePage() {
+  const url = `${__REPO_URL__.replace(/\/$/, '')}/releases/latest`
+  const api = window.electronAPI
+  if (api?.openExternal) void api.openExternal(url)
+  else window.open(url, '_blank', 'noopener,noreferrer')
 }
 
 function installAppUpdate() {
@@ -563,7 +607,8 @@ function installAppUpdate() {
 function initAppUpdate() {
   const api = (window as any).electronAPI
   if (!api) return
-  api.getAppVersion?.().then((v: string) => { if (v) appVersion.value = v }).catch(() => {})
+  api.getAppVersion?.().then((v: string) => { if (v) appVersion.value = v })
+    .catch((error: unknown) => console.warn('读取应用版本失败', error))
   // 启动时静默检查一次
   checkAppUpdate()
   // 主进程推送
@@ -748,7 +793,7 @@ function searchMarket() {
   fetch(`${GW}/api/config/skills-market?q=${encodeURIComponent(q)}`)
     .then(r => r.ok ? r.json() : Promise.reject(r))
     .then(d => { marketResults.value = d.results || [] })
-    .catch(() => {})
+    .catch((error: unknown) => console.warn('搜索 Skills 市场失败', error))
     .finally(() => { marketSearching.value = false })
 }
 async function installFromMarket(item: any) {
@@ -818,8 +863,7 @@ async function loadSkills() {
       const data = await res.json()
       skills.value = data.skills || []
     }
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   skillsLoading.value = false
 }
 
@@ -849,8 +893,7 @@ async function saveSkill() {
     setTimeout(() => {
       skillSaved.value = false
     }, 3000)
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   skillSaving.value = false
 }
 
@@ -924,8 +967,7 @@ async function loadAgents() {
       const data = await res.json();
       agents.value = data.agents || []
     }
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   agentsLoading.value = false
 }
 
@@ -952,8 +994,7 @@ async function saveAgent() {
     setTimeout(() => {
       agentSaved.value = false
     }, 3000)
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   agentSaving.value = false
 }
 
@@ -994,8 +1035,7 @@ async function deleteAgent(agent: any) {
     try {
       await fetch(`${GW}/api/config/agents/${encodeURIComponent(agent.name)}`, {method: 'DELETE'})
       await loadAgents()
-    } catch {
-    }
+    } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   })
 }
 
@@ -1030,8 +1070,7 @@ async function loadCommands() {
       commands.value = data.commands || [];
       commandsLive.value = !!data.live
     }
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   commandsLoading.value = false
 }
 
@@ -1071,8 +1110,7 @@ async function loadHooks() {
   try {
     const res = await fetch(`${GW}/api/config/hooks`)
     if (res.ok) hooks.value = await res.json()
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   hooksLoading.value = false
 }
 
@@ -1120,8 +1158,7 @@ async function saveHook() {
     setTimeout(() => {
       hookSaved.value = false
     }, 3000)
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   hookSaving.value = false
 }
 
@@ -1220,8 +1257,7 @@ async function loadRules() {
       const data = await res.json()
       rules.value = data.rules || []
     }
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   rulesLoading.value = false
 }
 
@@ -1247,8 +1283,7 @@ async function saveRule() {
     setTimeout(() => {
       ruleSaved.value = false
     }, 3000)
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   ruleSaving.value = false
 }
 
@@ -1329,8 +1364,7 @@ async function loadMemorySummary() {
       const data = await res.json()
       memoryProjects.value = data.projects || []
     }
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   memoryLoading.value = false
 }
 
@@ -1347,8 +1381,7 @@ async function loadMemoryForProject(encodedDir: string) {
       const data = await res.json()
       proj.files = data.files || []
     }
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   proj._loading = false
 }
 
@@ -1387,8 +1420,7 @@ async function saveMemory() {
       memorySaved.value = false
     }, 3000)
     await loadMemoryForProject(encodedDir)
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   memorySaving.value = false
 }
 
@@ -1405,8 +1437,7 @@ async function createMemory(encodedDir: string) {
     })
     newMemoryName.value = ''
     await loadMemoryForProject(encodedDir)
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   memorySaving.value = false
 }
 
@@ -1416,8 +1447,7 @@ async function deleteMemory(filename: string, encodedDir: string) {
     try {
       await fetch(`${GW}/api/projects/${encodedDir}/memory/${filename}`, {method: 'DELETE'})
       await loadMemoryForProject(encodedDir)
-    } catch {
-    }
+    } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   })
 }
 
@@ -1492,8 +1522,7 @@ async function loadMcp() {
       const data = await res.json()
       mcpPlugins.value = data.plugins || []
     }
-  } catch {
-  }
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   mcpLoading.value = false
 }
 
@@ -1594,20 +1623,20 @@ async function saveMcpServer() {
   if (f.transport === 'stdio') {
     body.command = f.command.trim()
     if (f.args.trim()) body.args = f.args.trim().split('\n').map(a => a.trim()).filter(Boolean)
+    const env: Record<string, string> = {}
     if (f.envText.trim()) {
-      const env: Record<string, string> = {}
       for (const line of f.envText.trim().split('\n')) {
         const eq = line.indexOf('=')
         if (eq > 0) env[line.slice(0, eq).trim()] = line.slice(eq + 1).trim()
       }
-      if (Object.keys(env).length) body.env = env
     }
+    body.env = env
   } else {
     body.url = f.url.trim()
     if (f.headersText.trim()) {
       try { body.headers = JSON.parse(f.headersText.trim()) }
       catch { mcpFormError.value = 'Headers JSON 格式错误'; mcpFormSaving.value = false; return }
-    }
+    } else body.headers = {}
   }
   try {
     const res = await fetch(`${GW}/api/config/mcp-servers`, {
@@ -1644,7 +1673,7 @@ const scheduledTasks = ref<any[]>([])
 const schedLoading = ref(false)
 const showSchedForm = ref(false)
 const editingSchedId = ref<string | null>(null)
-const schedForm = ref({cron: '', prompt: '', workDir: '', model: '', enabled: true})
+const schedForm = ref({cron: '', prompt: '', workDir: '', model: '', permissionMode: 'default', maxTurns: 20, enabled: true})
 const schedSaving = ref(false)
 const schedSearch = ref('')
 const filteredScheduledTasks = computed(() => {
@@ -1717,13 +1746,13 @@ async function loadScheduledTasks() {
 function openNewSched() {
   editingSchedId.value = null
   resetSchedVisualForm()
-  schedForm.value = {cron: '0 9 * * *', prompt: '', workDir: '', model: '', enabled: true}
+  schedForm.value = {cron: '0 9 * * *', prompt: '', workDir: '', model: '', permissionMode: 'default', maxTurns: 20, enabled: true}
   showSchedForm.value = true
 }
 function editSched(t: any) {
   editingSchedId.value = t.id
   parseCronToForm(t.cron)
-  schedForm.value = {cron: t.cron, prompt: t.prompt, workDir: t.workDir, model: t.model || '', enabled: t.enabled}
+  schedForm.value = {cron: t.cron, prompt: t.prompt, workDir: t.workDir, model: t.model || '', permissionMode: t.permissionMode || 'default', maxTurns: t.maxTurns || 20, enabled: t.enabled}
   showSchedForm.value = true
 }
 async function saveSched() {
@@ -1762,7 +1791,10 @@ async function runSchedNow(t: any) {
   try {
     const r = await fetch(`${GW}/api/config/scheduled-tasks/${t.id}/run`, {method: 'POST'})
     if (!r.ok) { const d = await r.json(); showAlert(d.error || '执行失败'); return }
-    showAlert('任务已触发')
+    const d = await r.json()
+    if (d.reason === 'already_running') { showAlert('任务正在运行，已忽略本次触发'); return }
+    if (d.reason === 'concurrency_limit') { showAlert('已达到定时任务并发上限'); return }
+    showAlert(d.started ? '任务已启动' : '任务未启动')
   } catch (e: any) { showAlert('执行失败: ' + (e.message || '')) }
 }
 async function deleteSched(id: string) {
@@ -1778,20 +1810,104 @@ async function deleteSched(id: string) {
 // ── IM 连接 ──
 const imPlatforms = ref<any[]>([])
 const imLoading = ref(false)
+const imConfigError = ref('')
 const editingPlatform = ref<any>(null)
 const editPlatformConfig = ref('')
+const bindingCleanupMode = ref<'' | 'stale' | 'all'>('')
+const notificationAction = ref('')
+
+const imBindingTotals = computed(() => imPlatforms.value.reduce((totals, platform) => {
+  totals.total += Number(platform.bindings?.total || 0)
+  totals.active += Number(platform.bindings?.active || 0)
+  totals.stale += Number(platform.bindings?.stale || 0)
+  return totals
+}, {total: 0, active: 0, stale: 0}))
+
+function notificationIssueCount(platform: any) {
+  return Number(platform.notifications?.pending || 0)
+    + Number(platform.notifications?.failed || 0)
+    + Number(platform.notifications?.dead || 0)
+}
 
 async function loadIM() {
   imLoading.value = true
+  imConfigError.value = ''
   try {
     const res = await fetch(`${GW}/api/config/adapters`)
-    if (res.ok) {
-      const data = await res.json()
-      imPlatforms.value = data.platforms || []
-    }
-  } catch {
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+    imPlatforms.value = data.platforms || []
+    imConfigError.value = data.configError || ''
+  } catch (error: any) {
+    imConfigError.value = error?.message || 'IM 配置读取失败'
   }
   imLoading.value = false
+}
+
+function confirmClearBindings(staleOnly: boolean) {
+  const count = staleOnly ? imBindingTotals.value.stale : imBindingTotals.value.total
+  if (count <= 0) return
+  const message = staleOnly
+    ? `确定清理 ${count} 条已失效的会话绑定吗？下次收到消息时会重新绑定当前桌面会话。`
+    : `确定清空全部 ${count} 条会话绑定吗？平台凭据和配对关系不会被删除。`
+  showConfirm(message, () => { void clearBindings(staleOnly) })
+}
+
+async function clearBindings(staleOnly: boolean) {
+  bindingCleanupMode.value = staleOnly ? 'stale' : 'all'
+  try {
+    const suffix = staleOnly ? '?stale=1' : ''
+    const response = await fetch(`${GW}/api/config/adapters/bindings${suffix}`, {method: 'DELETE'})
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}))
+      throw new Error(data.error || '清理失败')
+    }
+    await loadIM()
+  } catch (error: any) {
+    showAlert(`清理会话绑定失败: ${error?.message || '未知错误'}`)
+  } finally {
+    bindingCleanupMode.value = ''
+  }
+}
+
+async function retryPlatformNotifications(platformId: string) {
+  notificationAction.value = `${platformId}:retry`
+  try {
+    const response = await fetch(`${GW}/api/config/adapters/${platformId}/notifications/retry`, {method: 'POST'})
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}))
+      throw new Error(data.error || '重试失败')
+    }
+    await loadIM()
+  } catch (error: any) {
+    showAlert(`通知重试失败: ${error?.message || '未知错误'}`)
+  } finally {
+    notificationAction.value = ''
+  }
+}
+
+function confirmDiscardDeadNotifications(platform: any) {
+  const count = Number(platform.notifications?.dead || 0)
+  if (!count) return
+  showConfirm(`确定清除 ${platform.name} 的 ${count} 条永久失败通知吗？清除后无法恢复。`, () => {
+    void discardDeadNotifications(platform.id)
+  })
+}
+
+async function discardDeadNotifications(platformId: string) {
+  notificationAction.value = `${platformId}:discard`
+  try {
+    const response = await fetch(`${GW}/api/config/adapters/${platformId}/notifications/dead`, {method: 'DELETE'})
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}))
+      throw new Error(data.error || '清除失败')
+    }
+    await loadIM()
+  } catch (error: any) {
+    showAlert(`清除失败通知失败: ${error?.message || '未知错误'}`)
+  } finally {
+    notificationAction.value = ''
+  }
 }
 
 // ── 查看平台配置（JSON 格式展示）──
@@ -1802,6 +1918,9 @@ function startEditPlatform(p: any) {
     accountId: p.accountId,
     baseUrl: p.baseUrl,
     pairedUsers: p.pairedUsers || [],
+    bindings: p.bindings || {},
+    notifications: p.notifications || {},
+    runtime: p.runtime || {},
   }, null, 2)
 }
 
@@ -1907,8 +2026,7 @@ function startQRPoll(platformId: string) {
           }, 2000)
         }
       }
-    } catch {
-    }
+    } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   }, 2000)
 }
 
@@ -2157,6 +2275,10 @@ onUnmounted(() => {
         <!-- ──── 常规 Tab: AI 供应商 + API 配置 + 模型选择 + 其他设置 + 主题/语言 ──── -->
         <template v-if="activeTab === 'general'">
           <div v-if="settingsLoading" class="loading-state">{{ t('common.loading') }}</div>
+          <div v-else-if="settingsLoadError && !settings" class="error-banner settings-load-error">
+            <span>{{ settingsLoadError }}</span>
+            <button class="retry-btn" @click="loadSettings">{{ t('common.retry') }}</button>
+          </div>
           <div v-else-if="settings">
             <!-- 供应商选择: provider-card 卡片列表，选中高亮+打勾，点击切换 selectProvider -->
             <section class="section-block">
@@ -2201,6 +2323,7 @@ onUnmounted(() => {
                       </svg>
                     </a>
                   </div>
+                  <span v-if="localProxyNotice" class="field-hint warning-hint">{{ localProxyNotice }}</span>
                 </div>
                 <div class="field">
                   <label>API Key</label>
@@ -2325,7 +2448,7 @@ onUnmounted(() => {
               <div class="settings-grid">
                 <div class="field">
                   <label>{{ t('gen.maxContext') }}</label>
-                  <input v-model="tokenInput" class="field-input mono" placeholder="1M / 200K / 1000000"
+                  <input v-model="tokenInput" class="field-input mono" placeholder="自动 / 200K / 256000"
                          @blur="onTokenBlur"/>
                 </div>
                 <div class="field">
@@ -2367,31 +2490,34 @@ onUnmounted(() => {
             <!-- 应用版本与更新 -->
             <section class="section-block">
               <h2 class="section-title">应用更新</h2>
-              <p class="section-desc">更新通过 GitHub Releases 分发，检测到新版本后可一键下载安装</p>
+              <p class="section-desc">
+                {{ updateBlocked ? '当前构建未启用可信应用内更新，请从官方 GitHub Release 手动下载。' : '更新通过 GitHub Releases 分发，检测到新版本后可下载安装。' }}
+              </p>
               <div v-if="appVersion" class="field">
                 <label>当前版本</label>
                 <span class="field-value">v{{ appVersion }}</span>
               </div>
               <div v-if="updateAvailable" class="field">
                 <label>最新版本</label>
-                <span class="field-value" style="color:var(--success);font-weight:600">v{{ updateAvailable.version }}</span>
+                <span class="field-value update-version">v{{ updateAvailable.version }}</span>
               </div>
-              <div v-if="updateError" class="hint-warn" style="margin-top:6px">{{ updateError }}</div>
-              <div v-if="updateAvailable && !updateDownloaded && !updateDownloading" style="margin-top:10px">
+              <div v-if="updateError" class="hint-warn update-message">{{ updateError }}</div>
+              <div v-if="updateAvailable && !updateDownloaded && !updateDownloading && !updateBlocked" class="update-actions">
                 <button class="btn-primary" @click="downloadAppUpdate">{{ t('gen.updateDownload') }}</button>
               </div>
-              <div v-if="updateDownloading" style="margin-top:10px">
-                <div class="progress-bar-wrap" style="height:6px;background:var(--bg-deep);border-radius:3px;overflow:hidden">
-                  <div :style="{width:updateProgress+'%',height:'100%',background:'var(--accent-blue)',transition:'width .3s'}"></div>
+              <div v-if="updateDownloading" class="update-actions">
+                <div class="progress-bar-wrap">
+                  <div class="progress-bar-value" :style="{width:updateProgress+'%'}"></div>
                 </div>
-                <span style="font-size:12px;color:var(--text-muted)">{{ t('gen.updateProgress', {pct: updateProgress}) }}</span>
+                <span class="update-progress-label">{{ t('gen.updateProgress', {pct: updateProgress}) }}</span>
               </div>
-              <div v-if="updateDownloaded" style="margin-top:10px">
-                <div class="hint-warn" style="margin-bottom:8px">{{ t('gen.updateReadyHint', {version: updateAvailable?.version || ''}) }}</div>
+              <div v-if="updateDownloaded" class="update-actions">
+                <div class="hint-warn update-ready-message">{{ t('gen.updateReadyHint', {version: updateAvailable?.version || ''}) }}</div>
                 <button class="btn-primary" @click="installAppUpdate">{{ t('gen.updateInstall') }}</button>
               </div>
-              <div style="margin-top:12px">
-                <button class="btn-secondary btn-sm" :disabled="updateChecking" @click="checkAppUpdate">
+              <div class="update-actions">
+                <button v-if="updateBlocked" class="btn-primary btn-sm" @click="openReleasePage">打开官方 Release</button>
+                <button v-else class="btn-secondary btn-sm" :disabled="updateChecking" @click="checkAppUpdate">
                   {{ updateChecking ? t('gen.updateChecking') : t('gen.updateCheck') }}
                 </button>
               </div>
@@ -2402,7 +2528,7 @@ onUnmounted(() => {
           <div class="action-bar">
             <span v-if="settingsSaved" class="save-ok">{{ t('gen.savedOk') }}</span>
             <span v-if="settingsError" class="save-err">{{ settingsError }}</span>
-            <button class="btn-primary" @click="saveSettings">{{ t('gen.saveBtn') }}</button>
+            <button class="btn-primary" :disabled="!settings || settingsLoading" @click="saveSettings">{{ t('gen.saveBtn') }}</button>
           </div>
         </template>
 
@@ -2996,12 +3122,24 @@ onUnmounted(() => {
                 {{ (retryCount['im'] || 0) >= MAX_RETRIES ? t('common.retryMaxed') : t('common.retry') }}
               </button>
             </div>
+            <div v-if="imConfigError" class="error-banner im-config-error">
+              <span>IM 加密配置不可用：{{ imConfigError }}</span>
+              <button class="retry-btn" :disabled="imLoading" @click="loadIM">{{ t('common.retry') }}</button>
+            </div>
             <!-- 模块标题 + 刷新 -->
             <div class="module-header">
               <div class="module-header-left">
                 <span style="font-family:var(--font-heading);font-size:17px;font-weight:600">{{ t('tab.im') }}</span>
               </div>
-              <div style="display:flex;align-items:center;gap:8px;margin-left:auto">
+              <div class="im-toolbar-actions">
+                <button v-if="imBindingTotals.stale > 0" class="btn-text im-binding-action"
+                        :disabled="!!bindingCleanupMode" @click="confirmClearBindings(true)">
+                  {{ bindingCleanupMode === 'stale' ? '清理中...' : `清理失效绑定 (${imBindingTotals.stale})` }}
+                </button>
+                <button v-if="imBindingTotals.total > 0" class="btn-text danger im-binding-action"
+                        :disabled="!!bindingCleanupMode" @click="confirmClearBindings(false)">
+                  {{ bindingCleanupMode === 'all' ? '清理中...' : '清空全部绑定' }}
+                </button>
                 <button class="refresh-btn" :class="{ spinning: imLoading }" @click="loadIM" :disabled="imLoading"
                       :title="t('common.refresh')">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
@@ -3013,7 +3151,7 @@ onUnmounted(() => {
             </div>
             </div>
             <!-- IM 平台卡片: 图标+名称+状态+API地址+绑定用户数+配置指南+绑定/解绑按钮 -->
-            <div v-for="p in imPlatforms" :key="p.id" class="im-card">
+            <div v-for="p in imPlatforms" :key="p.id" class="im-card" :class="{'im-card-disabled': !!imConfigError}">
               <div class="im-card-header">
                 <div class="im-card-title">
                   <span class="im-icon" v-html="p.icon"></span>
@@ -3035,8 +3173,40 @@ onUnmounted(() => {
                 </div>
                 <div class="im-row" v-if="p.pairedUsers?.length">
                   <span class="im-label">{{ t('im.boundUsers') }}</span>
-                  <span class="im-value">{{ t('im.boundUsersN', {n: p.pairedUsers.length}) }}</span>
+                  <span class="im-value">
+                    {{ p.bindings?.active || 0 }} 个活跃
+                    <template v-if="p.bindings?.stale"> · {{ p.bindings.stale }} 个失效</template>
+                  </span>
                 </div>
+                <div class="im-row" v-if="p.pairCode">
+                  <span class="im-label">当前配对码</span>
+                  <code class="im-value im-pair-code">{{ p.pairCode }}</code>
+                </div>
+                <div class="im-row" v-if="p.runtime?.state && !['connected', 'running'].includes(p.runtime.state)">
+                  <span class="im-label">连接状态</span>
+                  <span class="im-value" :class="{'im-value-warn': ['error', 'failed'].includes(p.runtime.state)}">
+                    {{ p.runtime.state }}
+                  </span>
+                </div>
+              </div>
+
+              <div v-if="notificationIssueCount(p) > 0" class="im-delivery-status"
+                   :class="{danger: Number(p.notifications?.dead || 0) > 0}">
+                <span>通知队列</span>
+                <span v-if="p.notifications?.pending">待发送 {{ p.notifications.pending }}</span>
+                <span v-if="p.notifications?.failed">重试中 {{ p.notifications.failed }}</span>
+                <span v-if="p.notifications?.dead">永久失败 {{ p.notifications.dead }}</span>
+                <span class="im-delivery-actions">
+                  <button v-if="Number(p.notifications?.failed || 0) + Number(p.notifications?.dead || 0) > 0"
+                          class="btn-text" :disabled="!!notificationAction"
+                          @click="retryPlatformNotifications(p.id)">
+                    {{ notificationAction === `${p.id}:retry` ? '重试中...' : '立即重试' }}
+                  </button>
+                  <button v-if="p.notifications?.dead" class="btn-text danger" :disabled="!!notificationAction"
+                          @click="confirmDiscardDeadNotifications(p)">
+                    {{ notificationAction === `${p.id}:discard` ? '清除中...' : '清除永久失败' }}
+                  </button>
+                </span>
               </div>
 
               <div class="im-guide">
@@ -3048,6 +3218,7 @@ onUnmounted(() => {
 
               <div class="im-card-actions">
                 <button class="btn-bind" :class="{ bound: p.hasAccount }"
+                        :disabled="!!imConfigError"
                         @click="p.hasAccount ? startEditPlatform(p) : startBind(p.id)">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                        stroke-linecap="round" stroke-linejoin="round">
@@ -3056,7 +3227,7 @@ onUnmounted(() => {
                   </svg>
                   {{ p.hasAccount ? t('im.bound') : p.id === 'wechat' ? t('im.bindQr') : t('im.bindCred') }}
                 </button>
-                <button v-if="p.hasAccount" class="btn-unbind" :disabled="unbindId === p.id" @click="confirmUnbind(p)">
+                <button v-if="p.hasAccount" class="btn-unbind" :disabled="unbindId === p.id || !!imConfigError" @click="confirmUnbind(p)">
                   <template v-if="unbindId === p.id">{{ t('im.unbinding') }}</template>
                   <template v-else>{{ t('im.unbind') }}</template>
                 </button>
@@ -3436,6 +3607,18 @@ onUnmounted(() => {
           </div>
           <div class="field"><label>模型 (可选)</label>
             <input v-model="schedForm.model" class="field-input mono" placeholder="deepseek-v4-pro"/>
+          </div>
+          <div class="field"><label>权限模式</label>
+            <select v-model="schedForm.permissionMode" class="field-input">
+              <option value="default">默认（需要确认）</option>
+              <option value="acceptEdits">自动接受编辑</option>
+              <option value="plan">仅规划</option>
+              <option value="bypassPermissions">完全自动执行</option>
+            </select>
+          </div>
+          <div class="field"><label>最大轮数</label>
+            <input v-model.number="schedForm.maxTurns" type="number" min="1" max="100" class="field-input mono"/>
+            <span class="field-hint">限制单次定时任务的 Agent 轮数</span>
           </div>
 <div class="qr-actions">
             <button class="btn-text" @click="showSchedForm = false">{{ t('common.cancel') }}</button>
@@ -4187,6 +4370,41 @@ onUnmounted(() => {
   padding: 10px 14px;
   margin-top: 12px;
   line-height: 1.5;
+}
+
+.update-version {
+  color: var(--success);
+  font-weight: 600;
+}
+
+.update-message {
+  margin-top: 6px;
+}
+
+.update-actions {
+  margin-top: 10px;
+}
+
+.progress-bar-wrap {
+  height: 6px;
+  overflow: hidden;
+  background: var(--bg-deep);
+  border-radius: 3px;
+}
+
+.progress-bar-value {
+  height: 100%;
+  background: var(--accent-blue);
+  transition: width 0.3s;
+}
+
+.update-progress-label {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.update-ready-message {
+  margin-bottom: 8px;
 }
 
 .field-value {
@@ -5044,6 +5262,67 @@ input[type="time"].field-input::-webkit-calendar-picker-indicator {
   font-size: 13px;
   color: var(--text-secondary);
   font-family: var(--font-mono);
+}
+
+.im-value-warn {
+  color: var(--danger);
+}
+
+.im-card-disabled {
+  opacity: 0.72;
+}
+
+.im-config-error {
+  gap: 16px;
+}
+
+.im-pair-code {
+  color: var(--accent-gold);
+  font-size: 15px;
+  font-weight: 700;
+  user-select: all;
+}
+
+.im-binding-action {
+  white-space: nowrap;
+}
+
+.im-toolbar-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.im-delivery-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin: 0 0 14px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--accent-gold);
+  background: color-mix(in srgb, var(--accent-gold) 8%, transparent);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.im-delivery-status.danger {
+  border-left-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  color: var(--danger);
+}
+
+.im-delivery-actions {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.im-delivery-actions .btn-text {
+  padding: 0;
+  font-size: 12px;
 }
 
 .im-guide {

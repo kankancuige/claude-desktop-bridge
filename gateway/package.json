@@ -10,7 +10,8 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.206",
-    "@larksuiteoapi/node-sdk": "^1.67.0",
+    "@larksuiteoapi/node-sdk": "^1.72.0",
+    "@tree-sitter-grammars/tree-sitter-kotlin": "^1.1.0",
     "dingtalk-stream": "^2.1.6-beta.1",
     "dotenv": "^16.4.0",
     "node-cron": "^4.5.0",
@@ -31,7 +32,9 @@
     "tree-sitter-rust": "^0.24.0",
     "tree-sitter-swift": "^0.7.1",
     "tree-sitter-typescript": "^0.23.2",
-    "@tree-sitter-grammars/tree-sitter-kotlin": "^1.1.0",
     "ws": "^8.18.0"
+  },
+  "overrides": {
+    "protobufjs": "7.6.5"
   }
 }

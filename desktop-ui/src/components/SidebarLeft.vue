@@ -63,6 +63,7 @@ const emit = defineEmits<{
   (e: 'loadProjects', reorder: boolean): void
   (e: 'toggleProject', workDir: string): void
   (e: 'newSession', workDir: string, encodedDir: string, sid?: string): void
+  (e: 'forkSession', workDir: string, encodedDir: string, sid: string): void
   (e: 'deleteSession', sid: string): void
   (e: 'hideProject', workDir: string): void
   (e: 'showProject', workDir: string): void
@@ -227,7 +228,7 @@ function visibleSessions(p: Project, showAllSessions: Set<string>, pageSize: num
           <div v-for="s in visibleSessions(p, showAllSessions, sessionPageSize)" :key="s.id"
                class="session-item"
                :class="{ selected: $props.activeSessionId === s.id }"
-               @click.stop="batchMode ? emit('toggleSelect', s.id) : emit('newSession', p.workDir, p.encodedDir, s.id)">
+               @click.stop="batchMode ? emit('toggleSelect', s.id) : emit('newSession', p.workDir, s.encodedDir || p.encodedDir, s.id)">
             <!-- 批量模式：多选框；普通模式：对话气泡图标 -->
             <label v-if="batchMode" class="batch-checkbox" @click.stop>
               <input type="checkbox" :checked="selectedSessions.has(s.id)"
@@ -241,7 +242,15 @@ function visibleSessions(p: Project, showAllSessions: Set<string>, pageSize: num
               <div class="session-title">{{ s.title || s.id.slice(0, 8) }}</div>
               <div class="session-id-text">{{ s.id.slice(0, 12) }}</div>
             </div>
-            <button v-if="!batchMode" class="session-del" @click.stop="emit('deleteSession', s.id)" :title="t('common.delete')">
+            <button v-if="!batchMode" class="session-action session-fork"
+                    @click.stop="emit('forkSession', p.workDir, s.encodedDir || p.encodedDir, s.id)"
+                    :title="t('ws.forkSession')">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="6" cy="4" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="18" cy="18" r="2"/>
+                <path d="M6 6v6a6 6 0 0 0 6 6h4M8 6h4a6 6 0 0 1 6 6v4"/>
+              </svg>
+            </button>
+            <button v-if="!batchMode" class="session-action session-del" @click.stop="emit('deleteSession', s.id)" :title="t('common.delete')">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <polyline points="3 6 5 6 21 6"/>
                 <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
@@ -499,12 +508,15 @@ function visibleSessions(p: Project, showAllSessions: Set<string>, pageSize: num
 .session-title { font-size: 13px; color: var(--text-primary); }
 .session-id-text { font-size: 11px; font-family: var(--font-mono); color: var(--text-muted); }
 
-.session-del {
+.session-action {
   background: none; border: none; color: var(--text-muted);
-  cursor: pointer; padding: 2px; border-radius: 4px; opacity: 0;
+  cursor: pointer; padding: 3px; border-radius: 4px; opacity: 0;
+  width: 20px; height: 20px; flex: 0 0 20px;
+  display: inline-flex; align-items: center; justify-content: center;
   transition: all .12s;
 }
-.session-item:hover .session-del { opacity: 1; }
+.session-item:hover .session-action { opacity: 1; }
+.session-fork:hover { color: var(--accent-blue); background: var(--bg-deep); }
 .session-del:hover { color: var(--error); }
 
 .show-more-btn {

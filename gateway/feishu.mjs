@@ -26,17 +26,34 @@
  * - bridge-paired-feishu.json: 已配对的飞书用户白名单
  * - adapter-sessions.json: 用户→session 绑定关系(mirror 模式用)
  */
-import {readFileSync, writeFileSync} from 'node:fs'
+import {readFileSync} from 'node:fs'
 import {join} from 'node:path'
 import {homedir} from 'node:os'
-import {WSClient, EventDispatcher, Client, LoggerLevel} from '@larksuiteoapi/node-sdk'
+import {randomInt} from 'node:crypto'
+import {WSClient, EventDispatcher, Client, LoggerLevel, defaultHttpInstance} from '@larksuiteoapi/node-sdk'
 import WebSocket from 'ws'
 import {createLogger} from './logger.mjs'
 import {detectCommand, executeCommand} from './im-commands.mjs'
+import {gatewayFetch, gatewayWsOptions, gatewayHttpBase, gatewayWsUrl} from './gateway-client.mjs'
+import {SessionTaskQueue} from './session-task-queue.mjs'
+import {ImMessageDeduper} from './im-message-dedupe.mjs'
+import {claimDurableInboxMessage, ImInbox} from './im-inbox.mjs'
+import {SecurePayloadCodec} from './secure-payload.mjs'
+import {NotificationOutbox} from './notification-outbox.mjs'
+import {startNotificationWorker, sendOrQueue} from './notification-worker.mjs'
+import {splitTextByUtf8Bytes} from './text-chunks.mjs'
+import {loadPairedUsers, savePairedUsers} from './paired-users.mjs'
+import {readAdapterConfig} from './adapter-config.mjs'
+import {turnFallbackText} from './im-turn-finish.mjs'
+import {validateImText} from './im-input.mjs'
+import {createMirrorStateResolver} from './mirror-state.mjs'
+import {platformEntryFilePath} from './platform-entry-store.mjs'
+import {PendingConfirmRegistry} from './pending-confirm.mjs'
+import {findLatestAdapterUserForSession} from './adapter-bindings.mjs'
 
 const log = createLogger('feishu')
 
-const GW = 'http://127.0.0.1:3456'              // Gateway 本地 HTTP 地址
+const GW = () => gatewayHttpBase()              // Gateway 本地 HTTP 地址
 const CLAUDE_HOME = join(homedir(), '.claude')   // Claude 配置根目录
 
 // ── startFeishuAdapter ──
@@ -46,6 +63,9 @@ const CLAUDE_HOME = join(homedir(), '.claude')   // Claude 配置根目录
 // 关键数据流: adapters.json 加载凭据 → 创建 Client + WSClient → 注册事件处理器 → 启动 WS → 返回钩子对象
 export function startFeishuAdapter(token) {
     let appId, appSecret
+    let stopped = false
+    let connectionError = null
+    const activeSockets = new Set()
 
     // ── reloadCreds ──
     // 功能说明: 从磁盘重新加载飞书应用凭据
@@ -53,7 +73,7 @@ export function startFeishuAdapter(token) {
     // SIDE_EFFECT: 修改模块级变量 appId / appSecret
     function reloadCreds() {
         try {
-            const adapters = JSON.parse(readFileSync(join(CLAUDE_HOME, 'adapters.json'), 'utf8'))
+            const adapters = readAdapterConfig(join(CLAUDE_HOME, 'adapters.json'))
             appId = adapters.feishu?.appId
             appSecret = adapters.feishu?.appSecret
             if (!appId || !appSecret) {
@@ -76,41 +96,53 @@ export function startFeishuAdapter(token) {
     // 实现方式: 文件不存在时默认空集合，首次配对成功时写入磁盘持久化。
     // 飞书使用独立的配对文件，与微信/钉钉隔离。
     const pairedFile = join(CLAUDE_HOME, 'bridge-paired-feishu.json')
-    let pairedUsers = new Set()
-    try {
-        const d = JSON.parse(readFileSync(pairedFile, 'utf8'));
-        pairedUsers = new Set(d.users || [])
-    } catch {
-    }
+    const pairedUsers = loadPairedUsers(pairedFile)
 
     // ── 配对码生成 ──
-    const pairCode = String(Math.floor(100000 + Math.random() * 900000))
-    log.info({pairCodeMasked: pairCode.slice(0, 2) + '****'}, '配对码已生成')
+    const pairCode = String(randomInt(100000, 1000000))
+    log.info('配对码已生成，可在桌面端 IM 设置中查看')
 
     // ── 配对暴力破解防护 ──
     const pairFailCount = new Map()
     const PAIR_MAX_FAIL = 5
     const PAIR_COOLDOWN_MS = 10 * 60 * 1000
+    const PAIR_ATTEMPT_TTL_MS = 60 * 60 * 1000
+    const PAIR_MAX_TRACKED_USERS = 5000
 
     // ── pendingConfirm 挂起确认表 ──
     // 功能说明: 记录等待用户回复确认的请求，key 为飞书用户 open_id
-    const pendingConfirm = new Map()
+    const pendingConfirm = new PendingConfirmRegistry()
+    const sessionQueue = new SessionTaskQueue({maxDepth: 8})
+    const messageDeduper = new ImMessageDeduper()
+    const payloadCodec = new SecurePayloadCodec(join(CLAUDE_HOME, 'bridge-store-key'))
+    const legacyInboxFile = join(CLAUDE_HOME, 'bridge-im-inbox.json')
+    const legacyOutboxFile = join(CLAUDE_HOME, 'bridge-notification-outbox.json')
+    const inbox = new ImInbox({
+        filePath: platformEntryFilePath(CLAUDE_HOME, 'bridge-im-inbox', 'feishu'), legacyFilePath: legacyInboxFile,
+        platform: 'feishu', payloadCodec,
+        onPersistError: error => log.error({err: error}, 'IM inbox 持久化失败'),
+    })
+    const outbox = new NotificationOutbox({
+        filePath: platformEntryFilePath(CLAUDE_HOME, 'bridge-notification-outbox', 'feishu'), legacyFilePath: legacyOutboxFile,
+        platform: 'feishu', payloadCodec,
+        onPersistError: error => log.error({err: error}, '通知 outbox 持久化失败'),
+    })
     // pendingConfirm TTL 清理：5 分钟超时自动清除，防止异常路径下残留
     const _confirmCleanup = setInterval(() => {
-      const cutoff = Date.now() - 5 * 60 * 1000
-      for (const [uid, pc] of pendingConfirm) {
-        if ((pc._at || 0) < cutoff) pendingConfirm.delete(uid)
+      pendingConfirm.cleanup()
+      for (const [uid, attempt] of pairFailCount) {
+        if (Date.now() - Number(attempt.lastAttemptAt || 0) > PAIR_ATTEMPT_TTL_MS) pairFailCount.delete(uid)
       }
     }, 5 * 60 * 1000)
     if (_confirmCleanup.unref) _confirmCleanup.unref()
-    // 包装 set 自动注入 _at 时间戳，供 TTL 清理使用
-    const _pcSet = pendingConfirm.set.bind(pendingConfirm)
-    pendingConfirm.set = (k, v) => _pcSet(k, {...v, _at: Date.now()})
-
     // ── 飞书 API 客户端 (发消息用) ──
     // 功能说明: 用于通过 HTTP API 发送消息到飞书用户
     // 实现方式: 飞书 SDK Client 封装了 access_token 自动获取/刷新，无需手动管理
-    const client = new Client({appId, appSecret})
+    const client = new Client({
+        appId,
+        appSecret,
+        httpInstance: defaultHttpInstance.create({timeout: 15_000}),
+    })
 
     // ── 飞书 WS 长连接客户端 (收消息用) ──
     // 功能说明: 建立到飞书服务端的 WebSocket 长连接，接收事件推送
@@ -130,6 +162,7 @@ export function startFeishuAdapter(token) {
     // 异常处理: 捕获异常仅打印日志不抛出，避免因发送失败中断主流程
     // 关键数据流: 参数组装 → Client API → 飞书服务端 → 用户飞书客户端
     async function sendMsg(userId, text) {
+        if (stopped) return false
         try {
             await client.im.message.create({
                 params: {receive_id_type: 'open_id'},
@@ -140,8 +173,10 @@ export function startFeishuAdapter(token) {
                 },
             })
             log.debug('sendMsg ok')
+            return true
         } catch (e) {
             log.error({err: e}, 'sendMsg 异常')
+            return false
         }
     }
 
@@ -170,16 +205,10 @@ export function startFeishuAdapter(token) {
     //   2. 有挂起确认→拦截当前消息作为确认回复提交到 /api/confirm
     //   3. 正常对话→resolve session → injectAndWait
     // 关键数据流: raw msg → 配对检查 → session resolve → injectAndWait → 结果回传飞书
-    async function handleMessage(uid, text) {
-        // ── 第0层: IM 自定义命令 ──
-        const cmd = detectCommand(text)
-        if (cmd) {
-            const r = await executeCommand(cmd)
-            if (r?.replyText) await sendMsg(uid, r.replyText)
-            return
-        }
-
-        // ── 第1层: 配对鉴权 ──
+    async function processMessage(uid, text, messageId = '') {
+        if (stopped) return
+        const identity = {source: 'feishu', userId: uid}
+        // ── 第0层: 配对鉴权 ──
         if (!pairedUsers.has(uid)) {
             const fc = pairFailCount.get(uid)
             if (fc && fc.count >= PAIR_MAX_FAIL && Date.now() < fc.cooldownUntil) {
@@ -190,16 +219,18 @@ export function startFeishuAdapter(token) {
             if (text.trim() === pairCode) {
                 pairedUsers.add(uid)
                 pairFailCount.delete(uid)
-                writeFileSync(pairedFile, JSON.stringify({users: [...pairedUsers]}))  // SIDE_EFFECT: 持久化白名单
+                savePairedUsers(pairedFile, pairedUsers)  // SIDE_EFFECT: 持久化白名单
                 await sendMsg(uid, '配对成功！现在可以开始对话了。')
             } else {
                 const cur = pairFailCount.get(uid) || {count: 0, cooldownUntil: 0}
                 cur.count++
+                cur.lastAttemptAt = Date.now()
                 if (cur.count >= PAIR_MAX_FAIL) {
                     cur.cooldownUntil = Date.now() + PAIR_COOLDOWN_MS
                     log.warn({userId: uid?.slice(0, 8), failCount: cur.count}, '配对码暴力破解触发冷却')
                 }
                 pairFailCount.set(uid, cur)
+                while (pairFailCount.size > PAIR_MAX_TRACKED_USERS) pairFailCount.delete(pairFailCount.keys().next().value)
                 const left = PAIR_MAX_FAIL - cur.count
                 await sendMsg(uid, left > 0
                     ? `配对码错误，还剩 ${left} 次机会`
@@ -208,28 +239,40 @@ export function startFeishuAdapter(token) {
             return
         }
 
+        // ── 第1层: 已配对用户命令 ──
+        const cmd = detectCommand(text)
+        if (cmd) {
+            const r = await executeCommand(cmd, token, identity)
+            if (r?.replyText) await sendMsg(uid, r.replyText)
+            return
+        }
+
         // ── 第2层: 挂起确认拦截 ──
         // 处理挂起的确认请求：用户发送回复时，先检测是否为确认回复而非新 prompt
-        if (pendingConfirm.has(uid)) {
-            const pc = pendingConfirm.get(uid)
+        const pc = pendingConfirm.peek(uid)
+        if (pc) {
             const parsed = parseConfirmReply(text, pc.type)
             if (!parsed) {
                 await sendMsg(uid, pc.type === 'choice' ? '请回复选项编号（如 1、2）' : '请回复 y/确认 或 n/拒绝')
                 return
             }
             try {
-                const r = await fetch(`${GW}/api/confirm`, {
+                const r = await gatewayFetch(`${GW()}/api/confirm`, token, {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({sessionId: pc.sessionId, requestId: pc.requestId, ...parsed}),
                     signal: AbortSignal.timeout(5000),
-                })
-                if (r.ok) await sendMsg(uid, '已提交')
-                else await sendMsg(uid, '该请求已处理')
+                }, identity)
+                const d = await r.json().catch(() => ({}))
+                if (r.ok || d.reason === 'already_resolved') {
+                    pendingConfirm.remove(uid, pc)
+                    await sendMsg(uid, d.ok ? '已提交' : '该请求已处理')
+                } else {
+                    await sendMsg(uid, '提交失败，请稍后重试')
+                }
             } catch (e) {
                 await sendMsg(uid, '提交失败，请稍后重试')
             }
-            pendingConfirm.delete(uid)  // 无论成功与否都清除挂起状态
             return
         }
 
@@ -239,10 +282,10 @@ export function startFeishuAdapter(token) {
             let sid = null, noActive = false
             // 解析用户绑定的活跃 session
             try {
-                const r = await fetch(`${GW}/api/sessions/resolve`, {
+                const r = await gatewayFetch(`${GW()}/api/sessions/resolve`, token, {
                     method: 'POST', headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({userId: uid}), signal: AbortSignal.timeout(5000),
-                })
+                }, identity)
                 if (r.ok) {
                     const d = await r.json();
                     sid = d.sessionId;
@@ -262,14 +305,67 @@ export function startFeishuAdapter(token) {
                 await sendMsg(uid, '无法连接会话');
                 return
             }
-            await injectAndWait(sid, uid, text)
+            const position = sessionQueue.depth(sid)
+            if (position > 0) await sendMsg(uid, `当前会话已有 ${position} 条消息处理中，本条将按顺序执行`)
+            await sessionQueue.enqueue(sid, () => injectAndWait(sid, uid, text, messageId))
         } catch (e) {
+            if (e?.code === 'queue_full') {
+                await sendMsg(uid, '当前会话待处理消息已达上限，请稍后重试')
+                return
+            }
+            if (e?.code === 'session_cancelled') {
+                await sendMsg(uid, '当前会话已停止，本条排队消息已取消')
+                return
+            }
             log.error({err: e, userId: uid?.slice(0, 8)}, '处理失败')
             try {
                 await sendMsg(uid, '处理失败，请稍后重试')
-            } catch {
+            } catch (notifyError) {
+                log.warn({err: notifyError, userId: uid?.slice(0, 8)}, '发送处理失败提示失败')
             }
         }
+    }
+
+    function handleMessage(uid, text, messageId = '') {
+        const validation = validateImText(text)
+        if (!validation.ok && !messageId) return sendReliableText(uid, turnFallbackText('invalid_input'))
+        if (!messageId) return processMessage(uid, text, messageId)
+        const claim = claimDurableInboxMessage({
+            inbox, deduper: messageDeduper, messageId,
+            payload: {uid, text: validation.ok ? text : ''},
+        })
+        if (!claim.accepted) return
+        return (async () => {
+            try {
+                if (validation.ok) await processMessage(uid, text, messageId)
+                else await sendReliableText(uid, turnFallbackText('invalid_input'))
+                if (stopped) return
+                if (!inbox.complete(messageId)) log.error({messageId: String(messageId).slice(0, 32)}, 'IM inbox 完成状态持久化失败')
+            } catch (error) {
+                if (stopped) return
+                messageDeduper.forget(messageId)
+                if (!inbox.fail(messageId, error)) log.error({messageId: String(messageId).slice(0, 32)}, 'IM inbox 失败状态持久化失败')
+                log.error({err: error, messageId: String(messageId).slice(0, 32)}, 'inbox 消息处理失败')
+            }
+        })()
+    }
+
+    const notificationWorker = startNotificationWorker({
+        outbox,
+        deliver: payload => sendMsg(payload.userId, payload.text),
+        log,
+    })
+
+    async function sendReliableText(userId, text) {
+        if (stopped) return false
+        const parts = splitTextByUtf8Bytes(text, 4000)
+        let sent = true
+        for (let i = 0; i < parts.length; i++) {
+            const content = parts.length > 1 ? `【${i + 1}/${parts.length}】${parts[i]}` : parts[i]
+            const result = await sendOrQueue(outbox, {userId, text: content}, payload => sendMsg(payload.userId, payload.text))
+            if (!result.sent) sent = false
+        }
+        return sent
     }
 
     // ── injectAndWait ── WS 注入 + 进度反馈 + 回复发送
@@ -281,17 +377,20 @@ export function startFeishuAdapter(token) {
     //   4. 超时 5.5 分钟后自动结束
     // mirror 模式: 若 mirror 开关开启则完全跳过回复发送(bridge 统一广播)
     // 关键数据流: user_message → WS 事件流 → replyText 累积 → finish() → sendMsg 飞书用户
-    async function injectAndWait(sessionId, userId, text) {
-        return new Promise(async (resolve) => {
+    async function injectAndWait(sessionId, userId, text, messageId = '') {
+        if (stopped) return
+        return new Promise((resolve) => {
             let ws2
             try {
-                ws2 = new WebSocket(`ws://127.0.0.1:3456/ws/${sessionId}?source=feishu&token=${encodeURIComponent(token)}`)
+                ws2 = new WebSocket(gatewayWsUrl(`/ws/${sessionId}?source=feishu`), gatewayWsOptions(token, {source: 'feishu', userId}))
+                activeSockets.add(ws2)
             } catch (e) {
                 resolve()
                 return
             }
             let toolCount = 0, done = false, replyText = ''
-            let mirrorOn = false
+            let expectedTurnId = null
+            const mirrorState = createMirrorStateResolver(() => shouldSkipReply(sessionId, userId))
             let timeoutId = null
 
             // ── finish ──
@@ -301,26 +400,25 @@ export function startFeishuAdapter(token) {
                 if (done) return;
                 done = true;
                 if (timeoutId) clearTimeout(timeoutId)
+                activeSockets.delete(ws2)
                 log.info({
                     sessionId: sessionId?.slice(0, 8),
                     reason,
                     tools: toolCount,
                     textLen: replyText.length
                 }, 'finish')
+                try { ws2.close() } catch (error) {
+                    log.debug({err: error}, '关闭飞书注入 WebSocket 失败')
+                }
                 try {
-                    ws2.close()
-                } catch {
+                    if (stopped || reason === 'adapter_stopped') return
+                    if (await mirrorState.resolve()) return
+                    await sendReliableText(userId, replyText.trim() || turnFallbackText(reason))
+                } catch (error) {
+                    log.error({err: error, sessionId: sessionId?.slice(0, 8), reason}, '飞书回合收尾失败')
+                } finally {
+                    resolve()
                 }
-                if (mirrorOn) {
-                    resolve();
-                    return
-                }
-                if (!replyText.trim()) {
-                    resolve();
-                    return
-                }
-                await sendMsg(userId, replyText.trim())
-                resolve()
             }
 
             // 事件处理器必须在 await 前注册: await 会让出事件循环，localhost WS 握手极快，
@@ -330,15 +428,36 @@ export function startFeishuAdapter(token) {
             timeoutId = setTimeout(() => finish('timeout'), 5 * 60 * 1000 + 30000)
 
             ws2.onopen = () => {
-                ws2.send(JSON.stringify({type: 'user_message', content: text}));
-                log.info({sessionId: sessionId?.slice(0, 8), text: text.slice(0, 50)}, '→session')
+                ws2.send(JSON.stringify({type: 'user_message', content: text, messageId, permissionMode: 'default'}));
+                log.info({sessionId: sessionId?.slice(0, 8), textLength: text.length}, '→session')
             }
-
-            mirrorOn = await shouldSkipReply(sessionId)
 
             ws2.onmessage = (e) => {
                 try {
                     const msg = JSON.parse(e.data)
+                    if (msg.type === 'connected') {
+                        if (typeof msg.mirrorEnabled === 'boolean') {
+                            mirrorState.set(msg.mirrorEnabled)
+                        }
+                        return
+                    }
+                    if (msg.type === 'message_accepted') {
+                        if (!messageId || msg.messageId === messageId) expectedTurnId = msg.turnId || null
+                        return
+                    }
+                    if (msg.type === 'message_duplicate') {
+                        finish('duplicate')
+                        return
+                    }
+                    if (msg.type === 'message_rejected') {
+                        finish(msg.code === 'input_queue_full' ? 'queue_full' : 'invalid_input')
+                        return
+                    }
+                    if (msg.type === 'error') {
+                        finish('ws_error')
+                        return
+                    }
+                    if (expectedTurnId && msg.turnId && msg.turnId !== expectedTurnId) return
                     if (msg.type === 'text_delta' && msg.text) {
                         replyText += msg.text
                     } else if (msg.type === 'assistant_message') {
@@ -349,34 +468,44 @@ export function startFeishuAdapter(token) {
                         replyText = parts.join('\n')
                     } else if (msg.type === 'tool_use_start') {
                         toolCount++
-                        if (!mirrorOn) sendMsg(userId, `⏳ [${toolCount}] ${msg.tool_name || '工具'}...`)
+                        if (!mirrorState.value) sendMsg(userId, `⏳ [${toolCount}] ${msg.tool_name || '工具'}...`)
                     } else if (msg.type === 'permission_request') {
-                        if (!mirrorOn) {
-                            pendingConfirm.set(userId, {sessionId, requestId: msg.requestId, type: 'permission'})
-                            sendMsg(userId, `需要授权\n工具: ${msg.toolName}\n\n回复 y/确认 允许，n/拒绝 拒绝`)
+                        if (!mirrorState.value) {
+                            if (pendingConfirm.add(userId, {sessionId, requestId: msg.requestId, type: 'permission'})) {
+                                sendReliableText(userId, `需要授权\n工具: ${msg.toolName}\n\n回复 y/确认 允许，n/拒绝 拒绝`)
+                            }
                         }
                     } else if (msg.type === 'choice_request') {
-                        if (!mirrorOn) {
+                        if (!mirrorState.value) {
                             const lines = [];
                             const q = msg.questions?.[0]
                             if (q?.question) lines.push(q.question)
                             ;
                             (q?.options || []).forEach((o, i) => lines.push(`${i + 1}. ${o.label}`))
-                            pendingConfirm.set(userId, {
+                            const added = pendingConfirm.add(userId, {
                                 sessionId,
                                 requestId: msg.requestId,
                                 type: 'choice',
                                 questions: msg.questions
                             })
-                            sendMsg(userId, `请选择\n${lines.join('\n')}\n\n回复选项编号`)
+                            if (added) sendReliableText(userId, `请选择\n${lines.join('\n')}\n\n回复选项编号`)
                         }
                     } else if (msg.type === 'result') {
-                        if (toolCount > 0 && !mirrorOn) sendMsg(userId, `共执行 ${toolCount} 个工具`)
+                        if (toolCount > 0 && !mirrorState.value) sendMsg(userId, `共执行 ${toolCount} 个工具`)
                         setTimeout(finish, 500, 'result')
+                    } else if (msg.type === 'generation_stopped') {
+                        sessionQueue.cancel(sessionId)
+                        finish('stopped')
                     }
-                } catch {
+                } catch (error) {
+                    log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '飞书 WebSocket 消息处理失败')
+                    void finish('ws_message_error')
                 }
             }
+
+            void mirrorState.resolve().catch(error => {
+                log.debug({err: error, sessionId: sessionId?.slice(0, 8)}, '预读取飞书镜像状态失败')
+            })
 
         })
     }
@@ -388,7 +517,8 @@ export function startFeishuAdapter(token) {
         if (input.file_path) return `文件: ${input.file_path}`
         try {
             return JSON.stringify(input).slice(0, 200)
-        } catch {
+        } catch (error) {
+            log.debug({err: error}, '飞书权限输入无法序列化')
             return ''
         }
     }
@@ -401,30 +531,21 @@ export function startFeishuAdapter(token) {
 
     // ── findUserForSession ──
     // 功能说明: 根据 sessionId 查找绑定的飞书用户 ID(open_id 或 user_id)
-    // 实现方式: 读取 adapter-sessions.json，精确匹配 sessionId，
-    //          找不到则回退到最近活跃用户。
+    // 实现方式: 读取 adapter-sessions.json，仅匹配 feishu 平台的精确绑定；找不到则不发送，避免串发给其他用户。
     function findUserForSession(sid) {
         let ad = {}
         try {
             ad = JSON.parse(readFileSync(join(CLAUDE_HOME, 'adapter-sessions.json'), 'utf8'))
-        } catch {
+        } catch (error) {
+            log.debug({err: error, sessionId: sid?.slice(0, 8)}, '读取飞书镜像状态失败')
         }
-        let best = null, bestAt = -1
-        for (const [uid, v] of Object.entries(ad)) {
-            // 飞书的 uid 格式是 open_id 或 user_id
-            if (v?.sessionId === sid) return uid  // 精确匹配优先
-            if ((v?.updatedAt || 0) > bestAt) {
-                bestAt = v?.updatedAt || 0;
-                best = uid
-            }  // 回退最近活跃
-        }
-        return best
+        return findLatestAdapterUserForSession(ad, 'feishu', sid)
     }
 
     // ── onConfirmRequest ── 镜像确认请求(桌面端发起)
     // 功能说明: 收到桌面回合的授权/选择请求 → 推送给飞书用户 + 登记 pendingConfirm
     function onConfirmRequest(info) {
-        const uid = findUserForSession(info.sessionId)
+        const uid = info.userId || findUserForSession(info.sessionId)
         if (!uid || !pairedUsers.has(uid)) return
         if (info.type === 'choice') {
             const lines = [];
@@ -432,63 +553,45 @@ export function startFeishuAdapter(token) {
             if (q?.question) lines.push(q.question)
             ;
             (q?.options || []).forEach((o, i) => lines.push(`${i + 1}. ${o.label}`))
-            pendingConfirm.set(uid, {
+            const added = pendingConfirm.add(uid, {
                 sessionId: info.sessionId,
                 requestId: info.requestId,
                 type: 'choice',
                 questions: info.questions
             })
-            sendMsg(uid, `请选择(桌面)\n${lines.join('\n')}\n\n回复选项编号`)
+            if (added) sendReliableText(uid, `请选择(桌面)\n${lines.join('\n')}\n\n回复选项编号`)
         } else {
-            pendingConfirm.set(uid, {sessionId: info.sessionId, requestId: info.requestId, type: 'permission'})
-            sendMsg(uid, `需要授权(桌面)\n工具: ${info.toolName}\n\n回复 y/确认 允许，n/拒绝 拒绝`)
+            if (pendingConfirm.add(uid, {sessionId: info.sessionId, requestId: info.requestId, type: 'permission'})) {
+                sendReliableText(uid, `需要授权(桌面)\n工具: ${info.toolName}\n\n回复 y/确认 允许，n/拒绝 拒绝`)
+            }
         }
     }
 
     // ── onConfirmResolved ── 确认已被其它通道处理
     function onConfirmResolved(sessionId, requestId) {
-        for (const [uid, pc] of pendingConfirm) {
-            if (pc.sessionId === sessionId && pc.requestId === requestId) {
-                pendingConfirm.delete(uid);
-                break
-            }
-        }
+        pendingConfirm.removeByRequest(sessionId, requestId)
     }
 
     // ── sendToUser ── Mirror 发送到绑定用户(支持长文本分段)
     // 功能说明: 将镜像回复发送到绑定的飞书用户，超长文本自动按 4000 字节分段
-    async function sendToUser(sid, text) {
-        const uid = findUserForSession(sid)
+    async function sendToUser(sid, text, targetUserId = null) {
+        const uid = targetUserId || findUserForSession(sid)
         if (!uid || !text) return
-        const MAX = 4000  // 飞书单条消息最大字节数(UTF-8)
-        if (Buffer.byteLength(text, 'utf8') <= MAX) {
-            await sendMsg(uid, text);
-            return
-        }
-        // ── 长文本分段 ──
-        // 每段 MAX-16 字节(预留【N/M】标记)，while 回退确保 UTF-8 字符边界安全
-        const parts = [];
-        let remain = text
-        while (Buffer.byteLength(remain, 'utf8') > MAX) {
-            let cut = MAX - 16
-            while (cut > 0 && Buffer.byteLength(remain.slice(0, cut), 'utf8') > MAX - 16) cut--
-            parts.push(remain.slice(0, cut));
-            remain = remain.slice(cut)
-        }
-        if (remain) parts.push(remain)
-        for (let i = 0; i < parts.length; i++) await sendMsg(uid, `【${i + 1}/${parts.length}】${parts[i]}`)
+        if (!pairedUsers.has(uid)) return false
+        return sendReliableText(uid, text)
     }
 
     // ── shouldSkipReply ──
     // 功能说明: 检查 session 的 mirror 开关是否已开启(飞书通道)
-    async function shouldSkipReply(sid) {
+    async function shouldSkipReply(sid, userId) {
         try {
-            const r = await fetch(`http://127.0.0.1:3456/api/sessions/${sid}/mirror`, {signal: AbortSignal.timeout(3000)})
+            const r = await gatewayFetch(`${GW()}/api/sessions/${sid}/mirror`, token, {signal: AbortSignal.timeout(3000)}, {source: 'feishu', userId})
             if (r.ok) {
                 const d = await r.json();
                 return !!d.mirrors?.feishu
             }
-        } catch {
+        } catch (error) {
+            log.debug({err: error, sessionId: sid?.slice(0, 8)}, '查询飞书镜像状态失败，按未开启处理')
         }
         return false
     }
@@ -502,9 +605,19 @@ export function startFeishuAdapter(token) {
     //     因此不能 await long-running 任务，实际处理异步进行
     // 关键数据流: 飞书 WS 事件 → EventDispatcher → im.message.receive_v1 handler
     //          → 提取 uid + text → handleMessage 异步执行 → 回调立即返回(避免重推)
+    queueMicrotask(() => {
+        for (const entry of inbox.recoverable()) {
+            inbox.fail(entry.messageId, 'restart_recovery')
+            messageDeduper.forget(entry.messageId)
+            Promise.resolve().then(() => handleMessage(entry.payload.uid, entry.payload.text, entry.messageId))
+                .catch(e => log.error({err: e, messageId: entry.messageId.slice(0, 32)}, '恢复 inbox 失败'))
+        }
+    })
+
     wsClient.start({
         eventDispatcher: new EventDispatcher({}).register({
             'im.message.receive_v1': (data) => {
+                if (stopped) return
                 // ⚠️ 飞书 SDK 要求事件回调 3 秒内返回，否则超时重推 → 不能 await long-running 任务
                 const sender = data.sender
                 const msg = data.message
@@ -522,18 +635,76 @@ export function startFeishuAdapter(token) {
                 let text = ''
                 try {
                     text = JSON.parse(msg.content || '{}').text || ''
-                } catch {
+                } catch (error) {
+                    log.warn({err: error, messageId: String(msg.message_id || '').slice(0, 32)}, '飞书消息内容不是有效 JSON')
                 }
                 if (!text) return
-                log.info({userId: uid?.slice(0, 8), text: text.slice(0, 50)}, '← 消息')
+                log.info({userId: uid?.slice(0, 8), textLength: text.length}, '← 消息')
                 // fire-and-forget: 实际处理异步进行，避免 SDK 超时重推
-                handleMessage(uid, text).catch(e => log.error({err: e}, 'handleMessage 异常'))
+                let handling
+                try {
+                    handling = handleMessage(uid, text, msg.message_id || data.event_id || '')
+                } catch (error) {
+                    log.error({err: error, messageId: String(msg.message_id || data.event_id || '').slice(0, 32)}, '飞书事件持久化失败，等待平台重推')
+                    throw error
+                }
+                handling?.catch(e => log.error({err: e}, 'handleMessage 异常'))
             },
         }),
-    }).catch(e => log.error({err: e}, '启动异常'))
+    }).then(() => {
+        connectionError = null
+    }).catch(e => {
+        connectionError = String(e?.message || e || 'start_failed')
+        log.error({err: e}, '启动异常')
+    })
 
     log.info('WSClient 已启动，等待事件')
 
+    function stop() {
+        if (stopped) return
+        stopped = true
+        try { wsClient.close({force: true}) } catch (error) {
+            log.warn({err: error}, '关闭飞书 WSClient 失败')
+        }
+        for (const ws of [...activeSockets]) {
+            try { ws.close(4002, 'adapter stopped') } catch (error) {
+                log.debug({err: error}, '飞书 WebSocket 已关闭，无需重复停止')
+            }
+        }
+        activeSockets.clear()
+        sessionQueue.cancelAll()
+        pendingConfirm.clear()
+        clearInterval(_confirmCleanup)
+        notificationWorker.stop()
+        log.info('适配器已停止')
+    }
+
+    function connectionStatus() {
+        if (stopped) return {state: 'stopped'}
+        try {
+            const status = wsClient.getConnectionStatus?.()
+            if (status?.state) return {...status, ...(connectionError ? {lastError: connectionError} : {})}
+        } catch (error) {
+            return {state: 'error', lastError: String(error?.message || error)}
+        }
+        return connectionError ? {state: 'error', lastError: connectionError} : {state: 'connecting'}
+    }
+
+    function retryNotifications() {
+        const reset = outbox.retryFailed()
+        notificationWorker.flush().catch(error => log.warn({err: error}, '手动重试通知失败'))
+        return {reset, ...outbox.summary()}
+    }
+
+    function discardNotifications() {
+        const deleted = outbox.discard({states: ['dead']})
+        return {deleted, ...outbox.summary()}
+    }
+
     // 返回镜像钩子对象供 Gateway 注册
-    return {onConfirmRequest, onConfirmResolved, findUserForSession, sendToUser}
+    return {
+        onConfirmRequest, onConfirmResolved, findUserForSession, sendToUser,
+        notificationStatus: notificationWorker.summary, pairingCode: () => pairCode,
+        retryNotifications, discardNotifications, connectionStatus, stop,
+    }
 }

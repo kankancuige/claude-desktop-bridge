@@ -15,12 +15,11 @@ declare global {
     openExternal: (url: string) => Promise<boolean>
     showWindow: () => void
     quitApp: () => void
-    onTrayNotification: (callback: (data: any) => void) => (() => void)
     isMaximized: () => Promise<boolean>
     getAppVersion: () => Promise<string>
     getBridgeToken: () => Promise<string | null>
     checkForUpdates: () => Promise<any>
-    downloadUpdate: () => void
+    downloadUpdate: () => Promise<{ok: boolean; error?: string}>
     installUpdate: () => void
     onUpdateAvailable: (cb: (info: any) => void) => () => void
     onUpdateDownloadProgress: (cb: (progress: any) => void) => () => void

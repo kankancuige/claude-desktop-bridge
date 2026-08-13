@@ -14,7 +14,7 @@
 
 import {defineStore} from 'pinia'
 import {ref} from 'vue'
-import {apiFetch, wsUrl} from '../api'
+import {apiFetch, createGatewayWebSocket} from '../api'
 
 // ── gateway 后端地址常量 ──
 // gateway 始终运行在 localhost:3456，不对外暴露
@@ -114,11 +114,15 @@ export const useGatewayStore = defineStore('gateway', () => {
      * @param {string} sid - 会话 ID
      * SIDE_EFFECT: 替换全局 ws 变量；注册事件监听器
      */
-    async function connect(sid) {
-        if (ws) ws.close()
+    async function connect(sid, forceRefresh = false) {
+        if (ws) {
+            ws.onclose = null
+            ws.onerror = null
+            ws.close()
+        }
         // 旧 ws 的 onclose 可能在新 ws onopen 之后异步触发，
         // 用 _wsInstance 标记避免旧连接覆盖新连接的 connected 状态
-        const thisWs = new WebSocket(await wsUrl(`/ws/${sid}`))
+        const thisWs = await createGatewayWebSocket(`/ws/${sid}`, forceRefresh)
         ws = thisWs
 
         // ── 连接成功 ──
@@ -144,10 +148,15 @@ export const useGatewayStore = defineStore('gateway', () => {
 
         // ── 连接关闭 ──
         // 仅当当前 ws 还是本连接实例时才写状态，防止旧连接 onclose 覆盖新连接状态
-        thisWs.onclose = () => {
+        thisWs.onclose = (event) => {
             if (ws !== thisWs) return
             connected.value = false
             status.value = 'idle'
+            if ((event.code === 4003 || event.code === 1006) && !forceRefresh) {
+                void connect(sid, true).catch(error => {
+                    console.error('[gateway] token 刷新后重连失败:', error)
+                })
+            }
         }
 
         // ── 连接错误 ──

@@ -9,25 +9,44 @@
  * 避免额外依赖外部 Node 运行时。gateway 崩溃后最多自动重启 MAX_RESTARTS 次。
  */
 
-const { app, BrowserWindow, shell, ipcMain, dialog, Tray, Menu, nativeImage, Notification } = require('electron')
+const { app, BrowserWindow, shell, ipcMain, dialog, Tray, Menu, nativeImage, safeStorage } = require('electron')
 const { spawn } = require('child_process')
+const crypto = require('crypto')
 const path = require('path')
 const fs = require('fs')
+const os = require('os')
+const { pathToFileURL } = require('url')
+const {normalizeExternalUrl} = require('./external-url.cjs')
 const { checkForUpdates, downloadUpdate, quitAndInstall } = require('./updater.cjs')
 
 // ── 全局状态 ──
 let mainWindow = null           // 主窗口实例，全局唯一
 let tray = null                 // 系统托盘图标实例
 let gatewayProcess = null       // gateway 子进程句柄，null 表示未运行
+const stoppingGatewayProcesses = new WeakSet()
 let gatewayRestarts = 0         // 当前生命周期内已重启次数
+let gatewayRestartTimer = null  // 自动重启定时器，退出/手动重启时必须取消
+let gatewayStableTimer = null   // 连续稳定运行后清零重启预算
 const MAX_RESTARTS = 5          // 最大自动重启次数，防止无限重启循环
+const GATEWAY_STABLE_RESET_MS = 5 * 60 * 1000
 let GATEWAY_LOG = ''            // gateway 日志文件路径，在 app.whenReady 中初始化
 let isQuitting = false          // 真退出标记，区分"关闭窗口"和"退出应用"
+let quitCleanupStarted = false
+let gatewaySecurePayloadKey = null
+
+const ownsAppInstance = app.requestSingleInstanceLock()
+if (!ownsAppInstance) app.quit()
+app.on('second-instance', () => {
+  if (!mainWindow) return
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+})
 
 /**
  * ── 写入 gateway 日志文件（异步队列，不阻塞事件循环）──
  * 写入请求入队后由 drain 循环逐个消费，保证日志顺序不交错。
- * 队列无界——日志量远小于内存容量，不会 OOM。
+ * 队列有上限；异常刷屏时丢弃最旧记录，避免主进程内存持续增长。
  */
 let _logQueue = []
 let _logDraining = false
@@ -47,11 +66,63 @@ function drainLogQueue() {
     const batch = _logQueue
     _logQueue = []
     fs.appendFile(GATEWAY_LOG, batch.join(''), (err) => {
-      if (err) { /* 磁盘满等 I/O 异常，静默丢弃 */ }
+      if (err) console.error('[main] gateway 日志写入失败:', err.message)
       setImmediate(next)
     })
   }
   setImmediate(next)
+}
+
+function readLegacySecurePayloadKey() {
+  const legacyPath = path.join(os.homedir(), '.claude', 'bridge-store-key')
+  try {
+    const encoded = fs.readFileSync(legacyPath, 'utf8').trim()
+    const key = Buffer.from(encoded, 'hex')
+    if (key.length === 32) return {key, legacyPath}
+  } catch (error) {
+    if (error?.code !== 'ENOENT') logToFile(`[WARN] legacy secure key read failed: ${error.message}`)
+  }
+  return {key: null, legacyPath}
+}
+
+function getGatewaySecurePayloadKey() {
+  if (gatewaySecurePayloadKey) return gatewaySecurePayloadKey
+  const {key: legacyKey, legacyPath} = readLegacySecurePayloadKey()
+  const backend = process.platform === 'linux' ? safeStorage.getSelectedStorageBackend?.() : null
+  const canUseOsStore = safeStorage.isEncryptionAvailable() && backend !== 'basic_text'
+
+  if (!canUseOsStore) {
+    const key = legacyKey || crypto.randomBytes(32)
+    if (!legacyKey) {
+      fs.mkdirSync(path.dirname(legacyPath), {recursive: true})
+      fs.writeFileSync(legacyPath, key.toString('hex'), {encoding: 'utf8', mode: 0o600})
+    }
+    logToFile('[WARN] OS secure storage unavailable; using permission-restricted local key')
+    gatewaySecurePayloadKey = key.toString('base64')
+    return gatewaySecurePayloadKey
+  }
+
+  const protectedPath = path.join(app.getPath('userData'), 'bridge-store-key.bin')
+  let key = null
+  if (fs.existsSync(protectedPath)) {
+    const decrypted = safeStorage.decryptString(fs.readFileSync(protectedPath))
+    const decoded = Buffer.from(decrypted, 'hex')
+    if (decoded.length !== 32) throw new Error('OS-protected secure payload key is invalid')
+    key = decoded
+  } else {
+    key = legacyKey || crypto.randomBytes(32)
+    fs.mkdirSync(path.dirname(protectedPath), {recursive: true})
+    const tmp = `${protectedPath}.tmp`
+    fs.writeFileSync(tmp, safeStorage.encryptString(key.toString('hex')), {mode: 0o600})
+    fs.renameSync(tmp, protectedPath)
+  }
+  if (legacyKey) {
+    try { fs.unlinkSync(legacyPath) } catch (error) {
+      logToFile(`[WARN] legacy plaintext key cleanup failed: ${error.message}`)
+    }
+  }
+  gatewaySecurePayloadKey = key.toString('base64')
+  return gatewaySecurePayloadKey
 }
 
 /**
@@ -66,6 +137,7 @@ function drainLogQueue() {
  * SIDE_EFFECT: 设置 gatewayProcess 全局变量；写入日志文件
  */
 function startGateway() {
+  if (gatewayProcess || isQuitting || !ownsAppInstance) return
   // ── 计算 gateway 目录和入口文件路径 ──
   const isDev = !!process.env.VITE_DEV_SERVER_URL
   const gatewayDir = isDev
@@ -77,41 +149,78 @@ function startGateway() {
   logToFile(`Gateway dir: ${gatewayDir}`)
 
   // ELECTRON_RUN_AS_NODE=1 让 electron.exe 作为纯 Node.js 运行，不创建窗口
-  gatewayProcess = spawn(process.execPath, [gatewayEntry], {
+  let securePayloadKey
+  try {
+    securePayloadKey = getGatewaySecurePayloadKey()
+  } catch (error) {
+    logToFile(`[ERROR] secure payload key unavailable: ${error.message}`)
+    return
+  }
+
+  const proc = spawn(process.execPath, [gatewayEntry], {
     cwd: gatewayDir,                              // 工作目录设为 gateway 目录，确保相对路径正确
-    stdio: ['pipe', 'pipe', 'pipe'],              // 三个流都走 pipe，方便重定向
+    stdio: ['pipe', 'pipe', 'pipe', 'ipc'],       // IPC 用于 Windows 下可靠的优雅关闭
     windowsHide: true,                            // Windows 下隐藏控制台窗口
     env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },  // 继承环境变量并设置 NODE 模式标志
   })
+  gatewayProcess = proc
+  proc.on('message', (message) => {
+    if (message?.type !== 'bridge:init-request') return
+    try {
+      proc.send({type: 'bridge:init', securePayloadKey})
+    } catch (error) {
+      logToFile(`[ERROR] gateway secure initialization failed: ${error.message}`)
+    }
+  })
+  if (gatewayStableTimer) clearTimeout(gatewayStableTimer)
+  gatewayStableTimer = setTimeout(() => {
+    if (gatewayProcess === proc) {
+      gatewayRestarts = 0
+      logToFile('[RECOVERY] gateway stable; restart budget reset')
+    }
+    gatewayStableTimer = null
+  }, GATEWAY_STABLE_RESET_MS)
+  gatewayStableTimer.unref?.()
 
   // ── stdout 重定向：输出到主进程 stdout 并写入日志 ──
-  gatewayProcess.stdout.on('data', (d) => {
+  proc.stdout.on('data', (d) => {
     const msg = d.toString()
     process.stdout.write(`[gw] ${msg}`)
     logToFile(`[stdout] ${msg.trim()}`)
   })
 
   // ── stderr 重定向：输出到主进程 stderr 并写入日志 ──
-  gatewayProcess.stderr.on('data', (d) => {
+  proc.stderr.on('data', (d) => {
     const msg = d.toString()
     process.stderr.write(`[gw:err] ${msg}`)
     logToFile(`[stderr] ${msg.trim()}`)
   })
 
   // ── spawn 错误处理：如可执行文件不存在、权限不足等 ──
-  gatewayProcess.on('error', (e) => {
+  proc.on('error', (e) => {
     logToFile(`[ERROR] spawn failed: ${e.message}`)
   })
 
   // ── 退出处理：非零退出码时自动重启（指数退避简化为固定 2s） ──
-  gatewayProcess.on('exit', (code) => {
+  proc.on('exit', (code) => {
     logToFile(`[EXIT] code=${code}`)
-    gatewayProcess = null
-    if (_isQuitting) return  // 退出中，不重启
+    if (gatewayStableTimer) {
+      clearTimeout(gatewayStableTimer)
+      gatewayStableTimer = null
+    }
+    if (gatewayProcess === proc) gatewayProcess = null
+    if (stoppingGatewayProcesses.has(proc)) return
+    if (isQuitting) return  // 退出中，不重启
     if (code !== 0 && gatewayRestarts < MAX_RESTARTS) {
       gatewayRestarts++
       logToFile(`[RESTART] ${gatewayRestarts}/${MAX_RESTARTS}`)
-      setTimeout(startGateway, 2000)  // 延迟 2 秒后重启，避免快速循环
+      const restartDelay = Math.min(30_000, 2_000 * (2 ** (gatewayRestarts - 1)))
+      logToFile(`[RESTART] retrying in ${restartDelay}ms`)
+      gatewayRestartTimer = setTimeout(() => {
+        gatewayRestartTimer = null
+        startGateway()
+      }, restartDelay)
+      gatewayRestartTimer.unref?.()
     }
   })
 
@@ -128,16 +237,61 @@ function startGateway() {
  * SIDE_EFFECT: 清空 gatewayProcess 全局引用
  */
 function stopGateway() {
-  if (gatewayProcess) {
-    const proc = gatewayProcess
-    gatewayProcess = null
-    proc.kill('SIGTERM')
-    setTimeout(() => {
-      if (proc && !proc.killed) {
-        proc.kill('SIGKILL')
-      }
-    }, 3000)
+  if (gatewayRestartTimer) {
+    clearTimeout(gatewayRestartTimer)
+    gatewayRestartTimer = null
   }
+  if (gatewayStableTimer) {
+    clearTimeout(gatewayStableTimer)
+    gatewayStableTimer = null
+  }
+  const proc = gatewayProcess
+  if (!proc) return Promise.resolve()
+  stoppingGatewayProcesses.add(proc)
+  if (gatewayProcess === proc) gatewayProcess = null
+
+  return new Promise((resolve) => {
+    let settled = false
+    let termTimer = null
+    let killTimer = null
+    let resolveTimer = null
+    const finish = () => {
+      if (settled) return
+      settled = true
+      clearTimeout(termTimer)
+      clearTimeout(killTimer)
+      clearTimeout(resolveTimer)
+      resolve()
+    }
+    proc.once('exit', finish)
+    try {
+      if (proc.connected) proc.send({type: 'shutdown'})
+      else proc.kill('SIGTERM')
+    } catch (error) {
+      logToFile(`[WARN] graceful gateway stop failed: ${error.message}`)
+      try { proc.kill('SIGTERM') } catch (killError) {
+        logToFile(`[WARN] gateway SIGTERM failed: ${killError.message}`)
+      }
+    }
+    termTimer = setTimeout(() => {
+      if (proc.exitCode === null && proc.signalCode === null) {
+        try { proc.kill('SIGTERM') } catch (error) {
+          logToFile(`[WARN] gateway SIGTERM timeout kill failed: ${error.message}`)
+        }
+      }
+    }, 2500)
+    killTimer = setTimeout(() => {
+      if (proc.exitCode === null && proc.signalCode === null) {
+        try { proc.kill('SIGKILL') } catch (error) {
+          logToFile(`[WARN] gateway SIGKILL failed: ${error.message}`)
+        }
+      }
+    }, 3500)
+    resolveTimer = setTimeout(finish, 4500)
+    termTimer.unref?.()
+    killTimer.unref?.()
+    resolveTimer.unref?.()
+  })
 }
 
 /**
@@ -152,6 +306,7 @@ function stopGateway() {
  * SIDE_EFFECT: 设置 mainWindow 全局变量；注册 IPC 处理器
  */
 function createWindow() {
+  if (isQuitting) return
   mainWindow = new BrowserWindow({
     width: 1800,
     height: 960,
@@ -166,26 +321,60 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.cjs'), // 预加载脚本路径
       contextIsolation: true,                     // 开启上下文隔离（安全）
       nodeIntegration: false,                     // 禁止渲染进程直接使用 Node API
+      sandbox: true,
     },
   })
 
   // 确保菜单栏完全不可见
   mainWindow.setMenuBarVisibility(false)
 
+  // createWindow 可能在 macOS activate 后再次执行；先移除本应用拥有的 IPC，避免重复 handler/listener。
+  for (const channel of [
+    'window:minimize', 'window:maximize', 'window:close', 'window:show', 'app:quit',
+    'update:install', 'gateway:restart',
+  ]) ipcMain.removeAllListeners(channel)
+  for (const channel of [
+    'window:isMaximized', 'getAppVersion', 'update:check', 'update:download',
+    'getGatewayLogPath', 'getBridgeToken', 'shell:openExternal', 'dialog:selectDirectory',
+  ]) ipcMain.removeHandler(channel)
+
+  const isTrustedIpcEvent = (event) => {
+    const contents = mainWindow?.webContents
+    return !!contents
+      && event?.sender === contents
+      && event?.senderFrame === contents.mainFrame
+  }
+  const trustedOn = (channel, handler) => {
+    ipcMain.on(channel, (event, ...args) => {
+      if (!isTrustedIpcEvent(event)) {
+        logToFile(`[WARN] rejected IPC event: ${channel}`)
+        return
+      }
+      handler(...args)
+    })
+  }
+  const trustedHandle = (channel, handler) => {
+    ipcMain.handle(channel, (event, ...args) => {
+      if (!isTrustedIpcEvent(event)) throw new Error('untrusted IPC sender')
+      return handler(...args)
+    })
+  }
+
   // ── IPC: 窗口控制（单向通信，无返回值） ──
   // 功能说明: 渲染进程通过 ipcRenderer.send 触发，主进程执行对应窗口操作
-  ipcMain.on('window:minimize', () => mainWindow.minimize())
-  ipcMain.on('window:maximize', () => {
+  trustedOn('window:minimize', () => mainWindow?.minimize())
+  trustedOn('window:maximize', () => {
     // 切换最大化/还原状态
+    if (!mainWindow) return
     mainWindow.isMaximized() ? mainWindow.unmaximize() : mainWindow.maximize()
   })
-  ipcMain.on('window:close', () => {
+  trustedOn('window:close', () => {
     // 关闭窗口 → 隐藏到托盘（不退出应用）
-    mainWindow.hide()
+    mainWindow?.hide()
   })
 
   // ── IPC: 显示主窗口（托盘用）──
-  ipcMain.on('window:show', () => {
+  trustedOn('window:show', () => {
     if (mainWindow) {
       mainWindow.show()
       mainWindow.focus()
@@ -193,57 +382,59 @@ function createWindow() {
   })
 
   // ── IPC: 真退出应用 ──
-  ipcMain.on('app:quit', () => {
+  trustedOn('app:quit', () => {
     isQuitting = true
     app.quit()
   })
 
   // ── IPC: 检查窗口是否最大化 ──
-  ipcMain.handle('window:isMaximized', () => mainWindow?.isMaximized() ?? false)
-
-  // ── IPC: Gateway 请求发送系统通知 ──
-  ipcMain.handle('tray:sendNotification', (_e, title, body) => {
-    sendNotification(title, body)
-    return true
-  })
+  trustedHandle('window:isMaximized', () => mainWindow?.isMaximized() ?? false)
 
   // ── IPC: 更新相关 ──
-  ipcMain.handle('getAppVersion', () => app.getVersion())
-  ipcMain.handle('update:check', async () => {
+  trustedHandle('getAppVersion', () => app.getVersion())
+  trustedHandle('update:check', async () => {
     try {
       const au = require('./updater.cjs').autoUpdater
-      if (!au) return { ok: false, error: '开发模式，更新功能不可用' }
+      if (!au) return { ok: false, blocked: true, error: require('./updater.cjs').unavailableReason }
       const result = await au.checkForUpdates()
       return { ok: true, version: result?.updateInfo?.version }
     } catch (e) {
       return { ok: false, error: e.message }
     }
   })
-  ipcMain.on('update:download', () => {
-    downloadUpdate().catch(err => console.log('[updater] 下载失败:', err.message))
+  trustedHandle('update:download', async () => {
+    try {
+      await downloadUpdate()
+      return {ok: true}
+    } catch (error) {
+      console.log('[updater] 下载失败:', error.message)
+      return {ok: false, error: error.message}
+    }
   })
-  ipcMain.on('update:install', () => {
+  trustedOn('update:install', () => {
     quitAndInstall()
   })
 
   // ── IPC: gateway 重启 ──
   // 功能说明: 先停止当前 gateway，重置重启计数器，延迟 500ms 后启动新实例
-  ipcMain.on('gateway:restart', () => {
-    stopGateway()
+  trustedOn('gateway:restart', () => {
     gatewayRestarts = 0                           // 手动重启不计入自动重启计数
-    setTimeout(startGateway, 500)                 // 给旧进程 500ms 清理时间
+    void stopGateway().then(() => {
+      if (!isQuitting) startGateway()
+    })
   })
 
   // ── IPC: 获取 gateway 日志路径（双向通信，返回字符串） ──
-  ipcMain.handle('getGatewayLogPath', () => GATEWAY_LOG)
+  trustedHandle('getGatewayLogPath', () => GATEWAY_LOG)
 
   // ── IPC: 获取 Bridge Token（本地 API 认证） ──
-  const os = require('os')
-  ipcMain.handle('getBridgeToken', () => {
+  trustedHandle('getBridgeToken', () => {
     try {
       const tokenPath = path.join(os.homedir(), '.claude', 'bridge-token')
       if (fs.existsSync(tokenPath)) return fs.readFileSync(tokenPath, 'utf8').trim()
-    } catch {}
+    } catch (error) {
+      logToFile(`[WARN] bridge token read failed: ${error.message}`)
+    }
     return null
   })
 
@@ -251,14 +442,16 @@ function createWindow() {
   // 功能说明: 打开系统原生文件夹选择对话框，用于新增项目时选择工作目录
   // 取消时返回 null
   // ── IPC: 用系统默认浏览器打开 URL ──
-  ipcMain.handle('shell:openExternal', async (_e, url) => {
-    if (!url || typeof url !== 'string') return false
-    // 只允许 http/https URL（防止本地文件/命令注入）
-    if (!/^https?:\/\//i.test(url)) return false
-    return shell.openExternal(url).catch(() => false)
+  trustedHandle('shell:openExternal', async (url) => {
+    const target = normalizeExternalUrl(url)
+    if (!target) return false
+    return shell.openExternal(target).then(() => true).catch(error => {
+      logToFile(`[WARN] open external URL failed: ${error.message}`)
+      return false
+    })
   })
 
-  ipcMain.handle('dialog:selectDirectory', async () => {
+  trustedHandle('dialog:selectDirectory', async () => {
     const r = await dialog.showOpenDialog(mainWindow, {
       title: '选择项目文件夹',
       properties: ['openDirectory']               // 仅允许选择目录
@@ -270,18 +463,47 @@ function createWindow() {
   // ── 加载页面 ──
   // 开发模式: 加载 Vite 开发服务器 URL（支持 HMR 热更新）
   // 生产模式: 加载打包后的 index.html
+  let trustedNavigation
   if (process.env.VITE_DEV_SERVER_URL) {
-    mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL)
+    const devUrl = new URL(process.env.VITE_DEV_SERVER_URL)
+    trustedNavigation = (targetUrl) => {
+      try { return new URL(targetUrl).origin === devUrl.origin } catch { return false }
+    }
+    void mainWindow.loadURL(devUrl.toString()).catch(error => {
+      logToFile(`[ERROR] renderer loadURL failed: ${error.message}`)
+    })
   } else {
-    mainWindow.loadFile(path.join(__dirname, '../dist/index.html'))
+    const entryPath = path.join(__dirname, '../dist/index.html')
+    const entryUrl = pathToFileURL(entryPath).href
+    trustedNavigation = (targetUrl) => targetUrl.split('#')[0] === entryUrl
+    void mainWindow.loadFile(entryPath).catch(error => {
+      logToFile(`[ERROR] renderer loadFile failed: ${error.message}`)
+    })
   }
+
+  const guardNavigation = (event, targetUrl) => {
+    if (trustedNavigation(targetUrl)) return
+    event.preventDefault()
+    const externalUrl = normalizeExternalUrl(targetUrl)
+    if (externalUrl) {
+      void shell.openExternal(externalUrl).catch(error => {
+        logToFile(`[WARN] open external URL failed: ${error.message}`)
+      })
+    }
+  }
+  mainWindow.webContents.on('will-navigate', guardNavigation)
+  mainWindow.webContents.on('will-redirect', guardNavigation)
 
   // ── 外部链接处理 ──
   // 功能说明: 拦截 window.open 调用，改为在系统默认浏览器中打开
   // 实现方式: shell.openExternal 打开外部 URL，返回 { action: 'deny' } 阻止新窗口创建
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    // 仅允许 http/https URL，阻止 file:/// javascript: 等危险 scheme
-    if (/^https?:\/\//i.test(url)) shell.openExternal(url)
+    const externalUrl = normalizeExternalUrl(url)
+    if (externalUrl) {
+      void shell.openExternal(externalUrl).catch(error => {
+        logToFile(`[WARN] open popup URL failed: ${error.message}`)
+      })
+    }
     return { action: 'deny' }
   })
 
@@ -291,6 +513,10 @@ function createWindow() {
       e.preventDefault()
       mainWindow.hide()
     }
+  })
+  const thisWindow = mainWindow
+  mainWindow.on('closed', () => {
+    if (mainWindow === thisWindow) mainWindow = null
   })
 }
 /** 功能说明: 创建 Windows/macOS/Linux 通用的系统托盘图标
@@ -340,23 +566,6 @@ function createTray() {
   })
 }
 
-/**
- * ── 发送系统通知 ──
- * 功能说明: 权限确认等事件触发 Windows 原生通知，点击恢复主窗口
- * 实现方式: Electron Notification API → 点击事件聚焦主窗口
- */
-function sendNotification(title, body) {
-  if (!Notification.isSupported()) return
-  const n = new Notification({ title, body })
-  n.on('click', () => {
-    if (mainWindow) {
-      mainWindow.show()
-      mainWindow.focus()
-    }
-  })
-  n.show()
-}
-
 // ═══════════════════════════════════════════
 // ── 应用生命周期 ──
 // ═══════════════════════════════════════════
@@ -371,9 +580,14 @@ function sendNotification(title, body) {
  * SIDE_EFFECT: 初始化 GATEWAY_LOG 路径；启动 gateway 子进程；创建主窗口
  */
 app.whenReady().then(() => {
+  if (!ownsAppInstance) return
   // userData 在各平台均可写: Windows %APPDATA%, macOS ~/Library/Application Support, Linux ~/.config
   GATEWAY_LOG = path.join(app.getPath('userData'), 'gateway.log')
-  try { fs.mkdirSync(path.dirname(GATEWAY_LOG), { recursive: true }) } catch {}
+  try {
+    fs.mkdirSync(path.dirname(GATEWAY_LOG), { recursive: true })
+  } catch (error) {
+    console.error('[main] gateway 日志目录创建失败:', error.message)
+  }
   createTray()                                      // 创建托盘图标
   startGateway()
   setTimeout(createWindow, 1500)                    // 等 gateway 先启动
@@ -396,10 +610,13 @@ app.on('window-all-closed', () => {
  * 功能说明: 应用即将退出前做清理
  * 实现方式: 确保 gateway 子进程被终止，防止孤儿进程；清理托盘图标
  */
-let _isQuitting = false
-app.on('before-quit', () => {
-  _isQuitting = true
-  stopGateway()
+app.on('before-quit', (event) => {
+  isQuitting = true
+  if (!quitCleanupStarted && gatewayProcess) {
+    event.preventDefault()
+    quitCleanupStarted = true
+    void stopGateway().finally(() => app.quit())
+  }
   if (tray) {
     tray.destroy()
     tray = null

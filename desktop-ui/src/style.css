@@ -44,9 +44,9 @@
   --transition-slow: 300ms var(--ease-out);
 
   /* Fonts */
-  --font-heading:  'Space Grotesk', system-ui, sans-serif;
-  --font-body:     'Plus Jakarta Sans', system-ui, sans-serif;
-  --font-mono:     'JetBrains Mono', 'Cascadia Code', 'Fira Code', monospace;
+  --font-heading:  'Segoe UI Variable Display', 'Segoe UI', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  --font-body:     'Segoe UI Variable Text', 'Segoe UI', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  --font-mono:     'Cascadia Mono', 'Cascadia Code', Consolas, 'SFMono-Regular', monospace;
 }
 
 /* ── Light Theme (柔和暖白) ── */

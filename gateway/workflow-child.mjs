@@ -1,248 +1,460 @@
-// workflow-child.mjs — Workflow 子进程沙箱
-// 通过 IPC 与父进程通信，无 require/process.env/fs 权限
-// agent/parallel/pipeline/staged/phase/log 均为 IPC stub
+// workflow-child.mjs - Workflow 子进程执行边界
+// Workflow 仅面向可信本地脚本；独立进程和受限 VM context 用于降低误操作影响，不是 OS 级安全沙箱。
+import {createContext, runInContext} from 'node:vm'
+
+const MAX_SCRIPT_BYTES = 1024 * 1024
+const MAX_AGENT_PROMPT_BYTES = 1024 * 1024
+const MAX_AGENT_OPTIONS_BYTES = 256 * 1024
+const MAX_IPC_PAYLOAD_BYTES = 5 * 1024 * 1024
+const MAX_PENDING_AGENT_CALLS = 32
+const MAX_PENDING_TIMERS = 10
+const MAX_TIMER_DELAY_MS = 30_000
+const SYNC_EXECUTION_TIMEOUT_MS = 5_000
 
 let aborted = false
+let running = false
+let finalized = false
 let callIdCounter = 0
+let timerIdCounter = 0
 const pendingCalls = new Map()
+const pendingTimers = new Map()
 
-process.on('message', async (msg) => {
-    switch (msg.type) {
+function errorMessage(error) {
+    return error instanceof Error ? error.message : String(error)
+}
+
+function byteLength(value) {
+    return Buffer.byteLength(value, 'utf8')
+}
+
+function safeSend(message, callback) {
+    if (!process.connected || typeof process.send !== 'function') return false
+    try {
+        process.send(message, (error) => {
+            if (error && !finalized) {
+                process.stderr.write('[workflow-child] IPC 发送失败: ' + errorMessage(error) + '\n')
+            }
+            callback?.(error)
+        })
+        return true
+    } catch (error) {
+        if (!finalized) {
+            process.stderr.write('[workflow-child] IPC 发送异常: ' + errorMessage(error) + '\n')
+        }
+        callback?.(error)
+        return false
+    }
+}
+
+function clearAllTimers() {
+    for (const timeout of pendingTimers.values()) clearTimeout(timeout)
+    pendingTimers.clear()
+}
+
+function rejectPendingCalls(message) {
+    for (const pending of pendingCalls.values()) {
+        const error = new Error(message)
+        error.code = 'WORKFLOW_ABORTED'
+        pending.reject(error)
+    }
+    pendingCalls.clear()
+}
+
+function finish(message, exitAfterSend = false) {
+    if (finalized) return
+    finalized = true
+    clearAllTimers()
+    rejectPendingCalls('WorkflowAborted')
+    const sent = safeSend(message, () => {
+        if (exitAfterSend) process.exit(0)
+    })
+    if (exitAfterSend && !sent) process.exit(0)
+}
+
+function abortWorkflow(reason) {
+    if (finalized) return
+    aborted = true
+    finish({type: 'done', result: {paused: true, reason}}, true)
+}
+
+process.on('message', (message) => {
+    if (!message || typeof message !== 'object' || finalized) return
+
+    switch (message.type) {
         case 'init':
-            await runScript(msg)
+            if (running) {
+                finish({type: 'error', message: 'Workflow 子进程重复初始化', code: 'WORKFLOW_ALREADY_RUNNING'}, true)
+                return
+            }
+            running = true
+            void runScript(message)
             break
+
         case 'agent_result': {
-            const {callId, result, error, code} = msg
+            const callId = String(message.callId ?? '')
             const pending = pendingCalls.get(callId)
-            if (pending) {
-                pendingCalls.delete(callId)
-                if (error) {
-                    const err = new Error(error)
-                    if (code) err.code = code
-                    pending.reject(err)
-                } else {
-                    pending.resolve(result)
-                }
+            if (!pending) return
+            pendingCalls.delete(callId)
+            if (message.error) {
+                const error = new Error(String(message.error))
+                if (message.code) error.code = String(message.code)
+                pending.reject(error)
+            } else {
+                pending.resolve(message.result)
             }
             break
         }
+
         case 'abort':
-            aborted = true
-            for (const [, p] of pendingCalls) {
-                p.reject(new Error('WorkflowAborted'))
-            }
-            pendingCalls.clear()
+            abortWorkflow('parent_abort')
             break
     }
 })
 
-// 父进程断开 → 清理退出
 process.on('disconnect', () => {
     aborted = true
-    for (const [, p] of pendingCalls) {
-        p.reject(new Error('WorkflowAborted: 父进程断开'))
-    }
-    pendingCalls.clear()
+    clearAllTimers()
+    rejectPendingCalls('WorkflowAborted: 父进程断开')
     process.exit(0)
 })
 
-async function runScript(init) {
-    const {script, args: extraArgs, budget: initBudget, meta} = init
+process.on('uncaughtException', (error) => {
+    finish({type: 'error', message: errorMessage(error), code: 'WORKFLOW_CHILD_CRASH'}, true)
+})
 
-    const budget = {total: initBudget?.total || null}
-    const args = {...(extraArgs || {})}
+process.on('unhandledRejection', (error) => {
+    finish({type: 'error', message: errorMessage(error), code: 'WORKFLOW_UNHANDLED_REJECTION'}, true)
+})
 
-    // ── IPC stub: phase ──
-    const phase = (title) => {
-        process.send({type: 'phase', title})
+function serializeEnvelope(value) {
+    let payload
+    try {
+        payload = JSON.stringify({ok: true, value})
+    } catch (error) {
+        return JSON.stringify({ok: false, error: '结果无法序列化: ' + errorMessage(error), code: 'WORKFLOW_RESULT_SERIALIZATION_FAILED'})
     }
-
-    // ── IPC stub: log ──
-    const sandboxLog = (msg) => {
-        process.send({type: 'log', msg: String(msg)})
+    if (byteLength(payload) > MAX_IPC_PAYLOAD_BYTES) {
+        return JSON.stringify({ok: false, error: '结果超过 5MB 限制', code: 'WORKFLOW_RESULT_TOO_LARGE'})
     }
+    return payload
+}
 
-    // ── IPC stub: agent ──
-    const agent = (prompt, opts = {}) => {
-        if (aborted) return Promise.reject(new Error('WorkflowAborted'))
-        return new Promise((resolve, reject) => {
-            const callId = String(++callIdCounter)
-            pendingCalls.set(callId, {resolve, reject})
-            process.send({type: 'agent_call', callId, prompt, opts})
-        })
-    }
+function serializeErrorEnvelope(error) {
+    return JSON.stringify({
+        ok: false,
+        error: errorMessage(error),
+        code: typeof error?.code === 'string' ? error.code : undefined,
+    })
+}
 
-    // ── parallel (编排在子进程) ──
-    const MAX_CONCURRENT = 20
-    const parallel = async (thunks) => {
-        if (!Array.isArray(thunks) || thunks.length === 0) return []
-        sandboxLog('[Parallel] ' + thunks.length + ' 个任务')
-        const results = []
-        for (let i = 0; i < thunks.length; i += MAX_CONCURRENT) {
-            if (aborted) throw new Error('WorkflowAborted')
-            const batch = thunks.slice(i, i + MAX_CONCURRENT)
-            const batchResults = await Promise.all(batch.map(fn =>
-                fn().catch(e => {
-                    if (e.code === 'BUDGET_EXCEEDED') throw e
-                    sandboxLog('[Parallel] 异常: ' + e.message)
-                    return null
-                })
-            ))
-            results.push(...batchResults)
-        }
-        sandboxLog('[Parallel] 完成: ' + results.filter(Boolean).length + '/' + thunks.length)
-        return results
-    }
-
-    // ── pipeline (编排在子进程) ──
-    // 流式管道: 各 item 独立流经 stage, 无阶段间屏障
-    const pipeline = async (items, ...stages) => {
-        if (!Array.isArray(items) || items.length === 0) return []
-        if (stages.length === 0) return items
-        sandboxLog('[Pipeline] ' + items.length + ' 项 x ' + stages.length + ' 阶段')
-        const results = new Array(items.length)
-        await Promise.all(items.map(async (item, idx) => {
-            try {
-                let val = item
-                for (let si = 0; si < stages.length; si++) {
-                    if (aborted) throw new Error('WorkflowAborted')
-                    try {
-                        val = await stages[si](val, item, idx)
-                    } catch (stageErr) {
-                        if (stageErr.code === 'BUDGET_EXCEEDED') throw stageErr
-                        sandboxLog('[Pipeline 项' + idx + ' 阶段' + si + '] 异常: ' + stageErr.message)
-                        val = null; break
-                    }
-                }
-                results[idx] = val
-            } catch (e) {
-                if (e.code === 'BUDGET_EXCEEDED') throw e
-                sandboxLog('[Pipeline 项' + idx + '] 异常: ' + e.message)
-                results[idx] = null
-            }
-        }))
-        return results
-    }
-
-    // ── staged (编排在子进程) ──
-    // 屏障式管道: 所有 item 完成当前 stage 后才进入下一 stage
-    const staged = async (items, ...stages) => {
-        if (!Array.isArray(items) || items.length === 0) return []
-        if (stages.length === 0) return items
-        sandboxLog('[Staged] ' + items.length + ' 项 x ' + stages.length + ' 阶段（屏障模式）')
-        let current = [...items]
-        for (let si = 0; si < stages.length; si++) {
-            if (aborted) throw new Error('WorkflowAborted')
-            sandboxLog('[Staged] 阶段 ' + (si + 1) + '/' + stages.length)
-            const stageResults = await Promise.all(current.map(async (item, idx) => {
-                try {
-                    return await stages[si](item, current[idx], idx)
-                } catch (e) {
-                    if (e.code === 'BUDGET_EXCEEDED') throw e
-                    sandboxLog('[Staged 项' + idx + ' 阶段' + si + '] 异常: ' + e.message)
-                    return null
-                }
-            }))
-            current = stageResults
-        }
-        sandboxLog('[Staged] 完成')
-        return current
-    }
-
-    // ── 受控 setTimeout / clearTimeout ──
-    const MAX_PENDING_TIMERS = 10
-    const _pendingTimers = new Set()
-    const safeSetTimeout = (fn, delay) => {
-        if (typeof delay !== 'number' || delay < 0) delay = 0
-        if (_pendingTimers.size >= MAX_PENDING_TIMERS) {
-            sandboxLog('[Warn] setTimeout 已达上限(' + MAX_PENDING_TIMERS + ')，调用被忽略')
-            return -1
-        }
-        const id = setTimeout(() => {
-            _pendingTimers.delete(id)
-            try { fn() } catch (e) { sandboxLog('[Error] setTimeout 回调异常: ' + e.message) }
-        }, Math.min(delay, 30000))
-        _pendingTimers.add(id)
-        return id
-    }
-    const safeClearTimeout = (id) => {
-        if (id === undefined || id === null) return
-        clearTimeout(id)
-        _pendingTimers.delete(id)
-    }
-
-    // ── 解析并执行脚本 ──
-    let scriptBody = script
-    const metaKeyIdx = scriptBody.indexOf('export const meta = {')
-    if (metaKeyIdx !== -1) {
-        // 括号计数找 meta 块的结束位置
-        let depth = 0, inStr = false, ch = ''
-        const openIdx = metaKeyIdx + 21
-        let closeIdx = -1
-        for (let i = openIdx; i < scriptBody.length; i++) {
-            const c = scriptBody[i]
-            if (inStr) {
-                if (c === '\\') { i++; continue }
-                if (c === ch) inStr = false
+function stripWorkflowExports(source) {
+    let scriptBody = source
+    const metaMatch = /export\s+const\s+meta\s*=\s*\{/.exec(scriptBody)
+    if (metaMatch) {
+        let depth = 0
+        let quote = ''
+        let closeIndex = -1
+        const openIndex = scriptBody.indexOf('{', metaMatch.index)
+        for (let index = openIndex; index < scriptBody.length; index++) {
+            const char = scriptBody[index]
+            if (quote) {
+                if (char === '\\') index++
+                else if (char === quote) quote = ''
                 continue
             }
-            if (c === '"' || c === "'") { inStr = true; ch = c; continue }
-            if (c === '{') depth++
-            else if (c === '}') { if (--depth === 0) { closeIdx = i; break } }
+            if (char === '"' || char === "'" || char === '`') {
+                quote = char
+                continue
+            }
+            if (char === '{') depth++
+            else if (char === '}' && --depth === 0) {
+                closeIndex = index
+                break
+            }
         }
-        if (closeIdx !== -1) {
-            let end = closeIdx + 1
-            while (end < scriptBody.length && (scriptBody[end] === ';' || scriptBody[end] === '\n' || scriptBody[end] === '\r')) end++
-            scriptBody = scriptBody.substring(0, metaKeyIdx) + scriptBody.substring(end)
+        if (closeIndex >= 0) {
+            let end = closeIndex + 1
+            while (end < scriptBody.length && /[;\r\n]/.test(scriptBody[end])) end++
+            scriptBody = scriptBody.slice(0, metaMatch.index) + scriptBody.slice(end)
         }
     }
-    scriptBody = scriptBody.replace(/export\s+/g, '')
+    return scriptBody.replace(/^\s*export\s+/gm, '')
+}
 
-    const wrappedScript = `
-    (async () => {
-      try { ${scriptBody} }
-      catch (_wfError) {
-        if (_wfError.code === 'BUDGET_EXCEEDED') {
-          console.warn('Budget 已用尽: ' + _wfError.message);
-          throw _wfError;
-        }
-        console.error('Workflow script error: ' + (_wfError?.message || _wfError));
-        throw _wfError;
-      }
-    })()
-  `
+function createHostBridge() {
+    const bridge = Object.create(null)
 
-    try {
-        const fn = new Function(
-            'agent', 'parallel', 'pipeline', 'staged', 'phase', 'log', 'budget', 'args', 'meta',
-            'console', 'setTimeout', 'clearTimeout', 'process',
-            'Promise', 'JSON', 'Array', 'Object', 'String', 'Number', 'Boolean',
-            'Math', 'Date', 'Error', 'RegExp', 'Map', 'Set',
-            'parseInt', 'parseFloat', 'isNaN', 'isFinite',
-            'encodeURIComponent', 'decodeURIComponent',
-            wrappedScript
-        )
-        const result = await fn(
-            agent, parallel, pipeline, staged,
-            phase, sandboxLog, budget, args, meta,
-            {
-                log: (...a) => sandboxLog(a.map(String).join(' ')),
-                error: (...a) => sandboxLog('[Error] ' + a.map(String).join(' ')),
-                warn: (...a) => sandboxLog('[Warn] ' + a.map(String).join(' ')),
+    Object.defineProperties(bridge, {
+        agent: {
+            value: async (requestJson) => {
+                try {
+                    if (aborted) throw Object.assign(new Error('WorkflowAborted'), {code: 'WORKFLOW_ABORTED'})
+                    if (pendingCalls.size >= MAX_PENDING_AGENT_CALLS) {
+                        throw Object.assign(new Error('并发 agent 调用超过上限 ' + MAX_PENDING_AGENT_CALLS), {code: 'WORKFLOW_AGENT_LIMIT'})
+                    }
+                    if (typeof requestJson !== 'string' || byteLength(requestJson) > MAX_AGENT_PROMPT_BYTES + MAX_AGENT_OPTIONS_BYTES) {
+                        throw Object.assign(new Error('agent 请求超过大小限制'), {code: 'WORKFLOW_AGENT_REQUEST_TOO_LARGE'})
+                    }
+                    const request = JSON.parse(requestJson)
+                    if (typeof request.prompt !== 'string' || byteLength(request.prompt) > MAX_AGENT_PROMPT_BYTES) {
+                        throw Object.assign(new Error('agent prompt 必须是 1MB 以内的字符串'), {code: 'WORKFLOW_INVALID_AGENT_PROMPT'})
+                    }
+                    if (!request.opts || typeof request.opts !== 'object' || Array.isArray(request.opts)) {
+                        throw Object.assign(new Error('agent opts 必须是对象'), {code: 'WORKFLOW_INVALID_AGENT_OPTIONS'})
+                    }
+                    const optionsJson = JSON.stringify(request.opts)
+                    if (byteLength(optionsJson) > MAX_AGENT_OPTIONS_BYTES) {
+                        throw Object.assign(new Error('agent opts 超过 256KB 限制'), {code: 'WORKFLOW_INVALID_AGENT_OPTIONS'})
+                    }
+
+                    const result = await new Promise((resolve, reject) => {
+                        const callId = String(++callIdCounter)
+                        pendingCalls.set(callId, {resolve, reject})
+                        if (!safeSend({type: 'agent_call', callId, prompt: request.prompt, opts: request.opts})) {
+                            pendingCalls.delete(callId)
+                            reject(Object.assign(new Error('父进程 IPC 已断开'), {code: 'WORKFLOW_IPC_CLOSED'}))
+                        }
+                    })
+                    return serializeEnvelope(result)
+                } catch (error) {
+                    return serializeErrorEnvelope(error)
+                }
             },
-            safeSetTimeout, safeClearTimeout,
-            {cwd: () => process.cwd(), env: {}},
-            Promise, JSON, Array, Object, String, Number, Boolean,
-            Math, Date, Error, RegExp, Map, Set,
-            parseInt, parseFloat, isNaN, isFinite,
-            encodeURIComponent, decodeURIComponent
-        )
-        process.send({type: 'done', result})
-    } catch (e) {
-        if (aborted || e.message?.includes('WorkflowAborted')) {
-            process.send({type: 'done', result: {paused: true}})
-        } else {
-            process.send({type: 'error', message: e.message, code: e.code})
+            enumerable: true,
+        },
+        phase: {
+            value: (title) => {
+                if (!aborted) safeSend({type: 'phase', title: String(title).slice(0, 500)})
+            },
+            enumerable: true,
+        },
+        log: {
+            value: (message) => {
+                if (!aborted) safeSend({type: 'log', msg: String(message).slice(0, 16_384)})
+            },
+            enumerable: true,
+        },
+        setTimer: {
+            value: (callback, delay) => {
+                if (aborted || typeof callback !== 'function') return -1
+                if (pendingTimers.size >= MAX_PENDING_TIMERS) return -1
+                const numericDelay = Number(delay)
+                const boundedDelay = Number.isFinite(numericDelay)
+                    ? Math.max(0, Math.min(numericDelay, MAX_TIMER_DELAY_MS))
+                    : 0
+                const timerId = ++timerIdCounter
+                const timeout = setTimeout(() => {
+                    pendingTimers.delete(timerId)
+                    if (aborted || finalized) return
+                    try {
+                        const callbackResult = callback()
+                        Promise.resolve(callbackResult).catch((error) => {
+                            if (!finalized) safeSend({type: 'log', msg: '[Error] setTimeout 回调异常: ' + errorMessage(error)})
+                        })
+                    } catch (error) {
+                        safeSend({type: 'log', msg: '[Error] setTimeout 回调异常: ' + errorMessage(error)})
+                    }
+                }, boundedDelay)
+                timeout.unref?.()
+                pendingTimers.set(timerId, timeout)
+                return timerId
+            },
+            enumerable: true,
+        },
+        clearTimer: {
+            value: (timerId) => {
+                const timeout = pendingTimers.get(Number(timerId))
+                if (!timeout) return
+                clearTimeout(timeout)
+                pendingTimers.delete(Number(timerId))
+            },
+            enumerable: true,
+        },
+    })
+
+    return Object.freeze(bridge)
+}
+
+function createSandboxContext(seed) {
+    const sandbox = Object.create(null)
+    const context = createContext(sandbox, {
+        name: 'claude-desktop-bridge-workflow',
+        codeGeneration: {strings: false, wasm: false},
+    })
+    Object.defineProperty(sandbox, '__bridge', {
+        value: createHostBridge(),
+        configurable: true,
+        enumerable: false,
+        writable: false,
+    })
+
+    const seedJson = JSON.stringify(seed)
+    runInContext(`
+        (() => {
+            'use strict'
+            const bridge = globalThis.__bridge
+            const seed = JSON.parse(${JSON.stringify(seedJson)})
+            const decode = (payload) => {
+                const envelope = JSON.parse(payload)
+                if (envelope.ok) return envelope.value
+                const error = new Error(envelope.error || 'Workflow agent 调用失败')
+                if (envelope.code) error.code = envelope.code
+                throw error
+            }
+            const harden = (fn) => {
+                Object.setPrototypeOf(fn, null)
+                return Object.freeze(fn)
+            }
+            const logValue = (prefix, values) => {
+                bridge.log(prefix + values.map((value) => {
+                    if (typeof value === 'string') return value
+                    try { return JSON.stringify(value) }
+                    catch (_error) { return String(value) }
+                }).join(' '))
+            }
+
+            const agent = harden(async (prompt, opts = {}) => {
+                const request = JSON.stringify({prompt, opts})
+                return decode(await bridge.agent(request))
+            })
+            const phase = harden((title) => bridge.phase(title))
+            const log = harden((message) => bridge.log(message))
+            const setTimeout = harden((callback, delay) => bridge.setTimer(callback, delay))
+            const clearTimeout = harden((timerId) => bridge.clearTimer(timerId))
+            const parallel = harden(async (thunks) => {
+                if (!Array.isArray(thunks) || thunks.length === 0) return []
+                bridge.log('[Parallel] ' + thunks.length + ' 个任务')
+                const results = []
+                for (let index = 0; index < thunks.length; index += 16) {
+                    const batch = thunks.slice(index, index + 16)
+                    const batchResults = await Promise.all(batch.map(async (thunk) => {
+                        if (typeof thunk !== 'function') return null
+                        try { return await thunk() }
+                        catch (error) {
+                            if (error?.code === 'BUDGET_EXCEEDED' || error?.code === 'WORKFLOW_ABORTED') throw error
+                            bridge.log('[Parallel] 异常: ' + (error?.message || String(error)))
+                            return null
+                        }
+                    }))
+                    results.push(...batchResults)
+                }
+                bridge.log('[Parallel] 完成: ' + results.filter((value) => value != null).length + '/' + thunks.length)
+                return results
+            })
+            const pipeline = harden(async (items, ...stages) => {
+                if (!Array.isArray(items) || items.length === 0) return []
+                if (stages.length === 0) return [...items]
+                bridge.log('[Pipeline] ' + items.length + ' 项 x ' + stages.length + ' 阶段')
+                return Promise.all(items.map(async (originalItem, itemIndex) => {
+                    let value = originalItem
+                    for (let stageIndex = 0; stageIndex < stages.length; stageIndex++) {
+                        try { value = await stages[stageIndex](value, originalItem, itemIndex) }
+                        catch (error) {
+                            if (error?.code === 'BUDGET_EXCEEDED' || error?.code === 'WORKFLOW_ABORTED') throw error
+                            bridge.log('[Pipeline 项' + itemIndex + ' 阶段' + stageIndex + '] 异常: ' + (error?.message || String(error)))
+                            return null
+                        }
+                    }
+                    return value
+                }))
+            })
+            const staged = harden(async (items, ...stages) => {
+                if (!Array.isArray(items) || items.length === 0) return []
+                let current = [...items]
+                for (let stageIndex = 0; stageIndex < stages.length; stageIndex++) {
+                    bridge.log('[Staged] 阶段 ' + (stageIndex + 1) + '/' + stages.length)
+                    current = await Promise.all(current.map(async (item, itemIndex) => {
+                        try { return await stages[stageIndex](item, item, itemIndex) }
+                        catch (error) {
+                            if (error?.code === 'BUDGET_EXCEEDED' || error?.code === 'WORKFLOW_ABORTED') throw error
+                            bridge.log('[Staged 项' + itemIndex + ' 阶段' + stageIndex + '] 异常: ' + (error?.message || String(error)))
+                            return null
+                        }
+                    }))
+                }
+                return current
+            })
+            const console = Object.freeze(Object.assign(Object.create(null), {
+                log: harden((...values) => logValue('', values)),
+                error: harden((...values) => logValue('[Error] ', values)),
+                warn: harden((...values) => logValue('[Warn] ', values)),
+            }))
+
+            Object.defineProperties(globalThis, {
+                agent: {value: agent, enumerable: true},
+                parallel: {value: parallel, enumerable: true},
+                pipeline: {value: pipeline, enumerable: true},
+                staged: {value: staged, enumerable: true},
+                phase: {value: phase, enumerable: true},
+                log: {value: log, enumerable: true},
+                budget: {value: seed.budget, enumerable: true},
+                args: {value: seed.args, enumerable: true},
+                meta: {value: seed.meta, enumerable: true},
+                console: {value: console},
+                setTimeout: {value: setTimeout},
+                clearTimeout: {value: clearTimeout},
+                process: {value: undefined},
+                require: {value: undefined},
+                Buffer: {value: undefined},
+                eval: {value: undefined},
+                Function: {value: undefined},
+                WebAssembly: {value: undefined},
+                SharedArrayBuffer: {value: undefined},
+                Atomics: {value: undefined},
+            })
+            delete globalThis.__bridge
+        })()
+    `, context, {timeout: SYNC_EXECUTION_TIMEOUT_MS, displayErrors: true})
+
+    return context
+}
+
+async function runScript(init) {
+    try {
+        if (typeof init.script !== 'string' || byteLength(init.script) > MAX_SCRIPT_BYTES) {
+            throw Object.assign(new Error('Workflow 脚本必须是 1MB 以内的字符串'), {code: 'WORKFLOW_INVALID_SCRIPT'})
         }
+
+        const context = createSandboxContext({
+            budget: {total: init.budget?.total ?? null},
+            args: init.args && typeof init.args === 'object' ? init.args : {},
+            meta: init.meta && typeof init.meta === 'object' ? init.meta : null,
+        })
+        const scriptBody = stripWorkflowExports(init.script)
+        const wrappedScript = `
+            (async () => {
+                try {
+                    const value = await (async () => { ${scriptBody}\n })()
+                    return JSON.stringify({ok: true, value})
+                } catch (error) {
+                    return JSON.stringify({
+                        ok: false,
+                        error: error?.message || String(error),
+                        code: typeof error?.code === 'string' ? error.code : undefined,
+                    })
+                }
+            })()
+        `
+        const resultEnvelopeJson = await runInContext(wrappedScript, context, {
+            timeout: SYNC_EXECUTION_TIMEOUT_MS,
+            displayErrors: true,
+        })
+        if (aborted || finalized) return
+
+        if (typeof resultEnvelopeJson !== 'string' || byteLength(resultEnvelopeJson) > MAX_IPC_PAYLOAD_BYTES) {
+            throw Object.assign(new Error('Workflow 结果无效或超过 5MB 限制'), {code: 'WORKFLOW_RESULT_TOO_LARGE'})
+        }
+        const envelope = JSON.parse(resultEnvelopeJson)
+        if (!envelope.ok) {
+            finish({type: 'error', message: String(envelope.error || 'Workflow 执行失败'), code: envelope.code})
+            return
+        }
+        if (pendingCalls.size > 0) {
+            throw Object.assign(new Error('Workflow 返回时仍有未等待的 agent 调用'), {code: 'WORKFLOW_UNAWAITED_AGENT'})
+        }
+        finish({type: 'done', result: envelope.value})
+    } catch (error) {
+        if (aborted || finalized) return
+        finish({type: 'error', message: errorMessage(error), code: error?.code})
     }
 }

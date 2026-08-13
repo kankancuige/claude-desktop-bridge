@@ -44,6 +44,17 @@ export interface Message {
   expanded?: boolean
   tools?: ToolUse[]
   toolsExpanded?: boolean
+  compact?: {
+    trigger?: 'manual' | 'auto'
+    preTokens?: number
+    postTokens?: number
+    durationMs?: number
+    summary?: string
+    summaryExpanded?: boolean
+  }
+  tokens?: number
+  cost?: number
+  attachments?: any[]
 }
 
 /** 项目数据结构 */
@@ -52,7 +63,7 @@ export interface Project {
   encodedDir: string
   sessionCount: number
   lastActive: number
-  sessions: { id: string; title?: string; size: number }[]
+  sessions: { id: string; title?: string; size: number; encodedDir?: string }[]
 }
 
 /** Diff 单行 */
@@ -100,6 +111,10 @@ export interface AgentRun {
   id: string
   agentType: string
   description?: string
+  purpose?: string
+  task?: string
+  scope?: string
+  descriptionSource?: string
   status: 'spawning' | 'running' | 'done' | 'error'
   source: 'native' | 'workflow'
   spawnTime?: number
@@ -107,7 +122,9 @@ export interface AgentRun {
   doneTime?: number
   progress?: string
   currentTool?: string
+  currentAction?: string
   currentToolElapsed?: number
   transcriptPath?: string
   expanded?: boolean
+  toolUseId?: string
 }

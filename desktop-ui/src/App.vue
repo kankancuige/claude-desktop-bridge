@@ -10,6 +10,7 @@
  */
 import { ref, onMounted, onBeforeUnmount } from 'vue'
 import { t } from './i18n'
+import type { BridgeNotice } from './bridge-errors'
 
 // ── gateway 后端地址 ──
 const GW = 'http://127.0.0.1:3456'
@@ -66,7 +67,7 @@ async function applyInitialTheme() {
       const s = await res.json()
       if (s.theme) currentTheme = s.theme
     }
-  } catch {}
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   applyTheme(currentTheme)
 }
 
@@ -161,7 +162,7 @@ async function saveManualPath() {
         claudeMissing.value = false
       }
     }
-  } catch {}
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
 }
 
 /**
@@ -181,7 +182,7 @@ async function checkClaudeStatus() {
       const d = await res.json()
       claudeMissing.value = !d.found
     }
-  } catch {}
+  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   claudeChecking.value = false
 }
 
@@ -195,6 +196,35 @@ const updateDownloading = ref(false)
 const updateDownloadPercent = ref(0)
 const updateDownloaded = ref(false)
 const updateError = ref('')
+const bridgeNotice = ref<BridgeNotice | null>(null)
+let bridgeNoticeTimer: ReturnType<typeof setTimeout> | null = null
+let bridgeNoticeHandler: ((event: Event) => void) | null = null
+let bridgeRecoveredHandler: (() => void) | null = null
+
+function dismissBridgeNotice() {
+  bridgeNotice.value = null
+  if (bridgeNoticeTimer) {
+    clearTimeout(bridgeNoticeTimer)
+    bridgeNoticeTimer = null
+  }
+}
+
+function onBridgeNotice(event: Event) {
+  const notice = (event as CustomEvent<BridgeNotice>).detail
+  if (!notice?.message) return
+  bridgeNotice.value = notice
+  if (bridgeNoticeTimer) clearTimeout(bridgeNoticeTimer)
+  bridgeNoticeTimer = setTimeout(() => {
+    bridgeNotice.value = null
+    bridgeNoticeTimer = null
+  }, notice.severity === 'error' ? 15_000 : 8_000)
+}
+
+function onBridgeRecovered() {
+  if (!bridgeNotice.value || bridgeNotice.value.code === 'GATEWAY_UNAVAILABLE' || bridgeNotice.value.code === 'GATEWAY_TIMEOUT') {
+    dismissBridgeNotice()
+  }
+}
 let _cleanupUpdateAvail: (() => void) | null = null
 let _cleanupUpdateProg: (() => void) | null = null
 let _cleanupUpdateDone: (() => void) | null = null
@@ -225,6 +255,11 @@ onMounted(() => {
   // 延迟 2 秒等待 gateway 启动完成后再检测，避免 gateway 未就绪导致误报
   setTimeout(checkClaudeStatus, 2000)
 
+  bridgeNoticeHandler = onBridgeNotice
+  bridgeRecoveredHandler = onBridgeRecovered
+  window.addEventListener('bridge:notice', bridgeNoticeHandler)
+  window.addEventListener('bridge:recovered', bridgeRecoveredHandler)
+
   // ── 注册自动更新事件监听 ──
   if (api) {
     _cleanupUpdateAvail = api.onUpdateAvailable?.((info: any) => {
@@ -254,6 +289,9 @@ onBeforeUnmount(() => {
   _cleanupUpdateDone?.()
   _cleanupUpdateErr?.()
   if (_themeChangeHandler) window.matchMedia?.('(prefers-color-scheme: dark)').removeEventListener('change', _themeChangeHandler)
+  if (bridgeNoticeHandler) window.removeEventListener('bridge:notice', bridgeNoticeHandler)
+  if (bridgeRecoveredHandler) window.removeEventListener('bridge:recovered', bridgeRecoveredHandler)
+  dismissBridgeNotice()
 })
 
 // ═══════════════════════════════════════════
@@ -368,6 +406,13 @@ function closeWindow() { api?.close?.() }
           <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
         </svg>
       </button>
+    </div>
+
+    <div v-if="bridgeNotice" class="bridge-notice" :class="`bridge-notice-${bridgeNotice.severity}`" role="status">
+      <span class="bridge-notice-dot"></span>
+      <span class="bridge-notice-message">{{ bridgeNotice.message }}</span>
+      <span v-if="bridgeNotice.retryable" class="bridge-notice-hint">可重试</span>
+      <button class="bridge-notice-close" title="关闭" @click="dismissBridgeNotice">×</button>
     </div>
 
     <!-- ── 更新下载完成，重启安装弹窗 ── -->
@@ -487,6 +532,24 @@ function closeWindow() { api?.close?.() }
   display: flex; flex-direction: column;
   height: 100vh; overflow: hidden;                /* 占满视口，禁止滚动 */
 }
+
+.bridge-notice {
+  position: fixed; top: 52px; left: 50%; transform: translateX(-50%);
+  z-index: 500; display: flex; align-items: center; gap: 9px;
+  max-width: min(720px, calc(100vw - 32px)); padding: 10px 13px;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg-raised); color: var(--text-primary);
+  box-shadow: 0 8px 28px rgba(0,0,0,.28); font-size: 13px;
+}
+.bridge-notice-error { border-color: color-mix(in srgb, var(--error) 60%, var(--border)); }
+.bridge-notice-warning { border-color: color-mix(in srgb, var(--warning, #d99000) 60%, var(--border)); }
+.bridge-notice-info { border-color: color-mix(in srgb, var(--accent-blue) 60%, var(--border)); }
+.bridge-notice-dot { width: 7px; height: 7px; flex: 0 0 7px; border-radius: 50%; background: var(--accent-blue); }
+.bridge-notice-error .bridge-notice-dot { background: var(--error); }
+.bridge-notice-warning .bridge-notice-dot { background: var(--warning, #d99000); }
+.bridge-notice-message { overflow-wrap: anywhere; }
+.bridge-notice-hint { color: var(--text-muted); white-space: nowrap; }
+.bridge-notice-close { margin-left: 4px; border: 0; background: transparent; color: var(--text-muted); cursor: pointer; font-size: 18px; line-height: 1; }
 
 /* ── 标题栏容器 ── */
 .title-bar {

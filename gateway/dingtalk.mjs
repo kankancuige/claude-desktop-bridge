@@ -28,17 +28,34 @@
  * - bridge-paired-dingtalk.json: 已配对的钉钉用户白名单
  * - adapter-sessions.json: 用户→session 绑定关系(mirror 模式用)
  */
-import {readFileSync, writeFileSync} from 'node:fs'
+import {readFileSync} from 'node:fs'
 import {join} from 'node:path'
 import {homedir} from 'node:os'
+import {randomInt} from 'node:crypto'
 import {DWClient, TOPIC_ROBOT} from 'dingtalk-stream'
 import WebSocket from 'ws'
 import {createLogger} from './logger.mjs'
 import {detectCommand, executeCommand} from './im-commands.mjs'
+import {gatewayFetch, gatewayWsOptions, gatewayHttpBase, gatewayWsUrl} from './gateway-client.mjs'
+import {SessionTaskQueue} from './session-task-queue.mjs'
+import {ImMessageDeduper} from './im-message-dedupe.mjs'
+import {claimDurableInboxMessage, ImInbox} from './im-inbox.mjs'
+import {SecurePayloadCodec} from './secure-payload.mjs'
+import {NotificationOutbox} from './notification-outbox.mjs'
+import {startNotificationWorker, sendOrQueue} from './notification-worker.mjs'
+import {splitTextByUtf8Bytes} from './text-chunks.mjs'
+import {loadPairedUsers, savePairedUsers} from './paired-users.mjs'
+import {readAdapterConfig} from './adapter-config.mjs'
+import {turnFallbackText} from './im-turn-finish.mjs'
+import {validateImText} from './im-input.mjs'
+import {createMirrorStateResolver} from './mirror-state.mjs'
+import {platformEntryFilePath} from './platform-entry-store.mjs'
+import {PendingConfirmRegistry} from './pending-confirm.mjs'
+import {findLatestAdapterUserForSession} from './adapter-bindings.mjs'
 
 const log = createLogger('dingtalk')
 
-const GW = 'http://127.0.0.1:3456'              // Gateway 本地 HTTP 地址
+const GW = () => gatewayHttpBase()              // Gateway 本地 HTTP 地址
 const CLAUDE_HOME = join(homedir(), '.claude')   // Claude 配置根目录
 
 // ── startDingTalkAdapter ──
@@ -49,6 +66,9 @@ const CLAUDE_HOME = join(homedir(), '.claude')   // Claude 配置根目录
 //          → connect() → 返回钩子对象
 export function startDingTalkAdapter(token) {
     let appKey, appSecret
+    let stopped = false
+    let connectionError = null
+    const activeSockets = new Set()
 
     // ── reloadCreds ──
     // 功能说明: 从磁盘重新加载钉钉应用凭据
@@ -56,7 +76,7 @@ export function startDingTalkAdapter(token) {
     // SIDE_EFFECT: 修改模块级变量 appKey / appSecret
     function reloadCreds() {
         try {
-            const adapters = JSON.parse(readFileSync(join(CLAUDE_HOME, 'adapters.json'), 'utf8'))
+            const adapters = readAdapterConfig(join(CLAUDE_HOME, 'adapters.json'))
             appKey = adapters.dingtalk?.appKey
             appSecret = adapters.dingtalk?.appSecret
             if (!appKey || !appSecret) {
@@ -81,29 +101,37 @@ export function startDingTalkAdapter(token) {
     //   - 定时器: 每 100 分钟清空缓存(钉钉 token 有效期 2 小时)，迫使下次调用重新获取
     // 关键数据流: appKey+appSecret → /oauth2/accessToken → 缓存 → sendMsg 使用 → 100分钟后过期
     let accessToken = null
+    let accessTokenPromise = null
 
     // ── getAccessToken ──
     // 功能说明: 获取(或返回缓存的)钉钉 access_token
     async function getAccessToken() {
+        if (stopped) return null
         if (accessToken) return accessToken
-        try {
-            const r = await fetch('https://api.dingtalk.com/v1.0/oauth2/accessToken', {
-                method: 'POST', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({appKey, appSecret}),
-                signal: AbortSignal.timeout(10000),
-            })
-            const d = await r.json()
-            if (d.accessToken) {
-                accessToken = d.accessToken;
-                log.info('access_token 获取成功');
-                return accessToken
+        if (accessTokenPromise) return accessTokenPromise
+        accessTokenPromise = (async () => {
+            try {
+                const r = await fetch('https://api.dingtalk.com/v1.0/oauth2/accessToken', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({appKey, appSecret}),
+                    signal: AbortSignal.timeout(10000),
+                })
+                const d = await r.json()
+                if (d.accessToken && !stopped) {
+                    accessToken = d.accessToken;
+                    log.info('access_token 获取成功');
+                    return accessToken
+                }
+                log.error({code: d.code, message: d.message}, 'access_token 获取失败');
+                return null
+            } catch (e) {
+                log.error({err: e}, 'access_token 异常');
+                return null
+            } finally {
+                accessTokenPromise = null
             }
-            log.error({code: d.code, message: d.message}, 'access_token 获取失败');
-            return null
-        } catch (e) {
-            log.error({err: e}, 'access_token 异常');
-            return null
-        }
+        })()
+        return accessTokenPromise
     }
 
     // 每 100 分钟清除 token 缓存(钉钉 token 有效期 2 小时，提前 20 分钟刷新)
@@ -121,59 +149,81 @@ export function startDingTalkAdapter(token) {
     // 异常处理: 捕获异常仅打印日志不抛出
     // 关键数据流: getAccessToken → x-acs-dingtalk-access-token 头 → POST batchSend → 钉钉用户
     async function sendMsg(userId, text) {
-        const token = await getAccessToken()
-        if (!token) return
-        try {
-            const r = await fetch('https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend', {
-                method: 'POST', headers: {'Content-Type': 'application/json', 'x-acs-dingtalk-access-token': token},
-                body: JSON.stringify({
-                    robotCode: appKey,
-                    userIds: [userId],  // 钉钉 API 接受数组，单用户也是数组形式
-                    msgKey: 'sampleText',
-                    msgParam: JSON.stringify({content: text}),  // msgParam 必须是 JSON 字符串
-                }),
-                signal: AbortSignal.timeout(10000),
-            })
-            const d = await r.json()
-            if (d.code) log.error({code: d.code}, 'sendMsg 失败')
-            else log.debug('sendMsg ok')
-        } catch (e) {
-            log.error({err: e}, 'sendMsg 异常')
+        if (stopped) return false
+        for (let attempt = 0; attempt < 2; attempt++) {
+            const token = await getAccessToken()
+            if (!token) return false
+            try {
+                const r = await fetch('https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend', {
+                    method: 'POST', headers: {'Content-Type': 'application/json', 'x-acs-dingtalk-access-token': token},
+                    body: JSON.stringify({
+                        robotCode: appKey,
+                        userIds: [userId],  // 钉钉 API 接受数组，单用户也是数组形式
+                        msgKey: 'sampleText',
+                        msgParam: JSON.stringify({content: text}),  // msgParam 必须是 JSON 字符串
+                    }),
+                    signal: AbortSignal.timeout(10000),
+                })
+                if (r.status === 401 && attempt === 0) {
+                    if (accessToken === token) accessToken = null
+                    continue
+                }
+                if (!r.ok) return false
+                const d = await r.json()
+                if (d.code) {
+                    log.error({code: d.code}, 'sendMsg 失败')
+                    return false
+                }
+                log.debug('sendMsg ok')
+                return true
+            } catch (e) {
+                log.error({err: e}, 'sendMsg 异常')
+                return false
+            }
         }
+        return false
     }
 
     // ── 配对白名单 ──
     const pairedFile = join(CLAUDE_HOME, 'bridge-paired-dingtalk.json')
-    let pairedUsers = new Set()
-    try {
-        const d = JSON.parse(readFileSync(pairedFile, 'utf8'));
-        pairedUsers = new Set(d.users || [])
-    } catch {
-    }
+    const pairedUsers = loadPairedUsers(pairedFile)
 
     // ── 配对码生成 ──
-    const pairCode = String(Math.floor(100000 + Math.random() * 900000))
-    log.info({pairCodeMasked: pairCode.slice(0, 2) + '****'}, '配对码已生成')
+    const pairCode = String(randomInt(100000, 1000000))
+    log.info('配对码已生成，可在桌面端 IM 设置中查看')
 
     // ── 配对暴力破解防护 ──
     const pairFailCount = new Map()  // userId → {count, cooldownUntil}
     const PAIR_MAX_FAIL = 5           // 连续失败上限
     const PAIR_COOLDOWN_MS = 10 * 60 * 1000  // 冷却时间 10 分钟
+    const PAIR_ATTEMPT_TTL_MS = 60 * 60 * 1000
+    const PAIR_MAX_TRACKED_USERS = 5000
 
     // ── pendingConfirm 挂起确认表 ──
-    const pendingConfirm = new Map()
+    const pendingConfirm = new PendingConfirmRegistry()
+    const sessionQueue = new SessionTaskQueue({maxDepth: 8})
+    const messageDeduper = new ImMessageDeduper()
+    const payloadCodec = new SecurePayloadCodec(join(CLAUDE_HOME, 'bridge-store-key'))
+    const legacyInboxFile = join(CLAUDE_HOME, 'bridge-im-inbox.json')
+    const legacyOutboxFile = join(CLAUDE_HOME, 'bridge-notification-outbox.json')
+    const inbox = new ImInbox({
+        filePath: platformEntryFilePath(CLAUDE_HOME, 'bridge-im-inbox', 'dingtalk'), legacyFilePath: legacyInboxFile,
+        platform: 'dingtalk', payloadCodec,
+        onPersistError: error => log.error({err: error}, 'IM inbox 持久化失败'),
+    })
+    const outbox = new NotificationOutbox({
+        filePath: platformEntryFilePath(CLAUDE_HOME, 'bridge-notification-outbox', 'dingtalk'), legacyFilePath: legacyOutboxFile,
+        platform: 'dingtalk', payloadCodec,
+        onPersistError: error => log.error({err: error}, '通知 outbox 持久化失败'),
+    })
     // pendingConfirm TTL 清理：5 分钟超时自动清除，防止异常路径下残留
     const _confirmCleanup = setInterval(() => {
-      const cutoff = Date.now() - 5 * 60 * 1000
-      for (const [uid, pc] of pendingConfirm) {
-        if ((pc._at || 0) < cutoff) pendingConfirm.delete(uid)
+      pendingConfirm.cleanup()
+      for (const [uid, attempt] of pairFailCount) {
+        if (Date.now() - Number(attempt.lastAttemptAt || 0) > PAIR_ATTEMPT_TTL_MS) pairFailCount.delete(uid)
       }
     }, 5 * 60 * 1000)
     if (_confirmCleanup.unref) _confirmCleanup.unref()
-    // 包装 set 自动注入 _at 时间戳，供 TTL 清理使用
-    const _pcSet = pendingConfirm.set.bind(pendingConfirm)
-    pendingConfirm.set = (k, v) => _pcSet(k, {...v, _at: Date.now()})
-
     // ── parseConfirmReply ──
     // 功能说明: 解析用户的确认回复文本
     // 实现方式: choice 模式解析数字索引，permission 模式匹配中英文关键词白名单
@@ -191,16 +241,10 @@ export function startDingTalkAdapter(token) {
 
     // ── handleMessage ── 消息处理入口
     // 功能说明: 单条钉钉消息的处理入口，按优先级依次检查: 配对状态 → 挂起确认 → 正常对话
-    async function handleMessage(uid, text) {
-        // ── 第0层: IM 自定义命令 ──
-        const cmd = detectCommand(text)
-        if (cmd) {
-            const r = await executeCommand(cmd)
-            if (r?.replyText) await sendMsg(uid, r.replyText)
-            return
-        }
-
-        // ── 第1层: 配对鉴权 ──
+    async function processMessage(uid, text, messageId = '') {
+        if (stopped) return
+        const identity = {source: 'dingtalk', userId: uid}
+        // ── 第0层: 配对鉴权 ──
         if (!pairedUsers.has(uid)) {
             // 暴力破解防护：检查冷却期
             const fc = pairFailCount.get(uid)
@@ -212,16 +256,18 @@ export function startDingTalkAdapter(token) {
             if (text.trim() === pairCode) {
                 pairedUsers.add(uid)
                 pairFailCount.delete(uid)
-                writeFileSync(pairedFile, JSON.stringify({users: [...pairedUsers]}))  // SIDE_EFFECT: 持久化白名单
+                savePairedUsers(pairedFile, pairedUsers)  // SIDE_EFFECT: 持久化白名单
                 await sendMsg(uid, '配对成功！现在可以开始对话了。')
             } else {
                 const cur = pairFailCount.get(uid) || {count: 0, cooldownUntil: 0}
                 cur.count++
+                cur.lastAttemptAt = Date.now()
                 if (cur.count >= PAIR_MAX_FAIL) {
                     cur.cooldownUntil = Date.now() + PAIR_COOLDOWN_MS
                     log.warn({userId: uid?.slice(0, 8), failCount: cur.count}, '配对码暴力破解触发冷却')
                 }
                 pairFailCount.set(uid, cur)
+                while (pairFailCount.size > PAIR_MAX_TRACKED_USERS) pairFailCount.delete(pairFailCount.keys().next().value)
                 const left = PAIR_MAX_FAIL - cur.count
                 await sendMsg(uid, left > 0
                     ? `配对码错误，还剩 ${left} 次机会`
@@ -230,27 +276,39 @@ export function startDingTalkAdapter(token) {
             return
         }
 
+        // ── 第1层: 已配对用户命令 ──
+        const cmd = detectCommand(text)
+        if (cmd) {
+            const r = await executeCommand(cmd, token, identity)
+            if (r?.replyText) await sendMsg(uid, r.replyText)
+            return
+        }
+
         // ── 第2层: 挂起确认拦截 ──
-        if (pendingConfirm.has(uid)) {
-            const pc = pendingConfirm.get(uid)
+        const pc = pendingConfirm.peek(uid)
+        if (pc) {
             const parsed = parseConfirmReply(text, pc.type)
             if (!parsed) {
                 await sendMsg(uid, pc.type === 'choice' ? '请回复选项编号（如 1、2）' : '请回复 y/确认 或 n/拒绝')
                 return
             }
             try {
-                const r = await fetch(`${GW}/api/confirm`, {
+                const r = await gatewayFetch(`${GW()}/api/confirm`, token, {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({sessionId: pc.sessionId, requestId: pc.requestId, ...parsed}),
                     signal: AbortSignal.timeout(5000),
-                })
-                if (r.ok) await sendMsg(uid, '已提交')
-                else await sendMsg(uid, '该请求已处理')
+                }, identity)
+                const d = await r.json().catch(() => ({}))
+                if (r.ok || d.reason === 'already_resolved') {
+                    pendingConfirm.remove(uid, pc)
+                    await sendMsg(uid, d.ok ? '已提交' : '该请求已处理')
+                } else {
+                    await sendMsg(uid, '提交失败，请稍后重试')
+                }
             } catch (e) {
                 await sendMsg(uid, '提交失败，请稍后重试')
             }
-            pendingConfirm.delete(uid)
             return
         }
 
@@ -259,10 +317,10 @@ export function startDingTalkAdapter(token) {
             await sendMsg(uid, '收到，正在处理...')  // ACK
             let sid = null, noActive = false
             try {
-                const r = await fetch(`${GW}/api/sessions/resolve`, {
+                const r = await gatewayFetch(`${GW()}/api/sessions/resolve`, token, {
                     method: 'POST', headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({userId: uid}), signal: AbortSignal.timeout(5000),
-                })
+                }, identity)
                 if (r.ok) {
                     const d = await r.json();
                     sid = d.sessionId;
@@ -282,14 +340,67 @@ export function startDingTalkAdapter(token) {
                 await sendMsg(uid, '无法连接会话');
                 return
             }
-            await injectAndWait(sid, uid, text)
+            const position = sessionQueue.depth(sid)
+            if (position > 0) await sendMsg(uid, `当前会话已有 ${position} 条消息处理中，本条将按顺序执行`)
+            await sessionQueue.enqueue(sid, () => injectAndWait(sid, uid, text, messageId))
         } catch (e) {
+            if (e?.code === 'queue_full') {
+                await sendMsg(uid, '当前会话待处理消息已达上限，请稍后重试')
+                return
+            }
+            if (e?.code === 'session_cancelled') {
+                await sendMsg(uid, '当前会话已停止，本条排队消息已取消')
+                return
+            }
             log.error({err: e, userId: uid?.slice(0, 8)}, '处理失败')
             try {
                 await sendMsg(uid, '处理失败，请稍后重试')
-            } catch {
+            } catch (notifyError) {
+                log.warn({err: notifyError, userId: uid?.slice(0, 8)}, '发送处理失败提示失败')
             }
         }
+    }
+
+    function handleMessage(uid, text, messageId = '') {
+        const validation = validateImText(text)
+        if (!validation.ok && !messageId) return sendReliableText(uid, turnFallbackText('invalid_input'))
+        if (!messageId) return processMessage(uid, text, messageId)
+        const claim = claimDurableInboxMessage({
+            inbox, deduper: messageDeduper, messageId,
+            payload: {uid, text: validation.ok ? text : ''},
+        })
+        if (!claim.accepted) return
+        return (async () => {
+            try {
+                if (validation.ok) await processMessage(uid, text, messageId)
+                else await sendReliableText(uid, turnFallbackText('invalid_input'))
+                if (stopped) return
+                if (!inbox.complete(messageId)) log.error({messageId: String(messageId).slice(0, 32)}, 'IM inbox 完成状态持久化失败')
+            } catch (error) {
+                if (stopped) return
+                messageDeduper.forget(messageId)
+                if (!inbox.fail(messageId, error)) log.error({messageId: String(messageId).slice(0, 32)}, 'IM inbox 失败状态持久化失败')
+                log.error({err: error, messageId: String(messageId).slice(0, 32)}, 'inbox 消息处理失败')
+            }
+        })()
+    }
+
+    const notificationWorker = startNotificationWorker({
+        outbox,
+        deliver: payload => sendMsg(payload.userId, payload.text),
+        log,
+    })
+
+    async function sendReliableText(userId, text) {
+        if (stopped) return false
+        const parts = splitTextByUtf8Bytes(text, 4000)
+        let sent = true
+        for (let i = 0; i < parts.length; i++) {
+            const content = parts.length > 1 ? `【${i + 1}/${parts.length}】${parts[i]}` : parts[i]
+            const result = await sendOrQueue(outbox, {userId, text: content}, payload => sendMsg(payload.userId, payload.text))
+            if (!result.sent) sent = false
+        }
+        return sent
     }
 
     // ── injectAndWait ── WS 注入 + 进度反馈 + 回复发送
@@ -301,17 +412,20 @@ export function startDingTalkAdapter(token) {
     //   4. 超时 5.5 分钟后自动结束
     // mirror 模式: 若 mirror 开关开启则完全跳过回复发送
     // 关键数据流: user_message → WS 事件流 → replyText 累积 → finish() → sendMsg 钉钉用户
-    async function injectAndWait(sessionId, userId, text) {
-        return new Promise(async (resolve) => {
+    async function injectAndWait(sessionId, userId, text, messageId = '') {
+        if (stopped) return
+        return new Promise((resolve) => {
             let ws2
             try {
-                ws2 = new WebSocket(`ws://127.0.0.1:3456/ws/${sessionId}?source=dingtalk&token=${encodeURIComponent(token)}`)
+                ws2 = new WebSocket(gatewayWsUrl(`/ws/${sessionId}?source=dingtalk`), gatewayWsOptions(token, {source: 'dingtalk', userId}))
+                activeSockets.add(ws2)
             } catch (e) {
                 resolve()  // WebSocket 构造失败直接结束
                 return
             }
             let toolCount = 0, done = false, replyText = ''
-            let mirrorOn = false
+            let expectedTurnId = null
+            const mirrorState = createMirrorStateResolver(() => shouldSkipReply(sessionId, userId))
             let timeoutId = null
 
             // ── finish ──
@@ -319,26 +433,25 @@ export function startDingTalkAdapter(token) {
                 if (done) return;
                 done = true;
                 if (timeoutId) clearTimeout(timeoutId)
+                activeSockets.delete(ws2)
                 log.info({
                     sessionId: sessionId?.slice(0, 8),
                     reason,
                     tools: toolCount,
                     textLen: replyText.length
                 }, 'finish')
+                try { ws2.close() } catch (error) {
+                    log.debug({err: error}, '关闭钉钉注入 WebSocket 失败')
+                }
                 try {
-                    ws2.close()
-                } catch {
+                    if (stopped || reason === 'adapter_stopped') return
+                    if (await mirrorState.resolve()) return
+                    await sendReliableText(userId, replyText.trim() || turnFallbackText(reason))
+                } catch (error) {
+                    log.error({err: error, sessionId: sessionId?.slice(0, 8), reason}, '钉钉回合收尾失败')
+                } finally {
+                    resolve()
                 }
-                if (mirrorOn) {
-                    resolve();
-                    return
-                }
-                if (!replyText.trim()) {
-                    resolve();
-                    return
-                }
-                await sendMsg(userId, replyText.trim())
-                resolve()
             }
 
             // 事件处理器必须在 await 前注册: await 会让出事件循环，localhost WS 握手极快，
@@ -348,15 +461,36 @@ export function startDingTalkAdapter(token) {
             timeoutId = setTimeout(() => finish('timeout'), 5 * 60 * 1000 + 30000)
 
             ws2.onopen = () => {
-                ws2.send(JSON.stringify({type: 'user_message', content: text}));
-                log.info({sessionId: sessionId?.slice(0, 8), text: text.slice(0, 50)}, '→session')
+                ws2.send(JSON.stringify({type: 'user_message', content: text, messageId, permissionMode: 'default'}));
+                log.info({sessionId: sessionId?.slice(0, 8), textLength: text.length}, '→session')
             }
-
-            mirrorOn = await shouldSkipReply(sessionId)
 
             ws2.onmessage = (e) => {
                 try {
                     const msg = JSON.parse(e.data)
+                    if (msg.type === 'connected') {
+                        if (typeof msg.mirrorEnabled === 'boolean') {
+                            mirrorState.set(msg.mirrorEnabled)
+                        }
+                        return
+                    }
+                    if (msg.type === 'message_accepted') {
+                        if (!messageId || msg.messageId === messageId) expectedTurnId = msg.turnId || null
+                        return
+                    }
+                    if (msg.type === 'message_duplicate') {
+                        finish('duplicate')
+                        return
+                    }
+                    if (msg.type === 'message_rejected') {
+                        finish(msg.code === 'input_queue_full' ? 'queue_full' : 'invalid_input')
+                        return
+                    }
+                    if (msg.type === 'error') {
+                        finish('ws_error')
+                        return
+                    }
+                    if (expectedTurnId && msg.turnId && msg.turnId !== expectedTurnId) return
                     if (msg.type === 'text_delta' && msg.text) {
                         replyText += msg.text
                     } else if (msg.type === 'assistant_message') {
@@ -367,34 +501,44 @@ export function startDingTalkAdapter(token) {
                         replyText = parts.join('\n')
                     } else if (msg.type === 'tool_use_start') {
                         toolCount++
-                        if (!mirrorOn) sendMsg(userId, `⏳ [${toolCount}] ${msg.tool_name || '工具'}...`)
+                        if (!mirrorState.value) sendMsg(userId, `⏳ [${toolCount}] ${msg.tool_name || '工具'}...`)
                     } else if (msg.type === 'permission_request') {
-                        if (!mirrorOn) {
-                            pendingConfirm.set(userId, {sessionId, requestId: msg.requestId, type: 'permission'})
-                            sendMsg(userId, `需要授权\n工具: ${msg.toolName}\n\n回复 y/确认 允许，n/拒绝 拒绝`)
+                        if (!mirrorState.value) {
+                            if (pendingConfirm.add(userId, {sessionId, requestId: msg.requestId, type: 'permission'})) {
+                                sendReliableText(userId, `需要授权\n工具: ${msg.toolName}\n\n回复 y/确认 允许，n/拒绝 拒绝`)
+                            }
                         }
                     } else if (msg.type === 'choice_request') {
-                        if (!mirrorOn) {
+                        if (!mirrorState.value) {
                             const lines = [];
                             const q = msg.questions?.[0]
                             if (q?.question) lines.push(q.question)
                             ;
                             (q?.options || []).forEach((o, i) => lines.push(`${i + 1}. ${o.label}`))
-                            pendingConfirm.set(userId, {
+                            const added = pendingConfirm.add(userId, {
                                 sessionId,
                                 requestId: msg.requestId,
                                 type: 'choice',
                                 questions: msg.questions
                             })
-                            sendMsg(userId, `请选择\n${lines.join('\n')}\n\n回复选项编号`)
+                            if (added) sendReliableText(userId, `请选择\n${lines.join('\n')}\n\n回复选项编号`)
                         }
                     } else if (msg.type === 'result') {
-                        if (toolCount > 0 && !mirrorOn) sendMsg(userId, `共执行 ${toolCount} 个工具`)
+                        if (toolCount > 0 && !mirrorState.value) sendMsg(userId, `共执行 ${toolCount} 个工具`)
                         setTimeout(finish, 500, 'result')
+                    } else if (msg.type === 'generation_stopped') {
+                        sessionQueue.cancel(sessionId)
+                        finish('stopped')
                     }
-                } catch {
+                } catch (error) {
+                    log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '钉钉 WebSocket 消息处理失败')
+                    void finish('ws_message_error')
                 }
             }
+
+            void mirrorState.resolve().catch(error => {
+                log.debug({err: error, sessionId: sessionId?.slice(0, 8)}, '预读取钉钉镜像状态失败')
+            })
 
         })
     }
@@ -406,7 +550,8 @@ export function startDingTalkAdapter(token) {
         if (input.file_path) return `文件: ${input.file_path}`
         try {
             return JSON.stringify(input).slice(0, 200)
-        } catch {
+        } catch (error) {
+            log.debug({err: error}, '钉钉权限输入无法序列化')
             return ''
         }
     }
@@ -417,27 +562,20 @@ export function startDingTalkAdapter(token) {
     // ════════════════════════════════════════════════════════════
 
     // ── findUserForSession ──
-    // 功能说明: 根据 sessionId 查找绑定的钉钉用户 ID
+    // 功能说明: 根据 sessionId 查找绑定的钉钉用户 ID，仅使用精确平台绑定
     function findUserForSession(sid) {
         let ad = {}
         try {
             ad = JSON.parse(readFileSync(join(CLAUDE_HOME, 'adapter-sessions.json'), 'utf8'))
-        } catch {
+        } catch (error) {
+            log.debug({err: error, sessionId: sid?.slice(0, 8)}, '读取钉钉镜像状态失败')
         }
-        let best = null, bestAt = -1
-        for (const [uid, v] of Object.entries(ad)) {
-            if (v?.sessionId === sid) return uid  // 精确匹配优先
-            if ((v?.updatedAt || 0) > bestAt) {
-                bestAt = v?.updatedAt || 0;
-                best = uid
-            }  // 回退最近活跃
-        }
-        return best
+        return findLatestAdapterUserForSession(ad, 'dingtalk', sid)
     }
 
     // ── onConfirmRequest ── 镜像确认请求
     function onConfirmRequest(info) {
-        const uid = findUserForSession(info.sessionId)
+        const uid = info.userId || findUserForSession(info.sessionId)
         if (!uid || !pairedUsers.has(uid)) return
         if (info.type === 'choice') {
             const lines = [];
@@ -445,61 +583,44 @@ export function startDingTalkAdapter(token) {
             if (q?.question) lines.push(q.question)
             ;
             (q?.options || []).forEach((o, i) => lines.push(`${i + 1}. ${o.label}`))
-            pendingConfirm.set(uid, {
+            const added = pendingConfirm.add(uid, {
                 sessionId: info.sessionId,
                 requestId: info.requestId,
                 type: 'choice',
                 questions: info.questions
             })
-            sendMsg(uid, `请选择(桌面)\n${lines.join('\n')}\n\n回复选项编号`)
+            if (added) sendReliableText(uid, `请选择(桌面)\n${lines.join('\n')}\n\n回复选项编号`)
         } else {
-            pendingConfirm.set(uid, {sessionId: info.sessionId, requestId: info.requestId, type: 'permission'})
-            sendMsg(uid, `需要授权(桌面)\n工具: ${info.toolName}\n\n回复 y/确认 允许，n/拒绝 拒绝`)
+            if (pendingConfirm.add(uid, {sessionId: info.sessionId, requestId: info.requestId, type: 'permission'})) {
+                sendReliableText(uid, `需要授权(桌面)\n工具: ${info.toolName}\n\n回复 y/确认 允许，n/拒绝 拒绝`)
+            }
         }
     }
 
     // ── onConfirmResolved ── 确认已被其它通道处理
     function onConfirmResolved(sessionId, requestId) {
-        for (const [uid, pc] of pendingConfirm) {
-            if (pc.sessionId === sessionId && pc.requestId === requestId) {
-                pendingConfirm.delete(uid);
-                break
-            }
-        }
+        pendingConfirm.removeByRequest(sessionId, requestId)
     }
 
     // ── sendToUser ── Mirror 发送到绑定用户(支持长文本分段)
-    async function sendToUser(sid, text) {
-        const uid = findUserForSession(sid)
+    async function sendToUser(sid, text, targetUserId = null) {
+        const uid = targetUserId || findUserForSession(sid)
         if (!uid || !text) return
-        const MAX = 4000  // 钉钉单条消息最大字节数(UTF-8)
-        if (Buffer.byteLength(text, 'utf8') <= MAX) {
-            await sendMsg(uid, text);
-            return
-        }
-        // ── 长文本分段 ──
-        const parts = [];
-        let remain = text
-        while (Buffer.byteLength(remain, 'utf8') > MAX) {
-            let cut = MAX - 16
-            while (cut > 0 && Buffer.byteLength(remain.slice(0, cut), 'utf8') > MAX - 16) cut--
-            parts.push(remain.slice(0, cut));
-            remain = remain.slice(cut)
-        }
-        if (remain) parts.push(remain)
-        for (let i = 0; i < parts.length; i++) await sendMsg(uid, `【${i + 1}/${parts.length}】${parts[i]}`)
+        if (!pairedUsers.has(uid)) return false
+        return sendReliableText(uid, text)
     }
 
     // ── shouldSkipReply ──
     // 功能说明: 检查 session 的 mirror 开关是否已开启(钉钉通道)
-    async function shouldSkipReply(sid) {
+    async function shouldSkipReply(sid, userId) {
         try {
-            const r = await fetch(`http://127.0.0.1:3456/api/sessions/${sid}/mirror`, {signal: AbortSignal.timeout(3000)})
+            const r = await gatewayFetch(`${GW()}/api/sessions/${sid}/mirror`, token, {signal: AbortSignal.timeout(3000)}, {source: 'dingtalk', userId})
             if (r.ok) {
                 const d = await r.json();
                 return !!d.mirrors?.dingtalk
             }
-        } catch {
+        } catch (error) {
+            log.debug({err: error, sessionId: sid?.slice(0, 8)}, '查询钉钉镜像状态失败，按未开启处理')
         }
         return false
     }
@@ -528,8 +649,12 @@ export function startDingTalkAdapter(token) {
         //   message.headers: { messageId, topic, ... }
         //   message.body: 原始消息数据 (根据 topic 不同而不同)
         try {
+            if (stopped) {
+                dwClient.socketCallBackResponse(message.headers.messageId, {status: 'SUCCESS'})
+                return
+            }
             const body = message.body || {}
-            log.debug({raw: JSON.stringify(message).slice(0, 300)}, '收到回调')
+            log.debug({topic: message.headers?.topic || TOPIC_ROBOT, messageId: String(message.headers?.messageId || '').slice(0, 32)}, '收到回调')
 
             // 机器人消息体可能格式:
             //   { text: { content: "..." }, senderId: "..." }  ← 钉钉标准格式
@@ -542,16 +667,20 @@ export function startDingTalkAdapter(token) {
               dwClient.socketCallBackResponse(message.headers.messageId, {status: 'SUCCESS'})
               return
             }
-            log.info({userId: uid?.slice(0, 8), text: text.slice(0, 50)}, '← 消息')
-            await handleMessage(uid, text)
+            log.info({userId: uid?.slice(0, 8), textLength: text.length}, '← 消息')
+            const eventId = message.headers?.messageId || body.msgId || body.messageId || ''
+            // handleMessage 在第一次 await 前同步完成去重与 inbox claim，确保 SUCCESS 前已记录事件。
+            const handling = handleMessage(uid, text, eventId)
+            dwClient.socketCallBackResponse(message.headers.messageId, {status: 'SUCCESS'})
+            handling?.catch(e => log.error({err: e, eventId: String(eventId).slice(0, 32)}, 'handleMessage failed'))
 
             // 回调必须响应，否则 SDK 可能重试
-            dwClient.socketCallBackResponse(message.headers.messageId, {status: 'SUCCESS'})
         } catch (e) {
             log.error({err: e}, '回调处理异常')
             try {
                 dwClient.socketCallBackResponse(message.headers.messageId, {status: 'FAIL'})
-            } catch {
+            } catch (responseError) {
+                log.warn({err: responseError, messageId: String(message.headers?.messageId || '').slice(0, 32)}, '钉钉失败回执发送失败')
             }
         }
     })
@@ -580,12 +709,68 @@ export function startDingTalkAdapter(token) {
     }
 
     // ── 连接 Stream → 启动成功 ──
+    queueMicrotask(() => {
+        for (const entry of inbox.recoverable()) {
+            inbox.fail(entry.messageId, 'restart_recovery')
+            messageDeduper.forget(entry.messageId)
+            Promise.resolve().then(() => handleMessage(entry.payload.uid, entry.payload.text, entry.messageId))
+                .catch(e => log.error({err: e, messageId: entry.messageId.slice(0, 32)}, '恢复 inbox 失败'))
+        }
+    })
+
     dwClient.connect().then(() => {
+        connectionError = null
         log.info('Stream 客户端已启动，等待消息')
     }).catch(e => {
+        connectionError = String(e?.message || e || 'connect_failed')
         log.error({err: e}, '启动异常')
     })
 
+    function stop() {
+        if (stopped) return
+        stopped = true
+        try { dwClient.disconnect() } catch (error) {
+            log.warn({err: error}, '关闭钉钉 Stream 客户端失败')
+        }
+        for (const ws of [...activeSockets]) {
+            try { ws.close(4002, 'adapter stopped') } catch (error) {
+                log.debug({err: error}, '钉钉 WebSocket 已关闭，无需重复停止')
+            }
+        }
+        activeSockets.clear()
+        sessionQueue.cancelAll()
+        pendingConfirm.clear()
+        clearInterval(_confirmCleanup)
+        clearInterval(tokenRefreshTimer)
+        notificationWorker.stop()
+        accessToken = null
+        accessTokenPromise = null
+        log.info('适配器已停止')
+    }
+
+    function connectionStatus() {
+        if (stopped) return {state: 'stopped'}
+        if (dwClient.connected) return {state: 'connected'}
+        if (dwClient.reconnecting) return {state: 'reconnecting'}
+        if (connectionError) return {state: 'error', lastError: connectionError}
+        return {state: 'connecting'}
+    }
+
+    function retryNotifications() {
+        const reset = outbox.retryFailed()
+        notificationWorker.flush().catch(error => log.warn({err: error}, '手动重试通知失败'))
+        return {reset, ...outbox.summary()}
+    }
+
+    function discardNotifications() {
+        const deleted = outbox.discard({states: ['dead']})
+        return {deleted, ...outbox.summary()}
+    }
+
     // 返回镜像钩子对象供 Gateway 注册
-    return {onConfirmRequest, onConfirmResolved, findUserForSession, sendToUser}
+    return {
+        onConfirmRequest, onConfirmResolved, findUserForSession, sendToUser,
+        notificationStatus: notificationWorker.summary, pairingCode: () => pairCode,
+        retryNotifications, discardNotifications, connectionStatus, stop,
+    }
 }

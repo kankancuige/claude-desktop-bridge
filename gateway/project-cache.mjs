@@ -19,6 +19,7 @@ import {createRequire} from 'node:module'
 import {readdirSync, statSync, readFileSync, writeFileSync, mkdirSync, existsSync} from 'node:fs'
 import {join, dirname, relative, extname, basename} from 'node:path'
 import {homedir} from 'node:os'
+import {safeBasename, safeChildPath} from './path-security.mjs'
 
 const require = createRequire(import.meta.url)
 
@@ -35,6 +36,25 @@ const BINARY_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '
 
 // tree-sitter 可用性（惰性检测，只检测一次）
 let _tsAvailable = null
+const _parserWarnings = new Map()
+
+function recordParserWarning(lang, error) {
+    if (_parserWarnings.has(lang)) return
+    _parserWarnings.set(lang, String(error?.message || error || 'parser unavailable').replace(/[\r\n\t]+/g, ' ').slice(0, 240))
+}
+
+function parserWarningApplies(language, filePath) {
+    const ext = extname(filePath).toLowerCase()
+    if (language === 'javascript/typescript') return ['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.vue'].includes(ext)
+    return LANG_CONFIG[ext]?.lang === language
+}
+
+function warningsForFiles(filePaths) {
+    const paths = Array.isArray(filePaths) ? filePaths : []
+    return [..._parserWarnings.entries()]
+        .filter(([language]) => paths.some((filePath) => parserWarningApplies(language, filePath)))
+        .map(([language, error]) => ({language, error}))
+}
 
 // ── 多语言扩展名 → 语言配置映射 ──
 const LANG_CONFIG = {
@@ -175,6 +195,7 @@ async function ensureTreeSitter() {
         return parser
     } catch (e) {
         _tsAvailable = false
+        recordParserWarning('javascript/typescript', e)
         return null
     }
 }
@@ -481,6 +502,7 @@ async function ensureParserForLang(langConfig) {
         return _parserRegistry.get(lang)
     } catch (e) {
         _parserRegistry.set(lang, false)
+        recordParserWarning(lang, e)
         return null
     }
 }
@@ -1056,8 +1078,7 @@ function detectStack(workDir) {
             else if (existsSync(join(workDir, 'yarn.lock'))) result.packageManager = 'yarn'
             else if (existsSync(join(workDir, 'bun.lockb'))) result.packageManager = 'bun'
             else result.packageManager = 'npm'
-        } catch {
-        }
+        } catch (error) { console.debug('非关键缓存操作失败，已按降级路径继续', error) }
     }
 
     // TypeScript
@@ -1107,8 +1128,7 @@ function detectStack(workDir) {
                 }
             }
         }
-    } catch {
-    }
+    } catch (error) { console.debug('非关键缓存操作失败，已按降级路径继续', error) }
 
     return result
 }
@@ -1273,8 +1293,7 @@ function scanSourceFiles(workDir) {
                 let size = 0
                 try {
                     size = statSync(full).size
-                } catch {
-                }
+                } catch (error) { console.debug('非关键缓存操作失败，已按降级路径继续', error) }
                 if (size > MAX_SNAP_FILE_BYTES) {
                     tooLargeCount++
                     continue
@@ -1294,14 +1313,16 @@ function scanSourceFiles(workDir) {
 // ── cacheFilePath ── 缓存文件路径
 // 功能说明: 返回项目对应的缓存文件绝对路径
 export function cacheFilePath(workDir) {
-    return join(CLAUDE_HOME, 'projects', encodeProjectName(workDir), 'bridge-structure-cache.json')
+    const projectsDir = join(CLAUDE_HOME, 'projects')
+    const projectDir = safeBasename(projectsDir, encodeProjectName(workDir))
+    return projectDir ? safeChildPath(projectDir, 'bridge-structure-cache.json', {allowNested: false, extensions: ['.json']}) : null
 }
 
 // ── loadProjectCache ── 从磁盘加载缓存
 // 功能说明: 读取 JSON 缓存文件，校验最小结构完整性，损坏则返回 null
 export function loadProjectCache(workDir) {
     const p = cacheFilePath(workDir)
-    if (!existsSync(p)) return null
+    if (!p || !existsSync(p)) return null
     try {
         const data = readJSON(p)
         if (!data || typeof data.workDir !== 'string' || !data.fileCache) return null
@@ -1315,7 +1336,8 @@ export function loadProjectCache(workDir) {
 // 功能说明: 写入 JSON 缓存文件，自动创建父目录
 export function saveProjectCache(workDir, cache) {
     if (!cache) return
-    writeJSON(cacheFilePath(workDir), cache)
+    const p = cacheFilePath(workDir)
+    if (p) writeJSON(p, cache)
 }
 
 // ── buildProjectCache ── 全量构建缓存
@@ -1358,6 +1380,7 @@ export async function buildProjectCache(workDir) {
         truncated: scan.truncated,
         tooLargeCount: scan.tooLargeCount || 0,
         unfinishedDirs: scan.unfinishedDirs || [],
+        parserWarnings: warningsForFiles(scan.files.map((file) => file.path)),
         stack,
         fileTree,
         symbols,
@@ -1465,6 +1488,7 @@ export async function updateProjectCache(workDir, cache, diffMap) {
         cache.summary = buildCacheInjectionText(cache)
     }
 
+    cache.parserWarnings = warningsForFiles(Object.keys(cache.fileCache || {}))
     cache.scannedAt = Date.now()
     return {updated, skipped}
 }
@@ -1584,6 +1608,10 @@ export function buildCacheInjectionText(cache) {
     }
     if (cache.tooLargeCount > 0) {
         warnings.push(`- ${cache.tooLargeCount} 个文件因超过 ${MAX_SNAP_FILE_BYTES / 1024}KB 被跳过`)
+    }
+    if (cache.parserWarnings?.length) {
+        const languages = cache.parserWarnings.map(item => item.language).join(', ')
+        warnings.push(`- tree-sitter 解析器不可用: ${languages}；这些语言已降级为正则解析，依赖关系可能不完整`)
     }
     if (warnings.length) {
         parts.push(`\n## 扫描警告`)

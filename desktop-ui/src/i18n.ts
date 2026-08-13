@@ -54,8 +54,8 @@ export const locale = ref<Locale>(saved === 'english' ? 'english' : 'chinese')
  */
 export function setLocale(l: string | undefined | null) {
   locale.value = l === 'english' ? 'english' : 'chinese'
-  try { localStorage.setItem('bridge-locale', locale.value) } catch {}
-  try { document.documentElement.lang = locale.value === 'english' ? 'en' : 'zh-CN' } catch {}
+  try { localStorage.setItem('bridge-locale', locale.value) } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
+  try { document.documentElement.lang = locale.value === 'english' ? 'en' : 'zh-CN' } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
 }
 
 /**
@@ -187,7 +187,7 @@ const messages: Record<Locale, Record<string, string>> = {
     'gen.customModelId': '自定义模型 ID',
     'gen.customModelHint': '此供应商无预设模型，请在上方自定义模型 ID 框中输入',
     'gen.other': '其他设置',
-    'gen.maxContext': '最大上下文 (tokens)',
+    'gen.maxContext': '上下文安全上限 (留空跟随模型)',
     'gen.costLimit': '费用提醒阈值 (占余额 %)',
     'gen.costLimitHint': '本会话累计费用达余额此百分比时提醒一次，0 = 关闭',
     'gen.maxTurns': '单次最大轮数 (maxTurns)',
@@ -366,6 +366,7 @@ const messages: Record<Locale, Record<string, string>> = {
     'ws.notFound': '未找到项目',
     'ws.ensureGateway': '请确保 Gateway 已启动',
     'ws.newSession': '新建会话',
+    'ws.forkSession': '从此会话分支',
     'ws.sessionsCount': '{n} 会话',
     'ws.activeConn': '活跃连接',
     'ws.showAllSessions': '显示全部 session ({n})',
@@ -419,6 +420,8 @@ const messages: Record<Locale, Record<string, string>> = {
     'ws.chose': '已选择: {label}',
     'ws.injected': '已注入补充指令',
     'ws.notConnected': '未连接会话',
+    'ws.attachmentUploadFailed': '附件上传失败，消息未发送，请检查附件后重试',
+    'ws.attachmentSending': '发送中', 'ws.attachmentSent': '已发送', 'ws.attachmentFailed': '发送失败',
     'ws.thinkingWait': '正在思考中，请稍后再执行 /compact',
     'ws.mirrorOnToast': '已开启，回复将同步到对应平台', 'ws.mirrorOffToast': '已关闭同步',
     'ws.gatewayDown': 'Gateway 未启动或已崩溃。日志: exe同目录 gateway.log',
@@ -492,7 +495,7 @@ const messages: Record<Locale, Record<string, string>> = {
     // 上下文圆环（Context Ring）—— 上下文用量可视化、token 统计、费用追踪
     // ────────────────────────────────────────────────────────────────────────
     'ws.ctxRingTitle': '点击执行 /compact 压缩上下文',
-    'ws.ctxHint': '上下文已用 {pct}%，建议压缩(/compact)或新开会话',
+    'ws.ctxHint': '上下文已用 {pct}%，达到 90% 时会自动压缩',
     'ws.ttUsed': '已用', 'ws.ttPct': '占比', 'ws.ttInput': '输入', 'ws.ttThink': '思考',
     'ws.ttOutput': '输出', 'ws.ttCostTurn': '本句费用', 'ws.ttCostTotal': '累计费用', 'ws.ttRemaining': '剩余余额',
 
@@ -557,6 +560,13 @@ const messages: Record<Locale, Record<string, string>> = {
 
     'sys.model': '模型: {model} · {cwd}',
     'sys.done': '完成 · {turns} 轮 · {ms}ms · ↓{in} ~{think} ↑{out}',
+    'sys.incompleteMaxTurns': '任务尚未完成：已达到单次最大轮数（{turns} 轮）。已有修改和会话上下文已保留，可继续执行。',
+    'sys.maxBudget': '任务尚未完成：已达到本次预算限制。{detail}',
+    'sys.executionFailed': '任务执行中断：{detail}。已有修改和会话上下文已保留。',
+    'sys.taskInterruptedAfterRestart': 'Gateway 重启前任务未结束，已保留会话，可继续执行。',
+    'sys.noErrorDetail': '服务未返回更多错误信息',
+    'sys.taskIncompleteShort': '任务尚未完成',
+    'ws.continueTask': '继续执行',
     'sys.reverted': '已撤销到记录点「{prompt}」· 回退 {n} 个文件',
     'sys.revertedSkip': ' · {n} 个不可回退已跳过',
     'sys.committed': '已提交修改 · 新基线含 {n} 个文件，记录点已清空',
@@ -661,7 +671,7 @@ const messages: Record<Locale, Record<string, string>> = {
     'gen.customModelId': 'Custom Model ID',
     'gen.customModelHint': 'No preset models. Enter your model ID in the field above.',
     'gen.other': 'Other Settings',
-    'gen.maxContext': 'Max Context (tokens)',
+    'gen.maxContext': 'Context safety cap (blank = model limit)',
     'gen.costLimit': 'Cost Alert Threshold (% of balance)',
     'gen.costLimitHint': 'Alert once when session cost reaches this % of balance. 0 = off',
     'gen.maxTurns': 'Max Turns per Request',
@@ -818,6 +828,7 @@ const messages: Record<Locale, Record<string, string>> = {
     'ws.notFound': 'No projects found',
     'ws.ensureGateway': 'Make sure the Gateway is running',
     'ws.newSession': 'New session',
+    'ws.forkSession': 'Fork from this session',
     'ws.sessionsCount': '{n} sessions',
     'ws.activeConn': 'Active connection',
     'ws.showAllSessions': 'Show all sessions ({n})',
@@ -861,6 +872,8 @@ const messages: Record<Locale, Record<string, string>> = {
     'ws.chose': 'Chose: {label}',
     'ws.injected': 'Supplement injected',
     'ws.notConnected': 'No active session',
+    'ws.attachmentUploadFailed': 'Attachment upload failed; message was not sent',
+    'ws.attachmentSending': 'Sending', 'ws.attachmentSent': 'Sent', 'ws.attachmentFailed': 'Failed',
     'ws.thinkingWait': 'Busy thinking, run /compact later',
     'ws.mirrorOnToast': 'On: replies will sync to bound platforms', 'ws.mirrorOffToast': 'Mirror off',
     'ws.gatewayDown': 'Gateway not running or crashed. Log: gateway.log next to exe',
@@ -924,7 +937,7 @@ const messages: Record<Locale, Record<string, string>> = {
 
     // ── Context ring ──
     'ws.ctxRingTitle': 'Click to run /compact (compress context)',
-    'ws.ctxHint': 'Context at {pct}%, consider compacting (/compact) or starting a new session',
+    'ws.ctxHint': 'Context at {pct}%; it will auto-compact at 90%',
     'ws.ttUsed': 'Used', 'ws.ttPct': 'Ratio', 'ws.ttInput': 'Input', 'ws.ttThink': 'Thinking',
     'ws.ttOutput': 'Output', 'ws.ttCostTurn': 'Turn cost', 'ws.ttCostTotal': 'Total cost', 'ws.ttRemaining': 'Balance',
 
@@ -977,6 +990,13 @@ const messages: Record<Locale, Record<string, string>> = {
 
     'sys.model': 'Model: {model} · {cwd}',
     'sys.done': 'Done · {turns} turns · {ms}ms · ↓{in} ~{think} ↑{out}',
+    'sys.incompleteMaxTurns': 'Task incomplete: the per-run turn limit was reached ({turns} turns). Changes and context were preserved.',
+    'sys.maxBudget': 'Task incomplete: this run reached its budget limit. {detail}',
+    'sys.executionFailed': 'Task interrupted: {detail}. Changes and session context were preserved.',
+    'sys.taskInterruptedAfterRestart': 'The task was interrupted before Gateway restart; the session was preserved and can continue.',
+    'sys.noErrorDetail': 'No additional error detail was returned',
+    'sys.taskIncompleteShort': 'Task incomplete',
+    'ws.continueTask': 'Continue',
     'sys.reverted': 'Reverted to checkpoint "{prompt}" · {n} files restored',
     'sys.revertedSkip': ' · {n} not revertible skipped',
     'sys.committed': 'Committed · new baseline has {n} files, checkpoints cleared',

@@ -31,7 +31,7 @@ const LEVEL_MAP = {trace: 10, debug: 20, info: 30, warn: 40, error: 50, fatal: 6
 
 // ── 多流: 控制台（美化）+ 文件（JSON，按天+按大小分包）──
 // pino-roll v4 通过 pino.transport() worker 加载，避免 async 初始化问题
-function buildStreams(name) {
+function buildStreams() {
     const streams = []
 
     // 控制台流 — 按 LOG_LEVEL 过滤，pino-pretty 美化
@@ -53,11 +53,11 @@ function buildStreams(name) {
         streams.push({level: LOG_LEVEL, stream: process.stdout})
     }
 
-    // 全量文件 — pino-roll v4 按天+按大小分包，JSON 格式
+    // 文件日志与全局 LOG_LEVEL 保持一致；生产默认不落盘 Debug，避免协议细节被长期保存。
     // 输出: all.2026-06-26.1.log, all.2026-06-26.2.log ...
     try {
         streams.push({
-            level: 'debug',
+            level: LOG_LEVEL,
             stream: pino.transport({
                 target: 'pino-roll',
                 options: {
@@ -100,6 +100,12 @@ function buildStreams(name) {
 
 // ── Logger 缓存: 同 name 复用 logger 实例 ──
 const _cache = new Map()
+let _sharedStream = null
+
+function getSharedStream() {
+    if (!_sharedStream) _sharedStream = pino.multistream(buildStreams())
+    return _sharedStream
+}
 
 /**
  * 创建或复用指定模块的 logger。
@@ -116,6 +122,19 @@ export function createLogger(name, bindings = {}) {
     const logger = pino({
         name,
         level: LOG_LEVEL,
+        redact: {
+            paths: [
+                'token', 'accessToken', 'refreshToken', 'access_token', 'refresh_token',
+                'apiKey', 'api_key', 'appSecret', 'clientSecret', 'secret', 'password',
+                '*.token', '*.accessToken', '*.refreshToken', '*.access_token', '*.refresh_token',
+                '*.apiKey', '*.api_key', '*.appSecret', '*.clientSecret', '*.secret', '*.password',
+                'headers.authorization', 'headers.cookie', 'headers.set-cookie',
+                'req.headers.authorization', 'req.headers.cookie', 'req.headers.x-bridge-token',
+                'request.headers.authorization', 'request.headers.cookie', 'request.headers.x-bridge-token',
+                'config.headers.authorization', 'config.headers.cookie', 'config.apiKey',
+            ],
+            censor: '[REDACTED]',
+        },
         serializers: {
             err: pino.stdSerializers.err, // 完整堆栈序列化
             error: pino.stdSerializers.err,
@@ -133,7 +152,7 @@ export function createLogger(name, bindings = {}) {
         mixin() {
             return {}
         },
-    }, pino.multistream(buildStreams(name)))
+    }, getSharedStream())
 
     _cache.set(name, logger)
     return logger.child(bindings)
@@ -159,14 +178,21 @@ export function sessionLogger(name, sessionId) {
  */
 export function logHttpRequest(log, req, statusCode, startTime) {
     const dur = Date.now() - startTime
-    const url = new URL(req.url, `http://${req.headers.host || '127.0.0.1'}`)
+    let pathname = '/invalid-url'
+    let urlError = ''
+    try {
+        pathname = new URL(req.url, `http://${req.headers.host || '127.0.0.1'}`).pathname
+    } catch (error) {
+        urlError = String(error?.message || error).slice(0, 160)
+    }
     log.info({
         method: req.method,
-        path: url.pathname,
+        path: pathname,
         status: statusCode,
         duration_ms: dur,
         remote_ip: req.socket?.remoteAddress,
-    }, `${req.method} ${url.pathname} ${statusCode} ${dur}ms`)
+        ...(urlError ? {url_error: urlError} : {}),
+    }, `${req.method} ${pathname} ${statusCode} ${dur}ms`)
 }
 
 export {LEVEL_MAP}

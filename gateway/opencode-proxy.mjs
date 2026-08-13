@@ -18,12 +18,62 @@ let _startPromise = null
 
 const UPSTREAM = 'https://opencode.ai/zen/go/v1/chat/completions'
 const OC_PORT = parseInt(process.env.BRIDGE_OC_PORT, 10) || 8788
+const MAX_PROXY_REQUEST_BYTES = 10 * 1024 * 1024
+const MAX_PROXY_RESPONSE_BYTES = 20 * 1024 * 1024
+
+export async function readLimitedNodeStream(stream, limit = MAX_PROXY_REQUEST_BYTES) {
+    const chunks = []
+    let total = 0
+    const iterable = typeof stream.iterator === 'function'
+        ? stream.iterator({destroyOnReturn: false})
+        : stream
+    for await (const chunk of iterable) {
+        total += chunk.length
+        if (total > limit) {
+            const error = Object.assign(new Error('proxy payload too large'), {statusCode: 413})
+            // 保留 HTTP 请求连接，让上层仍能返回规范的 413；剩余数据仅排空不再入内存。
+            stream.resume?.()
+            throw error
+        }
+        chunks.push(chunk)
+    }
+    return Buffer.concat(chunks)
+}
+
+async function readLimitedResponseText(response, limit = MAX_PROXY_RESPONSE_BYTES) {
+    const declared = Number(response.headers.get('content-length') || 0)
+    if (Number.isFinite(declared) && declared > limit) {
+        await response.body?.cancel().catch(error => log.debug({err: error}, '取消超限上游响应失败'))
+        throw Object.assign(new Error('proxy response too large'), {statusCode: 502})
+    }
+    if (!response.body) return ''
+    const reader = response.body.getReader()
+    const chunks = []
+    let total = 0
+    try {
+        while (true) {
+            const {done, value} = await reader.read()
+            if (done) break
+            total += value.byteLength
+            if (total > limit) throw Object.assign(new Error('proxy response too large'), {statusCode: 502})
+            chunks.push(Buffer.from(value))
+        }
+    } catch (error) {
+        await reader.cancel(error).catch(cancelError => log.debug({err: cancelError}, '取消上游响应读取失败'))
+        throw error
+    }
+    return Buffer.concat(chunks).toString('utf8')
+}
 
 export function startOpenCodeProxy() {
     if (_startPromise) return _startPromise
     _startPromise = new Promise((resolve, reject) => {
         if (proxyServer) { resolve({server: proxyServer, port: proxyPort}); return }
         proxyServer = createServer(handleRequest)
+        proxyServer.headersTimeout = 10_000
+        proxyServer.requestTimeout = 30_000
+        proxyServer.keepAliveTimeout = 5_000
+        proxyServer.maxRequestsPerSocket = 1_000
         proxyServer.on('error', (e) => {
             if (e.code === 'EADDRINUSE') {
                 // 固定端口被占 → 直接报错，不静默回退（与 deepseek-proxy 一致策略）
@@ -44,7 +94,7 @@ export function isOpenCodeProxyRunning() { return proxyServer !== null && proxyS
 export function stopOpenCodeProxy() {
     // 重置 _startPromise：与 deepseek-proxy 一致，否则 stop→start 返回旧 resolved promise
     _startPromise = null
-    if (proxyServer) { try { proxyServer.closeAllConnections?.(); proxyServer.close() } catch {}; proxyServer = null; proxyPort = 0 }
+    if (proxyServer) { try { proxyServer.closeAllConnections?.(); proxyServer.close() } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }; proxyServer = null; proxyPort = 0 }
 }
 
 async function handleRequest(clientReq, clientRes) {
@@ -63,18 +113,28 @@ async function handleRequest(clientReq, clientRes) {
             return
         }
 
-        // 读取请求体（HEAD 请求无 body 跳过）
-        if (clientReq.method === 'HEAD') return
-        const chunks = []
-        for await (const c of clientReq) chunks.push(c)
-        if (chunks.length === 0) { clientRes.writeHead(400); clientRes.end('empty body'); return }
-        const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+        if (clientReq.method !== 'POST') {
+            clientRes.writeHead(405, {'Allow': 'GET, POST'})
+            clientRes.end('method not allowed')
+            return
+        }
+        const rawBody = await readLimitedNodeStream(clientReq)
+        if (rawBody.length === 0) { clientRes.writeHead(400); clientRes.end('empty body'); return }
+        const body = JSON.parse(rawBody.toString('utf8'))
+        if (!body || typeof body !== 'object' || Array.isArray(body)) {
+            clientRes.writeHead(400); clientRes.end('invalid body'); return
+        }
         log.info({model: body.model, msgs: body.messages?.length}, '→ opencode')
 
         const openai = translateBody(body)
 
         let apiKey = clientReq.headers['x-api-key'] || ''
         if (!apiKey) { const a = clientReq.headers['authorization'] || ''; apiKey = a.replace(/^Bearer\s+/i, '') }
+        if (typeof apiKey !== 'string' || !apiKey || apiKey.length > 8192 || /[\0\r\n]/.test(apiKey)) {
+            clientRes.writeHead(401, {'Content-Type':'application/json'})
+            clientRes.end(JSON.stringify({type:'error', error:{type:'authentication_error', message:'API key required'}}))
+            return
+        }
 
         const r = await fetch(UPSTREAM, {
             method: 'POST',
@@ -84,43 +144,51 @@ async function handleRequest(clientReq, clientRes) {
         })
 
         if (!r.ok) {
-            const errText = await r.text().catch(() => '')
-            log.warn({status: r.status, body: errText.slice(0, 300)}, 'upstream error')
+            const errText = await readLimitedResponseText(r).catch(() => '')
+            log.warn({status: r.status, responseLength: errText.length}, 'upstream error')
             clientRes.writeHead(r.status, {'Content-Type':'application/json'})
             clientRes.end(JSON.stringify({type:'error',error:{type:'api_error',message:`HTTP ${r.status}: ${errText.slice(0, 200)}`}}))
             return
         }
 
-        const respText = await r.text()
+        const respText = await readLimitedResponseText(r)
         let data
         try { data = JSON.parse(respText) } catch { data = null }
-        // 流式响应（SSE）落到此分支：JSON.parse 必失败 → data=null → 走错误分支快速返回，避免挂起
         if (!data || data.error) {
-            // 检测上游是否为 SSE 流式响应（translateBody 透传 stream:true 时可能发生）
-            const isSSE = respText.includes('data:') && (clientReq.headers['accept'] || '').includes('text/event-stream')
-            const msg = isSSE
-                ? 'OpenCode 代理暂不支持流式响应(SSE→Anthropic 翻译未实现),请用非流式模型或等待流式翻译补全'
-                : (data?.error?.message || `Bad response: ${respText.slice(0,200)}`)
-            log.warn({status: r.status, isSSE, body: respText.slice(0, 200)}, 'upstream 非 JSON 或错误')
+            const msg = data?.error?.message || `Bad response: ${respText.slice(0,200)}`
+            log.warn({status: r.status, responseLength: respText.length}, 'upstream 非 JSON 或错误')
             clientRes.writeHead(r.status||502, {'Content-Type':'application/json'})
             clientRes.end(JSON.stringify({type:'error',error:{type:'api_error',message:msg}}))
             return
         }
+        const translated = translateResponse(data, body.model)
+        if (body.stream === true) {
+            clientRes.writeHead(200, {
+                'Content-Type': 'text/event-stream; charset=utf-8',
+                'Cache-Control': 'no-cache, no-transform',
+                'Connection': 'keep-alive',
+            })
+            clientRes.end(toAnthropicSse(translated))
+            return
+        }
         clientRes.writeHead(200, {'Content-Type':'application/json'})
-        clientRes.end(JSON.stringify(translateResponse(data, body.model)))
+        clientRes.end(JSON.stringify(translated))
 
     } catch(e) {
         log.error({err: e}, 'proxy error')
-        if (!clientRes.headersSent) { clientRes.writeHead(500); clientRes.end(JSON.stringify({error:{message:e.message}})) }
+        if (!clientRes.headersSent) {
+            clientRes.writeHead(e.statusCode || (e instanceof SyntaxError ? 400 : 500), {'Content-Type':'application/json'})
+            clientRes.end(JSON.stringify({error:{message:e.statusCode === 413 ? 'payload too large' : e.message}}))
+        } else {
+            clientRes.destroy(e)
+        }
     }
 }
 
 // ── 翻译入口 ──
-function translateBody(body) {
-    // stream 跟随客户端请求；客户端发 stream:true 时该函数不强制改 false
-    // 注意：若 SDK 发 stream:true，上游返回 SSE，但下方 handleRequest 仅支持非流式（await r.text() 一次性读取）
-    //   流式情况会卡到上游超时或返回完整响应。流式 Anthropic↔OpenAI 翻译待实现，实战前需补。
-    const o = { model: body.model, max_tokens: body.max_tokens || 32000, stream: body.stream === true }
+export function translateBody(body) {
+    // 上游固定请求完整 JSON；客户端要求流式时由本代理转换为有限 Anthropic SSE 事件序列。
+    const o = { model: body.model, max_tokens: body.max_tokens || 32000, stream: false }
     const msgs = []
     if (body.system) {
         const s = Array.isArray(body.system) ? body.system.filter(b=>b.type==='text').map(b=>b.text).join('') : String(body.system)
@@ -166,7 +234,7 @@ function transAssistant(m) {
     if (tcs.length) r.tool_calls = tcs
     return r
 }
-function translateResponse(data, model) {
+export function translateResponse(data, model) {
     const c = data.choices?.[0]
     if (!c) return {id:data.id||'m0',type:'message',role:'assistant',model,content:[{type:'text',text:''}],stop_reason:'end_turn',usage:u(data.usage)}
     const content = []
@@ -181,5 +249,57 @@ function translateResponse(data, model) {
     if (c.finish_reason==='tool_calls') sr='tool_use'
     else if (c.finish_reason==='length') sr='max_tokens'
     return {id:data.id||'m'+Date.now(),type:'message',role:'assistant',model,content,stop_reason:sr,usage:u(data.usage)}
+}
+
+function sseEvent(type, data) {
+    return `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`
+}
+
+/** 将完整 Anthropic Message 转为顺序完整的 SSE 事件，不拆分 UTF-8 字符。 */
+export function toAnthropicSse(message) {
+    const usage = message.usage || {input_tokens: 0, output_tokens: 0}
+    let output = sseEvent('message_start', {
+        type: 'message_start',
+        message: {
+            id: message.id,
+            type: 'message',
+            role: 'assistant',
+            model: message.model,
+            content: [],
+            stop_reason: null,
+            stop_sequence: null,
+            usage: {input_tokens: usage.input_tokens || 0, output_tokens: 0},
+        },
+    })
+    for (let index = 0; index < (message.content || []).length; index++) {
+        const block = message.content[index]
+        if (block.type === 'tool_use') {
+            output += sseEvent('content_block_start', {
+                type: 'content_block_start', index,
+                content_block: {type: 'tool_use', id: block.id, name: block.name, input: {}},
+            })
+            output += sseEvent('content_block_delta', {
+                type: 'content_block_delta', index,
+                delta: {type: 'input_json_delta', partial_json: JSON.stringify(block.input || {})},
+            })
+        } else {
+            output += sseEvent('content_block_start', {
+                type: 'content_block_start', index,
+                content_block: {type: 'text', text: ''},
+            })
+            output += sseEvent('content_block_delta', {
+                type: 'content_block_delta', index,
+                delta: {type: 'text_delta', text: String(block.text || '')},
+            })
+        }
+        output += sseEvent('content_block_stop', {type: 'content_block_stop', index})
+    }
+    output += sseEvent('message_delta', {
+        type: 'message_delta',
+        delta: {stop_reason: message.stop_reason || 'end_turn', stop_sequence: null},
+        usage: {output_tokens: usage.output_tokens || 0},
+    })
+    output += sseEvent('message_stop', {type: 'message_stop'})
+    return output
 }
 function u(usage) { return usage ? {input_tokens:usage.prompt_tokens||0,output_tokens:usage.completion_tokens||0} : {input_tokens:0,output_tokens:0} }

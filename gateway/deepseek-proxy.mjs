@@ -10,16 +10,24 @@
  */
 
 // https://github.com/kankancuige/claude-desktop-bridge
-import {createServer as createHttpServer} from 'node:http'
+import {createServer as createHttpServer, request as httpRequest} from 'node:http'
 import {request as httpsRequest} from 'node:https'
 import {createHash} from 'node:crypto'
 import {createLogger} from './logger.mjs'
+import {resolveProviderUrl} from './provider-url-security.mjs'
 
 const log = createLogger('proxy')
 
 let proxyPort = 0
 let proxyServer = null
 let _startPromise = null
+let proxyTarget = null
+const MAX_PROXY_REQUEST_BYTES = 10 * 1024 * 1024
+const MAX_PROXY_RESPONSE_BYTES = 10 * 1024 * 1024
+const HOP_BY_HOP_HEADERS = new Set([
+    'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+    'te', 'trailer', 'transfer-encoding', 'upgrade',
+])
 
 // ── thinking 块缓存 (fingerprint → [{index, thinking, signature}]) ──
 const thinkingCache = new Map()
@@ -76,16 +84,25 @@ function getSessionFingerprint(body) {
  * @returns {Promise<{server, port}>}
  */
 export function startDeepSeekProxy(upstream) {
-    if (_startPromise) return _startPromise
-    _startPromise = new Promise((resolve, reject) => {
-        if (proxyServer) {
-            resolve({server: proxyServer, port: proxyPort})
-            return
+    let requestedHref
+    try {
+        requestedHref = new URL(upstream).href
+    } catch {
+        return Promise.reject(new Error('invalid DeepSeek upstream URL'))
+    }
+    if (_startPromise && (!proxyTarget || proxyTarget.parsed.href === requestedHref)) return _startPromise
+    // 已运行但目标变化时创建新的启动 Promise；旧目标会在新目标校验成功后关闭。
+    _startPromise = null
+    _startPromise = (async () => {
+        const target = await resolveProviderUrl(upstream)
+        if (proxyServer && proxyTarget?.parsed.href === target.parsed.href) {
+            return {server: proxyServer, port: proxyPort}
         }
+        if (proxyServer) await closeProxyServer()
 
-        const upstreamUrl = new URL(upstream)
+        return await new Promise((resolve, reject) => {
         proxyServer = createHttpServer((req, res) => {
-            handleProxyRequest(req, res, upstreamUrl)
+            void handleProxyRequest(req, res, target)
         })
 
         // 固定端口 8787，供 Claude Desktop settings.json 配置引用；可通过 BRIDGE_DS_PORT 覆盖
@@ -95,20 +112,27 @@ export function startDeepSeekProxy(upstream) {
                 // 固定端口被占 → 直接报错，不静默回退随机端口
                 // 回退随机端口会让 settings.json 里写死的 8787 静态引用失效（脱离 gateway 直跑 CLI 时连不上）
                 proxyServer = null
+                proxyTarget = null
                 _startPromise = null
                 reject(new Error('端口 8787 被占用，DeepSeek 代理无法启动。请关闭占用 8787 的进程后重启。'))
             } else {
                 log.error({err: e}, '代理服务异常')
                 proxyServer = null
+                proxyTarget = null
                 _startPromise = null
                 reject(e)
             }
         })
         proxyServer.listen(TRY_PORT, '127.0.0.1', () => {
             proxyPort = TRY_PORT
-            log.info({port: proxyPort, upstream}, '代理已启动')
+            proxyTarget = target
+            log.info({port: proxyPort, upstream: target.parsed.origin}, '代理已启动')
             resolve({server: proxyServer, port: proxyPort})
         })
+        })
+    })().catch((error) => {
+        _startPromise = null
+        throw error
     })
     return _startPromise
 }
@@ -125,55 +149,91 @@ export function isProxyRunning() {
     return proxyServer !== null && proxyServer.listening
 }
 
+export function isProxyConfiguredFor(upstream) {
+    if (!proxyTarget || typeof upstream !== 'string') return false
+    try {
+        return proxyTarget.parsed.href === new URL(upstream).href
+    } catch {
+        return false
+    }
+}
+
+function closeProxyServer() {
+    if (!proxyServer) return Promise.resolve()
+    const server = proxyServer
+    proxyServer = null
+    proxyTarget = null
+    proxyPort = 0
+    return new Promise((resolve) => {
+        try {
+            server.closeAllConnections?.()
+            server.close(() => resolve())
+        } catch (error) {
+            log.debug({err: error}, '关闭 DeepSeek 代理失败')
+            resolve()
+        }
+    })
+}
+
 /** 停止代理 (进程退出时调用)，同时清理缓存定时器 */
 export function stopDeepSeekProxy() {
     if (_cacheCleanupTimer) {
         clearInterval(_cacheCleanupTimer)
         _cacheCleanupTimer = null
     }
-    // 重置 _startPromise：否则 stop 后再 start 会返回旧的 resolved promise（指向已 close 的 server），代理无法重启
     _startPromise = null
-    if (proxyServer) {
-        try {
-            proxyServer.closeAllConnections?.()
-            proxyServer.close()
-            setTimeout(() => { proxyServer?.unref() }, 2000)
-        } catch {
-        }
-        proxyServer = null
-        proxyPort = 0
+    return closeProxyServer()
+}
+
+function copyEndToEndHeaders(headers) {
+    const out = {}
+    for (const [key, value] of Object.entries(headers || {})) {
+        if (!HOP_BY_HOP_HEADERS.has(key.toLowerCase()) && value !== undefined) out[key] = value
     }
+    return out
+}
+
+async function readLimitedBody(stream, limit) {
+    const chunks = []
+    let total = 0
+    for await (const chunk of stream) {
+        total += chunk.length
+        if (total > limit) {
+            const error = new Error('proxy request body too large')
+            error.statusCode = 413
+            throw error
+        }
+        chunks.push(chunk)
+    }
+    return Buffer.concat(chunks)
 }
 
 // ══════════════════════════════════════════════════════
 // ── 请求处理核心 ──
 // ══════════════════════════════════════════════════════
 
-async function handleProxyRequest(clientReq, clientRes, upstreamUrl) {
+async function handleProxyRequest(clientReq, clientRes, target) {
     try {
-        // ── 1. 读取完整请求体 ──
-        const chunks = []
-        for await (const chunk of clientReq) {
-            chunks.push(chunk)
+        const upstreamUrl = target.parsed
+        // 健康检查不读取请求体，避免无意义的大 body/slowloris 占用。
+        if (clientReq.url === '/health' && clientReq.method === 'GET') {
+            clientRes.writeHead(200, {'Content-Type': 'application/json'})
+            clientRes.end(JSON.stringify({
+                status: 'ok',
+                upstream: upstreamUrl.origin,
+                cacheSessions: thinkingCache.size,
+            }))
+            return
         }
-        const rawBody = Buffer.concat(chunks).toString('utf8')
+
+        // ── 1. 读取完整请求体 ──
+        const rawBody = (await readLimitedBody(clientReq, MAX_PROXY_REQUEST_BYTES)).toString('utf8')
 
         let body
         try {
             body = JSON.parse(rawBody)
         } catch {
             body = null
-        }
-
-        // ── 2. 健康检查端点 ──
-        if (clientReq.url === '/health' && clientReq.method === 'GET') {
-            clientRes.writeHead(200, {'Content-Type': 'application/json'})
-            clientRes.end(JSON.stringify({
-                status: 'ok',
-                upstream: upstreamUrl.href,
-                cacheSessions: thinkingCache.size,
-            }))
-            return
         }
 
         // ── 2b. GET /v1/models —— Claude Code 启动时校验模型名，DeepSeek 不实现此端点需伪造 ──
@@ -261,30 +321,55 @@ async function handleProxyRequest(clientReq, clientRes, upstreamUrl) {
         const modifiedBody = body ? JSON.stringify(body) : rawBody
 
         // ── 5. 构建上游请求 headers ──
-        const upstreamHeaders = {...clientReq.headers}
+        const upstreamHeaders = copyEndToEndHeaders(clientReq.headers)
         delete upstreamHeaders.host
         upstreamHeaders['content-length'] = Buffer.byteLength(modifiedBody)
+        upstreamHeaders['accept-encoding'] = 'identity'
 
         // 拼接上游 base path（如 /anthropic）+ 客户端请求路径
         const upstreamPath = (upstreamUrl.pathname || '').replace(/\/+$/, '') + clientReq.url
 
-        const proxyReq = httpsRequest({
+        const requestUpstream = upstreamUrl.protocol === 'http:' ? httpRequest : httpsRequest
+        const proxyReq = requestUpstream({
             hostname: upstreamUrl.hostname,
-            port: upstreamUrl.port || 443,
+            port: upstreamUrl.port || (upstreamUrl.protocol === 'http:' ? 80 : 443),
             path: upstreamPath,
             method: clientReq.method,
             headers: upstreamHeaders,
+            lookup: (_hostname, _options, callback) => callback(null, target.address, target.family),
         }, (upstreamRes) => {
             // ── 6. Bug B: 缓存响应中的 thinking 块 ──
             const responseChunks = []
-            upstreamRes.on('data', (chunk) => responseChunks.push(chunk))
+            let responseBytes = 0
+            let responseTooLarge = false
+            upstreamRes.on('data', (chunk) => {
+                if (responseTooLarge) return
+                responseBytes += chunk.length
+                if (responseBytes > MAX_PROXY_RESPONSE_BYTES) {
+                    responseTooLarge = true
+                    upstreamRes.destroy(new Error('proxy response body too large'))
+                    if (!clientRes.headersSent) {
+                        clientRes.writeHead(502, {'Content-Type': 'application/json'})
+                        clientRes.end(JSON.stringify({error: 'proxy_response_too_large'}))
+                    }
+                    return
+                }
+                responseChunks.push(chunk)
+            })
             upstreamRes.on('end', () => {
+                if (responseTooLarge) return
                 const responseBody = Buffer.concat(responseChunks).toString('utf8')
                 cacheResponseThinking(sessionFp, responseBody)
 
                 // 透传响应
-                clientRes.writeHead(upstreamRes.statusCode, upstreamRes.headers)
+                clientRes.writeHead(upstreamRes.statusCode, copyEndToEndHeaders(upstreamRes.headers))
                 clientRes.end(responseBody)
+            })
+            upstreamRes.on('error', (error) => {
+                if (responseTooLarge || clientRes.headersSent) return
+                log.error({err: error}, '读取上游响应失败')
+                clientRes.writeHead(502, {'Content-Type': 'application/json'})
+                clientRes.end(JSON.stringify({error: 'proxy_upstream_response_error'}))
             })
         })
 
@@ -305,8 +390,8 @@ async function handleProxyRequest(clientReq, clientRes, upstreamUrl) {
     } catch (e) {
         log.error({err: e}, '代理处理器异常')
         if (!clientRes.headersSent) {
-            clientRes.writeHead(500)
-            clientRes.end(JSON.stringify({error: 'proxy_internal_error', message: e.message}))
+            clientRes.writeHead(e.statusCode || 500, {'Content-Type': 'application/json'})
+            clientRes.end(JSON.stringify({error: e.statusCode === 413 ? 'proxy_request_too_large' : 'proxy_internal_error'}))
         }
     }
 }

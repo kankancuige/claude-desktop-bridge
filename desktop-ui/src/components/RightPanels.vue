@@ -202,14 +202,25 @@ function fmtTime(ts: number) {
               <span v-if="ag.status === 'done' && ag.doneTime && ag.spawnTime" class="ag-card-time">{{ fmtDur(ag.doneTime - ag.spawnTime) }}</span>
               <span v-else-if="ag.status === 'running' && ag.spawnTime" class="ag-card-time running">{{ fmtDur(Date.now() - ag.spawnTime) }}</span>
             </div>
-            <div v-if="ag.description" class="ag-card-desc" :title="ag.description">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0;margin-top:2px"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-              <span>{{ ag.description }}</span>
+            <div v-if="ag.purpose || ag.description || ag.task" class="ag-card-descriptor">
+              <div v-if="ag.purpose || ag.description" class="ag-card-desc" :title="ag.purpose || ag.description">
+                <span class="ag-card-desc-label">职责</span>
+                <span>{{ ag.purpose || ag.description }}</span>
+              </div>
+              <div v-if="ag.task" class="ag-card-desc" :title="ag.task">
+                <span class="ag-card-desc-label">本次任务</span>
+                <span>{{ ag.task }}</span>
+              </div>
+              <div v-if="ag.scope" class="ag-card-desc" :title="ag.scope">
+                <span class="ag-card-desc-label">范围</span>
+                <span>{{ ag.scope }}</span>
+              </div>
             </div>
             <div v-if="ag.status === 'running' || ag.status === 'done'" class="ag-card-progress">
               <div class="ag-card-bar"><div class="ag-card-bar-fill" :class="ag.status === 'done' ? 'done' : ''"></div></div>
               <div class="ag-card-tool-info">
                 <span v-if="ag.currentTool" class="ag-card-tool-name">{{ ag.currentTool }}</span>
+                <span v-else-if="ag.currentAction" class="ag-card-tool-name">{{ ag.currentAction }}</span>
                 <span v-if="ag.currentToolElapsed" class="ag-card-tool-time">{{ ag.currentToolElapsed }}s</span>
                 <span v-if="ag.status === 'running' && ag.spawnTime" class="ag-card-elapsed">总耗时 {{ fmtDur(Date.now() - ag.spawnTime) }}</span>
               </div>
@@ -435,6 +446,18 @@ function fmtTime(ts: number) {
 .ag-card-desc {
   display: flex; gap: 6px; font-size: 12px; color: var(--text-secondary);
   margin-bottom: 8px; line-height: 1.4;
+}
+.ag-card-descriptor {
+  margin-bottom: 8px;
+}
+.ag-card-descriptor .ag-card-desc {
+  align-items: flex-start;
+  margin-bottom: 4px;
+}
+.ag-card-desc-label {
+  flex: 0 0 52px;
+  color: var(--text-muted);
+  font-size: 11px;
 }
 .ag-card-progress {
   margin-bottom: 8px;

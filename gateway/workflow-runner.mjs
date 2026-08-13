@@ -1,15 +1,16 @@
 // workflow-runner.mjs — Claude Code 原生 Workflow 执行引擎
 // 基于 Claude Code v2.1.88 泄露源码 + cc-fleet 架构逆向实现
 // API: agent() / parallel() / pipeline() / phase() / log() / budget / args / meta
-// 特性: vm 沙箱 | Journal/Resume | Schema 验证+重试 | Worktree 隔离 | Budget 硬上限 | 节点暂停/恢复 | effort 参数
-import {createContext, runInContext} from 'node:vm'
+// 特性: 独立子进程 + 受限 node:vm context | Journal/Resume | Schema 验证+重试 | Worktree 隔离 | Budget 硬上限 | 节点暂停/恢复 | effort 参数
 import {createHash} from 'node:crypto'
 import {readdirSync, readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, rmSync, statSync, mkdtempSync} from 'node:fs'
-import {execSync, fork} from 'node:child_process'
+import {execFileSync, fork} from 'node:child_process'
 import {join, extname, dirname} from 'node:path'
-import {homedir, cpus, tmpdir} from 'node:os'
+import {homedir, tmpdir} from 'node:os'
 import {fileURLToPath} from 'node:url'
 import {createLogger} from './logger.mjs'
+import {safeBasename} from './path-security.mjs'
+import {sanitizeWorktreeSegment} from './worktree-path.mjs'
 
 const log = createLogger('workflow')
 
@@ -18,11 +19,10 @@ const CLAUDE_HOME = join(homedir(), '.claude')
 const WF_DIR = join(CLAUDE_HOME, 'workflows')
 const JOURNAL_DIR = join(CLAUDE_HOME, 'workflow-journals')
 const WORKTREE_ROOT = join(CLAUDE_HOME, 'worktrees')
-const CPU_COUNT = cpus().length
-const MAX_PARALLEL = Math.max(4, Math.min(16, CPU_COUNT - 2))  // min(16, cpu-2) 对齐原生
 const DEFAULT_MAX_TURNS = 15
 const SCRIPT_TIMEOUT_MS = 1_200_000    // 脚本总超时 20 分钟
 const AGENT_TIMEOUT_MS = 600_000       // 单 agent 超时 10 分钟
+const MAX_WORKFLOW_SCRIPT_BYTES = 1024 * 1024
 const HISTORY_FILE = join(CLAUDE_HOME, 'bridge-workflow-history.jsonl')
 const MAX_HISTORY_ENTRIES = 500
 
@@ -44,8 +44,7 @@ function parseAgentFrontmatter(content) {
             if (v.startsWith('[') && v.endsWith(']')) {
                 try {
                     v = JSON.parse(v)
-                } catch {
-                }
+                } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
             }
             fm[k] = v
         }
@@ -79,11 +78,9 @@ function buildAgentRegistry() {
                 }
                 if (!registry[fm.type]) registry[fm.type] = []
                 registry[fm.type].push(entry)
-            } catch {
-            }
+            } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
         }
-    } catch {
-    }
+    } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
     _agentRegistryCache = registry
     _agentRegistryCacheAt = Date.now()
     return registry
@@ -118,13 +115,11 @@ function detectProjectLanguage(workDir) {
                         if (ext) exts[ext] = (exts[ext] || 0) + 1
                     }
                 }
-            } catch {
-            }
+            } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
         }
 
         walk(workDir, 0)
-    } catch {
-    }
+    } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
     return exts
 }
 
@@ -617,8 +612,7 @@ function bootstrapBuiltinWorkflows() {
             try {
                 writeFileSync(fp, content, 'utf8');
                 log.info({name}, '内置模板已创建')
-            } catch {
-            }
+            } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
         }
     }
 }
@@ -659,9 +653,16 @@ function getRunState(nameOrWfId) {
 }
 
 function presetRunState(name) {
-    const wfId = 'wf-' + name.replace(/\.\w+$/, '') + '-' + Date.now().toString(36)
-    // 取消同名旧 wfId 的清理定时器
     const oldWfId = _activeByName.get(name)
+    const oldState = oldWfId ? _runStates.get(oldWfId) : null
+    if (oldState && (oldState.status === 'starting' || oldState.status === 'running')) {
+        const error = new Error('Workflow 已在运行')
+        error.code = 'WORKFLOW_ALREADY_RUNNING'
+        throw error
+    }
+    const safeName = sanitizeWorktreeSegment(name.replace(/\.\w+$/, ''), 'workflow')
+    const wfId = `wf-${safeName}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+    // 取消同名旧 wfId 的清理定时器
     if (oldWfId) {
         const oldTimer = _cleanupTimers.get(oldWfId)
         if (oldTimer) { clearTimeout(oldTimer); _cleanupTimers.delete(oldWfId) }
@@ -685,6 +686,7 @@ function scheduleRunStateCleanup(wfId) {
         _cleanupTimers.delete(wfId)
         cleanupJournal(wfId)
     }, RUN_STATE_TTL_MS)
+    timer.unref?.()
     _cleanupTimers.set(wfId, timer)
 }
 
@@ -713,8 +715,7 @@ function cleanupJournal(wfId) {
     try {
         const fp = join(JOURNAL_DIR, wfId + '.json');
         if (existsSync(fp)) unlinkSync(fp)
-    } catch {
-    }
+    } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
 }
 
 // ── 执行历史 (JSONL 持久化) ──
@@ -744,8 +745,7 @@ function appendHistory(record) {
             writeFileSync(HISTORY_FILE, kept.join('\n') + (kept.length ? '\n' : ''), 'utf8')
             _historyLineCount = kept.length
         }
-    } catch {
-    }
+    } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
 }
 
 function queryHistory(limit = 50) {
@@ -764,52 +764,46 @@ function queryHistory(limit = 50) {
 // ── Git Worktree 隔离 ──
 function createWorktree(projectDir, stepId, wfId) {
     if (!existsSync(WORKTREE_ROOT)) mkdirSync(WORKTREE_ROOT, {recursive: true})
-    const wtDir = join(WORKTREE_ROOT, wfId, stepId)
+    const wtDir = join(WORKTREE_ROOT, sanitizeWorktreeSegment(wfId, 'wf'), sanitizeWorktreeSegment(stepId, 'agent'))
     if (existsSync(wtDir)) {
         try {
             rmSync(wtDir, {recursive: true, force: true})
-        } catch {
-        }
+        } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
     }
 
-    // 校验 projectDir 不含 shell 特殊字符（防命令注入），wtDir 由内部生成已消毒
-    const safeForShell = (s) => /^[a-zA-Z0-9_:\\/\-. 一-鿿]+$/.test(String(s))
-    if (!safeForShell(projectDir)) {
-        log.warn({projectDir}, 'projectDir 含非法字符，跳过 worktree 创建')
-        return {dir: mkdtempSync(join(tmpdir(), 'wf-')), isGit: false}
-    }
     let isGit = false
     try {
-        execSync(`git -C "${projectDir}" rev-parse --git-dir`, {stdio: 'pipe', timeout: 5000})
+        execFileSync('git', ['-C', projectDir, 'rev-parse', '--git-dir'], {stdio: 'pipe', timeout: 5000})
         isGit = true
-    } catch {
+    } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
+
+    if (!isGit) {
+        const error = new Error('worktree 隔离仅支持 Git 仓库')
+        error.code = 'WORKTREE_UNAVAILABLE'
+        throw error
     }
 
-    if (isGit) {
-        try {
-            execSync(`git -C "${projectDir}" worktree prune`, {stdio: 'pipe'})
-            execSync(`git -C "${projectDir}" worktree add "${wtDir}" HEAD`, {stdio: 'pipe', timeout: 30000})
-            return {dir: wtDir, isGit: true}
-        } catch (e) {
-            log.warn({err: e}, 'worktree 创建失败, 降级为直接目录')
-        }
+    try {
+        execFileSync('git', ['-C', projectDir, 'worktree', 'prune'], {stdio: 'pipe', timeout: 10_000})
+        execFileSync('git', ['-C', projectDir, 'worktree', 'add', wtDir, 'HEAD'], {stdio: 'pipe', timeout: 30_000})
+        return {dir: wtDir, isGit: true}
+    } catch (cause) {
+        cleanupWorktree(wtDir, projectDir)
+        const error = new Error('worktree 创建失败，已拒绝在空目录或原项目中降级执行', {cause})
+        error.code = 'WORKTREE_CREATE_FAILED'
+        throw error
     }
-
-    mkdirSync(wtDir, {recursive: true})
-    return {dir: wtDir, isGit: false}
 }
 
 function cleanupWorktree(wtDir, projectDir) {
     try {
         if (existsSync(wtDir)) {
             try {
-                execSync(`git -C "${projectDir}" worktree remove "${wtDir}" --force`, {stdio: 'pipe', timeout: 10000})
-            } catch {
-            }
+                execFileSync('git', ['-C', projectDir, 'worktree', 'remove', wtDir, '--force'], {stdio: 'pipe', timeout: 10_000})
+            } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
             if (existsSync(wtDir)) rmSync(wtDir, {recursive: true, force: true})
         }
-    } catch {
-    }
+    } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
 }
 
 // ── 文件系统操作 ──
@@ -824,15 +818,15 @@ function listWorkflows() {
             const meta = parseMeta(st)
             list.push({name: fn, size: st.length, description: meta?.description || '', phases: meta?.phases || []})
         }
-    } catch {
-    }
+    } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
     return list
 }
 
 function getWorkflow(name) {
     // 先尝试原名称，再尝试追加 .mjs / .js 扩展名
     for (const candidate of [name, name + '.mjs', name + '.js']) {
-        const fp = join(WF_DIR, candidate)
+        const fp = safeBasename(WF_DIR, candidate, {extensions: ['.mjs', '.js']})
+        if (!fp) continue
         if (!existsSync(fp)) continue
         try {
             return readFileSync(fp, 'utf8')
@@ -844,18 +838,35 @@ function getWorkflow(name) {
 }
 
 function saveWorkflow(name, content) {
+    validateWorkflowContent(content)
     if (!existsSync(WF_DIR)) mkdirSync(WF_DIR, {recursive: true})
-    writeFileSync(join(WF_DIR, name), content, 'utf8')
+    const fp = safeBasename(WF_DIR, name, {extensions: ['.mjs', '.js']})
+    if (!fp) throw new Error('非法 Workflow 文件名')
+    writeFileSync(fp, content, 'utf8')
     return true
 }
 
+function validateWorkflowContent(content) {
+    if (typeof content !== 'string' || content.trim().length === 0) {
+        const error = new Error('Workflow 内容不能为空')
+        error.code = 'WORKFLOW_SCRIPT_INVALID'
+        throw error
+    }
+    if (Buffer.byteLength(content, 'utf8') > MAX_WORKFLOW_SCRIPT_BYTES) {
+        const error = new Error('Workflow 脚本不能超过 1MB')
+        error.code = 'WORKFLOW_SCRIPT_TOO_LARGE'
+        throw error
+    }
+    return content
+}
+
 function deleteWorkflow(name) {
-    const fp = join(WF_DIR, name)
+    const fp = safeBasename(WF_DIR, name, {extensions: ['.mjs', '.js']})
+    if (!fp) return false
     if (existsSync(fp)) {
         try {
             unlinkSync(fp)
-        } catch {
-        }
+        } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
         ;
         return true
     }
@@ -965,28 +976,24 @@ function extractJSON(text) {
     if (!text || typeof text !== 'string') return null
     try {
         return JSON.parse(text)
-    } catch {
-    }
+    } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
     const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/)
     if (fenced) {
         try {
             return JSON.parse(fenced[1])
-        } catch {
-        }
+        } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
     }
     const objMatch = text.match(/\{[\s\S]*\}/)
     if (objMatch) {
         try {
             return JSON.parse(objMatch[0])
-        } catch {
-        }
+        } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
     }
     const arrMatch = text.match(/\[[\s\S]*\]/)
     if (arrMatch) {
         try {
             return JSON.parse(arrMatch[0])
-        } catch {
-        }
+        } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
     }
     return null
 }
@@ -1042,11 +1049,14 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
         delete journalCache[contentHash]
     }
 
+    const sessionId = 'wf-agent-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6)
+
     // ── Worktree 隔离 ──
     let wtDir = null
     let effectiveWorkDir = workDir
     if (isolation === 'worktree') {
-        const stepId = agLabel.replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 32)
+        const labelPart = agLabel.replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 24) || 'agent'
+        const stepId = `${labelPart}-${sessionId.slice(-6)}`
         const wt = createWorktree(workDir, stepId, wfId || 'wf')
         wtDir = wt.dir
         effectiveWorkDir = wtDir
@@ -1054,7 +1064,6 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
     }
 
     // ── 创建子 session ──
-    const sessionId = 'wf-agent-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6)
     const pushStream = new _deps.PushStream()
     const cliSettings = _deps.loadCliSettings()
 
@@ -1069,22 +1078,37 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
     // effort 参数映射: low/medium/high/xhigh/max
     if (effort) modelOpts._effort = effort
 
-    const queryOpts = await _deps.makeQueryOptions(modelOpts, effectiveWorkDir, cliSettings, {}, sessionId)
-
-    // ── 启动 query ──
-    const q = _deps.query({prompt: pushStream, options: queryOpts})
+    let q
+    try {
+        const queryOpts = await _deps.makeQueryOptions(modelOpts, effectiveWorkDir, cliSettings, {}, sessionId)
+        // ── 启动 query ──
+        q = _deps.query({prompt: pushStream, options: queryOpts})
+    } catch (error) {
+        if (wtDir) cleanupWorktree(wtDir, workDir)
+        throw error
+    }
     if (_agentHandles) _agentHandles.set(agLabel, {q, pushStream, sessionId, status: 'running', _prompt: prompt, _opts: opts})
-    pushStream.push({
-        type: 'user', session_id: sessionId,
-        message: {role: 'user', content: [{type: 'text', text: prompt}]},
-        parent_tool_use_id: null,
-    })
+    try {
+        pushStream.push({
+            type: 'user', session_id: sessionId,
+            message: {role: 'user', content: [{type: 'text', text: prompt}]},
+            parent_tool_use_id: null,
+        })
+    } catch (error) {
+        _agentHandles?.delete(agLabel)
+        try { await q.return?.() } catch (closeError) {
+            logFn('[Agent:' + agLabel + '] 启动失败后关闭 query 异常: ' + closeError.message, agentPhase)
+        }
+        if (wtDir) cleanupWorktree(wtDir, workDir)
+        throw error
+    }
 
     // ── 流式读取 (带超时) ──
     let output = ''
     let usage = null
     let resolved = false
     let sdkSessionId = null  // 捕获 SDK conversation ID，用于事后清理
+    let controlError = null
     const _seenEventTypes = new Set()
     const _seenDeltaTypes = new Set()
     const _seenMsgTypes = new Set()
@@ -1104,13 +1128,13 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
                 }
                 // 工作流级暂停信号
                 if (abortedRef?.()) {
-                    try { await q.return?.() } catch {}
-                    break
+                    const err = new Error('WorkflowAborted: 工作流已被暂停')
+                    err.code = 'WORKFLOW_ABORTED'
+                    throw err
                 }
-                // 单 agent 独立暂停信号 → 抛错误触发 VM polling loop，不写 journal
+                // 单 agent 独立暂停信号由父进程保留调用，恢复后重新执行，不写 journal。
                 if (_agentAborts?.get(agLabel)) {
                     logFn('[Agent:' + agLabel + '] 已暂停，等待恢复...', agentPhase)
-                    try { await q.return?.() } catch {}
                     const err = new Error('AgentPaused: ' + agLabel)
                     err.code = 'AGENT_PAUSED'
                     throw err
@@ -1166,7 +1190,21 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
                     break
                 }
             }
+            // q.return() 可能让迭代器直接结束，结束后必须再次检查控制信号。
+            if (abortedRef?.()) {
+                const err = new Error('WorkflowAborted: 工作流已被暂停')
+                err.code = 'WORKFLOW_ABORTED'
+                throw err
+            }
+            if (_agentAborts?.get(agLabel)) {
+                const err = new Error('AgentPaused: ' + agLabel)
+                err.code = 'AGENT_PAUSED'
+                throw err
+            }
         } catch (e) {
+            if (e.code === 'AGENT_PAUSED' || e.code === 'WORKFLOW_ABORTED' || e.code === 'BUDGET_EXCEEDED') {
+                throw e
+            }
             if (!resolved) output = 'Agent error: ' + e.message
         }
     })()
@@ -1179,14 +1217,22 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
     try {
         await Promise.race([streamPromise, timeoutPromise])
     } catch (e) {
-        output = 'Agent error: ' + e.message
-        logFn('[Agent:' + agLabel + '] ' + e.message, agentPhase)
+        if (e.code === 'AGENT_PAUSED' || e.code === 'WORKFLOW_ABORTED' || e.code === 'BUDGET_EXCEEDED') {
+            controlError = e
+        } else {
+            output = 'Agent error: ' + e.message
+            logFn('[Agent:' + agLabel + '] ' + e.message, agentPhase)
+        }
     } finally {
         clearTimeout(timerId)
         resolved = true
         // 无论正常结束/超时/暂停，都显式调 q.return() 关闭底层 SDK query，
         //   防止 agent 在超时/暂停后仍后台运行继续消耗 API token
-        try { await q.return?.() } catch {}
+        try {
+            await q.return?.()
+        } catch (e) {
+            logFn('[Agent:' + agLabel + '] 关闭 query 失败: ' + e.message, agentPhase)
+        }
         _agentHandles?.delete(agLabel)
         // 清理 SDK transcript 文件，防止 agent 子 session 残留
         if (_deps?.deleteSession && _deps?.encodeProjectName) {
@@ -1194,11 +1240,19 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
             // 落在 worktree 路径对应的 project 目录，两个路径 encodeProjectName 不同
             const projectsDir = join(homedir(), '.claude', 'projects', _deps.encodeProjectName(effectiveWorkDir))
             if (sdkSessionId) {
-                try { await _deps.deleteSession(sdkSessionId, {dir: projectsDir}) } catch {}
+                try {
+                    await _deps.deleteSession(sdkSessionId, {dir: projectsDir})
+                } catch (error) {
+                    log.warn({err: error, agent: agLabel, sdkSessionId}, '清理 Agent SDK Session 失败')
+                }
             } else {
                 // 兜底: SDK 启动即崩溃等极端情况下 system/init 未送达，sdkSessionId 未捕获
                 // 先尝试用本 agent 的 sessionId 直接删 (SDK 可能以此作文件名)
-                try { await _deps.deleteSession(sessionId, {dir: projectsDir}) } catch {}
+                try {
+                    await _deps.deleteSession(sessionId, {dir: projectsDir})
+                } catch (error) {
+                    log.debug({err: error, agent: agLabel, sessionId}, '按父 Session ID 清理 Agent transcript 失败')
+                }
                 // 再扫描项目目录查找引用本 sessionId 的残留 .jsonl
                 try {
                     for (const f of readdirSync(projectsDir)) {
@@ -1209,9 +1263,13 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
                                 await _deps.deleteSession(f.replace('.jsonl', ''), {dir: projectsDir})
                                 break
                             }
-                        } catch {}
+                        } catch (error) {
+                            log.debug({err: error, agent: agLabel, file: f}, '检查 Agent transcript 失败')
+                        }
                     }
-                } catch {}
+                } catch (error) {
+                    log.debug({err: error, agent: agLabel, projectsDir}, '扫描 Agent transcript 目录失败')
+                }
             }
         }
     }
@@ -1220,9 +1278,12 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
     if (wtDir) {
         try {
             cleanupWorktree(wtDir, workDir)
-        } catch {
+        } catch (e) {
+            logFn('[Agent:' + agLabel + '] 清理 worktree 失败: ' + e.message, agentPhase)
         }
     }
+
+    if (controlError) throw controlError
 
     const tokensUsed = usage ? (usage.input_tokens || 0) + (usage.output_tokens || 0) : 0
     logFn('[Agent:' + agLabel + '] 完成 (' + output.length + ' 字符, ' + tokensUsed + ' tokens)', agentPhase)
@@ -1315,8 +1376,21 @@ function stopWorkflowAgent(wfId, agentLabel) {
     // 如果有活跃 handle，直接关闭底层 query 加速响应
     if (handle && handle.status === 'running') {
         handle.status = 'paused'
-        try { handle.pushStream?.close() } catch {}
-        try { handle.q?.return?.() } catch {}
+        try {
+            handle.pushStream?.close()
+        } catch (error) {
+            log.debug({err: error, workflowId: wfId, agent: agentLabel}, '暂停 Agent 时关闭输入流失败')
+        }
+        try {
+            const closeResult = handle.q?.return?.()
+            if (closeResult && typeof closeResult.catch === 'function') {
+                closeResult.catch(error => {
+                    log.debug({err: error, workflowId: wfId, agent: agentLabel}, '暂停 Agent 时关闭 query 失败')
+                })
+            }
+        } catch (error) {
+            log.debug({err: error, workflowId: wfId, agent: agentLabel}, '暂停 Agent 时关闭 query 失败')
+        }
     }
     // 广播给前端
     if (state._parentSid && _deps?.broadcast) {
@@ -1368,7 +1442,17 @@ async function resumeWorkflow(name, parentSidOrNull, overrideArgs = {}) {
 // ── Internal: 执行 Workflow 脚本 ──
 async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = null) {
     const src = getWorkflow(name)
-    if (!src) throw new Error('Workflow 脚本不存在: ' + name)
+    if (!src) {
+        const missingError = new Error('Workflow 脚本不存在: ' + name)
+        const pendingId = _activeByName.get(name)
+        const pendingState = pendingId ? _runStates.get(pendingId) : null
+        if (pendingState?.status === 'starting') {
+            pendingState.status = 'error'
+            pendingState.error = missingError.message
+            scheduleRunStateCleanup(pendingId)
+        }
+        throw missingError
+    }
 
     const meta = parseMeta(src)
     const s = _deps.sessions.get(parentSid)
@@ -1376,8 +1460,13 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
     // 复用 presetRunState 分配的 wfId，未预设则生成并注册
     let wfId = _activeByName.get(name)
     if (!wfId) {
-        wfId = 'wf-' + name.replace(/\.\w+$/, '') + '-' + Date.now().toString(36)
+        const safeName = sanitizeWorktreeSegment(name.replace(/\.\w+$/, ''), 'workflow')
+        wfId = `wf-${safeName}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
         _activeByName.set(name, wfId)   // 注册以支持后续 stop/state 按名称查找
+    } else if (!resumeState && _runStates.get(wfId)?.status === 'running') {
+        const error = new Error('Workflow 已在运行')
+        error.code = 'WORKFLOW_ALREADY_RUNNING'
+        throw error
     }
 
     // ── 状态变量 ──
@@ -1407,12 +1496,6 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
         spent: () => tokenSpent,
         remaining: () => budgetMax ? Math.max(0, budgetMax - tokenSpent) : Infinity,
     }
-    const budget = {
-        total: budgetMax,
-        spent: () => tokenSpent,
-        remaining: () => budgetMax ? Math.max(0, budgetMax - tokenSpent) : Infinity,
-    }
-
     // ── Sandbox 全局: phase(title) ──
     const phase = (title) => {
         if (currentPhase) {
@@ -1441,238 +1524,6 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
             savedAt: Date.now()
         })
     }
-
-    // ── Sandbox 全局: log(msg) ──
-    const log = (msg) => {
-        logFn(String(msg))
-    }
-
-    // ── Sandbox 全局: agent(prompt, opts) ──
-    const agent = async (prompt, opts = {}) => {
-        // 检查暂停信号
-        if (aborted) throw new Error('WorkflowAborted: 工作流已被暂停')
-
-        // 未指定模型时使用 tier 模型（由 autoTriggerWorkflow 根据任务等级自动选择）
-        if (!opts.model && extraArgs?._tierModel) {
-            opts = {...opts, model: extraArgs._tierModel}
-        }
-
-        const {phase: agentPhase} = opts
-        if (agentPhase && agentPhase !== currentPhase) phase(agentPhase)
-
-        const cacheKey = hashContent(prompt, {
-            agentType: opts.agentType,
-            model: opts.model,
-            schema: opts.schema,
-            effort: opts.effort,
-            isolation: opts.isolation,
-        })
-        const agLabel = opts.label || 'agent'
-
-        // 轮询重试: 单 agent 暂停后等待恢复，然后重新执行
-        while (true) {
-            if (aborted) throw new Error('WorkflowAborted: 工作流已被暂停')
-            try {
-                const result = await executeAgent(prompt, opts, workDir, _broadcast, logFn,
-                    journalCache, wfId, budgetRef, () => aborted, cacheKey, runState._agentAborts, runState._agentHandles)
-
-                // 成功 → 更新 token 统计，防重复计数
-                if (journalCache[cacheKey] && !_countedKeys.has(cacheKey)) {
-                    tokenSpent += journalCache[cacheKey].tokenSpent
-                    _countedKeys.add(cacheKey)
-                    runState._tokenSpent = tokenSpent
-                }
-                return result
-            } catch (e) {
-                if (e.code === 'AGENT_PAUSED') {
-                    logFn('[Agent:' + agLabel + '] 等待用户恢复...')
-                    // 轮询: 每 500ms 检查是否已恢复
-                    while (!aborted && runState._agentAborts?.get(agLabel)) {
-                        await new Promise(r => safeSetTimeout(r, 500))
-                    }
-                    if (aborted) throw new Error('WorkflowAborted: 工作流已被暂停')
-                    // 标记已清除，循环重新执行
-                    logFn('[Agent:' + agLabel + '] 已恢复，重新执行', agentPhase)
-                    continue
-                }
-                throw e  // 其他错误正常抛出
-            }
-        }
-    }
-
-    // ── Sandbox 全局: parallel(thunks) ──
-    const parallel = async (thunks) => {
-        if (!Array.isArray(thunks) || thunks.length === 0) return []
-        logFn('[Parallel] 并行执行 ' + thunks.length + ' 个任务')
-        const results = []
-        for (let i = 0; i < thunks.length; i += MAX_PARALLEL) {
-            if (aborted) throw new Error('WorkflowAborted: 工作流已被暂停')
-            const batch = thunks.slice(i, i + MAX_PARALLEL)
-            const batchResults = await Promise.all(batch.map((fn, bi) =>
-                fn().catch(e => {
-                    // BudgetExceeded 向上抛，其他异常返回 null
-                    if (e.code === 'BUDGET_EXCEEDED') {
-                        aborted = true
-                        throw e
-                    }
-                    logFn('[Parallel #' + (i + bi) + '] 异常: ' + e.message)
-                    return null
-                })
-            ))
-            results.push(...batchResults)
-        }
-        logFn('[Parallel] 完成: ' + results.filter(Boolean).length + '/' + thunks.length + ' 成功')
-        return results
-    }
-
-    // ── Sandbox 全局: pipeline(items, ...stages) ──
-    // 流式管道: 每个 item 独立流经所有 stage，不同 item 之间并行，无阶段间屏障。
-    // 如需屏障式阶段管道（所有 item 完成 stage N 后才进入 stage N+1），请使用 staged()。
-    const pipeline = async (items, ...stages) => {
-        if (!Array.isArray(items) || items.length === 0) return []
-        if (stages.length === 0) return items
-        logFn('[Pipeline] ' + items.length + ' 项 x ' + stages.length + ' 阶段')
-        const results = new Array(items.length)
-        await Promise.all(items.map(async (item, idx) => {
-            try {
-                let val = item
-                for (let si = 0; si < stages.length; si++) {
-                    if (aborted) throw new Error('WorkflowAborted')
-                    try {
-                        val = await stages[si](val, item, idx)
-                    } catch (stageErr) {
-                        if (stageErr.code === 'BUDGET_EXCEEDED') {
-                            aborted = true
-                            throw stageErr
-                        }
-                        logFn('[Pipeline 项' + idx + ' 阶段' + si + '] 异常: ' + stageErr.message)
-                        val = null;
-                        break
-                    }
-                }
-                results[idx] = val
-            } catch (e) {
-                if (e.code === 'BUDGET_EXCEEDED') {
-                    aborted = true
-                    throw e
-                }
-                logFn('[Pipeline 项' + idx + '] 异常: ' + e.message)
-                results[idx] = null
-            }
-        }))
-        return results
-    }
-
-    // ── Sandbox 全局: staged(items, ...stages) ──
-    // 阶段性管道: 所有 item 必须完成当前 stage 后，才一起进入下一个 stage。
-    // 等价于 DAG 编辑器每层节点全部完成后才进入下一层的行为。
-    const staged = async (items, ...stages) => {
-        if (!Array.isArray(items) || items.length === 0) return []
-        if (stages.length === 0) return items
-        logFn('[Staged] ' + items.length + ' 项 x ' + stages.length + ' 阶段（屏障模式）')
-        let current = [...items]
-        for (let si = 0; si < stages.length; si++) {
-            if (aborted) throw new Error('WorkflowAborted: 工作流已被暂停')
-            logFn('[Staged] 阶段 ' + (si + 1) + '/' + stages.length)
-            const stageResults = await Promise.all(current.map(async (item, idx) => {
-                try {
-                    return await stages[si](item, current[idx], idx)
-                } catch (e) {
-                    if (e.code === 'BUDGET_EXCEEDED') {
-                        aborted = true
-                        throw e
-                    }
-                    logFn('[Staged 项' + idx + ' 阶段' + si + '] 异常: ' + e.message)
-                    return null
-                }
-            }))
-            current = stageResults
-        }
-        logFn('[Staged] 完成')
-        return current
-    }
-
-    // ── Sandbox 全局: args ──
-    const args = {...(extraArgs || {})}
-
-    // ── 受控 setTimeout / clearTimeout（上限 + 自动清理，防止 VM 沙箱泄露） ──
-    const MAX_PENDING_TIMERS = 10
-    const _pendingTimers = new Set()
-
-    function safeSetTimeout(fn, delay) {
-        if (typeof delay !== 'number' || delay < 0) delay = 0
-        if (_pendingTimers.size >= MAX_PENDING_TIMERS) {
-            logFn('[Warn] setTimeout 已达上限(' + MAX_PENDING_TIMERS + ')，调用被忽略')
-            return -1
-        }
-        const id = setTimeout(() => {
-            _pendingTimers.delete(id)
-            try { fn() } catch (e) { logFn('[Error] setTimeout 回调异常: ' + e.message) }
-        }, Math.min(delay, 30000)) // 单次最长 30s
-        _pendingTimers.add(id)
-        return id
-    }
-
-    function safeClearTimeout(id) {
-        if (id === undefined || id === null) return
-        clearTimeout(id)
-        _pendingTimers.delete(id)
-    }
-
-    function cleanupAllTimers() {
-        for (const id of _pendingTimers) clearTimeout(id)
-        _pendingTimers.clear()
-    }
-
-    // ── 构建 VM 沙箱 ──
-    // 重要安全说明: node:vm 不是安全沙箱！官方文档明确警告:
-    // "The vm module is not a security mechanism. Do not use it to run untrusted code."
-    // 沙箱中的代码可通过 this.constructor.constructor('return process')() 逃逸。
-    // 本系统假定所有 workflow 脚本来自可信用户（存储在 ~/.claude/workflows/）。
-    // 如需运行不可信代码，应改用 child_process.fork() 或 OS 级沙箱隔离。
-    const sandbox = {
-        agent, parallel, pipeline, staged, phase, log, budget, args, meta,
-        console: {
-            log: (...a) => logFn(a.map(String).join(' ')),
-            error: (...a) => logFn('[Error] ' + a.map(String).join(' ')),
-            warn: (...a) => logFn('[Warn] ' + a.map(String).join(' ')),
-        },
-        process: {cwd: () => workDir, env: {}},
-        setTimeout: safeSetTimeout, clearTimeout: safeClearTimeout,
-        Promise, JSON, Array, Object, String, Number, Boolean,
-        Math, Date, Error, RegExp, Map, Set,
-        parseInt, parseFloat, isNaN, isFinite,
-        encodeURIComponent, decodeURIComponent,
-    }
-
-    // ── 脚本 AST 转换 ──
-    let scriptBody = src;
-    const metaKeyIdx = src.indexOf('export const meta = {');
-    if (metaKeyIdx !== -1) {
-        const openIdx = metaKeyIdx + 21;
-        const closeIdx = findMetaEnd(src, openIdx);
-        if (closeIdx !== -1) {
-            // 去掉 meta 块（含末尾的 ; 或换行）
-            let end = closeIdx + 1;
-            while (end < src.length && (src[end] === ';' || src[end] === '\n' || src[end] === '\r')) end++;
-            scriptBody = src.substring(0, metaKeyIdx) + src.substring(end);
-        }
-    }
-    scriptBody = scriptBody.replace(/export\s+/g, '')
-
-    const wrappedScript = `
-    (async () => {
-      try { ${scriptBody} }
-      catch (_wfError) {
-        if (_wfError.code === 'BUDGET_EXCEEDED') {
-          console.warn('Budget 已用尽: ' + _wfError.message);
-          throw _wfError;
-        }
-        console.error('Workflow script error: ' + (_wfError?.message || _wfError));
-        throw _wfError;
-      }
-    })()
-  `
 
     // ── 初始化运行状态 ──
     const runState = {
@@ -1704,9 +1555,6 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
         origLogFn(msg, ph);
         syncRunState()
     }
-    sandbox.log = (msg) => {
-        enhancedLog(String(msg))
-    }
 
     const isResume = !!resumeState
     _broadcast({
@@ -1717,8 +1565,12 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
     })
     enhancedLog(isResume ? '[Workflow] 恢复: ' + name + ' (' + tokenSpent + ' tokens 已用)' : '[Workflow] 开始: ' + name)
 
-    // ── fork 模式: child_process 子进程隔离 ──
-    const _execMode = extraArgs?._execMode || 'vm'
+    // ── child_process 子进程隔离 ──
+    // Workflow 不允许在持有 Provider 凭据的 Gateway 进程内执行。
+    const _execMode = extraArgs?._execMode || 'fork'
+    const modeError = _execMode === 'fork'
+        ? null
+        : new Error('Workflow 仅支持 fork 执行模式，Gateway 进程内 VM 模式已移除')
 
     async function _runWorkflowFork() {
         const childPath = join(__dirname, 'workflow-child.mjs')
@@ -1729,10 +1581,20 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
         return new Promise((resolve, reject) => {
             let resolved = false
             const pendingAgents = new Set()
+            let forceKillTimer = null
 
             const child = fork(childPath, [], {
                 silent: true,
                 stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
+                // 子进程不继承 Provider/API token 等 Gateway 凭据；仅保留 Node 启动所需的基础环境。
+                env: {
+                    PATH: process.env.PATH || '',
+                    SystemRoot: process.env.SystemRoot || '',
+                    WINDIR: process.env.WINDIR || '',
+                    TEMP: process.env.TEMP || '',
+                    TMP: process.env.TMP || '',
+                    NODE_ENV: 'production',
+                },
             })
 
             // stdout/stderr 转发到日志
@@ -1742,19 +1604,97 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
             })
             child.stderr?.on('data', d => {
                 const txt = d.toString().trim()
-                if (txt) enhancedLog('[child:err] ' + txt)
+                if (txt) enhancedLog('[child:err] ' + txt.slice(0, 16_384))
             })
 
-            const timeout = setTimeout(() => {
-                if (!resolved) {
-                    resolved = true
+            const childIsRunning = () => child.exitCode === null && child.signalCode === null
+
+            const terminateChild = () => {
+                if (!childIsRunning()) return
+                try {
                     child.kill('SIGTERM')
-                    setTimeout(() => { if (!child.killed) child.kill('SIGKILL') }, 5000)
-                    const err = new Error('Workflow child 进程超时 (' + SCRIPT_TIMEOUT_MS + 'ms)')
-                    err.code = 'FORK_FAILED'
-                    reject(err)
+                } catch (e) {
+                    enhancedLog('[fork] 终止子进程失败: ' + e.message)
                 }
+                forceKillTimer = setTimeout(() => {
+                    if (!childIsRunning()) return
+                    try {
+                        child.kill('SIGKILL')
+                    } catch (e) {
+                        enhancedLog('[fork] 强制终止子进程失败: ' + e.message)
+                    }
+                }, 5000)
+                forceKillTimer.unref?.()
+            }
+
+            const stopActiveAgents = (status = 'paused') => {
+                for (const handle of runState._agentHandles?.values() || []) {
+                    handle.status = status
+                    try {
+                        handle.pushStream?.close()
+                    } catch (e) {
+                        enhancedLog('[fork] 关闭 agent 输入流失败: ' + e.message)
+                    }
+                    try {
+                        const closeResult = handle.q?.return?.()
+                        Promise.resolve(closeResult).catch(e => {
+                            enhancedLog('[fork] 关闭 agent query 失败: ' + e.message)
+                        })
+                    } catch (e) {
+                        enhancedLog('[fork] 关闭 agent query 异常: ' + e.message)
+                    }
+                }
+            }
+
+            const sendToChild = (message, {fatal = false} = {}) => {
+                if (!child.connected || !childIsRunning()) {
+                    if (fatal && !resolved) {
+                        const err = new Error('Workflow child IPC 未连接')
+                        err.code = 'FORK_FAILED'
+                        settle('reject', err)
+                    }
+                    return false
+                }
+                try {
+                    child.send(message, (error) => {
+                        if (!error || resolved) return
+                        enhancedLog('[fork] IPC 发送失败: ' + error.message)
+                        if (fatal) {
+                            error.code = 'FORK_FAILED'
+                            settle('reject', error)
+                        }
+                    })
+                    return true
+                } catch (error) {
+                    enhancedLog('[fork] IPC 发送异常: ' + error.message)
+                    if (fatal && !resolved) {
+                        error.code = 'FORK_FAILED'
+                        settle('reject', error)
+                    }
+                    return false
+                }
+            }
+
+            const settle = (kind, value, {stopAgents = false} = {}) => {
+                if (resolved) return false
+                resolved = true
+                clearTimeout(timeout)
+                if (forceKillTimer) clearTimeout(forceKillTimer)
+                if (stopAgents) stopActiveAgents(kind === 'resolve' ? 'done' : 'paused')
+                terminateChild()
+                if (kind === 'resolve') resolve(value)
+                else reject(value)
+                return true
+            }
+
+            const timeout = setTimeout(() => {
+                if (resolved) return
+                aborted = true
+                const err = new Error('Workflow child 进程超时 (' + SCRIPT_TIMEOUT_MS + 'ms)')
+                err.code = 'WORKFLOW_TIMEOUT'
+                settle('reject', err, {stopAgents: true})
             }, SCRIPT_TIMEOUT_MS)
+            timeout.unref?.()
 
             child.on('message', async (msg) => {
                 if (resolved) return
@@ -1762,23 +1702,57 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
                     switch (msg.type) {
                         case 'agent_call': {
                             const {callId, prompt, opts} = msg
+                            if (typeof callId !== 'string' || typeof prompt !== 'string'
+                                || !opts || typeof opts !== 'object' || Array.isArray(opts)) {
+                                sendToChild({
+                                    type: 'agent_result', callId: String(callId || ''),
+                                    error: 'Workflow agent_call 消息格式无效', code: 'WORKFLOW_INVALID_AGENT_CALL',
+                                })
+                                break
+                            }
                             const promise = (async () => {
                                 try {
+                                    const effectiveOpts = !opts.model && extraArgs?._tierModel
+                                        ? {...opts, model: extraArgs._tierModel}
+                                        : {...opts}
+                                    if (effectiveOpts.phase && effectiveOpts.phase !== currentPhase) {
+                                        phase(effectiveOpts.phase)
+                                    }
                                     const cacheKey = hashContent(prompt, {
-                                        agentType: opts.agentType, model: opts.model,
-                                        schema: opts.schema, effort: opts.effort, isolation: opts.isolation,
+                                        agentType: effectiveOpts.agentType, model: effectiveOpts.model,
+                                        schema: effectiveOpts.schema, effort: effectiveOpts.effort, isolation: effectiveOpts.isolation,
                                     })
-                                    const result = await executeAgent(prompt, opts, workDir, _broadcast, enhancedLog,
-                                        journalCache, wfId, budgetRef, () => aborted, cacheKey, runState._agentAborts, runState._agentHandles)
+                                    const agentLabel = effectiveOpts.label || 'agent'
+                                    let result
+                                    while (true) {
+                                        try {
+                                            result = await executeAgent(prompt, effectiveOpts, workDir, _broadcast, enhancedLog,
+                                                journalCache, wfId, budgetRef, () => aborted, cacheKey,
+                                                runState._agentAborts, runState._agentHandles)
+                                            break
+                                        } catch (e) {
+                                            if (e.code !== 'AGENT_PAUSED') throw e
+                                            enhancedLog('[Agent:' + agentLabel + '] 等待用户恢复...')
+                                            while (!aborted && runState._agentAborts?.get(agentLabel)) {
+                                                await new Promise(resolveWait => setTimeout(resolveWait, 500))
+                                            }
+                                            if (aborted) {
+                                                const abortError = new Error('WorkflowAborted: 工作流已被暂停')
+                                                abortError.code = 'WORKFLOW_ABORTED'
+                                                throw abortError
+                                            }
+                                            enhancedLog('[Agent:' + agentLabel + '] 已恢复，重新执行')
+                                        }
+                                    }
                                     if (journalCache[cacheKey] && !_countedKeys.has(cacheKey)) {
                                         tokenSpent += journalCache[cacheKey].tokenSpent
                                         _countedKeys.add(cacheKey)
                                         runState._tokenSpent = tokenSpent
                                     }
-                                    child.send({type: 'agent_result', callId, result})
+                                    sendToChild({type: 'agent_result', callId, result})
                                 } catch (e) {
                                     if (e.code === 'BUDGET_EXCEEDED' && !aborted) aborted = true
-                                    child.send({type: 'agent_result', callId, error: e.message, code: e.code})
+                                    sendToChild({type: 'agent_result', callId, error: e.message, code: e.code})
                                 } finally {
                                     pendingAgents.delete(promise)
                                 }
@@ -1798,28 +1772,21 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
                         }
 
                         case 'done': {
-                            resolved = true
-                            clearTimeout(timeout)
-                            await Promise.allSettled([...pendingAgents])
-                            child.kill()
                             // 子进程因 abort 返回 paused → 抛异常走父进程 pause 路径
                             if (msg.result?.paused) {
                                 const err = new Error('WorkflowAborted')
                                 err.code = 'WORKFLOW_PAUSED'
-                                reject(err)
+                                settle('reject', err, {stopAgents: true})
                             } else {
-                                resolve(msg.result)
+                                settle('resolve', msg.result)
                             }
                             break
                         }
 
                         case 'error': {
-                            resolved = true
-                            clearTimeout(timeout)
-                            child.kill()
-                            const err = new Error(msg.message)
-                            if (msg.code) err.code = msg.code
-                            reject(err)
+                            const err = new Error(String(msg.message || 'Workflow child 执行失败'))
+                            if (msg.code) err.code = String(msg.code)
+                            settle('reject', err, {stopAgents: pendingAgents.size > 0})
                             break
                         }
                     }
@@ -1830,20 +1797,19 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
 
             child.on('exit', (code) => {
                 clearTimeout(timeout)
+                if (forceKillTimer) clearTimeout(forceKillTimer)
                 if (!resolved) {
-                    resolved = true
                     const err = new Error('Child 进程意外退出, code=' + code)
                     err.code = 'FORK_FAILED'
-                    reject(err)
+                    settle('reject', err, {stopAgents: true})
                 }
             })
 
             child.on('error', (e) => {
                 clearTimeout(timeout)
                 if (!resolved) {
-                    resolved = true
                     e.code = 'FORK_FAILED'
-                    reject(e)
+                    settle('reject', e, {stopAgents: true})
                 }
             })
 
@@ -1851,51 +1817,37 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
             runState._abort = () => {
                 aborted = true
                 runState._aborted = true
-                if (!child.killed) child.send({type: 'abort'})
+                stopActiveAgents('paused')
+                if (!sendToChild({type: 'abort'})) {
+                    const err = new Error('WorkflowAborted')
+                    err.code = 'WORKFLOW_PAUSED'
+                    settle('reject', err, {stopAgents: true})
+                }
             }
 
-            child.send({
+            sendToChild({
                 type: 'init',
                 script: src,
                 args: extraArgs || {},
                 budget: {total: extraArgs?.budgetMax || null},
                 meta: meta || null,
-            })
+            }, {fatal: true})
         })
     }
 
     // ── 执行脚本 ──
     let scriptPromise
-    let useVM = _execMode !== 'fork'
-    if (!useVM) {
+    if (modeError) {
+        scriptPromise = Promise.reject(modeError)
+    } else {
         const childPath = join(__dirname, 'workflow-child.mjs')
         if (!existsSync(childPath)) {
-            useVM = true
+            scriptPromise = Promise.reject(new Error('workflow-child.mjs 不存在，拒绝回退到 Gateway 内 VM 模式'))
         } else {
             enhancedLog('[Workflow] 开始 (fork): ' + name)
-            // 包装 fork，基础设施错误自动降级 VM
-            scriptPromise = _runWorkflowFork().catch(e => {
-                if (e.code === 'FORK_FAILED') {
-                    log.warn({err: e, wfId, name}, 'fork 失败，降级到 VM 沙箱')
-                    // 重置 abort，准备 VM 执行
-                    runState._abort = () => { aborted = true; runState._aborted = true }
-                    aborted = false
-                    const context = createContext(sandbox)
-                    return runInContext(wrappedScript, context, {
-                        timeout: SCRIPT_TIMEOUT_MS,
-                        displayErrors: true,
-                    })
-                }
-                throw e // BUDGET_EXCEEDED/WorkflowAborted 透传到 catch 块
-            })
+            // fork 失败必须显式失败，不能把不可信脚本降级到 Gateway 进程内执行。
+            scriptPromise = _runWorkflowFork()
         }
-    }
-    if (useVM) {
-        const context = createContext(sandbox)
-        scriptPromise = runInContext(wrappedScript, context, {
-            timeout: SCRIPT_TIMEOUT_MS,
-            displayErrors: true,
-        })
     }
 
     try {
@@ -1945,7 +1897,6 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
         appendHistory({wfId, name, status: 'done', startedAt: runState.startedAt, endedAt: Date.now(), tokenSpent, phases: [...phases]})
         scheduleRunStateCleanup(wfId)
 
-        cleanupAllTimers()
         return result
     } catch (e) {
         // BUDGET_EXCEEDED: 自动暂停，用户可调大 budget 后 resume
@@ -1981,7 +1932,6 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
             _broadcast({type: 'workflow_paused', workflowId: wfId, name, tokenSpent, logs: logs.slice(-50)})
             enhancedLog('[Workflow] 已暂停: ' + name)
             appendHistory({wfId, name, status: 'paused', startedAt: runState.startedAt, endedAt: Date.now(), tokenSpent, phases: [...phases]})
-            cleanupAllTimers()
             // 不抛异常，静默返回
             return {paused: true, tokenSpent, phases: [...phases]}
         }
@@ -2002,7 +1952,6 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
         _pausedStates.delete(name)
         appendHistory({wfId, name, status: 'error', startedAt: runState.startedAt, endedAt: Date.now(), tokenSpent, phases: [...phases], error: e.message})
         scheduleRunStateCleanup(wfId)
-        cleanupAllTimers()
         throw e
     }
 }
@@ -2097,6 +2046,8 @@ function getSessionWorkflowState(sessionId) {
 }
 
 export {
+    MAX_WORKFLOW_SCRIPT_BYTES,
+    validateWorkflowContent,
     setDeps,
     listWorkflows,
     getWorkflow,

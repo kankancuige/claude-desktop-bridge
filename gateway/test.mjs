@@ -2,7 +2,7 @@
  * Gateway 集成测试 — 完整生命周期验证
  * ── 功能说明 ──
  * 端到端测试 Gateway 的核心链路: 创建 session → WebSocket 连接 → 发送消息 → 流式接收回复
- * 用法: node test.mjs
+ * 用法: BRIDGE_RUN_INTEGRATION_TEST=1 node test.mjs
  *
  * ── 测试覆盖 ──
  *   1. HTTP POST /api/sessions 创建会话
@@ -15,8 +15,15 @@
  *   - Gateway 需已在 127.0.0.1:3456 运行
  */
 import WebSocket from 'ws'
+import {readFileSync} from 'node:fs'
+import {join} from 'node:path'
+import {homedir} from 'node:os'
 
+if (process.env.BRIDGE_RUN_INTEGRATION_TEST !== '1') {
+    console.log('Gateway 手动集成测试已跳过；设置 BRIDGE_RUN_INTEGRATION_TEST=1 后运行。')
+} else {
 const BASE = 'http://127.0.0.1:3456'
+const token = readFileSync(join(homedir(), '.claude', 'bridge-token'), 'utf8').trim()
 
 // ═══════════════════════════════════════════
 // ── Step 1: 创建 session ──
@@ -26,7 +33,7 @@ const BASE = 'http://127.0.0.1:3456'
 // ═══════════════════════════════════════════
 const createRes = await fetch(`${BASE}/api/sessions`, {
     method: 'POST',
-    headers: {'Content-Type': 'application/json'},
+    headers: {'Content-Type': 'application/json', 'x-bridge-token': token},
     body: JSON.stringify({workDir: 'D:/ckd/Code/znzpxt-vue3-new'}),
 })
 const {sessionId} = await createRes.json()
@@ -38,7 +45,9 @@ console.log(`✅ Session created: ${sessionId}`)
 // 实现方式: new WebSocket(url) → onopen 触发后发送测试消息
 // 关键数据流: WS 连接 → send(user_message) → onmessage 事件流 → result → exit
 // ═══════════════════════════════════════════
-const ws = new WebSocket(`ws://127.0.0.1:3456/ws/${sessionId}`)
+const ws = new WebSocket(`ws://127.0.0.1:3456/ws/${sessionId}`, {
+    headers: {'x-bridge-token': token},
+})
 
 // ── 连接成功 → 发送测试消息 ──
 ws.on('open', () => {
@@ -102,3 +111,4 @@ setTimeout(() => {
     console.log('\n⏰ Timeout');
     process.exit(1)
 }, 30000)
+}

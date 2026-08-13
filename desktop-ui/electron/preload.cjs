@@ -24,7 +24,7 @@ const { contextBridge, ipcRenderer } = require('electron')
  *     主进程通过 ipcMain.handle 响应，返回 Promise
  * 注意: 不要在此处添加任意 IPC 通道，每个新增 API 都应有明确的安全理由
  */
-contextBridge.exposeInMainWorld('electronAPI', {
+if (process.isMainFrame) contextBridge.exposeInMainWorld('electronAPI', {
   // ── Bridge Token（本地 API 认证）──
   getBridgeToken: () => ipcRenderer.invoke('getBridgeToken'),
 
@@ -57,14 +57,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
   showWindow: () => ipcRenderer.send('window:show'),
   quitApp: () => ipcRenderer.send('app:quit'),
 
-  // ── 主进程通知发送 IPC ──
-  onTrayNotification: (callback) => {
-    const handler = (_e, data) => callback(data)
-    ipcRenderer.on('tray:notification', handler)
-    // 返回 cleanup 函数，与 onUpdate* 系列一致，防止组件重复挂载累积 listener
-    return () => ipcRenderer.removeListener('tray:notification', handler)
-  },
-
   // ── 检查当前是否最大化 ──
   isMaximized: () => ipcRenderer.invoke('window:isMaximized'),
 
@@ -73,7 +65,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // ── 自动更新 ──
   checkForUpdates: () => ipcRenderer.invoke('update:check'),
-  downloadUpdate: () => ipcRenderer.send('update:download'),
+  downloadUpdate: () => ipcRenderer.invoke('update:download'),
   installUpdate: () => ipcRenderer.send('update:install'),
   // 监听主进程推送的更新事件
   onUpdateAvailable: (cb) => {

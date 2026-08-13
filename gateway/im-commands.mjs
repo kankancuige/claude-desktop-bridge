@@ -3,7 +3,9 @@
  * 9 条命令：/p /ss /sw /sws /ns /m /stop /i /h（+中文别名）
  */
 
-const GW = 'http://127.0.0.1:3456'
+import {gatewayFetch, gatewayHttpBase} from './gateway-client.mjs'
+
+const GW = () => gatewayHttpBase()
 
 // 命令定义：前缀 → key（按长度降序避免 /sw 误匹配 /sws）
 const CMD_LIST = [
@@ -73,43 +75,43 @@ function parseArgs(key, s) {
 }
 
 // ── executeCommand ──
-export async function executeCommand(cmd) {
+export async function executeCommand(cmd, token, identity) {
     const { key, args } = cmd
 
     switch (key) {
         case 'switch_project': {
-            const ok = await postNudge('switch_project', args)
+            const ok = await postNudge('switch_project', args, token, identity)
             if (!ok) return { replyText: '桌面端离线，指令未送达。请先打开桌面端。' }
-            return { replyText: `✅ 已切换至 [${args.projectName || ''}]` }
+            return { replyText: `切换项目请求已送达桌面端：[${args.projectName || ''}]` }
         }
         case 'switch_session': {
-            const ok = await postNudge('switch_session', args)
+            const ok = await postNudge('switch_session', args, token, identity)
             if (!ok) return { replyText: '桌面端离线，指令未送达。请先打开桌面端。' }
-            if (args.sessionId) return { replyText: `✅ 已切换会话 ${args.sessionId.slice(0, 8)}...` }
-            return { replyText: `✅ 已切换至第${args.sessionIndex}个会话` }
+            if (args.sessionId) return { replyText: `切换会话请求已送达桌面端：${args.sessionId.slice(0, 8)}...` }
+            return { replyText: `切换到第 ${args.sessionIndex} 个会话的请求已送达桌面端` }
         }
         case 'new_session': {
-            const ok = await postNudge('new_session', args)
+            const ok = await postNudge('new_session', args, token, identity)
             if (!ok) return { replyText: '桌面端离线，指令未送达。请先打开桌面端。' }
-            if (args.projectName) return { replyText: `✅ 已在 [${args.projectName}] 新建会话` }
-            return { replyText: '✅ 已新建会话' }
+            if (args.projectName) return { replyText: `在 [${args.projectName}] 新建会话的请求已送达桌面端` }
+            return { replyText: '新建会话请求已送达桌面端' }
         }
         case 'stop': {
-            const ok = await postNudge('stop', {})
-            if (!ok) return { replyText: '桌面端离线，指令未送达。' }
-            return { replyText: '✅ 已发送停止指令' }
+            const ok = await postNudge('stop', {}, token, identity)
+            if (!ok) return { replyText: '当前没有可停止的会话，或 Gateway 未响应。' }
+            return { replyText: '当前会话已停止' }
         }
         case 'projects':
-            return await handleProjects()
+            return await handleProjects(token, identity)
 
         case 'sessions':
-            return await handleSessions(args)
+            return await handleSessions(args, token, identity)
 
         case 'mirror':
-            return await handleMirror(args)
+            return await handleMirror(args, token, identity)
 
         case 'info':
-            return await handleInfo()
+            return await handleInfo(token, identity)
 
         case 'help':
             return { replyText: helpText() }
@@ -117,9 +119,9 @@ export async function executeCommand(cmd) {
 }
 
 // ── /p —— 列出所有已注册项目 ──
-async function handleProjects() {
+async function handleProjects(token, identity) {
     try {
-        const r = await fetch(`${GW}/api/projects`, { signal: AbortSignal.timeout(5000) })
+        const r = await gatewayFetch(`${GW()}/api/projects`, token, { signal: AbortSignal.timeout(5000) }, identity)
         if (!r.ok) return { replyText: '获取项目列表失败' }
         const { projects } = await r.json()
         if (!projects?.length) return { replyText: '暂无已注册项目' }
@@ -134,15 +136,15 @@ async function handleProjects() {
 }
 
 // ── /ss [项目] —— 列出项目下所有 Session（1 次 HTTP）──
-async function handleSessions(args) {
+async function handleSessions(args, token, identity) {
     if (!args.projectLabel) return { replyText: '用法: /ss <项目标签>\n项目标签见 /p 列表中方括号内的名称' }
     try {
-        const r = await fetch(`${GW}/api/sessions-by-label`, {
+        const r = await gatewayFetch(`${GW()}/api/sessions-by-label`, token, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ label: args.projectLabel }),
             signal: AbortSignal.timeout(5000),
-        })
+        }, identity)
         if (!r.ok) return { replyText: 'Gateway 未响应' }
         const { sessions } = await r.json()
         if (!sessions?.length) return { replyText: `[${args.projectLabel}] 下暂无会话。使用 /p 查看可用项目。` }
@@ -154,7 +156,7 @@ async function handleSessions(args) {
 }
 
 // ── /m [平台] [on/off] —— 镜像开关（1 次 HTTP）──
-async function handleMirror(args) {
+async function handleMirror(args, token, identity) {
     const platformMap = {
         '微信': 'wechat', 'wechat': 'wechat', 'wx': 'wechat',
         '飞书': 'feishu', 'feishu': 'feishu', 'fs': 'feishu',
@@ -165,11 +167,11 @@ async function handleMirror(args) {
     // /m 不带参数 → 查看所有镜像状态
     if (!platform) {
         try {
-            const r = await fetch(`${GW}/api/mirror`, {
+            const r = await gatewayFetch(`${GW()}/api/mirror`, token, {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({}),  // 不带 platform → 查询
                 signal: AbortSignal.timeout(3000),
-            })
+            }, identity)
             if (!r.ok) return { replyText: 'Gateway 未响应' }
             const { mirrors, hasSession } = await r.json()
             if (!hasSession) return { replyText: '尚无活跃 Session' }
@@ -195,12 +197,12 @@ async function handleMirror(args) {
         } else {
             body.action = 'toggle'  // 不带参数 → 翻转
         }
-        const r = await fetch(`${GW}/api/mirror`, {
+        const r = await gatewayFetch(`${GW()}/api/mirror`, token, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body),
             signal: AbortSignal.timeout(3000),
-        })
+        }, identity)
         if (!r.ok) return { replyText: 'Gateway 未响应' }
         const d = await r.json()
         if (!d.ok) {
@@ -214,15 +216,15 @@ async function handleMirror(args) {
 }
 
 // ── /i —— 当前项目/Session/桌面状态 ──
-async function handleInfo() {
+async function handleInfo(token, identity) {
     try {
-        const fr = await fetch(`${GW}/api/sessions/focused`, { signal: AbortSignal.timeout(3000) })
+        const fr = await gatewayFetch(`${GW()}/api/sessions/focused`, token, { signal: AbortSignal.timeout(3000) }, identity)
         if (fr.ok) {
             const { sessionId, workDir } = await fr.json()
             const projName = (workDir || '').replace(/\\/g, '/').split('/').filter(Boolean).pop() || workDir
             return { replyText: `项目: ${projName}\nSession: ${sessionId.slice(0, 8)}...\n桌面: 在线` }
         }
-        const pr = await fetch(`${GW}/api/projects`, { signal: AbortSignal.timeout(3000) })
+        const pr = await gatewayFetch(`${GW()}/api/projects`, token, { signal: AbortSignal.timeout(3000) }, identity)
         if (pr.ok) {
             const { projects } = await pr.json()
             if (projects?.length) return { replyText: '桌面在线，暂无活跃 Session。请先在桌面端打开一个项目。' }
@@ -247,16 +249,17 @@ function helpText() {
 }
 
 // ── postNudge ── 返回 true=桌面端在线已送达，false=离线未送达
-async function postNudge(action, args) {
+async function postNudge(action, args, token, identity) {
     try {
-        const r = await fetch(`${GW}/api/desktop/nudge`, {
+        const r = await gatewayFetch(`${GW()}/api/desktop/nudge`, token, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ action, args, source: 'adapter' }),
             signal: AbortSignal.timeout(3000),
-        })
+        }, identity)
         if (!r.ok) return false
         const d = await r.json()
+        if (action === 'stop') return d.stopped === true
         return d.delivered === true
     } catch {
         return false

@@ -5,11 +5,24 @@
  * GitHub repo 配置在 package.json → build.publish:
  *   改 owner/repo 为真实的 GitHub 仓库即可启用
  *
- * 安全: 仅签名更新有效 (electron-builder 构建时自动签名)
+ * 完整性: electron-updater 会校验发布元数据中的 SHA-512。
+ * 发布真实性仍依赖 Windows/macOS 代码签名；未配置证书时不能视为签名更新。
  */
 
 // ── 开发模式标记 ──
 const isDev = !!process.env.VITE_DEV_SERVER_URL
+const UPDATE_TRUST_REASON = '当前构建未配置代码签名，应用内自动更新已禁用；请从官方 Release 手动更新。'
+
+function hasTrustedUpdatePolicy() {
+  try {
+    const fs = require('fs')
+    const path = require('path')
+    const pkg = JSON.parse(fs.readFileSync(path.join(require('electron').app.getAppPath(), 'package.json'), 'utf8'))
+    return pkg?.bridgeUpdateTrust?.signed === true
+  } catch {
+    return false
+  }
+}
 
 // 检查 app-update.yml 是否存在——portable 打包不生成此文件，无需加载 electron-updater
 function hasUpdateConfig() {
@@ -26,7 +39,7 @@ function hasUpdateConfig() {
 let _autoUpdater = null
 let _updateCheckTimer = null
 function getAutoUpdater() {
-  if (!_autoUpdater && !isDev && hasUpdateConfig()) {
+  if (!_autoUpdater && !isDev && hasUpdateConfig() && hasTrustedUpdatePolicy()) {
     try {
       _autoUpdater = require('electron-updater').autoUpdater
       _autoUpdater.autoDownload = false
@@ -109,7 +122,7 @@ function startUpdateCheckInterval(intervalMs = 4 * 60 * 60 * 1000) {
  */
 function downloadUpdate() {
   const au = getAutoUpdater()
-  if (!au) return Promise.reject(new Error('autoUpdater 不可用'))
+  if (!au) return Promise.reject(new Error(isDev ? '开发模式下自动更新不可用' : UPDATE_TRUST_REASON))
   return au.downloadUpdate()
 }
 
@@ -121,4 +134,11 @@ function quitAndInstall() {
   if (au) au.quitAndInstall()
 }
 
-module.exports = { checkForUpdates, startUpdateCheckInterval, downloadUpdate, quitAndInstall, get autoUpdater() { return getAutoUpdater() } }
+module.exports = {
+  checkForUpdates,
+  startUpdateCheckInterval,
+  downloadUpdate,
+  quitAndInstall,
+  get unavailableReason() { return isDev ? '开发模式下自动更新不可用' : UPDATE_TRUST_REASON },
+  get autoUpdater() { return getAutoUpdater() },
+}

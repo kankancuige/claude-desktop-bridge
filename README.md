@@ -65,7 +65,7 @@
 │         @anthropic-ai/claude-agent-sdk + REST API             │
 │    ┌─────────────┐ ┌──────────────┐ ┌─────────────────┐     │
 │    │ Session Pool│ │ Workflow 引擎 │ │  DeepSeek Proxy  │     │
-│    │ PushStream  │ │ (VM 沙箱)     │ │  (兼容代理 :8787) │     │
+│    │ PushStream  │ │ (子进程隔离)  │ │  (兼容代理 :8787) │     │
 │    │ Checkpoints │ │              │ │                  │     │
 │    └─────────────┘ └──────────────┘ └─────────────────┘     │
 │    ┌─────────────┐ ┌──────────────┐ ┌─────────────────┐     │
@@ -123,13 +123,13 @@ SDK 触发工具调用 → canUseTool 回调 → 广播确认请求
 | **记录点** | 每轮 AI 操作自动生成 Checkpoint，支持回退文件到任意轮次之前，跨重启持久化 |
 | **桌面宠物** | Phaser 4 引擎驱动的 Shimeji 桌面精灵，50+ 角色可选，响应 AI 状态（思考/工具调用/错误） |
 | **项目结构缓存** | 13 语言 AST 解析（tree-sitter），自动构建依赖图 + 影响面分析，注入 Claude 上下文避免重复探索 |
-| **Workflow 编排** | 内置 7 种实战 Workflow 模板，VM 沙箱执行，支持暂停/恢复/Journal 缓存 |
+| **Workflow 编排** | 内置 7 种实战 Workflow 模板，独立子进程 + 受限 VM context 执行，支持暂停/恢复/Journal 缓存 |
 | **配置管理** | Skills / Agents / Hooks / Rules / Memory / MCP 完整 CRUD + 可视化编辑 |
 | **压缩模式** | Caveman（Token 压缩 ~75%）+ RTK（Bash 输出压缩），支持 GitHub 自动更新 |
 | **DeepSeek 代理** | 内置兼容代理修复 `thinking` 与 `reasoning_content` 兼容性 Bug，自动路由 |
 | **OCR 图片理解** | Tesseract.js 对非多模态模型自动 OCR 识别图片文字，作为 Claude 上下文注入 |
 | **定时任务** | Cron 定时任务 CRUD，支持一次性/周期性调度，持久化到磁盘 |
-| **自动更新** | electron-updater 自动检查/下载/安装更新，GitHub Release 分发 |
+| **更新策略** | 仅代码签名且标记为可信的正式构建启用 electron-updater；未签名构建只提供官方 Release 手动更新入口 |
 | **主题与语言** | Dark / Light / 跟随系统 + 中文 / English |
 | **日志系统** | 结构化日志（pino），按天+按大小分包，自动过期清理，完整堆栈保留 |
 | **GitHub Actions** | push 自动三平台构建，产物可直接下载 |
@@ -190,7 +190,8 @@ claude-desktop-bridge/
 │   ├── feishu.mjs                  # 飞书适配器 (WS 长连接)
 │   ├── dingtalk.mjs                # 钉钉适配器 (Stream 模式)
 │   ├── im-commands.mjs             # IM 自定义命令引擎 (9条远程控制命令)
-│   ├── workflow-runner.mjs         # Workflow 多 Agent 编排引擎 (VM 沙箱)
+│   ├── workflow-runner.mjs         # Workflow 多 Agent 编排与父子进程生命周期
+│   ├── workflow-child.mjs          # Workflow 子进程与受限 VM context
 │   ├── deepseek-proxy.mjs          # DeepSeek 兼容代理 (thinking/reasoning_content)
 │   ├── project-cache.mjs           # 项目结构缓存 (tree-sitter AST + 依赖图)
 │   ├── test.mjs                    # 手动集成测试脚本
@@ -204,7 +205,6 @@ claude-desktop-bridge/
 │   │   ├── preload.cjs             # IPC 安全桥接 (contextBridge)
 │   │   └── updater.cjs             # electron-updater 自动更新
 │   ├── scripts/
-│   │   ├── after-pack.cjs          # electron-builder 打包后处理
 │   │   └── prebuild.cjs            # 构建前清理 Electron 进程
 │   ├── src/
 │   │   ├── App.vue                 # 根组件（主题/自定义标题栏/Claude检测/更新提示）
@@ -432,24 +432,18 @@ Gateway 内置项目结构分析引擎（`project-cache.mjs`）：
 
 **阶段 2 — 用户激活（在 IM 客户端完成）**：
 
-Gateway 每次启动时为每个已连接的平台生成一个 6 位**授权码**，可从终端日志中看到：
-
-```
-[微信] 配对码: 123456 (发给bot即可配对)
-[飞书] 配对码: 789012
-[钉钉] 配对码: 345678
-```
+Gateway 每次启动时为每个已连接的平台生成一个 6 位**配对码**。配对码只在桌面端 **设置 → IM 连接 → 当前配对码** 中显示，不写入日志，也不会由 Bot 主动发送给未配对用户。
 
 激活步骤：
 
 ```
-1. 用户（或任何需要接入的人）在微信/飞书/钉钉中给 Bot 发送任意消息
-2. Bot 自动回复一条包含授权码的提示："请先发送配对码进行授权。你的配对码是: XXXXXX"
-3. 用户将授权码发给 Bot
+1. 管理员在桌面端设置页查看目标平台的当前配对码
+2. 将配对码通过可信渠道提供给需要接入的用户
+3. 用户在微信/飞书/钉钉中将配对码发给 Bot
 4. Bot 回复"配对成功" → 激活完成，此后可正常对话
 ```
 
-> **授权码仅需一次**：每个用户配对后即写入 `~/.claude/bridge-paired*.json` 持久化，此后永久有效。Gateway 重启后授权码会变，但**已配对用户完全不受影响**，无需重复操作。只有在设置页**解除绑定后重新绑定**时才需要再次使用新授权码。
+> **配对码仅需一次**：每个用户配对后即写入 `~/.claude/bridge-paired*.json` 持久化。Gateway 重启后配对码会变，但已配对用户无需重复操作。平台解绑会停止对应连接，并清除该平台凭据、账号缓存、配对白名单、Session 绑定、待处理消息和通知 outbox；重新绑定后需要使用新配对码。
 
 设置页 → **IM 连接** Tab：
 
@@ -476,6 +470,9 @@ Gateway 每次启动时为每个已连接的平台生成一个 6 位**授权码*
 2. IM 用户发送消息 → Gateway resolve session → 注入到同一 session
 3. Claude 回复 → 桌面端实时显示 + IM 用户收到回复
 4. 权限确认 → 可跨通道（桌面弹窗 or IM 回复）完成
+
+同一平台、同一 Session 的 IM 消息按 FIFO 串行执行，默认最多保留 8 条（包含当前执行中的 1 条）；不同平台和不同用户依靠 `turnId + platform + userId` 隔离回合，可同时排队而不会串回复。
+收到 `/stop` 时，当前执行会停止，尚未开始的排队消息会被取消并回传提示，避免停止后旧消息继续执行。
 ```
 
 **IM 自定义命令**（`im-commands.mjs` 引擎，支持微信/飞书/钉钉）：
@@ -517,7 +514,7 @@ Gateway 每次启动时为每个已连接的平台生成一个 6 位**授权码*
 - 自动布局（拓扑排序分层），属性面板编辑
 - DAG → JavaScript 代码导出
 
-**Workflow DSL**：完整的 JavaScript DSL（agent / parallel / pipeline / phase / log / budget / args），VM 沙箱隔离执行。支持 Journal 内容哈希缓存（Resume 断点续跑），Schema 验证 + 重试，Git Worktree 隔离环境，预算硬限制。
+**Workflow DSL**：完整的 JavaScript DSL（agent / parallel / pipeline / staged / phase / log / budget / args），在独立子进程的受限 VM context 中执行。脚本不能直接访问 `process`、`require`、`Buffer`、动态 `import`、字符串代码生成或 WebAssembly；agent 入参与结果通过 JSON 边界复制。支持 Journal 内容哈希缓存（Resume 断点续跑）、Schema 验证 + 重试、Git Worktree 隔离环境和预算硬限制。
 
 ### 配置管理（Settings）
 
@@ -531,10 +528,15 @@ Gateway 每次启动时为每个已连接的平台生成一个 6 位**授权码*
 | **Rules** | 编码规则（.md），按语言分组，paths 属性按文件扩展名匹配 |
 | **Memory** | 跨项目记忆文件概览，展开/折叠，创建/删除/刷新，.md 后缀自动追加 |
 | **MCP** | MCP 协议服务器，内置插件列表 + 已安装列表 + 自定义服务器 CRUD（stdio/sse/http 传输） |
-| **IM 连接** | 微信扫码绑定 / 飞书凭据 / 钉钉凭据，绑定/解绑/状态查看 |
+| **IM 连接** | 微信扫码绑定 / 飞书凭据 / 钉钉凭据，连接状态、配对码、用户与 Session 绑定、通知队列管理、平台解绑 |
 | **Workflow** | DAG 设计器 + 脚本编辑器 + 全局开关，支持执行/暂停/恢复/状态监控 |
 | **定时任务** | Cron 定时任务 CRUD，可视化频率选择（每天/工作日/每周/每月/自定义），手动触发 |
 | **开源** | Caveman 压缩配置 / RTK 压缩配置 / 桌面宠物选择 |
+
+Bridge 会话使用仓库内的 `gateway/BRIDGE_RULES.md` 作为长期规则。Claude Agent SDK 以
+`settingSources: []` 运行，不隐式加载用户或项目目录的 `CLAUDE.md`、`AGENTS.md` 和
+`.claude/settings*.json`。供应商、API Key、MCP、Skills 与 Agents 仍由 Gateway 配置层按需读取并显式传入；
+简单问答不加载这些扩展，执行型任务才升级为完整上下文。
 
 ### 压缩模式（Caveman / RTK）
 
@@ -548,6 +550,7 @@ Gateway 每次启动时为每个已连接的平台生成一个 6 位**授权码*
 - 对 Claude Code 的 Bash 命令输出进行无损压缩
 - 减少 token 消耗，加速长输出场景
 - 跨平台二进制（rtk-bin/），随应用打包分发
+- 在线更新只接受 Release 元数据中格式为 `sha256:<64位十六进制>` 的 digest；缺失或校验不一致会拒绝安装
 
 ### DeepSeek 兼容代理
 
@@ -569,15 +572,29 @@ Gateway 每次启动时为每个已连接的平台生成一个 6 位**授权码*
 - **完成通知**：任务执行完毕后通知当前会话
 - 任务持久化到 `~/.claude/scheduled-tasks/`，重启自动恢复
 
+### IM 通知可靠投递
+
+- 会话完成、错误和权限确认结果会按当前回合记录的 `platform + userId + turnId` 返回原平台、原用户
+- 同一平台允许多个用户绑定到当前 Session；parallel agent 同时产生的多个确认请求按用户 FIFO 保存，网络提交失败时可继续重试
+- 平台事件在 ACK 前同步写入加密 inbox；落盘失败时不确认事件，由微信游标或飞书/钉钉 SDK 重推
+- 直接发送失败时写入加密 notification outbox，每 30 秒扫描一次，并按 5 秒起步、最长 15 分钟的指数退避重试
+- inbox/outbox 按平台拆分为 `bridge-im-inbox.<platform>.json` 和 `bridge-notification-outbox.<platform>.json`；首次启动会从旧共享文件迁移本平台记录
+- 单条通知最多尝试 8 次，超过上限转为“永久失败”，避免无限占用队列
+- inbox/outbox 达容量上限时拒绝新记录并显式报错，不会静默淘汰仍在处理的消息或待发送通知
+- 设置页 **IM 连接** 可查看各平台待发送、重试中和永久失败数量，并可“立即重试”或“清除永久失败”
+- 平台解绑会清空该平台尚未发送的通知；这是不可恢复操作，设置页会二次确认
+
 ### 自动更新
 
-生产环境自动检查 GitHub Release 更新：
+代码签名且 `bridgeUpdateTrust.signed=true` 的正式构建可自动检查 GitHub Release 更新：
 
 - **electron-updater**：启动 5 秒后自动检查新版本
 - **下载进度**：桌面端右下角显示下载进度条
 - **安装**：下载完成后提示用户，点击立即重启安装
-- **降级**：允许降级到旧版本
-- 仅在打包后的生产环境激活（开发模式跳过）
+- **降级保护**：默认拒绝安装低于当前版本的发布包
+- 开发模式和未签名构建均禁用应用内下载，设置页只提供“打开官方 Release”
+
+> SHA-512 只校验下载完整性，不能证明发布者身份。发布前必须配置 Windows/macOS 代码签名，并用签名安装包完成真实升级验收。源码不提供绕过未签名更新限制的生产开关。
 
 ---
 
@@ -592,6 +609,13 @@ Gateway 每次启动时为每个已连接的平台生成一个 6 位**授权码*
 | `ANTHROPIC_API_KEY` | 空 | API Key |
 | `ANTHROPIC_BASE_URL` | 空 | API 基础 URL（支持 Anthropic 兼容端点） |
 | `ANTHROPIC_MODEL` | `deepseek-v4-pro` | 默认模型 |
+| `BRIDGE_ALLOW_LOCAL_PROVIDER` | `0` | 允许探测任意本机/私网 Provider；仅开发环境开启。内置 Ollama `localhost:11434/v1` 已单独白名单 |
+| `BRIDGE_ALLOW_TOKEN_ENDPOINT` | `0` | 开放 `/api/bridge-token` 给浏览器开发模式；生产环境保持关闭 |
+| `BRIDGE_SECURE_PAYLOAD_KEY` | 空 | 独立启动 Gateway 时使用的 32 字节主密钥，支持 64 位 hex 或 base64；读取已有加密配置时必须与创建它的密钥一致 |
+| `BRIDGE_SCHEDULED_MAX_CONCURRENT` | `2` | 定时任务全局并发上限，范围 1-8 |
+| `BRIDGE_SCHEDULED_MAX_DURATION_MS` | `1800000` | 单个定时任务最长运行时间，最少 60 秒 |
+| `BRIDGE_OCR_MAX_CONCURRENT` | `1` | OCR 并发上限，范围 1-4 |
+| `BRIDGE_UPLOAD_TTL_MS` | `86400000` | 临时上传文件保留时间，范围 5 分钟-30 天；过期文件自动清理 |
 | `LOG_LEVEL` | `info` | 日志级别: trace / debug / info / warn / error / fatal |
 | `LOG_MAX_SIZE` | `10m` | 单日志文件最大体积 (k/m/g) |
 | `LOG_RETAIN_DAYS` | `30` | 日志文件保留天数 |
@@ -627,22 +651,17 @@ Gateway 每次启动时为每个已连接的平台生成一个 6 位**授权码*
 
 路径：`~/.claude/adapters.json`
 
+该文件由设置页维护，当前格式是 AES-256-GCM 加密 envelope，不应手工填写平台凭据：
+
 ```json
 {
-  "wechat": {
-    "botToken": "your-wechat-bot-token",
-    "baseUrl": "https://ilinkai.weixin.qq.com"
-  },
-  "feishu": {
-    "appId": "cli_xxxx",
-    "appSecret": "your-secret"
-  },
-  "dingtalk": {
-    "appKey": "dingxxxxxxxx",
-    "appSecret": "your-secret"
-  }
+  "version": 2,
+  "encrypted": true,
+  "payload": "base64url-encoded-aes-256-gcm-payload"
 }
 ```
+
+Electron 启动时优先使用系统 `safeStorage` 保护主密钥，并通过 IPC 注入 Gateway。若操作系统安全存储不可用，则退回权限受限的 `~/.claude/bridge-store-key`。独立运行 `node gateway/index.mjs` 时，如需读取 Electron 已创建的加密数据，必须显式提供同一 `BRIDGE_SECURE_PAYLOAD_KEY`；缺少密钥会安全失败，不会创建新密钥覆盖旧数据。旧版明文配置会在密钥可用时自动迁移。
 
 ---
 
@@ -725,15 +744,40 @@ Gateway 启动时会按以下顺序自动查找 Claude Code 可执行文件：
 
 ## 安全注意事项
 
-- **凭据管理**：`.env` 和 `adapters.json` 包含敏感信息（API Key / Bot Token），已加入 `.gitignore`，**切勿提交到 Git**
+- **凭据管理**：`.env`、加密后的 `adapters.json`、`bridge-store-key*` 和 inbox/outbox 都属于敏感数据，已加入 `.gitignore`，**切勿提交到 Git**
+- **本地加密边界**：AES-256-GCM 防止配置文件被直接读取或篡改，但不能防御已控制当前用户进程或系统账户的攻击者
 - **Electron 安全**：`contextIsolation: true`，`nodeIntegration: false`，外部链接通过 `shell:openExternal` IPC 在系统浏览器打开
 - **输入校验**：IM 消息和 API 参数均在 Gateway 入口层校验，防止注入
 - **IM 配对**：微信/飞书/钉钉均需要配对码才能绑定，未配对用户消息自动拒绝
 - **确认机制**：工具调用需用户确认，5 分钟超时自动拒绝，防止无人值守时误操作
 - **日志安全**：日志不打印 API Key、Bot Token 等凭据；完整堆栈仅在错误日志中保留
 - **文件回退**：记录点回退直接写磁盘，高危操作有二次确认弹窗
+- **Workflow 边界**：Workflow 只允许在不继承 Provider 凭据的独立子进程中运行，并使用受限 VM context 禁止常见逃逸入口。它面向可信本地脚本，不是容器或 OS 级不可信代码沙箱；不要运行来源不明的 Workflow
 
 ---
+
+## AICodeMirror Codex Relay
+
+The settings page includes an `AICodeMirror Codex` provider for the Codex endpoint:
+
+```text
+https://api.claudecode.net.cn/api/codex/backend-api/codex
+```
+
+This endpoint is not an Anthropic Messages endpoint. Gateway starts a local adapter, keeps the relay key in the Gateway process, converts Claude Code `/v1/messages` requests to Codex `/responses`, and converts JSON/SSE responses back to Anthropic format. Claude Code sub-processes receive only the local `PROXY_MANAGED` token.
+
+Configuration:
+
+1. Open Settings -> General -> AICodeMirror Codex.
+2. Enter the AICodeMirror API key in API Key.
+3. Select a supported Codex model, such as `gpt-5.6-sol`.
+4. Click Test Connection, save settings, and restart the desktop app so Gateway reloads the provider.
+
+The adapter maps Claude/agent model aliases to the selected Codex model and preserves the existing tool permission, Session, and IM mirror flows. A real API key and network access are required for end-to-end validation.
+
+### 按需上下文
+
+新建且未恢复历史的 Session 默认使用轻量上下文：不加载 Skills、Agents、MCP、项目设置或 Claude Code 工具，适用于问候、模型身份和短概念解释。出现代码块、文件/Agent 引用、修改、调试、审查、执行或实时信息等信号时，Gateway 会在消息入队前把 Session 单向升级为完整 Claude Code 上下文；恢复历史、Workflow、定时任务和子 Agent 始终使用完整上下文。同一 Session 升级后不会自动降级，避免历史和工具状态反复重建。
 
 ## License
 
@@ -767,17 +811,18 @@ cat gateway/bridge-logs/error.$(date +%Y-%m-%d).*.log
 
 1. 检查 `~/.claude/adapters.json` 中 wechat.botToken 是否存在
 2. 检查 `~/.claude/bridge-paired.json` 中是否包含该用户的 `from_user_id`
-3. 查看终端日志确认授权码是否已生成，未配对时 Bot 会回复"请先发送配对码"
+3. 在桌面端 **设置 → IM 连接** 确认微信状态为运行中，并查看当前配对码
 4. 查看 Gateway 日志 `gateway/bridge-logs/` 搜索 `[wechat]` 或 `poll`
 
 ### IM 配对失败 / 找不到授权码
 
 授权码在 Gateway 每次启动时重新生成，流程分两步：先在设置页绑定平台，再在 IM 客户端里激活用户。常见问题：
 
-1. **Bot 没有回复** → 检查平台绑定是否成功（设置页 IM 连接页状态应为"已连接"）
-2. **配对码不对** → 把 Bot 提示消息里的那串数字原样发回去即可
-3. **终端没显示配对码** → 重启程序，Gateway 启动后前几行日志中搜索 `配对码`
-4. **已配对用户重启后无需操作** → 配对信息持久化到 `~/.claude/bridge-paired*.json`，重启不受影响。只有平台解绑后重新绑定才需要新授权码
+1. **Bot 没有回复** → 检查平台绑定是否成功（设置页 IM 连接页状态应为“运行中”或“已连接”）
+2. **找不到配对码** → 在桌面端 **设置 → IM 连接** 查看；日志和 Bot 回复不会显示配对码
+3. **配对码不对** → 确认使用的是同一平台当前显示的 6 位配对码；适配器重启后旧码会失效
+4. **连续输错被锁定** → 等待设置页提示的冷却时间后再试，避免继续触发暴力破解保护
+5. **已配对用户重启后无需操作** → 配对信息持久化到 `~/.claude/bridge-paired*.json`；平台解绑后白名单会被清除
 
 ### 桌面端连接 Gateway 失败
 

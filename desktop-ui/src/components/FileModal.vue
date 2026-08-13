@@ -69,14 +69,14 @@ function langFromPath(p: string): string {
 
 /** 销毁所有 Monaco 实例 */
 function disposeEditors() {
-  try { monacoDiffEditor.value?.dispose() } catch {}
+  try { monacoDiffEditor.value?.dispose() } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   monacoDiffEditor.value = null
-  try { monacoEditor.value?.dispose() } catch {}
+  try { monacoEditor.value?.dispose() } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   monacoEditor.value = null
   // diff 模式下 createModel 创建的 model 需单独 dispose，monacoDiffEditor.dispose() 不回收它们
-  try { diffOriginalModel?.dispose() } catch {}
+  try { diffOriginalModel?.dispose() } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   diffOriginalModel = null
-  try { diffModifiedModel?.dispose() } catch {}
+  try { diffModifiedModel?.dispose() } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   diffModifiedModel = null
 }
 

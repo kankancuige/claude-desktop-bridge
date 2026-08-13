@@ -1,26 +1,20 @@
 /**
- * prebuild — 打包前杀掉正在运行的 Electron 进程，避免 dist-electron 目录被锁
- * SIDE_EFFECT: 强制终止本机所有 electron.exe / Claude Desktop Bridge.exe 进程
+ * 构建前只检测已安装的本产品进程，避免自动终止用户正在运行的 Electron 应用。
+ * 开发态 electron.exe 无法仅凭进程名区分归属，因此不做全局处理。
  */
-const { execSync } = require('child_process')
-let killed = false
+const { execFileSync } = require('child_process')
 
 if (process.platform === 'win32') {
-  for (const name of ['Claude Desktop Bridge.exe', 'electron.exe']) {
-    try {
-      execSync(`taskkill /F /IM "${name}"`, { stdio: 'ignore' })
-      console.log(`[prebuild] 已终止: ${name}`)
-      killed = true
-    } catch {}
-  }
-} else {
-  for (const name of ['Claude Desktop Bridge', 'electron', 'Electron']) {
-    try {
-      execSync(`pkill -f "${name}"`, { stdio: 'ignore' })
-      console.log(`[prebuild] 已终止: ${name}`)
-      killed = true
-    } catch {}
+  try {
+    const output = execFileSync('tasklist.exe', [
+      '/FI', 'IMAGENAME eq Claude Desktop Bridge.exe', '/FO', 'CSV', '/NH',
+    ], { encoding: 'utf8', windowsHide: true })
+    if (/"Claude Desktop Bridge\.exe"/i.test(output)) {
+      console.error('[prebuild] Claude Desktop Bridge 正在运行，请退出应用后重新构建。')
+      process.exit(1)
+    }
+  } catch (error) {
+    if (error?.status === 1) process.exit(1)
+    console.warn(`[prebuild] 无法检查应用进程，将继续构建: ${error?.message || error}`)
   }
 }
-
-if (!killed) console.log('[prebuild] 未发现运行中的进程')
