@@ -8,6 +8,8 @@ export function hasStoppableSessionWork(session) {
         || session.pending?.size
         || session._pendingInputs?.length
         || session._pendingTurns?.length
+        || session.taskCompletion?.phase === 'reviewing'
+        || session.taskCompletion?.phase === 'fixing'
     )
 }
 

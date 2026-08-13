@@ -20,6 +20,11 @@ export function readNotificationSummary(filePath, platform) {
     }
 }
 
+function notificationEnqueueResult(key, platform, duplicate, state, structured) {
+    const id = key.slice(platform.length + 1)
+    return structured ? {id, duplicate, state} : id
+}
+
 export class NotificationOutbox {
     constructor({filePath, legacyFilePath = null, platform, payloadCodec, maxEntries = 2_000, maxAttempts = 8, sentTtlMs = 24 * 60 * 60 * 1000, onPersistError = null} = {}) {
         if (!filePath || !platform || !payloadCodec) throw new TypeError('filePath, platform and payloadCodec are required')
@@ -125,9 +130,14 @@ export class NotificationOutbox {
         }
     }
 
-    enqueue(payload, {id = crypto.randomUUID(), deferMs = 0} = {}) {
+    enqueue(payload, options = {}) {
+        const structured = Object.hasOwn(options, 'id') && options.id !== undefined && options.id !== null
+        const id = structured ? options.id : crypto.randomUUID()
+        const deferMs = options.deferMs || 0
         const key = `${this.platform}:${String(id).slice(0, 240)}`
         const previousEntries = new Map(this._entries)
+        const existing = this._entries.get(key)
+        if (existing) return notificationEnqueueResult(key, this.platform, true, existing.state, structured)
         if (!this._reserveCapacity(key)) return null
         const now = Date.now()
         this._entries.set(key, {
@@ -143,7 +153,7 @@ export class NotificationOutbox {
             this._entries = previousEntries
             return null
         }
-        return key.slice(this.platform.length + 1)
+        return notificationEnqueueResult(key, this.platform, false, 'pending', structured)
     }
 
     due({limit = 20, maxAttempts = 8, now = Date.now()} = {}) {

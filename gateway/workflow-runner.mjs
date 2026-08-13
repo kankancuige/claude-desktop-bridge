@@ -3,6 +3,8 @@
 // API: agent() / parallel() / pipeline() / phase() / log() / budget / args / meta
 // 特性: 独立子进程 + 受限 node:vm context | Journal/Resume | Schema 验证+重试 | Worktree 隔离 | Budget 硬上限 | 节点暂停/恢复 | effort 参数
 import {createHash} from 'node:crypto'
+import {assertWorkflowAgentModel, inferWorkflowAgentTier, resolveWorkflowAgentModel, resolveWorkflowPermissionMode} from './workflow-model-routing.mjs'
+import {buildAgentRuntimeMetadata} from './agent-runtime-metadata.mjs'
 import {readdirSync, readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, rmSync, statSync, mkdtempSync} from 'node:fs'
 import {execFileSync, fork} from 'node:child_process'
 import {join, extname, dirname} from 'node:path'
@@ -25,6 +27,23 @@ const AGENT_TIMEOUT_MS = 600_000       // 单 agent 超时 10 分钟
 const MAX_WORKFLOW_SCRIPT_BYTES = 1024 * 1024
 const HISTORY_FILE = join(CLAUDE_HOME, 'bridge-workflow-history.jsonl')
 const MAX_HISTORY_ENTRIES = 500
+
+async function cleanupWorkflowAgentSession({
+    deleteSession,
+    removeSdkSessionId,
+    workDir,
+    gatewaySessionId,
+    sdkSessionId,
+}) {
+    if (!deleteSession || !sdkSessionId) return {deleted: false, mappingRemoved: false}
+
+    // SDK 的 dir 与 listSessions 一致，必须传项目工作目录。
+    await deleteSession(sdkSessionId, {dir: workDir})
+    const mappingRemoved = removeSdkSessionId
+        ? removeSdkSessionId(workDir, gatewaySessionId, sdkSessionId) !== false
+        : false
+    return {deleted: true, mappingRemoved}
+}
 
 // ── Agent 类型注册表 ──
 // 扫描 ~/.claude/agents/*.md 的 frontmatter，建立 {type} → [{name, language, exts}] 索引
@@ -196,7 +215,7 @@ log('审查目标: ' + target + ' (Agent: reviewer)')
 phase('Review')
 const findings = await parallel(DIMENSIONS.map(d =>
   () => agent('审查 ' + target + ' 下的代码:\\n' + d.prompt, {
-    label: 'review:' + d.key, phase: 'Review', agentType: 'reviewer',
+    label: 'review:' + d.key, phase: 'Review', agentType: 'reviewer', modelTier: 'power',
     schema: {
       type: 'object',
       properties: {
@@ -224,7 +243,7 @@ log('初步发现 ' + allFindings.length + ' 个问题')
 phase('Verify')
 const verified = await parallel(allFindings.slice(0, 12).map(f =>
   () => agent('对抗性验证此发现是否真实存在。不存在则返回 refuted:true:\\n文件:' + f.file + '\\n标题:' + f.title + '\\n描述:' + f.description, {
-    label: 'verify:' + f.file, phase: 'Verify',
+    label: 'verify:' + f.file, phase: 'Verify', modelTier: 'power',
     schema: { type:'object', properties:{ isReal:{type:'boolean'}, refuted:{type:'boolean'}, reason:{type:'string'} }, required:['isReal'] },
   }).then(v => ({ ...f, verdict: v }))
 ))
@@ -234,9 +253,25 @@ log('确认 ' + confirmed.length + ' 个真实问题 (过滤 ' + (allFindings.le
 
 phase('Report')
 const report = await agent('汇总以下代码审查发现为 Markdown 报告（中文，按严重程度分组）:\\n' + JSON.stringify(confirmed, null, 2), {
-  label: 'report', phase: 'Report',
+  label: 'report', phase: 'Report', modelTier: 'power',
 })
 return { report, confirmed, totalFound: allFindings.length, agentType: 'reviewer' }
+`,
+    'final-review.mjs': `// ─── Final Review Gate ───
+export const meta = { name:'final-review', description:'按父任务风险执行一次定向最终门禁审查', phases:[{title:'Review',detail:'检查本轮真实变更'},{title:'Verify',detail:'仅证伪高风险候选项'}] }
+const target=args.target||'.'
+const tier=args.reviewTier==='power'?'power':'balanced'
+const mode=args.reviewMode==='gate'?'gate':'focused'
+const files=Array.isArray(args.files)?args.files.slice(0,80):[]
+const domains=Array.isArray(args.riskDomains)&&args.riskDomains.length?args.riskDomains.slice(0,8):['correctness']
+if(files.length===0)return {passed:true,findings:[],summary:'没有真实文件差异，跳过最终审查',tier}
+phase('Review')
+const review=await agent('只审查本轮列出的变更文件，不扫描整个仓库，不修改文件。\\n目标目录: '+target+'\\n审查模式: '+mode+'\\n风险域: '+domains.join(', ')+'\\n变更文件:\\n'+files.map((f,i)=>(i+1)+'. '+f.path+' ('+(f.lines||1)+' lines)').join('\\n')+'\\n只报告能用当前代码证据确认的真实问题。critical/high 默认 blocking；medium/low 默认 advisory。',{label:'final-review',phase:'Review',modelTier:tier,schema:{type:'object',properties:{findings:{type:'array',items:{type:'object',properties:{severity:{type:'string',enum:['critical','high','medium','low']},blocking:{type:'boolean'},title:{type:'string'},description:{type:'string'},file:{type:'string'},line:{type:'number'},suggestion:{type:'string'}},required:['severity','title','description','file']}},summary:{type:'string'}},required:['findings','summary']}})
+let findings=review?.findings||[]
+const candidates=findings.filter(i=>i.blocking===true||i.severity==='critical'||i.severity==='high').slice(0,8)
+if(tier==='power'&&candidates.length>0){phase('Verify');const verified=await parallel(candidates.map((finding,index)=>()=>agent('尝试证伪以下最终审查发现，只根据可定位代码证据判断:\\n'+JSON.stringify(finding),{label:'verify:'+index,phase:'Verify',modelTier:'power',schema:{type:'object',properties:{isReal:{type:'boolean'},reason:{type:'string'}},required:['isReal','reason']}}).then(verdict=>({finding,verdict}))));const realKeys=new Set(verified.filter(i=>i?.verdict?.isReal).map(i=>i.finding.file+'\\0'+i.finding.title));findings=findings.filter(i=>!(i.blocking===true||i.severity==='critical'||i.severity==='high')||realKeys.has(i.file+'\\0'+i.title))}
+const blocking=findings.filter(i=>i.blocking===true||i.severity==='critical'||i.severity==='high')
+return {passed:blocking.length===0,findings,summary:blocking.length>0?'最终审查发现 '+blocking.length+' 个阻断问题':(review?.summary||'最终审查通过'),tier}
 `,
 
     // ─── 2. Bug 猎手 ───
@@ -269,7 +304,7 @@ log('搜寻目标: ' + target + ' (Agent: reviewer)')
 phase('Hunt')
 const bugs = await parallel(ANGLES.map(a =>
   () => agent('在 ' + target + ' 中搜索:\\n' + a.prompt + '\\n只报告确信度高的真实 bug，返回 JSON', {
-    label: 'hunt:' + a.key, phase: 'Hunt', agentType: 'reviewer',
+    label: 'hunt:' + a.key, phase: 'Hunt', agentType: 'reviewer', modelTier: 'balanced',
     schema: {
       type: 'object', properties: { bugs: { type:'array', items:{ type:'object', properties:{ file:{type:'string'},line:{type:'number'},title:{type:'string'},confidence:{type:'string',enum:['high','medium']},description:{type:'string'} }, required:['file','title','confidence','description'] } } },
       required: ['bugs'],
@@ -284,7 +319,7 @@ log('猎手发现 ' + allBugs.length + ' 个可疑 bug')
 phase('Verify')
 const confirmed = await parallel(allBugs.slice(0, 10).map(b =>
   () => agent('尝试证伪以下 bug 报告，确认是否真正存在。如不存在返回 refuted:true:\\n文件:' + b.file + ':' + (b.line||'') + '\\n' + b.title + '\\n' + b.description, {
-    label: 'verify:' + b.file, phase: 'Verify',
+    label: 'verify:' + b.file, phase: 'Verify', modelTier: 'power',
     schema: { type:'object', properties:{ confirmed:{type:'boolean'}, refuted:{type:'boolean'}, actualImpact:{type:'string'}, fixSuggestion:{type:'string'} }, required:['confirmed'] },
   }).then(v => ({ ...b, verdict: v }))
 ))
@@ -333,7 +368,7 @@ phase('Draft')
 const drafts = await parallel(ANGLES.map(a =>
   () => agent(
     a.prompt + '\\n\\n## 代码分析（已提前完成，直接使用，不要再读文件）\\n' + codeAnalysis,
-    { label: 'draft:' + a.key, phase: 'Draft', model: 'sonnet' }
+    { label: 'draft:' + a.key, phase: 'Draft', modelTier: 'power' }
   )
 ))
 const validDrafts = drafts.filter(Boolean)
@@ -499,7 +534,7 @@ log('审计目标: ' + target + ' (quality/techdebt: reviewer, deps/structure: g
 phase('Scan')
 const results = await parallel(DIMENSIONS.map(d =>
   () => agent('扫描 ' + target + ' 下的 ' + d.prompt + '\\n返回结构化发现列表', {
-    label: 'scan:' + d.key, phase: 'Scan', agentType: agentTypeForDimension(d.key),
+    label: 'scan:' + d.key, phase: 'Scan', agentType: agentTypeForDimension(d.key), modelTier: 'balanced',
     schema: { type:'object', properties:{ findings:{type:'array',items:{type:'object',properties:{ area:{type:'string'},severity:{type:'string',enum:['critical','high','medium','low']},title:{type:'string'},file:{type:'string'},suggestion:{type:'string'} },required:['area','severity','title']} } }, required:['findings'] },
   })
 ))
@@ -514,7 +549,7 @@ let deepAnalysis = []
 if (critical.length > 0) {
   deepAnalysis = await parallel(critical.map((c, i) =>
     () => agent('深度分析此问题的影响范围和修复方案:\\n' + JSON.stringify(c), {
-      label: 'deep:' + i, phase: 'DeepDive',
+      label: 'deep:' + i, phase: 'DeepDive', modelTier: 'power',
       schema: { type:'object', properties:{ impact:{type:'string'}, effort:{type:'string',enum:['small','medium','large']}, recommendation:{type:'string'} }, required:['impact','recommendation'] },
     }).then(a => ({ issue: c, analysis: a }))
   ))
@@ -526,7 +561,7 @@ phase('Completeness')
 const critic = await agent(
   '以下是对 ' + target + ' 的多维度审计结果。你是一个完整性审查者——还有哪些维度没覆盖？哪些文件/模块被遗漏？\\n\\n## 已有发现\\n' +
   JSON.stringify({ dimensions: DIMENSIONS.map(d => d.key), issueCount: allIssues.length, issues: allIssues.slice(0, 20) }, null, 2),
-  { label: 'completeness', phase: 'Completeness',
+  { label: 'completeness', phase: 'Completeness', modelTier: 'power',
     schema: { type:'object', properties:{ missedDimensions:{type:'array',items:{type:'string'}}, missedAreas:{type:'array',items:{type:'string'}}, completeness:{type:'number'} }, required:['completeness'] },
   }
 )
@@ -537,7 +572,7 @@ phase('Report')
 const report = await agent(
   '生成项目审计报告（中文 Markdown，含评分、TOP 问题、改进路线图）:\\n' +
   JSON.stringify({ target, totalIssues: allIssues.length, bySeverity: { critical: allIssues.filter(i => i.severity==='critical').length, high: allIssues.filter(i => i.severity==='high').length, medium: allIssues.filter(i => i.severity==='medium').length, low: allIssues.filter(i => i.severity==='low').length }, deepAnalysis: deepAnalysis.map(d => ({ issue: d.issue.title, impact: d.analysis?.impact, recommendation: d.analysis?.recommendation })), completeness: critic }, null, 2),
-  { label: 'report', phase: 'Report' }
+  { label: 'report', phase: 'Report', modelTier: 'power' }
 )
 return { report, totalIssues: allIssues.length, completeness: critic?.completeness || 0, agentType: 'reviewer' }
 `,
@@ -562,7 +597,7 @@ phase('Plan')
 log('开始: ' + task + (budget.total ? ' (预算: ' + budget.total + ' tokens)' : ''))
 
 const plan = await agent('将以下任务拆分为 2-4 个可独立并行执行的子任务，返回 JSON 数组:\\n' + task, {
-  agentType: 'Plan', label: 'planner', model: 'sonnet',
+  agentType: 'Plan', label: 'planner', modelTier: 'power',
   schema: {
     type: 'array', items: { type:'object', properties:{ id:{type:'string'}, title:{type:'string'}, agentType:{type:'string',enum:['Explore','general-purpose','code-reviewer','Plan']} }, required:['title','agentType'] },
   },
@@ -573,7 +608,7 @@ log('计划: ' + subtasks.length + ' 个子任务')
 
 phase('Execute')
 const results = await parallel(subtasks.map(p =>
-  () => agent(p.title, { agentType: p.agentType || 'general-purpose', label: p.id || 'task', model: 'sonnet', maxTurns: 10 })
+  () => agent(p.title, { agentType: p.agentType || 'general-purpose', label: p.id || 'task', modelTier: 'balanced', maxTurns: 10 })
 ))
 const successCount = results.filter(Boolean).length
 log('执行: ' + successCount + '/' + subtasks.length)
@@ -597,7 +632,7 @@ const summary = await agent(
   '汇总以下执行结果为简洁的 Markdown 报告（中文）:\\n\\n## 任务\\n' + task + '\\n\\n## 执行结果\\n' +
   results.filter(Boolean).map((r, i) => '### ' + (subtasks[i]?.title || '#'+i) + '\\n' + String(r).substring(0, 2000)).join('\\n\\n') +
   (verified.length > 0 ? '\\n\\n## 审查发现\\n' + verified.filter(v => v.verdict && !v.verdict.ok).map(v => '- ' + (v.verdict?.issues || []).join('\\n- ')).join('\\n') : ''),
-  { label: 'synthesize', model: 'sonnet' }
+  { label: 'synthesize', modelTier: 'power' }
 )
 return { summary, subtaskCount: subtasks.length, successCount, verifiedCount: verified.length }
 `,
@@ -608,10 +643,11 @@ function bootstrapBuiltinWorkflows() {
     if (!existsSync(WF_DIR)) mkdirSync(WF_DIR, {recursive: true})
     for (const [name, content] of Object.entries(BUILTIN_WORKFLOWS)) {
         const fp = join(WF_DIR, name)
-        if (!existsSync(fp)) {
+        const bundledFinalReview = name === 'final-review.mjs'
+        if (!existsSync(fp) || bundledFinalReview) {
             try {
                 writeFileSync(fp, content, 'utf8');
-                log.info({name}, '内置模板已创建')
+                log.info({name}, bundledFinalReview ? '内置最终审查模板已同步' : '内置模板已创建')
             } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
         }
     }
@@ -652,8 +688,8 @@ function getRunState(nameOrWfId) {
     return {...state, pausedAgents}
 }
 
-function presetRunState(name) {
-    const oldWfId = _activeByName.get(name)
+function presetRunState(name, runKey = name) {
+    const oldWfId = _activeByName.get(runKey)
     const oldState = oldWfId ? _runStates.get(oldWfId) : null
     if (oldState && (oldState.status === 'starting' || oldState.status === 'running')) {
         const error = new Error('Workflow 已在运行')
@@ -667,8 +703,8 @@ function presetRunState(name) {
         const oldTimer = _cleanupTimers.get(oldWfId)
         if (oldTimer) { clearTimeout(oldTimer); _cleanupTimers.delete(oldWfId) }
     }
-    _runStates.set(wfId, {name, status: 'starting', phases: [], logs: [], startedAt: Date.now(), wfId})
-    _activeByName.set(name, wfId)
+    _runStates.set(wfId, {name, runKey, status: 'starting', phases: [], logs: [], startedAt: Date.now(), wfId})
+    _activeByName.set(runKey, wfId)
     return wfId
 }
 
@@ -680,7 +716,8 @@ function scheduleRunStateCleanup(wfId) {
         const state = _runStates.get(wfId)
         if (state) {
             // 如果 _activeByName 仍指向此 wfId，清除
-            if (_activeByName.get(state.name) === wfId) _activeByName.delete(state.name)
+            const runKey = state.runKey || state.name
+            if (_activeByName.get(runKey) === wfId) _activeByName.delete(runKey)
         }
         _runStates.delete(wfId)
         _cleanupTimers.delete(wfId)
@@ -1001,7 +1038,7 @@ function extractJSON(text) {
 // ── 单个 agent() 执行（核心） ──
 async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCache, wfId, budgetRef, abortedRef, _cacheKey = null, _agentAborts = null, _agentHandles = null) {
     const {
-        label, schema, model, phase: agentPhase, isolation,
+        label, schema, model, modelTier, phase: agentPhase, isolation,
         agentType: rawAgentType, maxTurns, permissionMode, effort,
     } = opts
 
@@ -1087,7 +1124,10 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
         if (wtDir) cleanupWorktree(wtDir, workDir)
         throw error
     }
-    if (_agentHandles) _agentHandles.set(agLabel, {q, pushStream, sessionId, status: 'running', _prompt: prompt, _opts: opts})
+    if (_agentHandles) _agentHandles.set(agLabel, {
+        q, pushStream, sessionId, status: 'running', _prompt: prompt, _opts: opts,
+        _metadata: opts.runtimeMetadata || null,
+    })
     try {
         pushStream.push({
             type: 'user', session_id: sessionId,
@@ -1125,6 +1165,11 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
                 // 捕获 SDK conversation ID，供事后清理使用
                 if (sdkMsg.type === 'system' && sdkMsg.subtype === 'init' && sdkMsg.session_id) {
                     sdkSessionId = sdkMsg.session_id
+                    // SIDE_EFFECT: 先登记 Agent 映射；即使进程异常退出，项目列表也能过滤残留 transcript。
+                    if (_deps?.persistSdkSessionId
+                        && !_deps.persistSdkSessionId(effectiveWorkDir, sessionId, sdkSessionId)) {
+                        log.warn({agent: agLabel, sdkSessionId}, 'Agent Session 映射持久化失败')
+                    }
                 }
                 // 工作流级暂停信号
                 if (abortedRef?.()) {
@@ -1241,7 +1286,16 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
             const projectsDir = join(homedir(), '.claude', 'projects', _deps.encodeProjectName(effectiveWorkDir))
             if (sdkSessionId) {
                 try {
-                    await _deps.deleteSession(sdkSessionId, {dir: projectsDir})
+                    const cleanup = await cleanupWorkflowAgentSession({
+                        deleteSession: _deps.deleteSession,
+                        removeSdkSessionId: _deps.removeSdkSessionId,
+                        workDir: effectiveWorkDir,
+                        gatewaySessionId: sessionId,
+                        sdkSessionId,
+                    })
+                    if (!cleanup.mappingRemoved) {
+                        log.warn({agent: agLabel, sdkSessionId}, 'Agent Session 映射清理失败')
+                    }
                 } catch (error) {
                     log.warn({err: error, agent: agLabel, sdkSessionId}, '清理 Agent SDK Session 失败')
                 }
@@ -1249,7 +1303,7 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
                 // 兜底: SDK 启动即崩溃等极端情况下 system/init 未送达，sdkSessionId 未捕获
                 // 先尝试用本 agent 的 sessionId 直接删 (SDK 可能以此作文件名)
                 try {
-                    await _deps.deleteSession(sessionId, {dir: projectsDir})
+                    await _deps.deleteSession(sessionId, {dir: effectiveWorkDir})
                 } catch (error) {
                     log.debug({err: error, agent: agLabel, sessionId}, '按父 Session ID 清理 Agent transcript 失败')
                 }
@@ -1260,7 +1314,7 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
                         try {
                             const head = readFileSync(join(projectsDir, f), 'utf8').slice(0, 4096)
                             if (head.includes(sessionId)) {
-                                await _deps.deleteSession(f.replace('.jsonl', ''), {dir: projectsDir})
+                                await _deps.deleteSession(f.replace('.jsonl', ''), {dir: effectiveWorkDir})
                                 break
                             }
                         } catch (error) {
@@ -1336,14 +1390,15 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
 }
 
 // ── 暂停工作流 ──
-function stopWorkflow(name) {
-    const wfId = _activeByName.get(name)
+function stopWorkflow(nameOrRunKey) {
+    const wfId = _runStates.has(nameOrRunKey) ? nameOrRunKey : _activeByName.get(nameOrRunKey)
     if (!wfId) return false
     const state = _runStates.get(wfId)
     if (!state || state.status !== 'running') return false
     // 保存快照供 resume
-    _pausedStates.set(name, {
-        name, status: 'paused', phases: state.phases, logs: state.logs,
+    const runKey = state.runKey || state.name
+    _pausedStates.set(runKey, {
+        name: state.name, runKey, status: 'paused', phases: state.phases, logs: state.logs,
         wfId: state.wfId, pausedAt: Date.now(),
         parentSid: state._parentSid, args: state._args, workDir: state._workDir,
         journalCache: state._journalCache, tokenSpent: state._tokenSpent,
@@ -1444,7 +1499,8 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
     const src = getWorkflow(name)
     if (!src) {
         const missingError = new Error('Workflow 脚本不存在: ' + name)
-        const pendingId = _activeByName.get(name)
+        const runKey = extraArgs?._runKey || resumeState?.runKey || name
+        const pendingId = _activeByName.get(runKey)
         const pendingState = pendingId ? _runStates.get(pendingId) : null
         if (pendingState?.status === 'starting') {
             pendingState.status = 'error'
@@ -1458,11 +1514,12 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
     const s = _deps.sessions.get(parentSid)
     const workDir = resumeState?.workDir || s?.workDir || process.cwd()
     // 复用 presetRunState 分配的 wfId，未预设则生成并注册
-    let wfId = _activeByName.get(name)
+    const runKey = extraArgs?._runKey || resumeState?.runKey || name
+    let wfId = _activeByName.get(runKey)
     if (!wfId) {
         const safeName = sanitizeWorktreeSegment(name.replace(/\.\w+$/, ''), 'workflow')
         wfId = `wf-${safeName}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
-        _activeByName.set(name, wfId)   // 注册以支持后续 stop/state 按名称查找
+        _activeByName.set(runKey, wfId)   // 注册以支持后续 stop/state 按运行键查找
     } else if (!resumeState && _runStates.get(wfId)?.status === 'running') {
         const error = new Error('Workflow 已在运行')
         error.code = 'WORKFLOW_ALREADY_RUNNING'
@@ -1527,7 +1584,7 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
 
     // ── 初始化运行状态 ──
     const runState = {
-        name, status: 'running', phases: meta?.phases || [], logs: [],
+        name, runKey, status: 'running', phases: meta?.phases || [], logs: [],
         startedAt: resumeState?.startedAt || Date.now(), wfId,
         _parentSid: parentSid, _args: extraArgs, _workDir: workDir,
         _aborted: false, _journalCache: journalCache, _tokenSpent: tokenSpent,
@@ -1711,10 +1768,35 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
                                 break
                             }
                             const promise = (async () => {
+                                let agentMetadata = buildAgentRuntimeMetadata({
+                                    id: opts?.label || 'agent',
+                                    agentType: opts?.agentType,
+                                    label: opts?.label,
+                                    phase: opts?.phase || currentPhase,
+                                    prompt,
+                                    workflowName: name,
+                                    runKey,
+                                })
                                 try {
-                                    const effectiveOpts = !opts.model && extraArgs?._tierModel
-                                        ? {...opts, model: extraArgs._tierModel}
+                                    const modelRoute = assertWorkflowAgentModel(resolveWorkflowAgentModel({
+                                        fixedModel: extraArgs?._fixedModel,
+                                        model: opts.model,
+                                        forcedModelTier: extraArgs?._forceModelTier,
+                                        modelTier: opts.modelTier || inferWorkflowAgentTier({
+                                            label: opts.label,
+                                            phase: opts.phase,
+                                            workflowTier: extraArgs?._workflowTier,
+                                        }),
+                                        workflowTier: extraArgs?._workflowTier,
+                                        modelTiers: extraArgs?._modelTiers,
+                                    }))
+                                    const effectiveOpts = modelRoute.model
+                                        ? {...opts, model: modelRoute.model}
                                         : {...opts}
+                                    effectiveOpts.permissionMode = resolveWorkflowPermissionMode({
+                                        parentPermissionMode: extraArgs?._permissionMode,
+                                        agentPermissionMode: effectiveOpts.permissionMode,
+                                    })
                                     if (effectiveOpts.phase && effectiveOpts.phase !== currentPhase) {
                                         phase(effectiveOpts.phase)
                                     }
@@ -1723,6 +1805,25 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
                                         schema: effectiveOpts.schema, effort: effectiveOpts.effort, isolation: effectiveOpts.isolation,
                                     })
                                     const agentLabel = effectiveOpts.label || 'agent'
+                                    agentMetadata = buildAgentRuntimeMetadata({
+                                        id: agentLabel,
+                                        agentType: effectiveOpts.agentType,
+                                        label: agentLabel,
+                                        phase: effectiveOpts.phase || currentPhase,
+                                        prompt,
+                                        modelRoute,
+                                        actualModel: effectiveOpts.model,
+                                        workflowName: name,
+                                        runKey,
+                                    })
+                                    effectiveOpts.runtimeMetadata = agentMetadata
+                                    _broadcast({
+                                        type: 'workflow_agent_started',
+                                        workflowId: wfId,
+                                        ...agentMetadata,
+                                        status: 'running',
+                                        ts: Date.now(),
+                                    })
                                     let result
                                     while (true) {
                                         try {
@@ -1744,6 +1845,13 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
                                             enhancedLog('[Agent:' + agentLabel + '] 已恢复，重新执行')
                                         }
                                     }
+                                    _broadcast({
+                                        type: 'workflow_agent_done',
+                                        workflowId: wfId,
+                                        ...agentMetadata,
+                                        status: 'done',
+                                        ts: Date.now(),
+                                    })
                                     if (journalCache[cacheKey] && !_countedKeys.has(cacheKey)) {
                                         tokenSpent += journalCache[cacheKey].tokenSpent
                                         _countedKeys.add(cacheKey)
@@ -1751,6 +1859,14 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
                                     }
                                     sendToChild({type: 'agent_result', callId, result})
                                 } catch (e) {
+                                    _broadcast({
+                                        type: 'workflow_agent_error',
+                                        workflowId: wfId,
+                                        ...agentMetadata,
+                                        status: e.code === 'AGENT_PAUSED' ? 'paused' : 'error',
+                                        error: String(e.message || e),
+                                        ts: Date.now(),
+                                    })
                                     if (e.code === 'BUDGET_EXCEEDED' && !aborted) aborted = true
                                     sendToChild({type: 'agent_result', callId, error: e.message, code: e.code})
                                 } finally {
@@ -1873,7 +1989,7 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
         enhancedLog('[Workflow] 完成: ' + name + ' (' + tokenSpent + ' tokens)')
 
         // 推结果回主 session
-        if (s?.pushStream) {
+        if (s?.pushStream && extraArgs?._returnToParent !== false) {
             const preview = typeof result === 'string' ? result.substring(0, 4000)
                 : (result ? JSON.stringify(result, null, 2).substring(0, 4000) : '(无输出)')
             s.pushStream.push({
@@ -1893,7 +2009,7 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
             currentPhase,
             savedAt: Date.now()
         })
-        _pausedStates.delete(name)
+        _pausedStates.delete(runKey)
         appendHistory({wfId, name, status: 'done', startedAt: runState.startedAt, endedAt: Date.now(), tokenSpent, phases: [...phases]})
         scheduleRunStateCleanup(wfId)
 
@@ -1921,9 +2037,9 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
                 paused: true
             })
             // BUDGET_EXCEEDED 内部触发时 stopWorkflow API 未被调用，内联保存快照
-            if (!_pausedStates.has(name)) {
-                _pausedStates.set(name, {
-                    name, status: 'paused', phases: [...phases], logs: [...logs],
+            if (!_pausedStates.has(runKey)) {
+                _pausedStates.set(runKey, {
+                    name, runKey, status: 'paused', phases: [...phases], logs: [...logs],
                     wfId, pausedAt: Date.now(), parentSid, args: extraArgs, workDir,
                     journalCache: {...journalCache}, tokenSpent, currentPhase,
                     _countedKeys: [..._countedKeys],
@@ -1949,7 +2065,7 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
             journalCache,
             savedAt: Date.now()
         })
-        _pausedStates.delete(name)
+        _pausedStates.delete(runKey)
         appendHistory({wfId, name, status: 'error', startedAt: runState.startedAt, endedAt: Date.now(), tokenSpent, phases: [...phases], error: e.message})
         scheduleRunStateCleanup(wfId)
         throw e
@@ -2015,6 +2131,7 @@ function getSessionWorkflowState(sessionId) {
                     status: h.status || 'running',
                     source: 'workflow',
                     progress: '',
+                    ...(h._metadata || {}),
                 })
             }
         }
@@ -2064,4 +2181,5 @@ export {
     resumeWorkflow,
     commitWorkflow,
     queryHistory,
+    cleanupWorkflowAgentSession,
 }

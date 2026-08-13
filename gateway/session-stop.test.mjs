@@ -15,6 +15,8 @@ test('运行、重建、确认和排队状态均可停止', () => {
     assert.equal(hasStoppableSessionWork({pending: new Map([['request-1', {}]])}), true)
     assert.equal(hasStoppableSessionWork({_pendingInputs: [{}]}), true)
     assert.equal(hasStoppableSessionWork({_pendingTurns: [{}]}), true)
+    assert.equal(hasStoppableSessionWork({taskCompletion: {phase: 'reviewing'}}), true)
+    assert.equal(hasStoppableSessionWork({taskCompletion: {phase: 'fixing'}}), true)
 })
 
 test('停止响应明确说明会话是否可以继续', () => {

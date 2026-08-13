@@ -34,6 +34,7 @@ import {normalizeWeChatBaseUrl} from './wechat-url.mjs'
 import {loadPairedUsers, savePairedUsers} from './paired-users.mjs'
 import {readAdapterConfig} from './adapter-config.mjs'
 import {turnFallbackText} from './im-turn-finish.mjs'
+import {createImTurnTimeout} from './im-turn-timeout.mjs'
 import {validateImText} from './im-input.mjs'
 import {createMirrorStateResolver} from './mirror-state.mjs'
 import {platformEntryFilePath} from './platform-entry-store.mjs'
@@ -447,14 +448,15 @@ export function startWeChatAdapter(token) {
             }
             let toolCount = 0, done = false, replyText = ''
             let expectedTurnId = null
+            let terminalNotificationId = null
             const mirrorState = createMirrorStateResolver(() => shouldSkipReply(sessionId, userId))
-            let timeoutId = null
+            const turnTimeout = createImTurnTimeout({onTimeout: () => finish('timeout')})
 
             // ── finish ── 必须在所有事件处理器之前定义
             const finish = async (reason) => {
                 if (done) return;
                 done = true;
-                if (timeoutId) clearTimeout(timeoutId)
+                turnTimeout.stop()
                 activeSockets.delete(ws)
                 try { ws.close() } catch (error) {
                     log.debug({err: error}, '关闭微信注入 WebSocket 失败')
@@ -466,12 +468,12 @@ export function startWeChatAdapter(token) {
                         return
                     }
                     if (!replyText.trim()) {
-                        await sendReliableText(userId, ctx, turnFallbackText(reason))
+                        await sendReliableText(userId, ctx, turnFallbackText(reason), terminalNotificationId)
                         return
                     }
                     const result = await sendOrQueue(outbox, {
                         kind: 'reply', userId, contextToken: ctx, text: replyText,
-                    }, deliverNotification)
+                    }, deliverNotification, {id: terminalNotificationId || undefined})
                     log.info({sessionId: sessionId?.slice(0, 8), sent: result.sent, queued: result.queued, length: replyText.length}, '← 回复')
                 } catch (error) {
                     log.error({err: error, sessionId: sessionId?.slice(0, 8), reason}, '微信回合收尾失败')
@@ -484,8 +486,6 @@ export function startWeChatAdapter(token) {
             //   若 await 期间 WS 已 OPEN 则 onopen 永远不触发 → user_message 丢失 → 超时
             ws.onerror = () => finish('ws_error')
             ws.onclose = () => finish('ws_close')
-            timeoutId = setTimeout(() => finish('timeout'), 5 * 60 * 1000 + 30000)
-
             ws.onopen = () => {
                 ws.send(JSON.stringify({type: 'user_message', content: text, messageId, permissionMode: 'default'}));
                 log.info({sessionId: sessionId?.slice(0, 8), textLength: text.length}, '→session')
@@ -494,6 +494,7 @@ export function startWeChatAdapter(token) {
             ws.onmessage = (e) => {
                 try {
                     const msg = JSON.parse(e.data)
+                    turnTimeout.touch()
                     if (msg.type === 'connected') {
                         if (typeof msg.mirrorEnabled === 'boolean') {
                             mirrorState.set(msg.mirrorEnabled)
@@ -549,8 +550,14 @@ export function startWeChatAdapter(token) {
                             if (!mirrorState.value) sendMsg(userId, ctx, '桌面端已处理该确认')
                         }
                     } else if (msg.type === 'result') {
-                        if (toolCount > 0 && !mirrorState.value) sendMsg(userId, ctx, `✅ 共执行 ${toolCount} 个工具，正在整理回复...`)
-                        setTimeout(() => finish('result'), 500)
+                        if (msg.parentTaskTerminal && toolCount > 0 && !mirrorState.value) sendMsg(userId, ctx, `✅ 共执行 ${toolCount} 个工具，正在整理回复...`)
+                    } else if (msg.type === 'task_completed') {
+                        terminalNotificationId = msg.notificationId || terminalNotificationId
+                        setTimeout(() => finish('task_completed'), 500)
+                    } else if (msg.type === 'task_failed' || msg.type === 'task_review_paused') {
+                        terminalNotificationId = msg.notificationId || terminalNotificationId
+                        if (msg.detail) replyText = [replyText.trim(), `[Bridge] ${msg.detail}`].filter(Boolean).join('\n\n')
+                        finish(msg.type)
                     } else if (msg.type === 'generation_stopped') {
                         sessionQueue.cancel(sessionId)
                         finish('stopped')
@@ -645,7 +652,7 @@ export function startWeChatAdapter(token) {
 
     const notificationWorker = startNotificationWorker({outbox, deliver: deliverNotification, log})
 
-    async function sendReliableText(userId, contextToken, text) {
+    async function sendReliableText(userId, contextToken, text, notificationId = null) {
         if (stopped) return false
         const parts = splitTextByUtf8Bytes(text, 3500)
         let sent = true
@@ -653,7 +660,7 @@ export function startWeChatAdapter(token) {
             const content = parts.length > 1 ? `【${i + 1}/${parts.length}】${parts[i]}` : parts[i]
             const result = await sendOrQueue(outbox, {
                 kind: 'direct', userId, contextToken: contextToken || '', text: content,
-            }, deliverNotification)
+            }, deliverNotification, {id: notificationId ? `${notificationId}:part:${i + 1}` : undefined})
             if (!result.sent) sent = false
         }
         return sent
@@ -730,11 +737,11 @@ export function startWeChatAdapter(token) {
     //          超出则按 3500 字节一段切割，每段前加【N/M】标记。
     // 注意: 分段使用 Buffer.byteLength(text, 'utf8') 精确计算 UTF-8 字节数，
     //        避免中文字符被截断产生乱码，切割时通过 while 回退确保不在多字节字符中间切断。
-    async function sendToUser(sid, text, targetUserId = null) {
+    async function sendToUser(sid, text, targetUserId = null, notificationId = null) {
         const uid = targetUserId || findUserForSession(sid)
         if (!uid || !text) return
         if (!pairedUsers.has(uid)) return false
-        return sendReliableText(uid, '', text)
+        return sendReliableText(uid, '', text, notificationId)
     }
 
     // ── shouldSkipReply ──

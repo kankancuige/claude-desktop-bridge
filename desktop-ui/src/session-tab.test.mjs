@@ -6,7 +6,7 @@ import {transform} from 'esbuild'
 const source = readFileSync(new URL('./session-tab.ts', import.meta.url), 'utf8')
 const compiled = await transform(source, {loader: 'ts', format: 'esm', target: 'es2022'})
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(compiled.code).toString('base64')}`
-const {findSessionTab, sessionTabIdentityKey, tabMatchesSession, tabCanHostNewSession} = await import(moduleUrl)
+const {findSessionTab, sessionRequestStillOwned, sessionTabIdentityKey, tabMatchesSession, tabCanHostNewSession} = await import(moduleUrl)
 
 test('同一项目的不同历史会话不能复用同一个 tab', () => {
   const tab = {projectPath: 'D:/work', historySessionId: 'sdk-a', gatewaySessionId: 'gw-a'}
@@ -34,4 +34,12 @@ test('持久化 tab 使用规范化项目路径和会话 ID 去重', () => {
     'd:/work|sdk-a',
   )
   assert.equal(sessionTabIdentityKey({projectPath: 'D:/work', historySessionId: null, gatewaySessionId: null}), null)
+})
+
+test('迟到请求只有在标签页和会话身份都未变化时才能写回', () => {
+  const owner = {id: 'tab-1', projectPath: 'D:/work', historySessionId: 'sdk-1', gatewaySessionId: 'gw-1'}
+  assert.equal(sessionRequestStillOwned(owner, {...owner}), true)
+  assert.equal(sessionRequestStillOwned(owner, {...owner, gatewaySessionId: 'gw-2'}), false)
+  assert.equal(sessionRequestStillOwned(owner, {...owner, id: 'tab-2'}), false)
+  assert.equal(sessionRequestStillOwned({...owner, gatewaySessionId: null}, {...owner, gatewaySessionId: 'gw-created'}), true)
 })

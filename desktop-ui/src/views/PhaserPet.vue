@@ -23,7 +23,6 @@ const emit = defineEmits<{
   (e: 'switch-pet', id: string): void
 }>()
 
-const el = ref<HTMLDivElement>()
 const gameContainer = ref<HTMLDivElement>()
 const handleEl = ref<HTMLDivElement>()
 let game: Phaser.Game | null = null
@@ -304,7 +303,7 @@ class PetScene extends Phaser.Scene {
         else if (r < 0.92) { this.switchState('sit'); this.time.delayedCall(3000, () => { if (this.currentState === 'sit') this.switchState('stand') }) }
       }
     }
-    if (ps2 === 'building' && this.pet.body!.blocked.top) {
+    if (ps2 === 'building' && this.pet.body!.blocked.up) {
       this.switchState('crawl'); this.pet.body!.setVelocityY(0)
       this.pet.body!.setVelocityX(this.pet.flipX ? FRAME_RATE * 6 : -FRAME_RATE * 6)
     }
@@ -387,7 +386,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-<div ref="el" class="pet-layer">
+<div class="pet-layer">
   <div ref="gameContainer" class="pet-canvas" />
   <!-- 透明手柄覆在 pet 上方，唯一接收鼠标事件的元素 -->
   <div

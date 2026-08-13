@@ -1,6 +1,6 @@
-const VERSION = 1
+const VERSION = 4
 const MAX_DETAIL_LENGTH = 2000
-const STATUSES = new Set(['idle', 'running', 'succeeded', 'incomplete', 'failed', 'stopped', 'interrupted'])
+const STATUSES = new Set(['idle', 'running', 'reviewing', 'changes_required', 'fixing', 'review_paused', 'succeeded', 'incomplete', 'failed', 'stopped', 'interrupted'])
 const OUTCOMES = new Set(['succeeded', 'incomplete', 'failed'])
 const REASONS = new Set(['max_turns', 'max_budget', 'execution_error', 'structured_output', 'stopped', 'unknown_error', null])
 
@@ -28,7 +28,12 @@ export function normalizeTaskState(raw = {}, {recoverRunning = false, now = Date
         reason = 'execution_error'
         resumable = Boolean(input.historySessionId || input.sdkSessionId || input.resumable)
     }
-    if (status === 'succeeded') {
+    if (status === 'reviewing' || status === 'changes_required' || status === 'fixing' || status === 'review_paused') {
+        // 审查中间态不能在恢复或投影时被误判为成功；保留原阶段供用户继续处理。
+        outcome = null
+        resumable = true
+        reason = status === 'review_paused' ? 'execution_error' : null
+    } else if (status === 'succeeded') {
         outcome = 'succeeded'
         reason = null
         resumable = false
@@ -48,9 +53,34 @@ export function normalizeTaskState(raw = {}, {recoverRunning = false, now = Date
         subtype: text(input.subtype, 120) || null,
         sdkSessionId: text(input.sdkSessionId, 160) || null,
         historySessionId: text(input.historySessionId, 160) || null,
+        taskId: text(input.taskId, 200) || null,
+        turnId: text(input.turnId, 200) || null,
+        sequence: Number.isFinite(Number(input.sequence)) ? Math.max(0, Math.trunc(Number(input.sequence))) : 0,
         numTurns: Number.isFinite(Number(input.numTurns)) ? Math.max(0, Math.min(100000, Math.trunc(Number(input.numTurns)))) : 0,
+        startedAt: Number.isFinite(Number(input.startedAt)) ? Math.max(0, Number(input.startedAt)) : 0,
+        completedAt: Number.isFinite(Number(input.completedAt)) ? Math.max(0, Number(input.completedAt)) : 0,
+        durationMs: Number.isFinite(Number(input.durationMs)) ? Math.max(0, Number(input.durationMs)) : 0,
         detail: redactTaskDetail(input.detail),
+        review: normalizeReviewProjection(input.review),
         updatedAt: Number.isFinite(Number(input.updatedAt)) ? Number(input.updatedAt) : now,
+    }
+}
+
+function normalizeReviewProjection(value) {
+    const input = value && typeof value === 'object' ? value : {}
+    const findings = Array.isArray(input.blockingFindings) ? input.blockingFindings.slice(0, 20).map(item => ({
+        severity: typeof item?.severity === 'string' ? item.severity.slice(0, 20) : 'medium',
+        title: text(item?.title, 300),
+        file: text(item?.file, 500),
+        line: Number.isFinite(Number(item?.line)) ? Math.max(1, Math.trunc(Number(item.line))) : null,
+        description: text(item?.description, 1000),
+    })) : []
+    return {
+        round: Number.isFinite(Number(input.round)) ? Math.max(0, Math.min(2, Math.trunc(Number(input.round)))) : 0,
+        tier: input.tier === 'power' ? 'power' : input.tier === 'balanced' ? 'balanced' : null,
+        summary: text(input.summary, 1000),
+        blockingCount: findings.length,
+        blockingFindings: findings,
     }
 }
 
@@ -77,6 +107,9 @@ export function taskStateFromResult(result = {}, identity = {}) {
         subtype: result.subtype,
         detail: result.result || result.detail || result.errors?.join('\n') || '',
         numTurns: result.numTurns,
+        startedAt: identity.startedAt,
+        completedAt: identity.completedAt,
+        durationMs: identity.durationMs,
         sdkSessionId: identity.sdkSessionId,
         historySessionId: identity.historySessionId || identity.sdkSessionId,
     })
@@ -90,6 +123,9 @@ export function taskStateForStop(identity = {}) {
         resumable: Boolean(identity.sdkSessionId || identity.historySessionId),
         sdkSessionId: identity.sdkSessionId,
         historySessionId: identity.historySessionId || identity.sdkSessionId,
+        startedAt: identity.startedAt,
+        completedAt: identity.completedAt,
+        durationMs: identity.durationMs,
     })
 }
 
@@ -102,6 +138,9 @@ export function taskStateForError(error, identity = {}) {
         detail: error?.message || error,
         sdkSessionId: identity.sdkSessionId,
         historySessionId: identity.historySessionId || identity.sdkSessionId,
+        startedAt: identity.startedAt,
+        completedAt: identity.completedAt,
+        durationMs: identity.durationMs,
     })
 }
 
@@ -122,8 +161,15 @@ export function taskStateForClient(state) {
         continuationReason: normalized.continuationReason,
         resumable: normalized.resumable,
         subtype: normalized.subtype,
+        taskId: normalized.taskId,
+        turnId: normalized.turnId,
+        sequence: normalized.sequence,
         numTurns: normalized.numTurns,
+        startedAt: normalized.startedAt,
+        completedAt: normalized.completedAt,
+        durationMs: normalized.durationMs,
         detail: normalized.detail,
+        review: normalized.review,
         updatedAt: normalized.updatedAt,
     }
 }

@@ -18,7 +18,7 @@
 //   9. IM 连接 - 微信 QR 绑定 / 飞书钉钉凭证配置 / 解绑确认
 // ═══════════════════════════════════════════════════════════════════
 
-import {ref, onMounted, onUnmounted, computed, watch} from 'vue'
+import {ref, onMounted, onUnmounted, computed} from 'vue'
 import {useRouter} from 'vue-router'
 import {t, setLocale} from '../i18n'
 import WorkflowTab from './WorkflowTab.vue'
@@ -251,11 +251,16 @@ const localProxyNotice = computed(() => {
 
 // ── Workflow 模型等级: 将供应商模型映射到能力等级 ──
 const MODEL_TIERS = [
-  {key: 'power', label: '强 (Power)', desc: '最强模型 — 深度调研、方案对比、架构分析'},
-  {key: 'balanced', label: '均衡 (Balanced)', desc: '日常主力 — 代码审查、Bug 排查、代码生成'},
-  {key: 'light', label: '轻量 (Light)', desc: '快速便宜 — 意图分类、简单问答、路由转发'},
+  {key: 'power', label: '强 (Power)', desc: '架构、高风险任务、最终审查'},
+  {key: 'balanced', label: '均衡 (Balanced)', desc: '普通实现、局部修复、普通审查'},
+  {key: 'light', label: '轻量 (Light)', desc: '简单问答、项目结构探索、机械提取'},
 ]
 const modelTiers = ref<Record<string, string>>({})
+const modelTierError = ref('')
+const tiersPointToSameModel = computed(() => {
+  const configured = Object.values(modelTiers.value).filter(Boolean)
+  return currentModels.value.length >= 2 && configured.length >= 2 && new Set(configured).size === 1
+})
 
 async function loadModelTiers() {
   try {
@@ -268,14 +273,22 @@ async function loadModelTiers() {
 }
 
 async function saveModelTier(tier: string, modelId: string) {
-  const r = await fetch(`${GW}/api/config/workflow-settings`)
-  const cfg = r.ok ? await r.json() : {}
-  cfg.modelTiers = {...(cfg.modelTiers || {}), [tier]: modelId || null}
-  await fetch(`${GW}/api/config/workflow-settings`, {
-    method: 'PUT',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(cfg),
-  })
+  modelTierError.value = ''
+  try {
+    const r = await fetch(`${GW}/api/config/workflow-settings`)
+    if (!r.ok) throw new Error(`读取模型档位失败（HTTP ${r.status}）`)
+    const cfg = await r.json()
+    cfg.modelTiers = {...(cfg.modelTiers || {}), [tier]: modelId || null}
+    const saved = await fetch(`${GW}/api/config/workflow-settings`, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(cfg),
+    })
+    if (!saved.ok) throw new Error(`保存模型档位失败（HTTP ${saved.status}）`)
+    modelTiers.value = {...modelTiers.value, [tier]: modelId || ''}
+  } catch (error) {
+    modelTierError.value = error instanceof Error ? error.message : '保存模型档位失败'
+  }
 }
 
 // ── loadSettings: GET /api/config/settings → merge defaults → 推断供应商 → 应用主题 ──
@@ -2425,9 +2438,9 @@ onUnmounted(() => {
               </div>
             </section>
 
-            <!-- 模型等级配置: 将供应商模型映射到能力等级，Workflow 按任务难度自动选择 -->
+            <!-- 自动任务模型配置: 将供应商模型映射到任务能力等级 -->
             <section class="section-block">
-              <h2 class="section-title">Workflow 模型等级</h2>
+              <h2 class="section-title">自动任务模型</h2>
               <div class="settings-grid">
                 <div v-for="tier in MODEL_TIERS" :key="tier.key" class="field">
                   <label>{{ tier.label }}</label>
@@ -2440,6 +2453,10 @@ onUnmounted(() => {
                   <span class="field-hint">{{ tier.desc }}</span>
                 </div>
               </div>
+              <p v-if="tiersPointToSameModel" class="field-hint warning-hint">
+                三档当前指向同一模型，不会发生实际能力切换。
+              </p>
+              <p v-if="modelTierError" class="field-hint warning-hint">{{ modelTierError }}</p>
             </section>
 
             <!-- 其他设置: maxContext(tokens,K/M格式) + costLimit%(滑块) + maxTurns + fileInject(KB) + theme + language -->
@@ -2856,7 +2873,7 @@ onUnmounted(() => {
                 <span class="cat-badge custom-badge">{{
                     t('common.custom')
                   }} {{
-                    Object.keys(hooks).reduce((s, e) => s + (hooks[e] || []).reduce((a, en) => a + (en.hooks || []).length, 0), 0)
+                    Object.keys(hooks).reduce((s: number, e: string) => s + (hooks[e] || []).reduce((a: number, en: any) => a + (en.hooks || []).length, 0), 0)
                   }}</span>
               </div>
               <div style="display:flex;align-items:center;gap:6px">

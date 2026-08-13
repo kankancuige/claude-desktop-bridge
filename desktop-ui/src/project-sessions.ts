@@ -13,6 +13,8 @@ export interface ProjectSessionGroup {
   sessions: ProjectSessionItem[]
 }
 
+const USER_SESSION_SOURCES = new Set(['desktop', 'wechat', 'feishu', 'dingtalk'])
+
 function normalizePath(value: string): string {
   return String(value || '').replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/+$/, '').toLowerCase()
 }
@@ -35,4 +37,15 @@ export function upsertProjectSession<T extends ProjectSessionGroup>(
   })
   if (foundProject) return next
   return [{workDir, encodedDir, sessionCount: 1, lastActive: now, sessions: [{id: sessionId, size: 0, encodedDir}]} as T, ...next]
+}
+
+export function applySessionVisibilityEvent<T extends ProjectSessionGroup>(
+  projects: T[],
+  event: {type?: string; source?: string; historySessionId?: string},
+  context: {workDir: string; encodedDir: string; now?: number},
+): T[] {
+  if (event?.type !== 'session_visible' || !USER_SESSION_SOURCES.has(String(event.source || ''))) return projects
+  const sessionId = String(event.historySessionId || '').trim()
+  if (!sessionId) return projects
+  return upsertProjectSession(projects, {...context, sessionId})
 }

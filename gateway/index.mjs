@@ -23,7 +23,8 @@ import {getSessionRuntimeState} from './session-runtime-state.mjs'
 import {classifyTranscriptFile} from './transcript-classifier.mjs'
 import {parseSessionHistory} from './session-history.mjs'
 import {findSessionTranscript, listProjectTranscriptCandidates} from './project-transcript-location.mjs'
-import {resolveMappedGatewaySessionId, updateSessionMap} from './session-map-consistency.mjs'
+import {removeSessionMapEntry, resolveMappedGatewaySessionId, updateSessionMap} from './session-map-consistency.mjs'
+import {isUserSessionSource, loadSessionVisibility, markSessionVisible, migrateLegacySessionVisibility, removeSessionVisibility, sessionVisibilitySource, shouldShowSession} from './session-visibility.mjs'
 import {initialSessionIdentity, resolveSessionCreateMode} from './session-create-mode.mjs'
 import {buildProjectContinuationContext, composeContinuationPrompt} from './project-continuation-context.mjs'
 import {buildAgentDescriptor, buildAgentToolLifecycleEvent} from './agent-tool-lifecycle.mjs'
@@ -63,12 +64,13 @@ import {startOpenCodeProxy, getOpenCodeProxyUrl, stopOpenCodeProxy, isOpenCodePr
 import {validateProviderUrl, resolveProviderUrl, resolveProviderRedirect, buildProviderModelsUrl, buildProviderFallbackUrls, createPinnedLookup} from './provider-url-security.mjs'
 import {listAdapterBindings, normalizeAdapterBindings, removeAdapterBindings, upsertAdapterBinding} from './adapter-bindings.mjs'
 import {readNotificationSummary} from './notification-outbox.mjs'
+import {scheduleSessionBackgroundInitialization} from './session-background-init.mjs'
 import {
     buildIncompleteMirrorText,
     canResumeTask,
     classifyTaskResult,
 } from './task-result-outcome.mjs'
-import {createTaskStatePatch, recoverTaskState, taskStateForClient, taskStateForError, taskStateForStop, taskStateFromResult, taskStateFileId} from './task-state.mjs'
+import {createTaskStatePatch, recoverTaskState, taskStateForClient, taskStateForError, taskStateForStop, taskStateFileId} from './task-state.mjs'
 import {clearPlatformEntries, platformEntryFilePath} from './platform-entry-store.mjs'
 import {createTurnIdentity, shouldDeliverTurnEvent, shouldRouteMirror} from './turn-routing.mjs'
 import {normalizeWeChatBaseUrl} from './wechat-url.mjs'
@@ -79,7 +81,11 @@ import {redactSecretMap, restoreSecretMap, restoreSecretValue} from './config-re
 import {buildWindowsRtkExtractArgs, buildWindowsRtkExtractEnv, selectRtkReleaseAsset, verifyRtkAssetDigest} from './rtk-archive.mjs'
 import {getCodexRelayProxyUrl, startCodexRelayProxy, stopCodexRelayProxy} from './codex-relay-proxy.mjs'
 import {BRIDGE_PROVIDER_ENV_KEYS, extractBridgeProviderSettings, normalizeBridgeProviderSettings, overlayBridgeProviderSettings} from './bridge-provider-settings.mjs'
-import {applyContextProfile, classifyContextProfile, nextContextProfile, normalizeContextProfile} from './context-profile.mjs'
+import {applyContextProfile, classifyContextProfile, normalizeContextProfile} from './context-profile.mjs'
+import {decideTask} from './task-decision.mjs'
+import {normalizeExplicitModel, resolveTaskModelRoute, resolveTurnModelRoute, shouldDeferAutomaticQuery, shouldValidateProviderModel, validateProviderModel} from './model-routing.mjs'
+import {resolveWorkflowFinalReviewTier, shouldAutoTriggerWorkflow} from './workflow-model-routing.mjs'
+import {createTaskCompletionState, normalizeReviewOutcome, resolveFinalReviewPlan, transitionTaskCompletion} from './task-completion.mjs'
 import {applySkillRoute, routeSkills} from './skill-router.mjs'
 import {buildSystemInitEvent} from './session-init-event.mjs'
 import {resolveRtkCommandArgs} from './rtk-command.mjs'
@@ -89,6 +95,7 @@ import {parseDeepSeekBalance, resolveBalanceProvider} from './balance-provider.m
 import {
     calculateAutoCompactWindow,
     compactBoundaryToEvent,
+    compactSummaryForDisplay,
     contextUsageEvent,
     isSyntheticCompactSummary,
     parseTokenCount,
@@ -243,9 +250,9 @@ function getClaudeExe() {
 
 const MODEL = process.env.ANTHROPIC_MODEL || 'deepseek-v4-pro'
 
-// 模型名直传，不做映射。SDK 0.1.77 dJ() 对非别名模型名原样放行，DeepSeek API 也直接接受。
+// 模型名直传，不做映射；缺失值必须保持为空，由调用点按当前 Bridge 供应商配置回退。
 function mapModel(name) {
-    return name || MODEL
+    return normalizeExplicitModel(name)
 }
 
 const CLAUDE_HOME = join(homedir(), '.claude')
@@ -481,6 +488,7 @@ const IM_SOURCES = new Set(['wechat', 'feishu', 'dingtalk'])
 const MAX_SESSION_INPUT_QUEUE = 32
 const VALID_PERMISSION_MODES = new Set(['default', 'acceptEdits', 'plan', 'bypassPermissions'])
 const VALID_THINKING_LEVELS = new Set(['auto', 'off', 'low', 'medium', 'high', 'xhigh', 'max'])
+const VALID_MODEL_MODES = new Set(['auto', 'fixed'])
 
 function taskStateStorePath(workDir, sessionId) {
     const safeId = taskStateFileId(sessionId, null)
@@ -513,6 +521,46 @@ function updateTaskState(session, sessionId, next) {
     session.taskState = createTaskStatePatch(next)
     saveTaskState(session, sessionId)
     return session.taskState
+}
+
+function taskStateFromCompletion(session, detail = '') {
+    const completion = createTaskCompletionState(session?.taskCompletion)
+    const reviewOutcome = completion.reviewOutcome || {}
+    const status = completion.phase === 'fixing' ? 'fixing' : completion.phase
+    const startedAt = Number(session?.taskStartedAt || session?.taskState?.startedAt || 0)
+    const terminal = ['succeeded', 'failed', 'incomplete', 'review_paused', 'stopped', 'interrupted'].includes(status)
+    const completedAt = terminal ? Number(session?.taskCompletedAt || Date.now()) : 0
+    return createTaskStatePatch({
+        status,
+        outcome: status === 'succeeded' ? 'succeeded' : status === 'failed' ? 'failed' : status === 'incomplete' ? 'incomplete' : null,
+        continuationReason: status === 'failed' || status === 'review_paused' ? 'execution_error' : null,
+        resumable: !['succeeded'].includes(status) && Boolean(session?.lastSessionId || session?._hasConversation),
+        subtype: session?.lastTaskResult?.subtype || null,
+        detail: detail || completion.detail || session?.lastTaskResult?.result || '',
+        numTurns: session?.lastTaskResult?.numTurns || 0,
+        startedAt,
+        completedAt,
+        durationMs: startedAt && completedAt ? Math.max(0, completedAt - startedAt) : 0,
+        sdkSessionId: session?.lastSessionId,
+        historySessionId: session?.lastSessionId,
+        taskId: session?.taskCompletionTaskId || null,
+        turnId: session?.taskCompletionTurnId || null,
+        sequence: session?._taskCompletionSequence || 0,
+        review: {
+            round: completion.reviewRound,
+            tier: completion.reviewPlan?.tier || null,
+            summary: reviewOutcome.summary || completion.detail || '',
+            blockingFindings: reviewOutcome.blockingFindings || [],
+        },
+    })
+}
+
+function updateTaskCompletion(session, sessionId, event) {
+    const transition = transitionTaskCompletion(session?.taskCompletion, event)
+    if (!session) return transition
+    session.taskCompletion = transition.state
+    updateTaskState(session, sessionId, taskStateFromCompletion(session))
+    return transition
 }
 
 function isValidSessionId(value) {
@@ -549,7 +597,7 @@ function cleanupSessionUploads(workDir, removeAll = false) {
     })
 }
 
-function acceptSessionInput(s, source, messageId, userId = null) {
+function acceptSessionInput(s, source, messageId, userId = null, taskDecision = null) {
     const now = Date.now()
     if (!s._inputIds) s._inputIds = new Map()
     for (const [id, at] of s._inputIds) {
@@ -568,6 +616,7 @@ function acceptSessionInput(s, source, messageId, userId = null) {
         turnId,
         source,
         userId: IM_SOURCES.has(source) ? String(userId || '') : null,
+        taskDecision,
         dedupeKey,
     })
     return {ok: true, messageId: id, turnId, queuePosition: queued, dedupeKey}
@@ -619,11 +668,17 @@ async function stopSessionGeneration(sessionId, s) {
     const operation = (async () => {
         const stoppedTurnId = s.activeTurnId || null
         const stoppedTurnIdentity = s.activeTurnIdentity ? {...s.activeTurnIdentity} : null
+        s.taskCompletion = createTaskCompletionState({
+            ...s.taskCompletion,
+            phase: 'stopped',
+            detail: '用户已暂停任务',
+        })
         for (const id of [...(s.pending?.keys() || [])]) settlePending(sessionId, id, {
             behavior: 'deny',
             message: '已取消',
             interrupt: true,
         }, 'stopped')
+        if (s.taskCompletion?.phase === 'reviewing') stopWorkflow(`final-review:${sessionId}`)
         await closeSessionRuntime(s, {sessionId, reason: 'stop_generation'})
         s.query = null
         s.pushStream = null
@@ -642,8 +697,22 @@ async function stopSessionGeneration(sessionId, s) {
         s.activeTurnId = null
         s.activeTurnIdentity = null
         s.lastSessionId = s.lastSessionId || sessionId
-        updateTaskState(s, sessionId, taskStateForStop({sdkSessionId: s.lastSessionId, historySessionId: s.lastSessionId}))
-        broadcastTurn(sessionId, {type: 'generation_stopped', turnId: stoppedTurnId, taskState: taskStateForClient(s.taskState)}, stoppedTurnIdentity)
+        const completedAt = Date.now()
+        s.taskCompletedAt = completedAt
+        const startedAt = Number(s.taskStartedAt || s.taskState?.startedAt || completedAt)
+        updateTaskState(s, sessionId, taskStateForStop({
+            sdkSessionId: s.lastSessionId,
+            historySessionId: s.lastSessionId,
+            startedAt,
+            completedAt,
+            durationMs: Math.max(0, completedAt - startedAt),
+        }))
+        broadcastTurn(sessionId, {
+            type: 'generation_stopped',
+            turnId: stoppedTurnId,
+            durationMs: s.taskState.durationMs,
+            taskState: taskStateForClient(s.taskState),
+        }, stoppedTurnIdentity)
         return {stopped: true, cancelledInputs, turnId: stoppedTurnId}
     })()
     s._stopPromise = operation
@@ -654,9 +723,9 @@ async function stopSessionGeneration(sessionId, s) {
     }
 }
 
-function markInternalInput(s) {
+function markInternalInput(s, taskDecision = null) {
     if (!Array.isArray(s._pendingInputs)) s._pendingInputs = []
-    s._pendingInputs.unshift({messageId: null, turnId: null, source: s.lastTurnSource || 'desktop', userId: null})
+    s._pendingInputs.unshift({messageId: null, turnId: null, source: s.lastTurnSource || 'desktop', userId: null, taskDecision})
 }
 
 // 活跃 Session 的附件目录定期回收；非活跃 Session 会在删除或下次上传时回收。
@@ -796,7 +865,7 @@ function broadcastDesktop(sid, msg) {
 }
 
 // 注入依赖到 workflow-runner，供 Workflow 子进程通过受控 IPC 请求 agent() 调用
-setDeps({query, deleteSession, makeQueryOptions, loadCliSettings, loadWfConfig, PushStream, broadcast, sessions, persistSdkSessionId, encodeProjectName})
+setDeps({query, deleteSession, makeQueryOptions, loadCliSettings, loadWfConfig, PushStream, broadcast, sessions, persistSdkSessionId, removeSdkSessionId, encodeProjectName})
 
 // 收口：任一通道响应或超时都走这里，幂等（已 settled 则忽略）
 // ── 确认请求收口（settlePending）──
@@ -2267,14 +2336,46 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
         : (baseUrl && baseUrl.includes('opencode') && isOpenCodeProxyRunning()) ? getOpenCodeProxyUrl()
         : baseUrl
 
-    // 模型选择: 用户显式选 → body.model; 未选 → 按消息复杂度自动匹配 modelTiers; 都没有 → settings.model
-    const autoModel = (!body.model && body.text) ? pickTierModelByContent(body.text, loadWfConfig()) : null
-    let resolvedModel = mapModel(body.model) || autoModel || cliS.model || MODEL
-    if (usesCodexRelay && !/^(?:gpt-|o\d|codex|computer-use)/i.test(String(resolvedModel || ''))) {
-        resolvedModel = cliS.env?.CODEX_MODEL || 'gpt-5.6-sol'
+    const requestedModelMode = VALID_MODEL_MODES.has(body.modelMode)
+        ? body.modelMode
+        : (body.model ? 'fixed' : 'auto')
+    const initialDecision = body.taskDecision || (body.text ? decideTask({text: body.text}) : null)
+    const deferAutomaticQuery = shouldDeferAutomaticQuery({
+        modelMode: requestedModelMode,
+        hasTaskDecision: Boolean(initialDecision),
+        hasConversationTarget: Boolean(body.resume || body.forkFrom),
+    })
+    const initialRoute = body._resolvedModel
+        ? {mode: requestedModelMode, model: mapModel(body._resolvedModel), tier: initialDecision?.modelTier || null, blockingReason: null}
+        : initialDecision
+            ? resolveTaskModelRoute({
+                modelMode: requestedModelMode,
+                explicitModel: mapModel(body.model),
+                decision: initialDecision,
+                modelTiers: loadWfConfig().modelTiers,
+                defaultModel: cliS.model || MODEL,
+            })
+            : {mode: requestedModelMode, model: mapModel(body.model) || cliS.model || MODEL, tier: null, blockingReason: null}
+    if (initialRoute.blockingReason) {
+        const error = new Error(initialRoute.blockingReason === 'power_model_required'
+            ? '当前高风险任务需要配置 Power 模型后才能执行'
+            : '当前供应商没有可用模型')
+        error.code = initialRoute.blockingReason
+        throw error
+    }
+    const resolvedModel = initialRoute.model || cliS.model || MODEL
+    const compatibilityError = shouldValidateProviderModel({
+        modelMode: requestedModelMode,
+        hasTaskDecision: Boolean(initialDecision),
+        hasConversationTarget: Boolean(body.resume || body.forkFrom),
+    }) ? validateProviderModel({baseUrl, model: resolvedModel}) : null
+    if (compatibilityError) {
+        const error = new Error('当前 Codex Relay 不支持所选模型，请为该档位配置 Codex 模型')
+        error.code = compatibilityError
+        throw error
     }
     let sdkApiKey = apiKey
-    if (usesCodexRelay) {
+    if (usesCodexRelay && !deferAutomaticQuery) {
         const relayConfig = {upstream: baseUrl, apiKey, model: resolvedModel}
         try {
             const relay = await startCodexRelayProxy(relayConfig)
@@ -2438,7 +2539,7 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
                     broadcast(sessionId, {
                         type: 'context_compaction_summary',
                         trigger: input.trigger || 'auto',
-                        summary: input.compact_summary || '',
+                        summary: compactSummaryForDisplay(input.compact_summary),
                         ts: Date.now(),
                     })
                     return {}
@@ -2446,7 +2547,7 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
             }],
         }
     }
-    // 暴露本次生效的 env 给同进程 fetch 路径（classifyWorkflowViaAI 等），替代写 process.env 全局
+    // 暴露本次生效的 env 给同进程兼容路径，替代写 process.env 全局
     opts.runtimeEnv = {
         ANTHROPIC_BASE_URL: effectiveBaseUrl,
         ANTHROPIC_API_KEY: sdkApiKey,
@@ -2469,6 +2570,11 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
     opts.bridgeContextProfile = contextProfile
     opts.bridgeSkillRoute = skillRoute
     opts.bridgeContextSafetyCap = configuredContextCap
+    opts.bridgeModelMode = requestedModelMode
+    opts.bridgeTaskDecision = initialDecision
+    opts.bridgeModelTier = initialRoute.tier || null
+    opts.bridgeProviderBaseUrl = baseUrl || ''
+    opts.bridgeProviderApiKey = apiKey || ''
     // SDK 的 Anthropic client 读 process.env(不读 opts.env)，直接设 process.env
     // 不再 restore: 多个 session 共享 process.env，restore 会导致 A 恢复 B 的值
     return opts
@@ -2527,6 +2633,20 @@ async function startStreamPump(sessionId) {
                     if (!persistSdkSessionId(s.workDir, sessionId, sdkMsg.session_id)) {
                         log.warn({sessionId: sessionId?.slice(0, 8)}, 'Session 映射未持久化，重启后可能无法续接')
                     }
+                    const visibleSource = s.visibleSource
+                        || sessionVisibilitySource(getProjectVisibility(s.workDir), sessionId, sdkMsg.session_id)
+                    if (visibleSource) {
+                        s.visibleSource = visibleSource
+                        if (!markVisibleSession(s.workDir, sessionId, sdkMsg.session_id, visibleSource)) {
+                            log.warn({sessionId: sessionId?.slice(0, 8)}, 'Session 可见性未持久化')
+                        }
+                        broadcastDesktop(sessionId, {
+                            type: 'session_visible',
+                            sessionId,
+                            historySessionId: sdkMsg.session_id,
+                            source: visibleSource,
+                        })
+                    }
                 }
                 // 顺手把 init 暴露的命令/agent 名单缓存下来，供设置页冷启动读取
                 if (Array.isArray(sdkMsg.slash_commands)) {
@@ -2559,6 +2679,7 @@ async function startStreamPump(sessionId) {
                 s.activeTurnId = inputMeta?.turnId || null
                 s.lastTurnSource = inputMeta?.source || legacySource || s.lastTurnSource || 'desktop'
                 s.activeTurnIdentity = createTurnIdentity(s.lastTurnSource, inputMeta?.userId, IM_SOURCES)
+                s.activeTaskDecision = inputMeta?.taskDecision || s.taskDecision || null
                 s.turnText = ''
                 s.turnToolCount = 0
             }
@@ -2594,23 +2715,18 @@ async function startStreamPump(sessionId) {
                     }
                 }
             }
-            // result 标志一个回合结束 → 结算记录点 + 镜像到所有已开启的 IM 平台
+            // result 只标志主 SDK 回合结束；父任务是否完成由 task-completion 协调器决定。
             if (sdkMsg.type === 'result') {
                 const taskResult = classifyTaskResult(sdkMsg)
+                const completionDecision = s.activeTaskDecision || s.taskCompletionDecision || s.taskDecision || null
                 s.lastTaskResult = {
                     ...taskResult,
+                    subtype: sdkMsg.subtype,
                     resumable: canResumeTask(taskResult, Boolean(s.lastSessionId || sdkMsg.session_id)),
                     result: sdkMsg.result || sdkMsg.errors?.join('\n') || '',
                     numTurns: sdkMsg.num_turns || 0,
                     at: Date.now(),
                 }
-                updateTaskState(s, sessionId, taskStateFromResult({
-                    ...taskResult,
-                    subtype: sdkMsg.subtype,
-                    result: sdkMsg.result || sdkMsg.errors?.join('\n') || '',
-                    numTurns: sdkMsg.num_turns || 0,
-                    resumable: canResumeTask(taskResult, Boolean(s.lastSessionId || sdkMsg.session_id)),
-                }, {sdkSessionId: s.lastSessionId || sdkMsg.session_id}))
                 // maybeUpdateProjectCache 必须在 finalizeCheckpoint 之前调用：
                 // finalizeCheckpoint 会清 s.pendingTurn，而 maybeUpdateProjectCache 依赖它拿 preSnapshot
                 try {
@@ -2618,25 +2734,62 @@ async function startStreamPump(sessionId) {
                 } catch (e) {
                     log.warn({err: e, sessionId: sessionId?.slice(0, 8)}, 'project-cache 更新失败')
                 }
+                let checkpoint = null
                 try {
-                    finalizeCheckpoint(sessionId)
+                    checkpoint = finalizeCheckpoint(sessionId)
                 } catch (e) {
                     log.warn({err: e, sessionId: sessionId?.slice(0, 8)}, 'finalizeCheckpoint 失败')
                 }
-                try {
-                    maybeMirror(sessionId, taskResult)
-                } catch (e) {
-                    log.warn({err: e, sessionId: sessionId?.slice(0, 8)}, 'mirror 失败')
+                const fixing = s.taskCompletion?.phase === 'fixing'
+                const workflowEnabled = loadWfConfig().enabled
+                const reviewPlan = fixing && s.taskCompletion?.reviewPlan
+                    ? s.taskCompletion.reviewPlan
+                    : workflowEnabled
+                        ? resolveFinalReviewPlan({decision: completionDecision, checkpoint})
+                        : {required: false, tier: 'none', mode: 'none', riskDomains: []}
+                if (checkpoint?.files?.length) {
+                    const previous = fixing && Array.isArray(s.taskReviewFiles) ? s.taskReviewFiles : []
+                    const byPath = new Map(previous.map(file => [file.path, file]))
+                    for (const file of checkpoint.files) byPath.set(file.path, file)
+                    s.taskReviewFiles = [...byPath.values()]
+                    s.taskReviewCheckpointId = checkpoint.id
                 }
+                s.taskCompletionDecision = completionDecision
+                s.taskCompletionIdentity = s.activeTurnIdentity ? {...s.activeTurnIdentity} : s.taskCompletionIdentity || null
+                s.taskFinalReplyText = String(s.turnText || s.lastTaskResult.result || '').trim().slice(-100000)
+                const transition = updateTaskCompletion(s, sessionId, {
+                    type: 'primary_result',
+                    result: {
+                        ...taskResult,
+                        detail: s.lastTaskResult.result,
+                        text: s.taskFinalReplyText,
+                    },
+                    reviewPlan,
+                })
+                s._pendingCompletionEffects = transition.effects
+                taskCompletionEventForClient(s, sessionId, 'primary_completed', {
+                    primaryOutcome: taskResult.outcome,
+                    detail: s.lastTaskResult.result || '',
+                })
                 s.turnText = ''
                 void refreshContextUsage(sessionId, s, 'result')
             }
             if (sdkMsg.type === 'result') s._generating = false
             const wsMsg = convertSdkToWs(sdkMsg, sessionId)
-            if (wsMsg) broadcastTurn(sessionId, {...wsMsg, turnId: s.activeTurnId || null}, s.activeTurnIdentity)
+            if (wsMsg) broadcastTurn(sessionId, {
+                ...wsMsg,
+                turnId: s.activeTurnId || null,
+                parentTaskTerminal: sdkMsg.type === 'result' ? ['succeeded', 'failed', 'incomplete'].includes(s.taskCompletion?.phase) : undefined,
+                taskState: sdkMsg.type === 'result' ? taskStateForClient(s.taskState) : undefined,
+            }, s.activeTurnIdentity)
             if (sdkMsg.type === 'result') {
+                const effects = Array.isArray(s._pendingCompletionEffects) ? s._pendingCompletionEffects.splice(0) : []
+                void applyTaskCompletionEffects(sessionId, effects).catch(error => {
+                    log.error({err: error, sessionId: sessionId?.slice(0, 8)}, '父任务完成副作用处理失败')
+                })
                 s.activeTurnId = null
                 s.activeTurnIdentity = null
+                s.activeTaskDecision = null
             }
             // text_delta 兜底累积到 turnText，防止后续轮次 SDK 不发 assistant 消息导致 mirror 丢文本
             if (wsMsg?.type === 'text_delta' && wsMsg.text) {
@@ -2665,12 +2818,24 @@ async function startStreamPump(sessionId) {
             failedSession.activeTurnId = null
             failedSession.activeTurnIdentity = null
             failPendingSessionInputs(sessionId, failedSession, e)
+            const completedAt = Date.now()
+            failedSession.taskCompletedAt = completedAt
+            const startedAt = Number(failedSession.taskStartedAt || failedSession.taskState?.startedAt || completedAt)
             updateTaskState(failedSession, sessionId, taskStateForError(e, {
                 sdkSessionId: failedSession.lastSessionId,
                 historySessionId: failedSession.lastSessionId,
+                startedAt,
+                completedAt,
+                durationMs: Math.max(0, completedAt - startedAt),
             }))
         }
-        if (e.message !== 'cancelled') broadcastTurn(sessionId, {type: 'error', message: e.message, code: 'stream_error'}, failedTurnIdentity)
+        if (e.message !== 'cancelled') broadcastTurn(sessionId, {
+            type: 'error',
+            message: e.message,
+            code: 'stream_error',
+            durationMs: failedSession?.taskState?.durationMs || 0,
+            taskState: taskStateForClient(failedSession?.taskState),
+        }, failedTurnIdentity)
     } finally {
         const s2 = sessions.get(sessionId);
         // 仅当 query 未被重建替换时才置空，避免覆盖新 pump 持有的 query
@@ -2781,17 +2946,17 @@ async function sendWeChatChunks(bn, token, userId, contextToken, fullText) {
 // 实现方式: 取 s.turnText 文本，trim 后非空则逐适配器 hook.sendToUser(sid, text)；各适配器负责自己的格式化/发送逻辑
 // 关键数据流: s.turnText（startStreamPump 中累积）→ 遍历 confirmHooks
 //   → check s.mirrors[hook.platform] → hook.sendToUser(sid, text) → IM 平台
-async function maybeMirror(sid, taskResult = {outcome: 'succeeded'}) {
+async function maybeMirror(sid, taskResult = {outcome: 'succeeded'}, notificationId = null) {
     const s = sessions.get(sid)
     if (!s) return
-    const text = buildIncompleteMirrorText(s.turnText, taskResult)
+    const text = buildIncompleteMirrorText(s.turnText || s.taskFinalReplyText, taskResult)
     if (!text) return
     const turnIdentity = s.activeTurnIdentity ? {...s.activeTurnIdentity} : null
     for (const hook of confirmHooks) {
         if (!s.mirrors[hook.platform]) continue
         if (!shouldRouteMirror(hook.platform, turnIdentity)) continue
         try {
-            await hook.sendToUser(sid, text, turnIdentity?.userId || null)
+            await hook.sendToUser(sid, text, turnIdentity?.userId || null, notificationId)
         } catch (e) {
             log.warn({err: e, platform: hook.platform, sessionId: sid?.slice(0, 8)}, 'mirror sendToUser 失败')
         }
@@ -3016,6 +3181,110 @@ function finishScheduledRun(id) {
     scheduledRuns.delete(id)
 }
 
+function taskCompletionEventForClient(s, sessionId, type, extra = {}) {
+    const identity = s?.taskCompletionIdentity || null
+    const sequence = (s._taskCompletionSequence = (s._taskCompletionSequence || 0) + 1)
+    const taskId = s?.taskCompletionTaskId || `${sessionId}:${s?.taskCompletionTurnId || 'task'}`
+    const turnId = s?.taskCompletionTurnId || s?.activeTurnId || null
+    if (s && ['task_completed', 'task_failed', 'task_review_paused'].includes(type) && !s.taskCompletedAt) {
+        s.taskCompletedAt = Date.now()
+    }
+    updateTaskState(s, sessionId, taskStateFromCompletion(s))
+    const taskState = taskStateForClient(s?.taskState)
+    broadcastTurn(sessionId, {
+        type,
+        taskId,
+        turnId,
+        required: Boolean(s?.taskCompletion?.reviewPlan?.required),
+        status: taskState.status,
+        outcome: taskState.outcome,
+        sequence,
+        timestamp: Date.now(),
+        startedAt: taskState.startedAt,
+        durationMs: taskState.durationMs,
+        notificationId: `${taskId}:${type}`,
+        taskState,
+        ...extra,
+    }, identity)
+}
+
+async function applyTaskCompletionEffects(sessionId, effects = []) {
+    const s = sessions.get(sessionId)
+    if (!s) return
+    for (const effect of effects) {
+        if (effect.type === 'start_review') {
+            const plan = effect.plan || s.taskCompletion?.reviewPlan
+            taskCompletionEventForClient(s, sessionId, 'task_reviewing', {
+                reviewTier: plan?.tier || 'balanced',
+                reviewMode: plan?.mode || 'focused',
+                reviewRound: effect.round || s.taskCompletion?.reviewRound || 1,
+                riskDomains: plan?.riskDomains || ['correctness'],
+            })
+            const checkpoint = {
+                id: s.taskReviewCheckpointId || `task-${sessionId}`,
+                prompt: s.taskCompletionDecision?.text || s.lastTaskResult?.result || '',
+                files: s.taskReviewFiles || [],
+            }
+            await autoTriggerFinalReview(sessionId, s.taskCompletionDecision, checkpoint, plan)
+        } else if (effect.type === 'request_fix') {
+            taskCompletionEventForClient(s, sessionId, 'task_changes_required', {
+                review: s.taskCompletion?.reviewOutcome || null,
+                detail: effect.outcome?.summary || '审查发现需要修复的问题',
+            })
+            if (!s.pushStream || s.taskCompletion?.fixAttempts !== 1) continue
+            updateTaskCompletion(s, sessionId, {type: 'fix_started'})
+            taskCompletionEventForClient(s, sessionId, 'task_fixing', {
+                review: s.taskCompletion?.reviewOutcome || null,
+                detail: effect.outcome?.summary || '正在根据最终审查修复阻断问题',
+            })
+            const findings = (effect.outcome?.blockingFindings || []).slice(0, 12).map(item => {
+                const location = item.file ? `${item.file}${item.line ? ':' + item.line : ''}` : ''
+                return `- [${item.severity || 'high'}] ${item.title || '问题'}${location ? ` (${location})` : ''}\n  ${item.description || ''}${item.suggestion ? `\n  建议：${item.suggestion}` : ''}`
+            }).join('\n')
+            const prompt = [
+                '[Bridge 内部审查反馈] 主任务已执行完成，但最终审查发现以下必须修复的问题。',
+                '请只修复这些问题，保留已完成的其他改动；完成后运行必要的测试。',
+                findings || '- 审查返回了未结构化的阻断问题，请检查本轮变更并修复真实问题。',
+            ].join('\n')
+            beginTurn(sessionId, prompt)
+            markInternalInput(s, s.taskCompletionDecision)
+            s.pushStream.push({
+                type: 'user',
+                session_id: sessionId,
+                message: {role: 'user', content: [{type: 'text', text: prompt}]},
+                parent_tool_use_id: null,
+            })
+            s.hasUserTurns = true
+            await new Promise(resolve => setImmediate(resolve))
+        } else if (effect.type === 'complete') {
+            if (s.taskCompletion?.notificationEmitted) continue
+            s.taskCompletion.notificationEmitted = true
+            updateTaskState(s, sessionId, taskStateFromCompletion(s, effect.detail))
+            taskCompletionEventForClient(s, sessionId, 'task_completed', {
+                reply: s.taskFinalReplyText || '',
+                review: s.taskCompletion?.reviewOutcome || null,
+            })
+            try {
+                await maybeMirror(sessionId, {outcome: 'succeeded'}, `${s.taskCompletionTaskId || sessionId}:task_completed`)
+            } catch (error) {
+                log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '最终完成镜像失败')
+            }
+        } else if (effect.type === 'fail' || effect.type === 'pause') {
+            updateTaskState(s, sessionId, taskStateFromCompletion(s, effect.detail))
+            taskCompletionEventForClient(s, sessionId, effect.type === 'pause' ? 'task_review_paused' : 'task_failed', {
+                detail: effect.detail || '任务未完成',
+                review: s.taskCompletion?.reviewOutcome || null,
+            })
+            try {
+                const eventType = effect.type === 'pause' ? 'task_review_paused' : 'task_failed'
+                await maybeMirror(sessionId, {outcome: effect.type === 'pause' ? 'incomplete' : 'failed', continuationReason: 'execution_error'}, `${s.taskCompletionTaskId || sessionId}:${eventType}`)
+            } catch (error) {
+                log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '任务失败镜像失败')
+            }
+        }
+    }
+}
+
 /**
  * 空白会话只在第一条消息判断一次跨会话接力。内部上下文送入 SDK，
  * checkpoint、IM echo 和前端气泡仍保留用户原文。
@@ -3142,9 +3411,14 @@ async function executeScheduledTask(id) {
         createdAt: Date.now(), pending: new Map(),
         permissionMode: opts.permissionMode || 'default',
         thinkingLevel: task.thinkingLevel || 'auto',
+        modelMode: opts.bridgeModelMode || 'fixed',
         mirrors: {wechat: false, feishu: false, dingtalk: false},
         queryOpts: opts,
-        runtimeEnv: opts.runtimeEnv,  // 供 classifyWorkflowViaAI 同进程 fetch，不污染 process.env
+        runtimeEnv: opts.runtimeEnv,  // 保存当前会话供应商环境，不污染 process.env
+        providerBaseUrl: opts.bridgeProviderBaseUrl || '',
+        providerApiKey: opts.bridgeProviderApiKey || '',
+        taskDecision: opts.bridgeTaskDecision || null,
+        modelTier: opts.bridgeModelTier || null,
         parentSessionId: null, agentName: 'scheduler',
         taskId: null, children: new Set(), depth: 0,
                 turnText: '', turnToolCount: 0,
@@ -3216,102 +3490,16 @@ function resumeScheduledTasks() {
 }
 
 // ── 用户消息工作流自动匹配 ──
-// 功能说明: AI 分类优先（高精度），关键词降级兜底（AI 超时/不可用时），自动选择最合适的 workflow
-// 实现方式:
-//   1. classifyWorkflowViaAI(text): fetch 调用 API 做意图分类，~100 token 输入 / 1 token 输出，5s 超时
-//   2. analyzeMessageForWorkflow(text): 关键词匹配降级兜底，AI 失败时启用
-//   3. autoTriggerWorkflow(sid, text): 编排函数——先推用户消息，再异步分类+启动 workflow
-// 关键数据流: 用户消息 → classifyWorkflowViaAI → 命中→start workflow / 失败→关键词降级 / 都不中→跳过
-const WF_VALID_NAMES = ['code-review', 'bug-hunter', 'audit-sweep', 'deep-research', 'judge-panel', 'generate-critic-fix', 'default']
-
+// 统一任务决策器是主事实源；旧路径缺少决策时仅使用本地关键词兼容，不再发起二次模型分类。
 // 任务类型 → 模型等级映射 (power=最强, balanced=均衡, light=轻量)
 const WF_TIER_MAP = {
-    'code-review': 'balanced',
-    'bug-hunter': 'balanced',
-    'audit-sweep': 'balanced',
+    'code-review': 'power',
+    'bug-hunter': 'power',
+    'audit-sweep': 'power',
     'deep-research': 'power',
     'judge-panel': 'power',
     'generate-critic-fix': 'balanced',
     'default': 'balanced',
-}
-
-// 根据 workflow 名称和 modelTiers 配置解析实际模型 ID
-function resolveTierModel(wfName, wfCfg) {
-    const tier = WF_TIER_MAP[wfName] || 'balanced'
-    return wfCfg?.modelTiers?.[tier] || null
-}
-
-// 根据消息内容复杂度自动选择模型等级（用户未显式选模型时生效）
-function pickTierModelByContent(text, wfCfg) {
-    if (!text || !wfCfg?.modelTiers) return null
-    // 简单问答 — 短消息 + 问候/询问模式 → light
-    if (text.length < 60 && /^(你好|hi|hello|什么是|怎么|如何|为什么|怎么用|帮我解释|帮助|help|what|how|why)/i.test(text.trim())) {
-        return wfCfg.modelTiers.light || null
-    }
-    // 复杂任务 — 长消息 或 包含代码块 → power
-    if (text.length > 500 || (text.match(/```/g) || []).length >= 2) {
-        return wfCfg.modelTiers.power || null
-    }
-    // 默认 → balanced
-    return wfCfg.modelTiers.balanced || null
-}
-
-async function classifyWorkflowViaAI(text, sessionId) {
-    const cliS = loadCliSettings()
-    // 优先从当前 session 的 runtimeEnv 取（感知临时切换的 provider），fallback 到 settings
-    const s = sessionId ? sessions.get(sessionId) : null
-    const re = s?.runtimeEnv || {}
-    const apiKey = re.ANTHROPIC_API_KEY || re.ANTHROPIC_AUTH_TOKEN || cliS.env?.ANTHROPIC_AUTH_TOKEN
-    const baseUrl = re.ANTHROPIC_BASE_URL || cliS.env?.ANTHROPIC_BASE_URL
-    // 分类模型: 优先用 bridge-workflow.json modelTiers.light，未配则用 session 模型
-    const wfCfg = loadWfConfig()
-    const model = wfCfg.modelTiers?.light || re.ANTHROPIC_MODEL || cliS.model || 'deepseek-v4-pro'
-    if (!apiKey || !baseUrl) return null
-
-    const apiUrl = baseUrl.endsWith('/v1/messages') ? baseUrl : baseUrl.replace(/\/+$/, '') + '/v1/messages'
-    const prompt = [
-        '分类用户意图，只回复一个词。',
-        '工作流: code-review(代码审查、review、检查代码质量)',
-        'bug-hunter(找bug、排查异常、调试报错)',
-        'audit-sweep(安全审计、全面排查、扫描漏洞)',
-        'deep-research(深度调研、技术研究、了解新技术)',
-        'judge-panel(方案对比、技术选型、架构决策)',
-        'generate-critic-fix(修复代码、打补丁、修正bug)',
-        'default(复杂多步骤任务、重构、实现新功能)',
-        'none(简单问答、解释概念、聊天、不需要工作流)',
-        '',
-        '用户消息: """' + text.slice(0, 600).replace(/"/g, "'") + '"""',
-        '',
-        '回复:'
-    ].join('\n')
-
-    try {
-        const fetched = await fetchProviderResponse(apiUrl, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'x-api-key': apiKey,
-                'anthropic-version': '2023-06-01',
-            },
-            body: JSON.stringify({
-                model,
-                max_tokens: 10,
-                temperature: 0,
-                system: '你是工作流路由器。根据用户意图输出一个词。不要解释。',
-                messages: [{role: 'user', content: prompt}],
-            }),
-            signal: AbortSignal.timeout(8000),
-        })
-        const resp = fetched.response
-        if (!resp.ok) return null
-        const data = await resp.json()
-        const answer = (data.content?.[0]?.text || '').trim().toLowerCase()
-            .replace(/[^a-z-]/g, '')  // 去掉标点、空白等噪音
-        if (answer === 'none') return null
-        return WF_VALID_NAMES.includes(answer) ? answer : null
-    } catch {
-        return null
-    }
 }
 
 const WORKFLOW_TRIGGERS = [
@@ -3338,22 +3526,18 @@ function analyzeMessageForWorkflow(text) {
     return null
 }
 
-async function autoTriggerWorkflow(sessionId, msgContent) {
+async function autoTriggerWorkflow(sessionId, msgContent, taskDecision = null) {
     const wfCfg = loadWfConfig()
     if (!wfCfg.enabled) return
-    if (classifyContextProfile(msgContent) === 'light') return
+    if (taskDecision && !shouldAutoTriggerWorkflow(taskDecision)) return
+    if (!taskDecision && classifyContextProfile(msgContent) === 'light') return
 
-    let matchedWf = null
-    const kwResult = analyzeMessageForWorkflow(msgContent)
-    if (kwResult === '__skip__') return  // 明确不要 workflow
-
-    // AI 分类优先；失败/超时/不可用 → 降级到关键词
-    try {
-        matchedWf = await classifyWorkflowViaAI(msgContent, sessionId)
-    } catch {
-        matchedWf = null
-    }
-    if (!matchedWf) matchedWf = kwResult  // 关键词降级
+    let matchedWf = taskDecision?.workflow && taskDecision.workflow !== 'none'
+        ? taskDecision.workflow
+        : null
+    const kwResult = matchedWf ? null : analyzeMessageForWorkflow(msgContent)
+    if (!matchedWf && kwResult === '__skip__') return
+    if (!matchedWf) matchedWf = kwResult
     if (!matchedWf || matchedWf === '__skip__') return
 
     const wfList = listWorkflows()
@@ -3379,8 +3563,21 @@ async function autoTriggerWorkflow(sessionId, msgContent) {
         task: msgContent.slice(0, 100),
         ts: Date.now(),
     })
-    const tierModel = resolveTierModel(matchedWf, wfCfg)
-    runWfScript(matchedWf, sessionId, {task: msgContent, _tierModel: tierModel}).catch(e => {
+    const requestedTier = taskDecision?.finalReview && taskDecision.finalReview !== 'none'
+        ? taskDecision.finalReview
+        : taskDecision?.modelTier || WF_TIER_MAP[matchedWf] || 'balanced'
+    const workflowTier = ['code-review', 'bug-hunter', 'audit-sweep', 'generate-critic-fix'].includes(matchedWf)
+        ? resolveWorkflowFinalReviewTier({risk: taskDecision?.risk, requestedTier})
+        : requestedTier
+    runWfScript(matchedWf, sessionId, {
+        task: msgContent,
+        _workflowTier: workflowTier,
+        _modelTiers: wfCfg.modelTiers || {},
+        _fixedModel: sessions.get(sessionId)?.modelMode === 'fixed'
+            ? sessions.get(sessionId)?.queryOpts?.model || null
+            : null,
+        _taskDecision: taskDecision || null,
+    }).catch(e => {
         log.error({err: e, sessionId: sessionId?.slice(0, 8), workflow: matchedWf}, '自动 workflow 失败')
     })
 }
@@ -3721,6 +3918,7 @@ async function handleHttpRequest(req, res) {
             || (body.forkFrom !== undefined && !isValidSessionId(body.forkFrom))
             || (body.permissionMode !== undefined && !VALID_PERMISSION_MODES.has(body.permissionMode))
             || (body.thinkingLevel !== undefined && !VALID_THINKING_LEVELS.has(body.thinkingLevel))
+            || (body.modelMode !== undefined && !VALID_MODEL_MODES.has(body.modelMode))
             || (body.model !== undefined && (typeof body.model !== 'string' || body.model.length > 256))
             || (body.maxTurns !== undefined && (!Number.isFinite(Number(body.maxTurns)) || Number(body.maxTurns) < 1 || Number(body.maxTurns) > 100))
             || (body.baseUrl !== undefined && (typeof body.baseUrl !== 'string' || body.baseUrl.length > 2048))
@@ -3848,7 +4046,12 @@ async function handleHttpRequest(req, res) {
                     gitInfo: sessions.get(sessionId)?.snapshot?.gitHead || null}));
                 return
             }
-            const q = query({prompt: pushStream, options: opts})
+            const deferAutomaticQuery = createMode.mode === 'new' && shouldDeferAutomaticQuery({
+                modelMode: opts.bridgeModelMode,
+                hasTaskDecision: Boolean(opts.bridgeTaskDecision),
+                hasConversationTarget: false,
+            })
+            const q = deferAutomaticQuery ? null : query({prompt: pushStream, options: opts})
             // 清理已死的旧会话资源
             if (oldSess) {
                 await closeSessionRuntime(oldSess, {sessionId, reason: 'replace_stale_session'})
@@ -3858,16 +4061,21 @@ async function handleHttpRequest(req, res) {
             sessions.set(sessionId, {
                 query: q,
                 workDir,
-                pushStream,
+                pushStream: deferAutomaticQuery ? null : pushStream,
                 clients: new Set(),
                 createdAt: Date.now(),
                 pending: new Map(),
                 permissionMode: opts.permissionMode,
                 thinkingLevel: body.thinkingLevel || 'auto',
+                modelMode: opts.bridgeModelMode || (body.model ? 'fixed' : 'auto'),
+                providerBaseUrl: opts.bridgeProviderBaseUrl || body.baseUrl || '',
+                providerApiKey: opts.bridgeProviderApiKey || '',
                 mirrors: {wechat: false, feishu: false, dingtalk: false},
                 queryOpts: opts,
-                runtimeEnv: opts.runtimeEnv,  // 供 classifyWorkflowViaAI 同进程 fetch，不污染 process.env
+                runtimeEnv: opts.runtimeEnv,  // 保存当前会话供应商环境，不污染 process.env
                 contextProfile: opts.bridgeContextProfile || 'full',
+                taskDecision: opts.bridgeTaskDecision || null,
+                taskCompletion: createTaskCompletionState(),
                 skillRoute: opts.bridgeSkillRoute || [],
                 ...initialSessionIdentity(resumeSid),
                 forkedFrom,
@@ -3884,7 +4092,9 @@ async function handleHttpRequest(req, res) {
                 activeTurnIdentity: null,
                 depth: body._depth || 0,
                 modelMeta: body.modelMeta || null,  // 前端传入的 model contextWindow/pricing，供 lookupModelInfo 回退
-                _gitContext: null  // git 仓库上下文，snapshot 构建后填充
+                _gitContext: null,  // git 仓库上下文，由响应后的后台初始化填充
+                snapshotReady: false,
+                checkpointsLoaded: false,
             })
             const createdSession = sessions.get(sessionId)
             const persistedTaskState = resumeSid
@@ -3898,6 +4108,36 @@ async function handleHttpRequest(req, res) {
                 sdkSessionId: resumeSid,
                 historySessionId: resumeSid,
             })
+            if (persistedTaskState && ['reviewing', 'changes_required', 'fixing', 'review_paused'].includes(persistedTaskState.status)) {
+                const recoveredPhase = persistedTaskState.status === 'reviewing' || persistedTaskState.status === 'fixing'
+                    ? 'review_paused'
+                    : persistedTaskState.status
+                createdSession.taskCompletion = createTaskCompletionState({
+                    phase: recoveredPhase,
+                    reviewRound: persistedTaskState.review?.round || 0,
+                    reviewPlan: persistedTaskState.review?.tier ? {
+                        required: true,
+                        tier: persistedTaskState.review.tier,
+                        mode: persistedTaskState.review.tier === 'power' ? 'gate' : 'focused',
+                        riskDomains: ['correctness'],
+                    } : null,
+                    reviewOutcome: persistedTaskState.review ? {
+                        passed: false,
+                        blockingFindings: persistedTaskState.review.blockingFindings || [],
+                        advisoryFindings: [],
+                        summary: persistedTaskState.review.summary || '',
+                        tier: persistedTaskState.review.tier || 'balanced',
+                    } : null,
+                    detail: recoveredPhase === 'review_paused'
+                        ? 'Gateway 重启中断了最终审查，请继续当前任务以恢复处理。'
+                        : persistedTaskState.detail || '',
+                })
+                createdSession.taskState = taskStateFromCompletion(createdSession, createdSession.taskCompletion.detail)
+            }
+            createdSession.taskCompletionTaskId = persistedTaskState?.taskId || null
+            createdSession.taskCompletionTurnId = persistedTaskState?.turnId || null
+            createdSession._taskCompletionSequence = persistedTaskState?.sequence || 0
+            createdSession.visibleSource = sessionVisibilitySource(getProjectVisibility(workDir), sessionId, resumeSid)
             if (resumeSid && createdSession.taskState.status === 'running') {
                 createdSession.taskState = recoverTaskState(createdSession.taskState)
             }
@@ -3905,46 +4145,8 @@ async function handleHttpRequest(req, res) {
             if (resumeSid && !persistSdkSessionId(workDir, sessionId, resumeSid)) {
                 log.warn({sessionId: sessionId?.slice(0, 8), historySessionId: resumeSid.slice(0, 8)}, '恢复 Session 映射未立即持久化')
             }
-            // 文件 diff 基线：优先载入已持久化的基线（重启/resume 后仍显示累计改动）；没有才新拍并落盘
-            try {
-                const ss = sessions.get(sessionId)
-                if (ss) {
-                    const persisted = loadSnapshot(workDir, sessionId)
-                    if (persisted) ss.snapshot = persisted
-                    else {
-                        ss.snapshot = buildFileSnapshot(workDir);
-                        // 异步落盘：2MB+ JSON 同步写会阻塞 session 创建响应，推迟到下一 tick
-                        const snapSession = ss
-                        setImmediate(() => {
-                            if (!saveSnapshot(snapSession, sessionId)) {
-                                log.warn({sessionId: sessionId?.slice(0, 8)}, '保存 Session snapshot 失败')
-                            }
-                        })
-                    }
-                }
-            } catch (e) {
-                log.warn({err: e, sessionId: sessionId?.slice(0, 8)}, 'snapshot 失败')
-            }
-            // 构建 git 上下文（仅 git 仓库有效，供 maybeInjectGitContext 注入）
-            try {
-                const sss = sessions.get(sessionId)
-                const ctx = buildGitContext(workDir)
-                if (ctx && sss) sss._gitContext = ctx
-            } catch (error) {
-                log.debug({err: error, sessionId: sessionId?.slice(0, 8), workDir}, '构建 Git 上下文失败')
-            }
-            // resume 续接：载入历史记录点 + 恢复递增序号
-            try {
-                const ss = sessions.get(sessionId)
-                if (ss) {
-                    ss.checkpoints = loadCheckpoints(workDir, sessionId);
-                    ss.checkpointSeq = ss.checkpoints.reduce((mx, c) => Math.max(mx, parseInt(String(c.id).replace('cp-', ''), 10) || 0), 0)
-                }
-            } catch (e) {
-                log.warn({err: e, sessionId: sessionId?.slice(0, 8)}, 'load checkpoints 失败')
-            }
             focusedSessionId = sessionId
-            startStreamPump(sessionId)
+            if (q) startStreamPump(sessionId)
             // 后台异步构建项目结构缓存（仅首次，后续会话直接复用）
             const projectCachePath = cacheFilePath(workDir)
             if (projectCachePath && !existsSync(projectCachePath)) {
@@ -3958,6 +4160,18 @@ async function handleHttpRequest(req, res) {
                 historySessionId: resumeSid,
                 taskState: taskStateForClient(sessions.get(sessionId)?.taskState),
                 gitInfo: sessions.get(sessionId)?.snapshot?.gitHead || null}))
+            const backgroundSession = sessions.get(sessionId)
+            scheduleSessionBackgroundInitialization({
+                sessionId,
+                session: backgroundSession,
+                getSession: id => sessions.get(id),
+                loadSnapshot,
+                buildSnapshot: buildFileSnapshot,
+                saveSnapshot,
+                buildGitContext,
+                loadCheckpoints,
+                log,
+            })
         } catch (e) {
             log.error({err: e}, 'session 创建失败')
             if (!res.headersSent) {
@@ -4176,6 +4390,8 @@ async function handleHttpRequest(req, res) {
         }
         // 先标记删除再清内存（_deletedSessionIds 已持久化，scanProjects 不会扫回）
         markSessionDeleted(delParam)
+        if (s?.workDir) removeVisibleSession(s.workDir, id, s.lastSessionId || delParam)
+        else removeVisibleSessionEverywhere(id, delParam)
         if (s) { sessions.delete(id); invalidateProjectsCache() }
         clearAdapterBindingsForSessions(delParam, id, s?.lastSessionId)
         if (focusedSessionId === id) focusedSessionId = null;
@@ -4247,11 +4463,13 @@ async function handleHttpRequest(req, res) {
                     }
                 }
                 sessions.delete(id)
+                removeVisibleSession(s.workDir, id, s.lastSessionId || rawId)
                 clearAdapterBindingsForSessions(rawId, id, s.lastSessionId)
                 if (focusedSessionId === id) focusedSessionId = null
                 cleanupSessionUploads(s.workDir, deleteFiles)
             }
             markSessionDeleted(rawId)
+            if (!s) removeVisibleSessionEverywhere(rawId, rawId)
             if (!s) clearAdapterBindingsForSessions(rawId)
             if (deleteFiles) deleteSessionFiles(rawId).catch(error => {
                 log.warn({err: error, sessionId: rawId?.slice(0, 8)}, '后台批量清理 Session 文件失败')
@@ -7323,6 +7541,71 @@ async function handleHttpRequest(req, res) {
     }
 }
 
+async function autoTriggerFinalReview(sessionId, taskDecision, checkpoint, reviewPlan = null) {
+    const s = sessions.get(sessionId)
+    const wfCfg = loadWfConfig()
+    if (!s) return
+    if (!wfCfg.enabled || !checkpoint?.files?.length) {
+        const detail = !wfCfg.enabled ? '最终审查在启动前被关闭' : '最终审查缺少变更文件'
+        const transition = updateTaskCompletion(s, sessionId, {type: 'review_error', detail})
+        await applyTaskCompletionEffects(sessionId, transition.effects)
+        return
+    }
+    const plan = reviewPlan || resolveFinalReviewPlan({decision: taskDecision, checkpoint})
+    if (!plan.required) return
+    const reviewKey = `${checkpoint.id || 'checkpoint'}:${s.taskCompletion?.reviewRound || 1}`
+    if (s._finalReviewKey === reviewKey) return
+    const workflow = 'final-review'
+    if (!listWorkflows().some(w => w.name.replace('.mjs', '') === workflow)) {
+        const transition = updateTaskCompletion(s, sessionId, {type: 'review_error', detail: '最终审查 Workflow 不存在'})
+        await applyTaskCompletionEffects(sessionId, transition.effects)
+        return
+    }
+    let wfId
+    const runKey = `${workflow}:${sessionId}`
+    try { wfId = presetRunState(workflow, runKey) } catch (error) {
+        const detail = error?.code === 'WORKFLOW_ALREADY_RUNNING' ? '已有最终审查正在运行' : String(error?.message || error)
+        if (error?.code !== 'WORKFLOW_ALREADY_RUNNING') log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '最终复核预注册失败')
+        const transition = updateTaskCompletion(s, sessionId, {type: 'review_error', detail})
+        await applyTaskCompletionEffects(sessionId, transition.effects)
+        return
+    }
+    s._finalReviewKey = reviewKey
+    broadcast(sessionId, {type: 'workflow_auto_started', workflowId: wfId, name: workflow, task: '回合完成后的风险门禁最终审查', finalReview: true, reviewTier: plan.tier, required: true, ts: Date.now()})
+    try {
+        const result = await runWfScript(workflow, sessionId, {
+            target: s.workDir,
+            task: checkpoint.prompt,
+            files: checkpoint.files.map(file => ({
+                path: file.path,
+                lines: Math.max(1, Number(file.added || 0) + Number(file.removed || 0)),
+            })),
+            reviewTier: plan.tier,
+            reviewMode: plan.mode,
+            riskDomains: plan.riskDomains,
+            _workflowTier: plan.tier,
+            _forceModelTier: plan.tier,
+            _modelTiers: wfCfg.modelTiers || {},
+            _fixedModel: s.modelMode === 'fixed' ? s.queryOpts?.model || null : null,
+            _permissionMode: 'plan',
+            _returnToParent: false,
+            _runKey: runKey,
+        })
+        if (result?.paused) {
+            const transition = updateTaskCompletion(s, sessionId, {type: 'review_paused', detail: '最终审查已暂停，可恢复后继续'})
+            await applyTaskCompletionEffects(sessionId, transition.effects)
+            return
+        }
+        const outcome = normalizeReviewOutcome(result, plan)
+        const transition = updateTaskCompletion(s, sessionId, {type: 'review_result', outcome})
+        await applyTaskCompletionEffects(sessionId, transition.effects)
+    } catch (error) {
+        log.error({err: error, sessionId: sessionId?.slice(0, 8), workflow}, '最终复核失败')
+        const transition = updateTaskCompletion(s, sessionId, {type: 'review_error', detail: String(error?.message || error)})
+        await applyTaskCompletionEffects(sessionId, transition.effects)
+    }
+}
+
 const httpServer = createServer((req, res) => {
     void handleHttpRequest(req, res).catch(error => {
         log.error({err: error, method: req.method, url: String(req.url || '').slice(0, 512)}, 'HTTP 请求处理异常')
@@ -7542,32 +7825,87 @@ wss.on('connection', (ws, req) => {
             if (s._stopPromise) await s._stopPromise
             const desktopInput = !IM_SOURCES.has(ws._source)
             if (typeof msg.content !== 'string' || !msg.content.trim() || Buffer.byteLength(msg.content, 'utf8') > 900_000
+                || (desktopInput && msg.taskText !== undefined && (typeof msg.taskText !== 'string' || Buffer.byteLength(msg.taskText, 'utf8') > 100_000))
+                || (desktopInput && msg.hasAttachments !== undefined && typeof msg.hasAttachments !== 'boolean')
                 || (desktopInput && msg.permissionMode !== undefined && !VALID_PERMISSION_MODES.has(msg.permissionMode))
                 || (desktopInput && msg.thinkingLevel !== undefined && !VALID_THINKING_LEVELS.has(msg.thinkingLevel))
+                || (desktopInput && msg.modelMode !== undefined && !VALID_MODEL_MODES.has(msg.modelMode))
                 || (desktopInput && msg.model !== undefined && (typeof msg.model !== 'string' || msg.model.length > 256))) {
                 ws.send(JSON.stringify({type: 'message_rejected', messageId: String(msg.messageId || ''), code: 'invalid_input'}))
                 return
             }
-            // 每轮消息前从 settings.json 刷新当前 session 的 runtimeEnv，确保设置页切换厂商后即时生效
-            // 不需要新建 session，也不需要依赖前端传 baseUrl/apiKey
-            (() => {
+            const activeTurnInput = Boolean(s._generating || s.activeTurnId || s._pendingInputs?.length)
+            // 仅在回合边界刷新供应商；执行中的补充消息不能关闭当前 Query。
+            if (!activeTurnInput) (() => {
                 const fresh = loadCliSettings()
                 const key = fresh.env?.ANTHROPIC_AUTH_TOKEN || fresh.env?.ANTHROPIC_API_KEY || ''
                 const url = fresh.env?.ANTHROPIC_BASE_URL || ''
-                const mdl = fresh.model || ''
                 // provider 变更检测: 比较当前 session runtimeEnv 与最新 settings
-                const prevUrl = s.runtimeEnv?.ANTHROPIC_BASE_URL || ''
-                const prevKey = s.runtimeEnv?.ANTHROPIC_AUTH_TOKEN || ''
+                const prevUrl = s.providerBaseUrl || ''
+                const prevKey = s.providerApiKey || ''
                 if ((url && url !== prevUrl) || (key && key !== prevKey)) {
                     // 厂商/API Key 变了，使 modelChanged 路径触发 query 重建
                     if (s.queryOpts) s.queryOpts.model = null
                     s.runtimeEnv = s.runtimeEnv || {}
                     s.runtimeEnv.ANTHROPIC_BASE_URL = url
                     s.runtimeEnv.ANTHROPIC_AUTH_TOKEN = key
+                    s.providerBaseUrl = url
+                    s.providerApiKey = key
                     log.info({sessionId: sessionId?.slice(0,8), baseUrl: url?.slice(0,40)}, '厂商配置变更，将重建 query')
                 }
             })()
-            const inputAccepted = acceptSessionInput(s, ws._source, msg.messageId, ws._adapterUserId || null)
+            const cliSettingsForDecision = loadCliSettings()
+            const requestedModelMode = desktopInput && VALID_MODEL_MODES.has(msg.modelMode)
+                ? msg.modelMode
+                : (s.modelMode || (msg.model ? 'fixed' : 'auto'))
+            const taskDecision = activeTurnInput && s.taskDecision
+                ? s.taskDecision
+                : decideTask({
+                    text: desktopInput && typeof msg.taskText === 'string' && msg.taskText.trim()
+                        ? msg.taskText
+                        : msg.content,
+                    previousDecision: s.taskDecision,
+                    diffRisk: s.lastDiffRisk,
+                    attachmentEvidence: desktopInput && msg.hasAttachments === true,
+                })
+            const taskRoute = resolveTurnModelRoute({
+                activeTurn: activeTurnInput,
+                currentMode: s.modelMode,
+                currentModel: s.queryOpts?.model,
+                currentTier: s.modelTier,
+                modelMode: requestedModelMode,
+                explicitModel: requestedModelMode === 'fixed' ? (msg.model || s.queryOpts?.model) : '',
+                decision: taskDecision,
+                modelTiers: loadWfConfig().modelTiers,
+                defaultModel: cliSettingsForDecision.model || s.queryOpts?.model || MODEL,
+            })
+            if (taskRoute.blockingReason) {
+                ws.send(JSON.stringify({
+                    type: 'message_rejected',
+                    messageId: String(msg.messageId || ''),
+                    code: taskRoute.blockingReason,
+                    message: taskRoute.blockingReason === 'power_model_required'
+                        ? '当前高风险任务需要先配置 Power 模型'
+                        : '当前供应商没有可用模型',
+                }))
+                return
+            }
+            const providerBaseUrl = cliSettingsForDecision.env?.ANTHROPIC_BASE_URL || s.providerBaseUrl || ''
+            const compatibilityError = activeTurnInput
+                ? null
+                : validateProviderModel({baseUrl: providerBaseUrl, model: taskRoute.model})
+            if (compatibilityError) {
+                ws.send(JSON.stringify({
+                    type: 'message_rejected',
+                    messageId: String(msg.messageId || ''),
+                    code: compatibilityError,
+                    message: '当前 Codex Relay 不支持所选模型，请在设置中为该档位配置 Codex 模型',
+                }))
+                return
+            }
+            if (!activeTurnInput) s.providerBaseUrl = providerBaseUrl
+            const previousModelMode = s.modelMode || (s.queryOpts?.model ? 'fixed' : 'auto')
+            const inputAccepted = acceptSessionInput(s, ws._source, msg.messageId, ws._adapterUserId || null, taskDecision)
             if (!inputAccepted.ok) {
                 ws.send(JSON.stringify(inputAccepted.duplicate
                     ? {type: 'message_duplicate', messageId: inputAccepted.messageId}
@@ -7575,6 +7913,38 @@ wss.on('connection', (ws, req) => {
                 return
             }
             acceptedInput = inputAccepted
+            if (!s.visibleSource && isUserSessionSource(ws._source)) {
+                const visibleSource = ws._source
+                if (!markVisibleSession(s.workDir, sessionId, s.lastSessionId, visibleSource)) {
+                    rollbackSessionInput(s, inputAccepted)
+                    acceptedInput = null
+                    ws.send(JSON.stringify({type: 'message_rejected', messageId: inputAccepted.messageId, code: 'session_visibility_persist_failed'}))
+                    return
+                }
+                s.visibleSource = visibleSource
+                if (s.lastSessionId) {
+                    broadcastDesktop(sessionId, {
+                        type: 'session_visible',
+                        sessionId,
+                        historySessionId: s.lastSessionId,
+                        source: visibleSource,
+                    })
+                }
+            }
+            if (!activeTurnInput) {
+                s.taskStartedAt = Date.now()
+                s.taskCompletedAt = 0
+                s.taskCompletion = createTaskCompletionState({phase: 'running'})
+                s.taskCompletionDecision = taskDecision
+                s.taskCompletionIdentity = createTurnIdentity(ws._source, ws._adapterUserId || null, IM_SOURCES)
+                s.taskFinalReplyText = ''
+                s.taskReviewFiles = []
+                s.taskReviewCheckpointId = null
+                s._finalReviewKey = null
+                s.taskCompletionTurnId = inputAccepted.turnId
+                s.taskCompletionTaskId = `${sessionId}:${inputAccepted.turnId}`
+                s._taskCompletionSequence = 0
+            }
             ws.send(JSON.stringify({
                 type: 'message_accepted',
                 messageId: inputAccepted.messageId,
@@ -7588,6 +7958,37 @@ wss.on('connection', (ws, req) => {
                 resumable: Boolean(s.lastSessionId),
                 sdkSessionId: s.lastSessionId,
                 historySessionId: s.lastSessionId,
+                taskId: s.taskCompletionTaskId || null,
+                turnId: s.taskCompletionTurnId || null,
+                sequence: s._taskCompletionSequence || 0,
+                startedAt: s.taskStartedAt || Date.now(),
+                completedAt: 0,
+                durationMs: 0,
+            })
+            if (!activeTurnInput) {
+                taskCompletionEventForClient(s, sessionId, 'task_started', {
+                    modelTier: taskDecision.modelTier,
+                    risk: taskDecision.risk,
+                })
+            }
+            s.taskDecision = taskDecision
+            s.modelTier = taskRoute.tier || null
+            broadcast(sessionId, {
+                type: 'task_decision',
+                version: taskDecision.version,
+                action: taskDecision.action,
+                complexity: taskDecision.complexity,
+                risk: taskDecision.risk,
+                modelTier: taskDecision.modelTier,
+                model: taskRoute.model,
+                modelMode: taskRoute.mode,
+                workflow: taskDecision.workflow,
+                finalReview: taskDecision.finalReview,
+                reasons: taskDecision.reasons,
+                hardTriggers: taskDecision.hardTriggers,
+                fallbackReason: taskRoute.fallbackReason,
+                inheritedFromActiveTurn: taskRoute.inheritedFromActiveTurn,
+                ts: Date.now(),
             })
             log.info({
                 sessionId: sessionId?.slice(0, 8),
@@ -7609,18 +8010,19 @@ wss.on('connection', (ws, req) => {
             // 检测权限/思考/模型设置是否变更，若变更则更新 session 并重建 query
             const newPerm = IM_SOURCES.has(ws._source) ? 'default' : msg.permissionMode
             const newThink = msg.thinkingLevel
-            const newModel = msg.model
+            const newModel = taskRoute.model
             const newMM = msg.modelMeta
-            const nextProfile = nextContextProfile(s.contextProfile || 'full', msg.content)
+            const nextProfile = taskDecision.contextProfile
             const permChanged = newPerm && newPerm !== s.permissionMode
             const thinkChanged = newThink && newThink !== s.thinkingLevel
             const modelChanged = newModel && newModel !== s.queryOpts?.model
+            const modeChanged = taskRoute.mode !== previousModelMode
             const contextChanged = nextProfile !== (s.contextProfile || 'full')
             const sdkInputContent = resolveSdkInputContent(sessionId, s, msg.content)
             const nextSkillRoute = routeSkills({text: sdkInputContent, workDir: s.workDir, profile: nextProfile})
             const skillRouteChanged = JSON.stringify(nextSkillRoute) !== JSON.stringify(s.skillRoute || [])
             beginTurn(sessionId, srcLabel + msg.content)
-            if (permChanged || thinkChanged || modelChanged || contextChanged || skillRouteChanged) {
+            if (permChanged || thinkChanged || modelChanged || modeChanged || contextChanged || skillRouteChanged) {
                 if (permChanged) {
                     s.permissionMode = newPerm;
                     log.info({sessionId: sessionId?.slice(0, 8), permissionMode: newPerm}, 'permissionMode 变更')
@@ -7633,6 +8035,9 @@ wss.on('connection', (ws, req) => {
                     s.queryOpts.model = newModel;
                     if (newMM) s.modelMeta = newMM;
                     log.info({sessionId: sessionId?.slice(0, 8), model: newModel}, 'model 变更')
+                }
+                if (modeChanged) {
+                    log.info({sessionId: sessionId?.slice(0, 8), modelMode: taskRoute.mode, tier: taskRoute.tier}, '模型模式变更')
                 }
                 if (contextChanged) {
                     s.contextProfile = nextProfile
@@ -7653,13 +8058,14 @@ wss.on('connection', (ws, req) => {
                 // 模型首次变更时 SDK 还没创建 conversation，设了会导致 resume 到不存在的会话
                 if (s._hasConversation) s.lastSessionId = s.lastSessionId || sessionId
             }
+            s.modelMode = taskRoute.mode
             // query 为 null（被中止过或设置变更重建）→ 懒重建，resume 续接原会话
             if (!s.query) {
                 // 防并发重建：不同 WS 连接可能同时进入此处，用 _rebuildPromise 互斥
                 if (s._rebuildPromise) {
                     if (!s._pendingMessages) s._pendingMessages = []
                     s._pendingMessages.push(sdkInputContent)
-                    if (!msg._noWorkflow) autoTriggerWorkflow(sessionId, msg.content).catch(e => {
+                    if (!msg._noWorkflow && !activeTurnInput) autoTriggerWorkflow(sessionId, msg.content, taskDecision).catch(e => {
                         log.warn({err: e, sessionId: sessionId?.slice(0, 8)}, 'autoTriggerWorkflow 异常')
                     })
                     acceptedInput = null
@@ -7677,20 +8083,24 @@ wss.on('connection', (ws, req) => {
                     const bodyOverride = {
                         resume: s.hasUserTurns ? (s.lastSessionId || undefined) : undefined,
                         model: s.queryOpts?.model,
+                        modelMode: s.modelMode || 'fixed',
+                        taskDecision: s.taskDecision || null,
                         permissionMode: s.permissionMode,
                         thinkingLevel: s.thinkingLevel,
                         contextProfile: s.contextProfile || 'full',
                         skillRoute: s.skillRoute || [],
                     }
                     // 厂商变更检测: session runtimeEnv 已刷新，携带最新 baseUrl/apiKey 避免回退到 cliS.env
-                    if (s.runtimeEnv?.ANTHROPIC_BASE_URL) bodyOverride.baseUrl = s.runtimeEnv.ANTHROPIC_BASE_URL
-                    if (s.runtimeEnv?.ANTHROPIC_AUTH_TOKEN) bodyOverride.apiKey = s.runtimeEnv.ANTHROPIC_AUTH_TOKEN
+                    if (s.providerBaseUrl) bodyOverride.baseUrl = s.providerBaseUrl
+                    if (s.providerApiKey) bodyOverride.apiKey = s.providerApiKey
                     const opts = await makeQueryOptions(bodyOverride, s.workDir, cliS, {}, sessionId)
                     // stop 或更新的 rebuild 已使本代际失效，禁止重新创建后台 query。
                     if (s._rebuildId !== myRebuildId || s.pushStream !== rebuildPushStream) return
                     if (bodyOverride.resume) opts.resume = bodyOverride.resume
                     s.query = query({prompt: rebuildPushStream, options: opts})
                     s.runtimeEnv = opts.runtimeEnv  // 模型变更重建后刷新 runtimeEnv
+                    s.providerBaseUrl = opts.bridgeProviderBaseUrl || s.providerBaseUrl
+                    s.providerApiKey = opts.bridgeProviderApiKey || s.providerApiKey
                     s.queryOpts = opts
                     startStreamPump(sessionId)
 
@@ -7717,7 +8127,7 @@ wss.on('connection', (ws, req) => {
                     s._pendingMessages = null
                     failPendingSessionInputs(sessionId, s, e)
                 })
-                if (!msg._noWorkflow) autoTriggerWorkflow(sessionId, msg.content).catch(e => {
+                if (!msg._noWorkflow && !activeTurnInput) autoTriggerWorkflow(sessionId, msg.content, taskDecision).catch(e => {
                     log.warn({err: e, sessionId: sessionId?.slice(0, 8)}, 'autoTriggerWorkflow 异常')
                 })
                 acceptedInput = null
@@ -7730,8 +8140,8 @@ wss.on('connection', (ws, req) => {
                 })
                 s.hasUserTurns = true
                 acceptedInput = null
-                if (!msg._noWorkflow) {
-                    autoTriggerWorkflow(sessionId, msg.content).catch(e => {
+                if (!msg._noWorkflow && !activeTurnInput) {
+                    autoTriggerWorkflow(sessionId, msg.content, taskDecision).catch(e => {
                         log.warn({err: e, sessionId: sessionId?.slice(0, 8)}, 'autoTriggerWorkflow 异常')
                     })
                 }
@@ -7945,6 +8355,7 @@ function cleanupOrphanSessionDirs() {
                 if (!statSync(projectDir).isDirectory()) continue
                 for (const entry of readdirSync(projectDir)) {
                     if (entry.endsWith('.jsonl') || entry.startsWith('.trash-') || entry === 'bridge-session-map.json'
+                        || entry === 'bridge-session-visibility.json'
                         || entry === 'bridge-snapshot' || entry === 'bridge-checkpoints' || entry === 'bridge-task-state'
                         || entry === 'bridge-deleted-sessions.json' || entry === 'bridge-scheduled-tasks.json'
                         || entry === 'bridge-workflow-history.jsonl' || entry === 'bridge-config.json') continue
@@ -8069,34 +8480,8 @@ async function scanProjects() {
             const full = join(base, name);
             if (!statSync(full).isDirectory()) continue
 
-            // 构建主 session SDK ID 白名单: session-map 中非 agent/wf-agent 前缀的 value
-            // + 内存中活跃 session 的 lastSessionId（解决 system/init 未到达的竞态）
-            let mainSdkIds = null
-            let agentSdkIds = new Set()  // session-map 中已知的 agent SDK ID，直接排除
-            try {
-                const smPath = join(full, 'bridge-session-map.json')
-                if (existsSync(smPath)) {
-                    mainSdkIds = new Set()
-                    const sm = JSON.parse(readFileSync(smPath, 'utf8'))
-                    for (const [k, v] of Object.entries(sm)) {
-                        if (k.startsWith('@rev:')) continue
-                        if (k.startsWith('agent-') || k.startsWith('wf-agent-')) {
-                            agentSdkIds.add(v)
-                        } else {
-                            mainSdkIds.add(v)
-                        }
-                    }
-                }
-            } catch (error) {
-                log.warn({err: error, projectDir: full}, '读取项目 Session 映射失败，回退内容识别')
-            }
-            // 内存中活跃 session 的 SDK ID 也加入白名单
-            for (const [gwSid, sess] of sessions) {
-                if (sess.lastSessionId) {
-                    if (!mainSdkIds) mainSdkIds = new Set()
-                    mainSdkIds.add(sess.lastSessionId)
-                }
-            }
+            const wd = resolveTranscriptProjectWorkDir(full, name)
+            const visibility = loadProjectVisibilityWithMigration(full, wd)
 
             const files = readdirSync(full).filter(f => {
                 if (!f.endsWith('.jsonl')) return false
@@ -8106,44 +8491,13 @@ async function scanProjects() {
                 if (_deletedSessionIds.has(sid)) {
                     return false
                 }
-                // agent-/wf-agent- 前缀: 直接过滤并加入后台清理队列
-                if (sid.startsWith('agent-') || sid.startsWith('wf-agent-')) {
-                    return false
-                }
-                // 白名单中的主 session → 展示
-                if (mainSdkIds && mainSdkIds.has(sid)) return true
-                // session-map 已知的 agent SDK ID → 过滤 + 清理
-                if (agentSdkIds.has(sid)) {
-                    return false
-                }
-                // 未知 UUID 必须按内容做 fail-open 判断，不能因 session-map 缺失而删除主会话。
-                if (mainSdkIds !== null) {
-                    return !isAgentTranscriptByContent(join(full, f))
-                }
-                // 兜底: session-map 不存在，内容检测排除 agent transcript
-                if (isAgentTranscriptByContent(join(full, f))) {
-                    return false
-                }
-                return true
+                return shouldShowSession(visibility, sid)
             })
                 .map(f => ({name: f, mtime: statSync(join(full, f)).mtimeMs}))
                 .sort((a, b) => b.mtime - a.mtime)
                 .map(f => f.name);
 
             if (!files.length) continue
-            // 遍历所有 jsonl 找 cwd，不只看最新的（删除后最新文件可能缺 cwd）
-            let wd = null
-            for (const fn of files) {
-                try {
-                    const head = readFileHeadLines(join(full, fn), 4096);
-                    const c = head.join('\n');
-                    const m = c.match(/"cwd":\s*"([^"]+)"/);
-                    if (m) { wd = normalizeWorkDir(m[1]); break }
-                } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
-            }
-            if (!wd) {
-                wd = decodeProjectName(name) || name
-            }
             const sds = files.map(f => {
                 const id = f.replace('.jsonl', '');
                 let t = id.slice(0, 8);
@@ -8286,6 +8640,17 @@ async function deleteSessionFiles(sessionId, relatedSessionIds = []) {
                 log.warn({err: error, workDir}, '保存清理后的 Session 映射失败')
             }
         }
+        const visibility = getProjectVisibility(workDir)
+        let nextVisibility = visibility
+        for (const targetId of targetIds) {
+            nextVisibility = removeSessionVisibility(nextVisibility, {gatewaySessionId: targetId, sdkSessionId: targetId})
+        }
+        if (JSON.stringify(nextVisibility) !== JSON.stringify(visibility)
+            && !saveSessionVisibility(workDir, nextVisibility)) {
+            const error = new Error(`保存清理后的 Session 可见性失败: ${workDir}`)
+            failures.push(error)
+            log.warn({err: error, workDir}, '保存清理后的 Session 可见性失败')
+        }
 
         for (const targetId of targetIds) {
             const artifacts = [
@@ -8316,48 +8681,66 @@ function isAgentTranscriptByContent(filePath) {
     return classifyTranscriptFile(filePath) === 'agent'
 }
 
-async function listProjectSessions(ed) {
-    const base = join(CLAUDE_HOME, 'projects', ed);
-    // 构建主 session SDK ID 白名单: session-map + 内存活跃 session
-    let mainSdkIds = null
-    let agentSdkIds = new Set()
+function resolveTranscriptProjectWorkDir(projectDir, encodedDir) {
     try {
-        const smPath = join(base, 'bridge-session-map.json')
-        if (existsSync(smPath)) {
-            mainSdkIds = new Set()
-            const sm = JSON.parse(readFileSync(smPath, 'utf8'))
-            for (const [k, v] of Object.entries(sm)) {
-                if (k.startsWith('@rev:')) continue
-                if (k.startsWith('agent-') || k.startsWith('wf-agent-')) {
-                    agentSdkIds.add(v)
-                } else {
-                    mainSdkIds.add(v)
+        const files = readdirSync(projectDir).filter(name => name.endsWith('.jsonl') && !name.startsWith('.trash-'))
+        for (const file of files) {
+            for (const line of readFileHeadLines(join(projectDir, file), 4096)) {
+                try {
+                    const record = JSON.parse(line)
+                    if (typeof record?.cwd === 'string' && record.cwd.trim()) return normalizeWorkDir(record.cwd)
+                } catch (error) {
+                    if (!(error instanceof SyntaxError)) throw error
                 }
             }
         }
     } catch (error) {
-        log.warn({err: error, projectDir: base}, '读取项目 Session 映射失败')
+        log.debug({err: error, projectDir}, '读取 transcript 项目目录失败')
     }
-    for (const [, sess] of sessions) {
-        if (sess.lastSessionId) {
-            if (!mainSdkIds) mainSdkIds = new Set()
-            mainSdkIds.add(sess.lastSessionId)
+    return decodeProjectName(encodedDir) || encodedDir
+}
+
+function loadProjectVisibilityWithMigration(projectDir, workDir) {
+    const canonicalDir = dirname(sessionVisibilityStorePath(workDir))
+    let state = loadSessionVisibility(canonicalDir)
+    if (projectDir !== canonicalDir) {
+        const legacy = loadSessionVisibility(projectDir)
+        for (const [gatewaySessionId, entry] of Object.entries(legacy.sessions || {})) {
+            state = markSessionVisible(state, {gatewaySessionId, ...entry})
         }
     }
+    if (state.legacyMigrationVersion >= 1) return state
+
+    const sessionMap = {
+        ...(readJSON(join(projectDir, 'bridge-session-map.json')) || {}),
+        ...(readJSON(join(canonicalDir, 'bridge-session-map.json')) || {}),
+    }
+    const transcriptKinds = {}
+    const taskStates = {}
+    for (const [gatewaySessionId, sdkSessionId] of Object.entries(sessionMap)) {
+        if (gatewaySessionId.startsWith('@rev:') || typeof sdkSessionId !== 'string') continue
+        const transcriptPath = [join(projectDir, `${sdkSessionId}.jsonl`), join(canonicalDir, `${sdkSessionId}.jsonl`)]
+            .find(path => existsSync(path))
+        if (transcriptPath) transcriptKinds[sdkSessionId] = classifyTranscriptFile(transcriptPath)
+        taskStates[gatewaySessionId] = readJSON(join(canonicalDir, 'bridge-task-state', `${gatewaySessionId}.json`))
+        taskStates[sdkSessionId] = readJSON(join(canonicalDir, 'bridge-task-state', `${sdkSessionId}.json`))
+    }
+    const migrated = migrateLegacySessionVisibility(state, {sessionMap, transcriptKinds, taskStates})
+    // 即使没有可迁移会话也保存版本，避免每次打开空项目都重复扫描 transcript。
+    saveSessionVisibility(workDir, migrated)
+    return migrated
+}
+
+async function listProjectSessions(ed) {
+    const base = join(CLAUDE_HOME, 'projects', ed);
+    const workDir = resolveTranscriptProjectWorkDir(base, ed)
+    const visibility = loadProjectVisibilityWithMigration(base, workDir)
     const r = []
     try {
         for (const f of readdirSync(base).filter(x => x.endsWith('.jsonl') && !x.startsWith('.trash-') && !x.startsWith('agent-') && !x.startsWith('wf-agent-'))) {
             const id = f.replace('.jsonl', '');
             const filePath = join(base, f)
-            // 白名单过滤: 在 session-map + agent 列表中存在时做精确判断
-            if (mainSdkIds !== null) {
-                if (mainSdkIds.has(id)) { /* 主 session，放行 */ }
-                else if (agentSdkIds.has(id)) continue  // 已知 agent → 跳过
-                else if (isAgentTranscriptByContent(filePath)) continue
-            } else {
-                // 兜底: session-map 不存在，内容检测排除 agent transcript
-                if (isAgentTranscriptByContent(filePath)) continue
-            }
+            if (!shouldShowSession(visibility, id)) continue
             const st = statSync(filePath);
             let t = id.slice(0, 8);
             try {
@@ -8761,9 +9144,75 @@ function saveSessionMap(workDir, map) {
     }
 }
 
+function sessionVisibilityStorePath(workDir) {
+    return join(CLAUDE_HOME, 'projects', encodeProjectName(workDir), 'bridge-session-visibility.json')
+}
+
+function saveSessionVisibility(workDir, state) {
+    try {
+        writeJSON(sessionVisibilityStorePath(workDir), state)
+        return true
+    } catch (error) {
+        log.warn({err: error, workDir}, 'Session 可见性白名单保存失败')
+        return false
+    }
+}
+
+function markVisibleSession(workDir, gatewaySessionId, sdkSessionId, source) {
+    const current = loadSessionVisibility(dirname(sessionVisibilityStorePath(workDir)))
+    const next = markSessionVisible(current, {gatewaySessionId, sdkSessionId, source})
+    const saved = saveSessionVisibility(workDir, next)
+    if (saved) invalidateProjectsCache()
+    return saved
+}
+
+function removeVisibleSession(workDir, gatewaySessionId, sdkSessionId) {
+    const current = loadSessionVisibility(dirname(sessionVisibilityStorePath(workDir)))
+    const next = removeSessionVisibility(current, {gatewaySessionId, sdkSessionId})
+    const saved = saveSessionVisibility(workDir, next)
+    if (saved) invalidateProjectsCache()
+    return saved
+}
+
+function removeVisibleSessionEverywhere(gatewaySessionId, sdkSessionId = null) {
+    const projectsDir = join(CLAUDE_HOME, 'projects')
+    try {
+        for (const encodedDir of readdirSync(projectsDir)) {
+            const projectDir = join(projectsDir, encodedDir)
+            if (!statSync(projectDir).isDirectory()) continue
+            const current = loadSessionVisibility(projectDir)
+            const next = removeSessionVisibility(current, {gatewaySessionId, sdkSessionId})
+            if (JSON.stringify(next) === JSON.stringify(current)) continue
+            try {
+                writeJSON(join(projectDir, 'bridge-session-visibility.json'), next)
+            } catch (error) {
+                log.warn({err: error, projectDir}, '跨项目清理 Session 可见性失败')
+            }
+        }
+    } catch (error) {
+        log.warn({err: error}, '扫描 Session 可见性文件失败')
+    }
+    invalidateProjectsCache()
+}
+
+function getProjectVisibility(workDir) {
+    return loadSessionVisibility(dirname(sessionVisibilityStorePath(workDir)))
+}
+
 function persistSdkSessionId(workDir, gatewaySessionId, sdkSessionId) {
     const map = updateSessionMap(loadSessionMap(workDir), gatewaySessionId, sdkSessionId)
-    return saveSessionMap(workDir, map)
+    const saved = saveSessionMap(workDir, map)
+    if (saved) invalidateProjectsCache()
+    return saved
+}
+
+function removeSdkSessionId(workDir, gatewaySessionId, sdkSessionId) {
+    const current = loadSessionMap(workDir)
+    const map = removeSessionMapEntry(current, gatewaySessionId, sdkSessionId)
+    if (Object.keys(map).length === Object.keys(current).length) return true
+    const saved = saveSessionMap(workDir, map)
+    if (saved) invalidateProjectsCache()
+    return saved
 }
 
 function lookupSdkSessionId(workDir, gatewaySessionId) {
@@ -8939,7 +9388,7 @@ function advancePendingTurn(sessionId, session) {
 
 function finalizeCheckpoint(sessionId) {
     const s = sessions.get(sessionId);
-    if (!s || !s.pendingTurn) { log.info({sessionId: sessionId?.slice(0,8), hasSession: !!s, hasPendingTurn: !!s?.pendingTurn}, '[ckpt] 跳过: 无会话或无 pendingTurn'); return }
+    if (!s || !s.pendingTurn) { log.info({sessionId: sessionId?.slice(0,8), hasSession: !!s, hasPendingTurn: !!s?.pendingTurn}, '[ckpt] 跳过: 无会话或无 pendingTurn'); return null }
     if (!s.pendingTurn.preSnapshot) {
         try {
             s.pendingTurn.preSnapshot = buildFileSnapshot(s.workDir, s.snapshot)
@@ -8947,7 +9396,7 @@ function finalizeCheckpoint(sessionId) {
         } catch (e) {
             log.warn({err: e}, 'finalizeCheckpoint snapshot 降级构建失败');
             advancePendingTurn(sessionId, s)
-            return
+            return null
         }
     }
     const currentTurn = s.pendingTurn
@@ -8955,9 +9404,9 @@ function finalizeCheckpoint(sessionId) {
     const prompt = currentTurn.prompt;
     const time = currentTurn.time
     advancePendingTurn(sessionId, s)
-    if (!pre) { log.info({sessionId: sessionId?.slice(0,8)}, '[ckpt] 跳过: preSnapshot 为空'); return }
+    if (!pre) { log.info({sessionId: sessionId?.slice(0,8)}, '[ckpt] 跳过: preSnapshot 为空'); return null }
     const scan = currentFileScan(s.workDir, pre)
-    if (scan.missing) { log.info({sessionId: sessionId?.slice(0,8)}, '[ckpt] 跳过: 工作目录不存在'); return }
+    if (scan.missing) { log.info({sessionId: sessionId?.slice(0,8)}, '[ckpt] 跳过: 工作目录不存在'); return null }
     const diffMap = diffSnapshotVsCurrent(pre, scan.files, s.workDir)
     const files = []
     let revertible = true
@@ -8977,10 +9426,11 @@ function finalizeCheckpoint(sessionId) {
         }
         files.push({path, status: d.status, before, notRevertible, added: d.added, removed: d.removed})
     }
-    if (!files.length) { log.info({sessionId: sessionId?.slice(0,8), totalDiff: diffMap.size, gitHead: !!pre?.gitHead}, '[ckpt] 跳过: 本轮未改动文件'); return }  // 本轮没动文件，不建记录点
+    if (!files.length) { log.info({sessionId: sessionId?.slice(0,8), totalDiff: diffMap.size, gitHead: !!pre?.gitHead}, '[ckpt] 跳过: 本轮未改动文件'); return null }  // 本轮没动文件，不建记录点
     if (!s.checkpoints) s.checkpoints = []
     s.checkpointSeq = (s.checkpointSeq || 0) + 1
-    s.checkpoints.push({id: `cp-${s.checkpointSeq}`, prompt, time, files, revertible})
+    const checkpoint = {id: `cp-${s.checkpointSeq}`, prompt, time, files, revertible}
+    s.checkpoints.push(checkpoint)
     log.info({sessionId: sessionId?.slice(0,8), cpId: `cp-${s.checkpointSeq}`, fileCount: files.length, gitHead: !!pre?.gitHead}, '[ckpt] 记录点已创建')
     // 裁剪上限，防止长会话无界增长
     if (s.checkpoints.length > 50) s.checkpoints.splice(0, s.checkpoints.length - 50)
@@ -8993,6 +9443,7 @@ function finalizeCheckpoint(sessionId) {
     })
     // 注意：不要在这里重置 session.snapshot —— 文件面板「仅改动」依赖会话起始基线，
     // 重置会让累计改动清零导致「仅改动」空白。记录点用自己的 per-turn preSnapshot，互不影响。
+    return {created: true, ...checkpoint}
 }
 
 // 回退到指定记录点之前的状态：倒序撤销该记录点及其之后的所有轮次

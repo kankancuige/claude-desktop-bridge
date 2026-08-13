@@ -8,7 +8,7 @@ const fakeOutbox = {
     enqueue: (payload, options) => {
         const id = `n${++nextId}`
         queued.push({payload, options, id})
-        return id
+        return {id, duplicate: false, state: 'pending'}
     },
     complete: id => { transitions.push(`complete:${id}`); return true },
     fail: id => { transitions.push(`fail:${id}`); return true },
@@ -27,6 +27,10 @@ assert.deepEqual(
 assert.deepEqual(
     await sendOrQueue({enqueue: () => { throw new Error('encrypt failed') }}, {text: 'direct'}, async () => true),
     {sent: true, queued: false, error: 'encrypt failed'},
+)
+assert.deepEqual(
+    await sendOrQueue({enqueue: () => ({id: 'same', duplicate: true, state: 'sent'})}, {text: 'duplicate'}, async () => { throw new Error('must not send') }, {id: 'same'}),
+    {sent: true, queued: false, id: 'same', duplicate: true},
 )
 
 let releaseDelivery

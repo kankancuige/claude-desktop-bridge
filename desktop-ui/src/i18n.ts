@@ -559,7 +559,7 @@ const messages: Record<Locale, Record<string, string>> = {
     'wf.started': '工作流已启动',
 
     'sys.model': '模型: {model} · {cwd}',
-    'sys.done': '完成 · {turns} 轮 · {ms}ms · ↓{in} ~{think} ↑{out}',
+    'sys.done': '任务完成 · {turns} 轮 · 主执行 {duration} · ↓{in} ~{think} ↑{out}',
     'sys.incompleteMaxTurns': '任务尚未完成：已达到单次最大轮数（{turns} 轮）。已有修改和会话上下文已保留，可继续执行。',
     'sys.maxBudget': '任务尚未完成：已达到本次预算限制。{detail}',
     'sys.executionFailed': '任务执行中断：{detail}。已有修改和会话上下文已保留。',
@@ -989,7 +989,7 @@ const messages: Record<Locale, Record<string, string>> = {
     'wf.started': 'Workflow started',
 
     'sys.model': 'Model: {model} · {cwd}',
-    'sys.done': 'Done · {turns} turns · {ms}ms · ↓{in} ~{think} ↑{out}',
+    'sys.done': 'Task complete · {turns} turns · primary {duration} · ↓{in} ~{think} ↑{out}',
     'sys.incompleteMaxTurns': 'Task incomplete: the per-run turn limit was reached ({turns} turns). Changes and context were preserved.',
     'sys.maxBudget': 'Task incomplete: this run reached its budget limit. {detail}',
     'sys.executionFailed': 'Task interrupted: {detail}. Changes and session context were preserved.',

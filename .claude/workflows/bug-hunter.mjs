@@ -41,6 +41,7 @@ Return JSON:
   {
     label: 'risk-classify',
     phase: 'Size',
+    modelTier: 'light',
     schema: {
       type: 'object',
       properties: {
@@ -91,6 +92,7 @@ phase('Hunt')
 const bugs = await parallel(enabledAngles.map(a =>
   () => agent('在 ' + target + ' 中搜索:\n' + a.prompt + '\n只报告确信度高的真实 bug，返回 JSON', {
     label: 'hunt:' + a.key, phase: 'Hunt',
+    modelTier: tier === 'large' ? 'power' : 'balanced',
     schema: {
       type: 'object',
       properties: {
@@ -127,6 +129,7 @@ phase('Verify')
 const confirmed = await parallel(allBugs.slice(0, 10).map(b =>
   () => agent('尝试证伪以下 bug 报告。不存在则返回 refuted:true:\n文件:' + b.file + ':' + (b.line || '') + '\n' + b.title + '\n' + b.description, {
     label: 'verify:' + b.file, phase: 'Verify',
+    modelTier: 'power',
     schema: {
       type: 'object',
       properties: { confirmed: { type: 'boolean' }, refuted: { type: 'boolean' }, actualImpact: { type: 'string' }, fixSuggestion: { type: 'string' } },

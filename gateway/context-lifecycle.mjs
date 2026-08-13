@@ -68,7 +68,17 @@ export function isSyntheticCompactSummary(sdkMsg) {
     const text = typeof content === 'string'
         ? content
         : Array.isArray(content) ? content.filter(block => block?.type === 'text').map(block => block.text || '').join('\n') : ''
-    return /^\s*This session is being continued\.\.\./i.test(text)
+    return /^\s*(?:This session is being continued\.\.\.|The conversation has been compacted|Context compacted)/i.test(text)
+}
+
+export function compactSummaryForDisplay(value, maxChars = 4000) {
+    const text = String(value || '').replace(/\0/g, '').trim()
+    if (!text) return ''
+    const limit = Number.isFinite(Number(maxChars)) ? Math.max(200, Math.floor(Number(maxChars))) : 4000
+    if (text.length <= limit) return text
+    const head = Math.floor(limit * 0.72)
+    const tail = Math.max(0, limit - head - 40)
+    return `${text.slice(0, head).trimEnd()}\n\n[摘要过长，已省略中间内容]\n\n${text.slice(-tail).trimStart()}`
 }
 
 export function compactBoundaryToEvent(sdkMsg) {

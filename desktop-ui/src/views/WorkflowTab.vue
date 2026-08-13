@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // WorkflowTab.vue —— Claude Code 原生 Workflow DAG 编辑器
-import {ref, onMounted, onBeforeUnmount, nextTick} from 'vue'
+import {ref, onMounted, onBeforeUnmount} from 'vue'
 import {useWorkflow} from '../composables/useWorkflow'
 
 const GW = 'http://127.0.0.1:3456'
@@ -105,7 +105,7 @@ const {
   addNode, removeNode, removeEdge,
   startConnect, completeConnect, updateNodePos,
   createGroup, removeGroup, recalcGroup,
-  addPhase, removePhase, updatePhasePos, updatePhaseTitle, updateGroupLabel,
+  addPhase, removePhase, updatePhasePos, updatePhaseTitle,
   reset, dtoWorkflowScript,
 } = useWorkflow()
 

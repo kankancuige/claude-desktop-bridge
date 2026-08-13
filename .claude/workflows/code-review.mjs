@@ -75,6 +75,7 @@ riskScore = sum(file.risk × file.lines × changeTypeMultiplier)`,
     {
       label: 'risk-classify',
       phase: 'Size',
+      modelTier: 'light',
       schema: {
         type: 'object',
         properties: {
@@ -165,6 +166,7 @@ hasCriticalPath = any file.risk >= 3`,
     {
       label: 'risk-classify',
       phase: 'Size',
+      modelTier: 'light',
       schema: {
         type: 'object',
         properties: {
@@ -261,6 +263,7 @@ if (tier === 'medium') {
     {
       label: 'review:bugs',
       phase: 'Review',
+      modelTier: 'balanced',
       schema: {
         type: 'object',
         properties: {
@@ -298,6 +301,7 @@ const DIMENSIONS = [
 const findings = await parallel(DIMENSIONS.map(d =>
   () => agent('审查 ' + target + ' 下的代码:\n' + d.prompt, {
     label: 'review:' + d.key, phase: 'Review',
+    modelTier: 'power',
     schema: {
       type: 'object',
       properties: {
@@ -327,6 +331,7 @@ phase('Verify')
 const verified = await parallel(allFindings.slice(0, 12).map(f =>
   () => agent('对抗性验证: 文件=' + f.file + ' 标题=' + f.title + ' 描述=' + f.description, {
     label: 'verify:' + f.file, phase: 'Verify',
+    modelTier: 'power',
     schema: {
       type: 'object',
       properties: { isReal: { type: 'boolean' }, refuted: { type: 'boolean' }, reason: { type: 'string' } },
@@ -341,6 +346,7 @@ log('确认 ' + confirmed.length + ' 个真实问题 (过滤 ' + (allFindings.le
 phase('Report')
 const report = await agent('汇总审查发现为 Markdown 报告（中文，按严重程度分组）:\n' + JSON.stringify(confirmed, null, 2), {
   label: 'report', phase: 'Report',
+  modelTier: 'power',
 })
 
 return { tier, riskScore, report, confirmed, totalFound: allFindings.length }

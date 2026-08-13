@@ -112,6 +112,7 @@ SDK 触发工具调用 → canUseTool 回调 → 广播确认请求
 | 模块 | 功能 |
 |------|------|
 | **多供应商 AI** | DeepSeek / Anthropic / OpenAI / 智谱 / Kimi / Gemini / Codex / Qwen / OpenRouter / Ollama / 火山引擎 + 自定义，支持动态模型列表 |
+| **自动模型路由** | 统一任务决策按 Light / Balanced / Power 选择模型；固定模式尊重用户选择，高风险缺少 Power 时明确阻断 |
 | **多平台桌面端** | Windows / macOS / Linux，Electron 原生窗口 + 自定义标题栏 + 系统托盘 |
 | **IM 集成** | 微信 (iLink Bot)、飞书 (企业自建应用)、钉钉 (内部应用 Stream 模式)，支持配对授权、IM 自定义命令远程控制桌面端 |
 | **IM 命令引擎** | 9 条跨平台命令（/p /ss /sw /sws /ns /m /stop /i /h），支持微信/飞书/钉钉远程切换项目/会话/镜像开关，送达状态实时反馈 |
@@ -285,6 +286,10 @@ LOG_LEVEL=info
 ```
 
 ### 2. 启动开发环境
+
+桌面端模型控制栏默认使用“自动”模式。请先在“设置 → 自动任务模型”分别配置 Light、Balanced、Power：Light 用于简单问答和结构探索，Balanced 用于普通实现和审查，Power 用于架构、高风险任务和最终审查。三个档位可以临时指向同一模型，但不会产生实际能力或成本切换。选择“固定”后，当前会话始终使用手工指定模型。
+
+Codex Relay 只能配置 Codex 兼容模型（如 `gpt-*`、`o*`、`codex*`）。不兼容配置会在消息接受前明确报错，不会静默替换成其他模型。自动模式只在回合边界切换模型；执行中的补充消息继承当前模型，避免中断工具调用。
 
 ```bash
 # 终端 1: 启动 Gateway（也可让 Electron 自动启动）

@@ -1,7 +1,12 @@
 export function turnFallbackText(reason) {
     switch (reason) {
         case 'result':
+        case 'task_completed':
             return '处理完成，无文本回复'
+        case 'task_failed':
+            return '任务未完成，请在当前会话查看错误并重试'
+        case 'task_review_paused':
+            return '最终审查已暂停，请在当前会话继续处理'
         case 'stopped':
             return '会话已停止'
         case 'duplicate':

@@ -4,7 +4,7 @@
  * 每次打开新建 Monaco 编辑器实例，关闭时 dispose。
  * 支持 file 模式（单文件 Monaco/Markdown 预览）和 diff 模式（对比）。全封闭组件，所有状态由 props/emits 管理。
  */
-import { ref, watch, nextTick, onBeforeUnmount, computed, shallowRef } from 'vue'
+import { watch, nextTick, onBeforeUnmount, computed, shallowRef } from 'vue'
 import * as monaco from 'monaco-editor'
 import { t } from '../i18n'
 import type { DiffResult } from './types'

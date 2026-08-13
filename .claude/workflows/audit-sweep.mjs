@@ -56,6 +56,7 @@ Return JSON:
   {
     label: 'scope-check',
     phase: 'Scope',
+    modelTier: 'light',
     schema: {
       type: 'object',
       properties: {
@@ -96,6 +97,7 @@ if (enabledDimensions.length === 0) {
 const results = await parallel(enabledDimensions.map(d =>
   () => agent('扫描 ' + target + ' 下的 ' + d.prompt + '\n返回结构化发现列表', {
     label: 'scan:' + d.key, phase: 'Scan',
+    modelTier: 'balanced',
     schema: {
       type: 'object',
       properties: {
@@ -130,6 +132,7 @@ if (critical.length > 0) {
   deepAnalysis = await parallel(critical.map((c, i) =>
     () => agent('深度分析此问题的影响范围和修复方案:\n' + JSON.stringify(c), {
       label: 'deep:' + i, phase: 'DeepDive',
+      modelTier: 'power',
       schema: {
         type: 'object',
         properties: { impact: { type: 'string' }, effort: { type: 'string', enum: ['small', 'medium', 'large'] }, recommendation: { type: 'string' } },
@@ -149,6 +152,7 @@ if (enabledDimensions.length >= 2 && allIssues.length > 0) {
     JSON.stringify({ dimensions: enabledDimensions.map(d => d.key), skipped: skippedDimensions.map(d => d.key), issueCount: allIssues.length, issues: allIssues.slice(0, 20) }, null, 2),
     {
       label: 'completeness', phase: 'Completeness',
+      modelTier: 'power',
       schema: {
         type: 'object',
         properties: {
@@ -181,7 +185,7 @@ const report = await agent(
     deepAnalysis: deepAnalysis.map(d => ({ issue: d.issue.title, impact: d.analysis?.impact, recommendation: d.analysis?.recommendation })),
     completeness: critic,
   }, null, 2),
-  { label: 'report', phase: 'Report' }
+  { label: 'report', phase: 'Report', modelTier: 'power' }
 )
 
 return { report, totalIssues: allIssues.length, enabledDimensions: enabledDimensions.map(d => d.key), skippedDimensions: skippedDimensions.map(d => d.key), completeness: critic?.completeness || 0 }

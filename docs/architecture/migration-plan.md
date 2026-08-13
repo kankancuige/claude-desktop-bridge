@@ -23,6 +23,9 @@ Incomplete: None
 | 5 稳定观察 | build/test 全绿 | 真实 Gateway/API 故障和重启 smoke | 日志+UI截图/步骤记录 | 会话重复、丢历史、密钥泄露 | 禁止清理旧 transcript；按阶段回滚代码 |
 | 6 身份即时固化 | resume 缺失测试通过 | runtime 创建即绑定并持久化 SDK ID | 重启前后映射一致性测试 | 同一 SDK ID 产生两个 runtime | 停用即时写入，保留 `system/init` 校正路径 |
 | 7 分支与按需接力 | SDK 支持 `forkSession`；上下文提取红测存在 | 新增 fork API/侧栏入口；引用短句按需读取最近 transcript | fork ID 不同且历史连续；普通首问零注入 | 源 transcript 被改写或错误会话被注入 | 移除新入口和接力调用；不删除已生成 fork transcript |
+| 8 统一任务决策 | 现有模型和 Context Profile 测试通过 | 新增纯函数 `TaskDecision`，旧分类器改为适配层 | 决策表测试覆盖硬风险和用户约束 | 同一输入产生不稳定结果 | 保留旧函数入口，停用新决策调用即可回滚 |
+| 9 自动模型模式 | 决策事件和模型档位校验通过 | 新客户端发送 `modelMode:auto`，Gateway 在回合边界选择模型 | 自动与固定模式契约测试；不会在执行中切换 | 重复执行消息或恢复到错误会话 | UI 默认切回 fixed；旧客户端路径不变 |
+| 10 Workflow 与审查收敛 | 自动模型模式稳定 | Workflow/Agent 消费统一决策；实施任务由主会话唯一写入；高风险成功回合基于真实 checkpoint 使用 Power 只读复核 | Workflow 模型继承、重复写入抑制和审查升级测试 | Power 不可用却错误报告成功，或主会话与 Workflow 并行写入 | 禁用自动 Workflow；主会话与旧手工 Workflow 保持可用 |
 
 ## 兼容、数据与删除
 
@@ -32,3 +35,6 @@ Incomplete: None
 - 本次没有不可逆数据迁移。稳定期内不删除旧分支或兼容逻辑。
 - 已存在的断裂 transcript 不自动合并或删除；后续只能显式归档，避免错误改写 SDK UUID 链。
 - 只有确认所有用户操作调用方使用稳定错误码后，才考虑收敛散落字符串；该清理不属于本次必需步骤。
+- `modelTiers` 保持原 JSON 结构；新增 `modelMode` 默认只影响新桌面端。旧客户端显式 `model` 继续视为 fixed，不需要批量迁移会话。
+- 自动路由失败不能重复提交已经接受的用户消息；切换失败返回不完整/可重试状态，由用户决定重发。
+- 回滚自动模式只需让桌面端恢复发送 fixed；不删除决策日志、transcript 或已完成任务结果。

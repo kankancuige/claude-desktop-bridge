@@ -4,7 +4,7 @@
  * 360px 固定宽度，由父组件控制显示/隐藏。
  * 文件树渲染、目录展开/折叠、文件点击预览/diff 均通过 emits 上报父组件。
  */
-import { computed, ref } from 'vue'
+import { ref } from 'vue'
 import { t } from '../i18n'
 import type { TreeNode, FlatFile, AgentRun } from './types'
 
@@ -264,7 +264,7 @@ function fmtTime(ts: number) {
         <div class="wf-phases-bar">
           <template v-for="(ph, pi) in wfRunState.phases" :key="ph.title">
             <span class="wf-phase-dot" :class="ph.status" :title="ph.title"></span>
-            <span v-if="pi < wfRunState.phases.length - 1" class="wf-phase-line" :class="{ done: ph.status === 'done' || ph.status === 'running' }"></span>
+            <span v-if="Number(pi) < wfRunState.phases.length - 1" class="wf-phase-line" :class="{ done: ph.status === 'done' || ph.status === 'running' }"></span>
           </template>
           <span style="font-size:11px;color:var(--text-muted);margin-left:6px">{{ wfRunState.currentPhase || wfRunState.phases?.find((p: any) => p.status === 'running')?.title }}</span>
         </div>

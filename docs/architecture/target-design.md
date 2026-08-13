@@ -88,3 +88,55 @@ interface BridgeNotice {
 - 构建：Gateway tests、`vue-tsc --noEmit`、Vite build、`git diff --check`。
 - runtime：新建回合 -> 暂停 -> 退出 -> 重启 -> 历史正文和草稿恢复 -> 继续发送；断开 Gateway 时出现提示，恢复后消失。
 - runtime：源会话 -> 显式分支 -> 新 SDK ID 保留源历史；空白新会话发送“加上”时命中最近有效会话，普通独立问题不注入。
+
+## 统一任务决策与模型路由
+
+### 目标边界
+
+- Gateway 新增无副作用的 `TaskDecision` 决策器，统一输出 `action`、`complexity`、`risk`、`modelTier`、`contextProfile`、`workflow`、`finalReview`、`reasons` 和 `hardTriggers`。
+- 桌面端只表达 `modelMode: auto | fixed`：自动模式由 Gateway 选择模型，固定模式使用用户显式选择的模型。旧客户端只要继续发送 `model` 且不发送 `modelMode`，就按固定模式兼容。
+- Context Profile 继续决定工具和注入范围，但由统一决策结果驱动；Workflow、Agent 和最终审查不再维护互相冲突的任务分类。
+- 模型档位仍只有 `light / balanced / power`。确定性构建、测试、类型检查和凭据扫描由工具执行，不为它们单独调用 Power。
+
+### 决策优先级与不变量
+
+1. 用户明确固定模型或只读约束优先。
+2. 安全、认证、会话身份、持久化、并发、协议、消息投递、公开契约和迁移是硬风险触发器；命中后不能被短文本或少文件降级。
+3. 动作和影响范围决定基础复杂度；文本长度和代码块数量只能作为辅助信号。
+4. `risk=high|critical` 必须 `modelTier=power` 且 `finalReview=power`；普通实现由 Balanced 执行，Power 负责设计或最终裁决。
+5. Light 仅负责简单问答、结构探索和机械提取，不得修改代码或作最终完成判断。
+6. 自动模式可以在回合边界切换实际模型；同一回合中不得切换，运行中的工具调用不得因模型路由被中断。
+7. 档位没有配置模型时回退到默认模型，并把 `fallback` 原因写入决策事件；不得静默伪装成已经切换。
+
+### 运行契约
+
+```ts
+interface TaskDecision {
+  version: 1
+  action: 'query' | 'inspect' | 'implement' | 'review' | 'refactor' | 'operate'
+  complexity: 'light' | 'balanced' | 'power'
+  risk: 'low' | 'medium' | 'high' | 'critical'
+  modelTier: 'light' | 'balanced' | 'power'
+  contextProfile: 'light' | 'focused' | 'full'
+  workflow: 'none' | 'code-review' | 'bug-hunter' | 'audit-sweep' | 'deep-research' | 'judge-panel' | 'generate-critic-fix' | 'default'
+  finalReview: 'none' | 'balanced' | 'power'
+  reasons: string[]
+  hardTriggers: string[]
+}
+```
+
+- 每条已接受用户消息在进入 SDK 前计算一次决策。Gateway 解析档位到实际模型，必要时沿用现有安全重建 Query 流程，然后向桌面广播 `task_decision`。
+- Workflow 自动触发直接消费 `decision.workflow` 和 `decision.modelTier`；Workflow 内未显式指定模型的 Agent 继承档位模型。内置 Workflow 不再写死供应商不一定支持的 `sonnet`。
+- 代码修改结束后的审查深度取任务决策风险与真实差异风险的较高值。高风险或关键路径最终审查必须使用 Power；低中风险由 Balanced 定向审查。
+- `task_decision` 仅包含模型 ID、档位、稳定原因码和非敏感描述，不包含 Prompt、API Key、请求体或内部思考内容。
+
+### 失败与降级
+
+| 失败 | 行为 |
+|---|---|
+| 自动档位未配置 | 使用默认模型，事件标记 `tier_model_unconfigured` |
+| 指定模型不在当前供应商列表 | 不在客户端猜测；Gateway 使用已保存默认模型并提示配置问题 |
+| 自动切换重建失败 | 当前消息失败并保留草稿，不回退到旧模型重复执行有副作用任务 |
+| 分类器不可用 | 使用本地确定性规则，不阻塞任务 |
+| Workflow 不存在或已运行 | 主会话继续执行，记录 Workflow 跳过原因 |
+| Power 不可用 | 高风险任务不得降级后宣称完成；返回可重试的不完整状态 |

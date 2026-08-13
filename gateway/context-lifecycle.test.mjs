@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
     calculateAutoCompactWindow,
+    compactSummaryForDisplay,
     compactBoundaryToEvent,
     isSyntheticCompactSummary,
     normalizeContextUsage,
@@ -70,5 +71,14 @@ test('synthetic compact summaries are hidden from normal transcript bubbles', ()
     assert.equal(isSyntheticCompactSummary({message: {isCompactSummary: true}}), true)
     assert.equal(isSyntheticCompactSummary({isCompactSummary: true, message: {content: 'internal'}}), true)
     assert.equal(isSyntheticCompactSummary({message: {content: [{type: 'text', text: 'This session is being continued...'}]}}), true)
+    assert.equal(isSyntheticCompactSummary({message: {content: 'The conversation has been compacted for continuation.'}}), true)
     assert.equal(isSyntheticCompactSummary({message: {content: [{type: 'text', text: 'normal user message'}]}}), false)
+})
+
+test('压缩摘要展示有硬上限并保留首尾关键信息', () => {
+    const summary = compactSummaryForDisplay(`HEAD-${'x'.repeat(6000)}-TAIL`, 1000)
+    assert.ok(summary.length <= 1050)
+    assert.match(summary, /^HEAD-/)
+    assert.match(summary, /-TAIL$/)
+    assert.match(summary, /已省略中间内容/)
 })

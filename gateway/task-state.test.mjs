@@ -9,10 +9,24 @@ test('success is terminal and never resumable', () => {
     assert.equal(isTaskResumable(state), false)
 })
 
+test('reviewing and changes_required remain resumable intermediate states', () => {
+    const reviewing = createTaskStatePatch({status: 'reviewing', resumable: false, review: {round: 1, tier: 'power', summary: '审查中'}})
+    assert.equal(reviewing.version, 4)
+    assert.equal(reviewing.status, 'reviewing')
+    assert.equal(reviewing.outcome, null)
+    assert.equal(reviewing.resumable, true)
+    assert.equal(reviewing.review.round, 1)
+
+    const changes = recoverTaskState({status: 'changes_required', resumable: true, review: {round: 1, tier: 'power', blockingFindings: [{severity: 'high', title: '问题'}]}})
+    assert.equal(changes.status, 'changes_required')
+    assert.equal(changes.outcome, null)
+    assert.equal(changes.review.blockingCount, 1)
+})
+
 test('running state becomes an interrupted resumable task after gateway restart', () => {
     const state = recoverTaskState({status: 'running', sdkSessionId: 'sdk-1', resumable: true}, {now: 123})
     assert.deepEqual(state, {
-        version: 1,
+        version: 4,
         status: 'interrupted',
         outcome: 'failed',
         continuationReason: 'execution_error',
@@ -20,8 +34,15 @@ test('running state becomes an interrupted resumable task after gateway restart'
         subtype: null,
         sdkSessionId: 'sdk-1',
         historySessionId: null,
+        taskId: null,
+        turnId: null,
+        sequence: 0,
         numTurns: 0,
+        startedAt: 0,
+        completedAt: 0,
+        durationMs: 0,
         detail: '',
+        review: {round: 0, tier: null, summary: '', blockingCount: 0, blockingFindings: []},
         updatedAt: 123,
     })
 })
@@ -31,6 +52,7 @@ test('detail is bounded and client projection excludes session identity', () => 
     const client = taskStateForClient(state)
     assert.equal(client.detail.length, 2000)
     assert.equal('sdkSessionId' in client, false)
+    assert.deepEqual(client.review, {round: 0, tier: null, summary: '', blockingCount: 0, blockingFindings: []})
 })
 
 test('incomplete result remains resumable', () => {
@@ -61,6 +83,24 @@ test('persisted task detail redacts common credential forms', () => {
     assert.equal(detail.includes('sk-live_123456789'), false)
     assert.equal(detail.includes('user:pass'), false)
     assert.match(detail, /\[REDACTED\]/)
+})
+
+test('父任务身份和事件序号可跨重启持久化', () => {
+    const state = createTaskStatePatch({
+        status: 'reviewing', taskId: 'gw-1:turn-2', turnId: 'turn-2', sequence: 4,
+    })
+    const restored = recoverTaskState(state)
+    assert.equal(restored.taskId, 'gw-1:turn-2')
+    assert.equal(restored.turnId, 'turn-2')
+    assert.equal(taskStateForClient(restored).sequence, 4)
+})
+
+test('任务起止时间和总耗时可持久化并投影给客户端', () => {
+    const state = createTaskStatePatch({status: 'succeeded', startedAt: 1000, completedAt: 4600, durationMs: 3600})
+    const client = taskStateForClient(state)
+    assert.equal(client.startedAt, 1000)
+    assert.equal(client.completedAt, 4600)
+    assert.equal(client.durationMs, 3600)
 })
 
 console.log('task-state tests passed')

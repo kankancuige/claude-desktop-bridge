@@ -1,5 +1,6 @@
 // 中文用户经常用“加上/添加/补一个”表达直接实现需求，不能只依赖“修改/实现”等书面词。
 import {appendBridgeRules} from './bridge-rules.mjs'
+import {decideTask} from './task-decision.mjs'
 
 const WRITE_SIGNALS = /(?:修改|修复|实现|新增|添加|增加|加上|加个|加一个|加些|加一(?:个|项)?|加(?=(?:按钮|功能|字段|模块|接口|页面|控件|能力|支持))|补上|补个|补一个|补些|补一(?:个|项)?|补(?=(?:按钮|功能|字段|模块|接口|页面|控件|能力|支持))|加入|移除|删除|重构|改代码|写代码|补代码|优化|完善|处理(?:一下)?(?:这个)?(?:问题|bug|功能)?|解决(?:一下|掉)?(?:这个)?(?:问题|bug)?|完成(?:这个)?(?:需求|功能)?|做出来|落地|应用补丁|执行命令|运行测试|构建项目|编译项目|提交代码|commit|push|部署|安装依赖)/i
 // 只有用户明确限制为只读/只分析时才关闭写入能力。普通的“检查/审查/排查/看看”
@@ -32,21 +33,9 @@ function hasCodeOrFileEvidence(normalized) {
 }
 
 export function classifyContextProfile(text) {
-    if (typeof text !== 'string') return 'full'
-    const normalized = text.trim()
-    if (!normalized) return 'full'
-    const explicitWrite = WRITE_SIGNALS.test(normalized)
-    const readOnly = READ_ONLY_SIGNALS.test(normalized)
-    const directWriteOverride = DIRECT_WRITE_OVERRIDE.test(normalized)
-    const lightQuestion = isIndependentLightQuestion(normalized)
-
-    // 用户明确要求不写入时，路径或“优化”字样不能把请求升级成可写任务。
-    if (readOnly && !directWriteOverride) return lightQuestion && !hasCodeOrFileEvidence(normalized) ? 'light' : 'focused'
-    if (explicitWrite || directWriteOverride) return 'full'
-    if (LIVE_INFORMATION_SIGNALS.test(normalized)) return 'full'
-    if (lightQuestion) return 'light'
-    // 非轻量问题默认保留完整执行上下文；是否真正写入仍由 permissionMode/用户确认控制。
-    return 'full'
+    if (typeof text !== 'string' || !text.trim()) return 'full'
+    if (LIVE_INFORMATION_SIGNALS.test(text)) return 'full'
+    return decideTask({text}).contextProfile
 }
 
 export function nextContextProfile(current, text) {

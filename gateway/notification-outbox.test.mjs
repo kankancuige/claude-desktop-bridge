@@ -91,6 +91,10 @@ try {
     capacityOutbox.complete(keptId)
     assert.ok(capacityOutbox.enqueue({text: 'after-sent'}))
 
+    const dedupe = new NotificationOutbox({filePath: join(dir, 'dedupe.json'), platform: 'wechat', payloadCodec})
+    assert.deepEqual(dedupe.enqueue({text: 'once'}, {id: 'task-1:completed'}), {id: 'task-1:completed', duplicate: false, state: 'pending'})
+    assert.deepEqual(dedupe.enqueue({text: 'twice'}, {id: 'task-1:completed'}), {id: 'task-1:completed', duplicate: true, state: 'pending'})
+
     const legacyFile = join(dir, 'legacy-outbox.json')
     const migratedFile = join(dir, 'wechat-outbox.json')
     writeFileSync(legacyFile, JSON.stringify({entries: {

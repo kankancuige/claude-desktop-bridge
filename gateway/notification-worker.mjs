@@ -46,12 +46,20 @@ export function startNotificationWorker({outbox, deliver, log, intervalMs = 30_0
     }
 }
 
-export async function sendOrQueue(outbox, payload, deliver, {leaseMs = 30_000} = {}) {
+export async function sendOrQueue(outbox, payload, deliver, {leaseMs = 30_000, id: requestedId} = {}) {
     // 先持久化并设置发送租约，覆盖进程在平台请求期间崩溃导致通知永久丢失的窗口。
     let id = null
     let persistError = null
     try {
-        id = outbox.enqueue(payload, {deferMs: leaseMs})
+        const enqueueOptions = requestedId === undefined ? {deferMs: leaseMs} : {id: requestedId, deferMs: leaseMs}
+        const enqueued = outbox.enqueue(payload, enqueueOptions)
+        if (typeof enqueued === 'string') id = enqueued
+        else if (enqueued?.id) {
+            id = enqueued.id
+            if (enqueued.duplicate) {
+                return {sent: enqueued.state === 'sent', queued: enqueued.state !== 'sent', id, duplicate: true}
+            }
+        }
     } catch (error) {
         persistError = error
     }

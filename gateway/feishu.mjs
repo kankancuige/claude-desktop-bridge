@@ -45,6 +45,7 @@ import {splitTextByUtf8Bytes} from './text-chunks.mjs'
 import {loadPairedUsers, savePairedUsers} from './paired-users.mjs'
 import {readAdapterConfig} from './adapter-config.mjs'
 import {turnFallbackText} from './im-turn-finish.mjs'
+import {createImTurnTimeout} from './im-turn-timeout.mjs'
 import {validateImText} from './im-input.mjs'
 import {createMirrorStateResolver} from './mirror-state.mjs'
 import {platformEntryFilePath} from './platform-entry-store.mjs'
@@ -356,13 +357,15 @@ export function startFeishuAdapter(token) {
         log,
     })
 
-    async function sendReliableText(userId, text) {
+    async function sendReliableText(userId, text, notificationId = null) {
         if (stopped) return false
         const parts = splitTextByUtf8Bytes(text, 4000)
         let sent = true
         for (let i = 0; i < parts.length; i++) {
             const content = parts.length > 1 ? `【${i + 1}/${parts.length}】${parts[i]}` : parts[i]
-            const result = await sendOrQueue(outbox, {userId, text: content}, payload => sendMsg(payload.userId, payload.text))
+            const result = await sendOrQueue(outbox, {userId, text: content}, payload => sendMsg(payload.userId, payload.text), {
+                id: notificationId ? `${notificationId}:part:${i + 1}` : undefined,
+            })
             if (!result.sent) sent = false
         }
         return sent
@@ -390,8 +393,9 @@ export function startFeishuAdapter(token) {
             }
             let toolCount = 0, done = false, replyText = ''
             let expectedTurnId = null
+            let terminalNotificationId = null
             const mirrorState = createMirrorStateResolver(() => shouldSkipReply(sessionId, userId))
-            let timeoutId = null
+            const turnTimeout = createImTurnTimeout({onTimeout: () => finish('timeout')})
 
             // ── finish ──
             // 功能说明: 标记完成并发送回复(reason 参数用于日志诊断结束原因)
@@ -399,7 +403,7 @@ export function startFeishuAdapter(token) {
             const finish = async (reason) => {
                 if (done) return;
                 done = true;
-                if (timeoutId) clearTimeout(timeoutId)
+                turnTimeout.stop()
                 activeSockets.delete(ws2)
                 log.info({
                     sessionId: sessionId?.slice(0, 8),
@@ -413,7 +417,7 @@ export function startFeishuAdapter(token) {
                 try {
                     if (stopped || reason === 'adapter_stopped') return
                     if (await mirrorState.resolve()) return
-                    await sendReliableText(userId, replyText.trim() || turnFallbackText(reason))
+                    await sendReliableText(userId, replyText.trim() || turnFallbackText(reason), terminalNotificationId)
                 } catch (error) {
                     log.error({err: error, sessionId: sessionId?.slice(0, 8), reason}, '飞书回合收尾失败')
                 } finally {
@@ -425,8 +429,6 @@ export function startFeishuAdapter(token) {
             //   若 await 期间 WS 已 OPEN 则 onopen 永远不触发 → user_message 丢失 → 超时
             ws2.onerror = () => finish('ws_error')
             ws2.onclose = () => finish('ws_close')
-            timeoutId = setTimeout(() => finish('timeout'), 5 * 60 * 1000 + 30000)
-
             ws2.onopen = () => {
                 ws2.send(JSON.stringify({type: 'user_message', content: text, messageId, permissionMode: 'default'}));
                 log.info({sessionId: sessionId?.slice(0, 8), textLength: text.length}, '→session')
@@ -435,6 +437,7 @@ export function startFeishuAdapter(token) {
             ws2.onmessage = (e) => {
                 try {
                     const msg = JSON.parse(e.data)
+                    turnTimeout.touch()
                     if (msg.type === 'connected') {
                         if (typeof msg.mirrorEnabled === 'boolean') {
                             mirrorState.set(msg.mirrorEnabled)
@@ -491,8 +494,14 @@ export function startFeishuAdapter(token) {
                             if (added) sendReliableText(userId, `请选择\n${lines.join('\n')}\n\n回复选项编号`)
                         }
                     } else if (msg.type === 'result') {
-                        if (toolCount > 0 && !mirrorState.value) sendMsg(userId, `共执行 ${toolCount} 个工具`)
-                        setTimeout(finish, 500, 'result')
+                        if (msg.parentTaskTerminal && toolCount > 0 && !mirrorState.value) sendMsg(userId, `共执行 ${toolCount} 个工具`)
+                    } else if (msg.type === 'task_completed') {
+                        terminalNotificationId = msg.notificationId || terminalNotificationId
+                        setTimeout(finish, 500, 'task_completed')
+                    } else if (msg.type === 'task_failed' || msg.type === 'task_review_paused') {
+                        terminalNotificationId = msg.notificationId || terminalNotificationId
+                        if (msg.detail) replyText = [replyText.trim(), `[Bridge] ${msg.detail}`].filter(Boolean).join('\n\n')
+                        finish(msg.type)
                     } else if (msg.type === 'generation_stopped') {
                         sessionQueue.cancel(sessionId)
                         finish('stopped')
@@ -574,11 +583,11 @@ export function startFeishuAdapter(token) {
 
     // ── sendToUser ── Mirror 发送到绑定用户(支持长文本分段)
     // 功能说明: 将镜像回复发送到绑定的飞书用户，超长文本自动按 4000 字节分段
-    async function sendToUser(sid, text, targetUserId = null) {
+    async function sendToUser(sid, text, targetUserId = null, notificationId = null) {
         const uid = targetUserId || findUserForSession(sid)
         if (!uid || !text) return
         if (!pairedUsers.has(uid)) return false
-        return sendReliableText(uid, text)
+        return sendReliableText(uid, text, notificationId)
     }
 
     // ── shouldSkipReply ──

@@ -17,3 +17,15 @@ export function updateSessionMap(map, gatewaySessionId, sdkSessionId) {
     next[`@rev:${sdkSessionId}`] = gatewaySessionId
     return next
 }
+
+/** 仅移除仍然成对一致的映射，避免并发更新后误删新会话。 */
+export function removeSessionMapEntry(map, gatewaySessionId, sdkSessionId) {
+    const next = {...(map || {})}
+    if (next[gatewaySessionId] !== sdkSessionId) return next
+
+    delete next[gatewaySessionId]
+    if (next[`@rev:${sdkSessionId}`] === gatewaySessionId) {
+        delete next[`@rev:${sdkSessionId}`]
+    }
+    return next
+}

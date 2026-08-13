@@ -34,9 +34,10 @@ test('只有明确只读限制才使用聚焦只读上下文', () => {
     for (const text of ['只看 #README.md 里写了什么，不要修改', '仅分析当前项目，不要执行命令', '只读检查这个文件']) {
         assert.equal(classifyContextProfile(text), 'focused', text)
     }
-    for (const text of ['看看 #README.md 里写了什么', '@reviewer 审查当前项目', '```js\nconsole.log(1)\n```\n这段代码哪里错了', '检查当前项目有什么问题']) {
-        assert.equal(classifyContextProfile(text), 'full', text)
+    for (const text of ['看看 #README.md 里写了什么', '```js\nconsole.log(1)\n```\n这段代码哪里错了']) {
+        assert.equal(classifyContextProfile(text), 'focused', text)
     }
+    for (const text of ['@reviewer 审查当前项目', '检查当前项目有什么问题']) assert.equal(classifyContextProfile(text), 'full', text)
 })
 
 test('轻量配置关闭工具、Skills、MCP、设置扫描和扩展思考', () => {

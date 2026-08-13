@@ -30,7 +30,7 @@ import {t, setLocale} from '../i18n'
 import {useResizeHandle} from '../composables/useResizeHandle'
 import {apiFetch, createGatewayWebSocket} from '../api'
 import {readWorkspaceShell, writeWorkspaceShell} from '../workspace-persistence'
-import {findSessionTab, sessionTabIdentityKey} from '../session-tab'
+import {findSessionTab, sessionRequestStillOwned, sessionTabIdentityKey} from '../session-tab'
 import {
   classifyBridgeFailure,
   dispatchBridgeNotice,
@@ -45,10 +45,26 @@ import {
   writeSessionDraftStore,
 } from '../session-drafts'
 import {classifySessionExistsResponse, isSameSessionSelection, resolveExistingSessionTarget, runtimeSessionMatchesHistory, shouldCloseSocketBeforeConnect, shouldReuseConnectedSession, shouldValidateSessionRuntime} from '../session-selection'
-import {upsertProjectSession} from '../project-sessions'
+import {applySessionVisibilityEvent} from '../project-sessions'
 import {buildSessionCreateRequest} from '../session-create-mode'
 import {attachmentKindLabel} from '../attachment-description'
+import {
+  buildLargeInputPrompt,
+  createLargeInputParts,
+  LARGE_INPUT_MAX_BYTES,
+  planLargeInput,
+} from '../large-input'
+import {buildModelSelectionPayload, describeTaskDecision} from '../model-routing.mjs'
+import type {TaskDecisionDisplay, ModelMode} from '../model-routing.mjs'
+import {mergeWorkflowAgentLogState, normalizeWorkflowLogAgentStatus} from '../agent-event-state.mjs'
 import {formatCompactSummary, normalizeContextUiState} from '../context-usage'
+import {createParentTaskUiState, reduceParentTaskUi, type ParentTaskUiState} from '../task-completion'
+import {
+  createTaskActivityState,
+  reduceTaskActivity,
+  taskActivityFreshness,
+  type TaskActivityState,
+} from '../task-activity'
 import {
   buildContinuationPrompt,
   normalizeTaskResult,
@@ -58,7 +74,6 @@ import DOMPurify from 'dompurify'
 const PhaserPet = defineAsyncComponent(() => import('./PhaserPet.vue'))
 const GlobalToast = defineAsyncComponent(() => import('../components/GlobalToast.vue'))
 const SidebarLeft = defineAsyncComponent(() => import('../components/SidebarLeft.vue'))
-const RightPanels = defineAsyncComponent(() => import('../components/RightPanels.vue'))
 
 const router = useRouter()
 // Gateway 后端地址：本地网关统一代理所有 API 请求
@@ -119,11 +134,12 @@ interface Message {
     continuationReason: ContinuationReason
     resumable: boolean
     originalTask: string
+    durationMs?: number
   }
 }
 
 interface PersistedTaskState {
-  status: 'idle' | 'running' | 'succeeded' | 'incomplete' | 'failed' | 'stopped' | 'interrupted'
+  status: 'idle' | 'running' | 'reviewing' | 'changes_required' | 'fixing' | 'review_paused' | 'succeeded' | 'incomplete' | 'failed' | 'stopped' | 'interrupted'
   outcome: 'succeeded' | 'incomplete' | 'failed' | null
   continuationReason: ContinuationReason | 'stopped' | null
   resumable: boolean
@@ -131,6 +147,16 @@ interface PersistedTaskState {
   numTurns?: number
   detail?: string
   updatedAt?: number
+  startedAt?: number
+  completedAt?: number
+  durationMs?: number
+  review?: {
+    round: number
+    tier: 'balanced' | 'power' | null
+    summary: string
+    blockingCount: number
+    blockingFindings: Array<{severity: string, title: string, file: string, line: number | null, description: string}>
+  }
 }
 
 interface MessageAttachment {
@@ -241,7 +267,7 @@ function toggleSessionSelect(sid: string) {
   selectedSessionIds.value = next
 }
 
-function toggleSelectAll(workDir: string, allIds: string[]) {
+function toggleSelectAll(_workDir: string, allIds: string[]) {
   const next = new Set(selectedSessionIds.value)
   const allSelected = allIds.every(id => next.has(id))
   if (allSelected) {
@@ -313,7 +339,6 @@ async function confirmBatchDelete() {
     // 本地更新项目列表
     _projectsEpoch++
     for (const p of projects.value) {
-      const before = p.sessions.length
       p.sessions = p.sessions.filter(s => !ids.includes(s.id))
       p.sessionCount = p.sessions.length
     }
@@ -347,12 +372,6 @@ const visibleProjects = computed(() => {
   if (showAllProjects.value || filteredProjects.value.length <= projectPageSize) return filteredProjects.value
   return filteredProjects.value.slice(0, projectPageSize)
 })
-
-/** 可见会话列表：未展开时只返回前 sessionPageSize 条 */
-function visibleSessions(p: Project) {
-  if (showAllSessions.value.has(p.workDir) || p.sessions.length <= sessionPageSize) return p.sessions
-  return p.sessions.slice(0, sessionPageSize)
-}
 
 /** 切换某个项目下会话的"展开全部/收起"状态 */
 function toggleShowAll(workDir: string) {
@@ -545,6 +564,37 @@ function stopTaskDurationTimer() {
 /** 当前 Claude 状态：'idle' 空闲 / 'thinking' 思考中 */
 const status = ref('idle')
 const tabTaskState = ref<PersistedTaskState | null>(null)
+const parentTaskUi = ref<ParentTaskUiState>(createParentTaskUiState())
+const taskActivity = ref<TaskActivityState>(createTaskActivityState())
+const activityClock = ref(Date.now())
+let activityClockTimer: ReturnType<typeof setInterval> | null = null
+const taskActivityFresh = computed(() => taskActivityFreshness(taskActivity.value, activityClock.value))
+const taskActivityElapsed = computed(() => {
+  if (!taskActivity.value.startedAt) return 0
+  const end = taskActivity.value.running ? activityClock.value : taskActivity.value.updatedAt
+  return Math.max(0, end - taskActivity.value.startedAt)
+})
+
+function formatRecentActivity(updatedAt: number): string {
+  if (!updatedAt) return '等待首个执行事件'
+  const seconds = Math.max(0, Math.floor((activityClock.value - updatedAt) / 1000))
+  if (seconds < 5) return '刚刚收到事件'
+  if (seconds < 60) return `${seconds} 秒前收到事件`
+  return `${Math.floor(seconds / 60)} 分钟前收到事件`
+}
+
+function startActivityClock() {
+  if (activityClockTimer) return
+  activityClock.value = Date.now()
+  activityClockTimer = setInterval(() => { activityClock.value = Date.now() }, 1000)
+}
+
+function stopActivityClock() {
+  if (!activityClockTimer) return
+  clearInterval(activityClockTimer)
+  activityClockTimer = null
+}
+let _pendingResultMessage: Message | null = null
 /** 当前会话的消息列表（按时间序追加） */
 const messages = ref<Message[]>([])
 
@@ -570,7 +620,9 @@ interface TabState {
   pendingChoice: any
   thinkingLevel: string
   permissionMode: string
+  modelMode: ModelMode
   model: string
+  taskDecision: TaskDecisionDisplay | null
   maxTokens: number
   pricing: {inputPrice: number, outputPrice: number, currency: string} | null
   turnThinkingText: string
@@ -578,6 +630,9 @@ interface TabState {
   mirrorState: Record<string, boolean>
   turnCompleted: boolean
   taskState: PersistedTaskState | null
+  parentTaskUi: ParentTaskUiState
+  taskActivity: TaskActivityState
+  pendingResultMessage: Message | null
 }
 
 /** 创建初始标签页状态（所有字段有默认值） */
@@ -602,7 +657,9 @@ function initialTabState(): TabState {
     pendingChoice: null,
     thinkingLevel: 'auto',
     permissionMode: 'default',
+    modelMode: 'auto',
     model: model.value,
+    taskDecision: null,
     maxTokens: 0,
     pricing: pricing.value,
     turnThinkingText: '',
@@ -610,6 +667,9 @@ function initialTabState(): TabState {
     mirrorState: { wechat: false, feishu: false, dingtalk: false },
     turnCompleted: false,
     taskState: null,
+    parentTaskUi: createParentTaskUiState(),
+    taskActivity: createTaskActivityState(),
+    pendingResultMessage: null,
   }
 }
 
@@ -635,7 +695,9 @@ function snapshotTabState(): TabState {
     pendingChoice: pendingChoice.value,
     thinkingLevel: thinkingLevel.value,
     permissionMode: permissionMode.value,
+    modelMode: modelMode.value,
     model: model.value,
+    taskDecision: taskDecision.value,
     maxTokens: maxTokens.value,
     pricing: pricing.value,
     turnThinkingText,
@@ -643,6 +705,9 @@ function snapshotTabState(): TabState {
     mirrorState: { ...mirrorState.value },
     turnCompleted: _turnCompleted,
     taskState: tabTaskState.value,
+    parentTaskUi: {...parentTaskUi.value},
+    taskActivity: {...taskActivity.value},
+    pendingResultMessage: _pendingResultMessage ? {..._pendingResultMessage} : null,
   }
 }
 
@@ -667,7 +732,9 @@ function restoreTabState(s: TabState) {
   pendingChoice.value = s.pendingChoice
   thinkingLevel.value = s.thinkingLevel
   permissionMode.value = s.permissionMode
+  modelMode.value = s.modelMode === 'fixed' ? 'fixed' : 'auto'
   model.value = s.model
+  taskDecision.value = s.taskDecision || null
   maxTokens.value = s.maxTokens
   pricing.value = s.pricing
   turnThinkingText = s.turnThinkingText
@@ -675,6 +742,9 @@ function restoreTabState(s: TabState) {
   mirrorState.value = { ...s.mirrorState }
   _turnCompleted = s.turnCompleted
   tabTaskState.value = s.taskState || null
+  parentTaskUi.value = createParentTaskUiState(s.parentTaskUi)
+  taskActivity.value = createTaskActivityState(s.taskActivity)
+  _pendingResultMessage = s.pendingResultMessage ? {...s.pendingResultMessage} : null
 }
 
 interface TabSession {
@@ -1025,7 +1095,7 @@ function persistPetToGateway() {
     const seq = ++_petPersistSeq
     fetch(`${GW}/api/config/settings`)
       .then(r => r.ok ? r.json() : {})
-      .then(s => {
+      .then((s: Record<string, any>) => {
         if (seq !== _petPersistSeq) return  // 已有更新的 persist 请求，丢弃本次
         s.petEnabled = petEnabledGlob.value
         s.pet = petId.value
@@ -1225,6 +1295,7 @@ function doExport(format: 'md' | 'json' | 'jsonl') {
 }
 /** 输入框文本（双向绑定） */
 const inputText = ref('')
+const largeInputPlan = computed(() => planLargeInput(inputText.value.trim()))
 let draftPersistTimer: ReturnType<typeof setTimeout> | null = null
 watch(inputText, (value) => {
   if (draftPersistTimer) clearTimeout(draftPersistTimer)
@@ -1245,6 +1316,7 @@ interface PendingAttachment {
   attachmentKind?: string
   contentType?: string
   uploadPromise?: Promise<boolean>
+  autoGenerated?: boolean
 }
 const pendingAttachments = ref<PendingAttachment[]>([])
 let attachmentIdCounter = 0
@@ -1259,16 +1331,23 @@ const fileInputRef = ref<HTMLInputElement | null>(null)
 
 /** 从 File 对象创建附件并加入待发送列表（粘贴和文件选择共用） */
 function addAttachment(file: File) {
-  const reader = new FileReader()
-  reader.onload = () => {
+  const enqueue = (dataUrl = '') => {
     pendingAttachments.value.push({
       id: ++attachmentIdCounter,
       file,
-      dataUrl: file.type.startsWith('image/') ? reader.result as string : '',
+      dataUrl,
       uploading: false,
     })
   }
-  file.type.startsWith('image/') ? reader.readAsDataURL(file) : reader.onload!(new ProgressEvent('load'))
+  if (!file.type.startsWith('image/')) {
+    enqueue()
+    return
+  }
+  const reader = new FileReader()
+  reader.onload = () => {
+    enqueue(typeof reader.result === 'string' ? reader.result : '')
+  }
+  reader.readAsDataURL(file)
 }
 
 /** 文件选择按钮处理 */
@@ -1331,6 +1410,34 @@ async function uploadAttachment(att: PendingAttachment, sessionId: string): Prom
   })()
   att.uploadPromise = task
   return task
+}
+
+function createPendingAttachment(file: File): PendingAttachment {
+  return {
+    id: ++attachmentIdCounter,
+    file,
+    dataUrl: '',
+    uploading: false,
+  }
+}
+
+function prepareLargeInput(text: string, attachments?: PendingAttachment[]) {
+  const plan = planLargeInput(text)
+  if (!plan.converted) return {text, attachments, converted: false, bytes: plan.bytes}
+  if (plan.bytes > LARGE_INPUT_MAX_BYTES) {
+    throw new Error(`输入内容超过自动附件上限（${formatAttachmentSize(LARGE_INPUT_MAX_BYTES)}）`)
+  }
+  const parts = createLargeInputParts(text, plan.filename)
+  const generatedAttachments = parts.map(part => ({
+    ...createPendingAttachment(new File([part.text], part.filename, {type: 'text/plain;charset=utf-8'})),
+    autoGenerated: true,
+  }))
+  return {
+    text: buildLargeInputPrompt(text, parts.map(part => part.filename), plan.bytes),
+    attachments: [...(attachments || []), ...generatedAttachments],
+    converted: true,
+    bytes: plan.bytes,
+  }
 }
 /** 正在创建新会话中（防止重复点击） */
 const connecting = ref(false)
@@ -1395,6 +1502,8 @@ const showCpDropdown = ref(false)
 // ── Modal：文件内容预览 / Diff 对比 ──
 /** modal 模式：'file' 文件内容预览 / 'diff' Diff 对比 / null 关闭 */
 const modalMode = ref<'file' | 'diff' | null>(null)
+/** 文件/Diff 弹窗是否占满应用可用区域 */
+const modalMaximized = ref(false)
 /** modal 中显示的文件路径 */
 const modalPath = ref('')
 /** 文件内容（文本文件） */
@@ -1468,7 +1577,7 @@ interface AgentRun {
   task?: string
   scope?: string
   descriptionSource?: string
-  status: 'spawning' | 'running' | 'done' | 'error'
+  status: 'spawning' | 'running' | 'paused' | 'done' | 'error'
   spawnTime: number;
   startTime: number;
   doneTime: number
@@ -1481,6 +1590,14 @@ interface AgentRun {
   currentAction?: string
   currentToolElapsed: number
   toolUseId?: string
+  phase?: string
+  role?: string
+  requestedModelTier?: string | null
+  actualModel?: string
+  modelSource?: string
+  fallbackReason?: string | null
+  required?: boolean
+  eventSource?: 'structured' | 'log'
 }
 
 /** 本轮对话中产生的所有 agent 运行记录（内联卡片数据源） */
@@ -1557,6 +1674,7 @@ interface WfLogEntry {
 interface WfRunState {
   name: string;
   status: 'running' | 'done' | 'error' | 'paused';
+  startedAt?: number;
   phases: { title: string; status: string }[]
   currentPhase: string;
   logs: WfLogEntry[];
@@ -1621,10 +1739,12 @@ interface QItem {
   text: string;
   time: number
   attachments?: PendingAttachment[]
+  originalText?: string
 }
 
 interface PendingInput {
   text: string
+  originalText: string
   sessionId: string
   payload: Record<string, unknown>
   attachments?: PendingAttachment[]
@@ -1760,12 +1880,10 @@ async function loadProviderModels() {
   }
 }
 
-/** 从 settings 读取的当前模型 ID（在 loadProviderModels 之前获取，确保默认选中正确） */
-let settingsModel = ''
-
 // 组件挂载：加载项目列表、余额、模型列表、斜杠命令、IM 绑定状态
 // 同时注册全局键盘快捷键（Esc 关闭弹窗）
 onMounted(async () => {
+  startActivityClock()
   // 组件重建时复位控制通道停止标志，确保 connectControlWS 能正常建立连接
   _ctrlRetryCount = 0
   _controlWSStopped = false
@@ -1774,7 +1892,7 @@ onMounted(async () => {
     const sr = await fetch(`${GW}/api/config/settings`)
     if (sr.ok) {
       const s = await sr.json()
-      if (s.model) settingsModel = s.model
+      if (s.model && !model.value) model.value = s.model
       if (typeof s.costLimitPercent === 'number') costLimitPercent.value = s.costLimitPercent
       if (typeof s.fileInjectLimitKB === 'number') fileInjectLimitKB.value = s.fileInjectLimitKB
       if (typeof s.maxContextTokens === 'number' && s.maxContextTokens > 0) contextSafetyCap.value = s.maxContextTokens
@@ -1827,6 +1945,7 @@ function onGlobalKeydown(e: KeyboardEvent) {
 let tabAutoSyncTimer: ReturnType<typeof setInterval> | null = null
 
 onActivated(() => {
+  startActivityClock()
   petEnabledGlob.value = localStorage.getItem('claude-bridge-pet-enabled') !== 'false'
   loadProviderModels()
   if (tabAutoSyncTimer) clearInterval(tabAutoSyncTimer)
@@ -2070,14 +2189,15 @@ async function _doHandleNewSession(workDir: string, encodedDir?: string, histSes
     contextPercentKnown.value = false
     contextCompacting.value = false
     rawMaxTokens.value = 0
+    taskDecision.value = null
     clearAgentRuns()
   }
 
-  // 恢复历史会话时先加载历史消息展示给用户
+  // 历史读取和 Gateway runtime 创建并行，避免大 transcript 串行阻塞会话打开。
+  let historyLoadPromise: Promise<boolean> | null = null
   if (encodedDir && histSessionId && !preserveExistingState) {
     tab.historySessionId = histSessionId
-    await loadHistory(encodedDir, histSessionId)
-    restoreDraftForTab(tab)
+    historyLoadPromise = loadHistory(encodedDir, histSessionId)
   }
   syncCurrentTabState()
 
@@ -2086,13 +2206,16 @@ async function _doHandleNewSession(workDir: string, encodedDir?: string, histSes
     const curProvider = providers.value.find((p: any) => p.id === providerId.value)
     const body: any = {
       ...buildSessionCreateRequest({workDir, resume: histSessionId, forkFrom}),
-      model: model.value,
+      ...buildModelSelectionPayload({
+        mode: modelMode.value,
+        model: model.value,
+        modelMeta: curModelInfo ? {contextWindow: curModelInfo.contextWindow, pricing: pricing.value} : null,
+      }),
       permissionMode: permissionMode.value,
       thinkingLevel: thinkingLevel.value,
       baseUrl: curProvider?.baseUrl || '',
       apiKey: savedApiKey.value || '',
       maxContextTokens: contextSafetyCap.value || undefined,
-      modelMeta: curModelInfo ? {contextWindow: curModelInfo.contextWindow, pricing: pricing.value} : null
     }
     const res = await apiFetch(`${GW}/api/sessions`, {
       method: 'POST',
@@ -2113,6 +2236,8 @@ async function _doHandleNewSession(workDir: string, encodedDir?: string, histSes
     }
     if (forkFrom && encodedDir && tab.historySessionId) {
       await loadHistory(encodedDir, tab.historySessionId, 'replace')
+    } else if (historyLoadPromise) {
+      await historyLoadPromise
     }
     gitInfo.value = data.gitInfo || null
     sessionStartTime.value = Date.now()
@@ -2126,7 +2251,6 @@ async function _doHandleNewSession(workDir: string, encodedDir?: string, histSes
     void focusSessionForIm(data.sessionId)
     loadSessionMirrors()
     setTimeout(loadSlashCommands, 1500)  // 会话起来后拉一次实时命令列表
-    loadMentionFiles()                   // 预加载文件列表供 # 引用
     loadMentionAgents()                  // 预加载 agent 列表供 @ 引用
     loadCheckpoints()                    // 预加载记录点，count badge 初始就能显示
     // 仅新建会话时刷新项目列表（新 .jsonl 需要出现在侧栏）；resume 已有会话时不刷，
@@ -2326,12 +2450,28 @@ let _loadHistorySeq = 0
 async function loadHistory(encodedDir: string, sId: string, mode: 'append' | 'replace' = 'append'): Promise<boolean> {
   const seq = ++_loadHistorySeq
   const ownerTabId = activeTabId.value
+  const ownerTab = tabSessions.value.find(tab => tab.id === ownerTabId)
+  const owner = {
+    id: ownerTabId,
+    projectPath: ownerTab?.projectPath || activeProject.value || '',
+    historySessionId: sId,
+    gatewaySessionId: ownerTab?.state.sessionId || sessionId.value,
+  }
+  const stillOwned = () => {
+    const current = tabSessions.value.find(tab => tab.id === activeTabId.value)
+    return !!current && sessionRequestStillOwned(owner, {
+      id: current.id,
+      projectPath: current.projectPath,
+      historySessionId: current.historySessionId,
+      gatewaySessionId: current.state.sessionId,
+    })
+  }
   try {
     const res = await fetch(`${GW}/api/projects/${encodedDir}/sessions/${sId}/messages`)
-    if (seq !== _loadHistorySeq || activeTabId.value !== ownerTabId) return false  // 已有更新的请求或已切换 tab
+    if (seq !== _loadHistorySeq || !stillOwned()) return false
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const data = await res.json()
-    if (seq !== _loadHistorySeq || activeTabId.value !== ownerTabId) return false
+    if (seq !== _loadHistorySeq || !stillOwned()) return false
     if (data.messages?.length) {
       _loadedHistoryTexts = new Set()
       const loadedMessages: Message[] = [
@@ -2354,7 +2494,7 @@ async function loadHistory(encodedDir: string, sId: string, mode: 'append' | 're
       return true
     }
   } catch (e) {
-    if (seq !== _loadHistorySeq || activeTabId.value !== ownerTabId) return false
+    if (seq !== _loadHistorySeq || !stillOwned()) return false
     console.error('[loadHistory] 请求历史消息失败:', e)
     messages.value.push({role: 'error', text: t('err.historyLoad'), time: Date.now()})
   }
@@ -2575,11 +2715,46 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         if (_saved) { try { restoreTabState(_saved!) } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) } }
         return
       }
+      taskActivity.value = reduceTaskActivity(taskActivity.value, msg)
       switch (msg.type) {
       case 'session_state_snapshot': {
         const wasThinking = status.value === 'thinking'
-        status.value = msg.generating === true ? 'thinking' : 'idle'
-        if (msg.taskState && typeof msg.taskState === 'object') tabTaskState.value = msg.taskState as PersistedTaskState
+        if (msg.taskState && typeof msg.taskState === 'object') {
+          tabTaskState.value = msg.taskState as PersistedTaskState
+          const persistedStatus = String(msg.taskState.status || 'idle')
+          parentTaskUi.value = createParentTaskUiState({
+            phase: (['running', 'reviewing', 'changes_required', 'fixing', 'review_paused', 'succeeded', 'incomplete', 'failed'].includes(persistedStatus)
+              ? persistedStatus
+              : 'idle') as ParentTaskUiState['phase'],
+            completionShown: persistedStatus === 'succeeded',
+            detail: String(msg.taskState.detail || ''),
+          })
+        }
+        status.value = msg.generating === true || ['running', 'reviewing', 'changes_required', 'fixing'].includes(String(msg.taskState?.status || ''))
+          ? 'thinking'
+          : 'idle'
+        if (status.value === 'thinking' && !taskActivity.value.running) {
+          const persistedStatus = String(msg.taskState?.status || 'running')
+          const snapshotEvent = persistedStatus === 'reviewing'
+            ? {type: 'task_reviewing', detail: msg.taskState?.detail}
+            : persistedStatus === 'changes_required'
+              ? {type: 'task_changes_required', detail: msg.taskState?.detail}
+            : persistedStatus === 'fixing'
+              ? {type: 'task_fixing', detail: msg.taskState?.detail}
+              : {type: 'task_started', startedAt: msg.taskState?.startedAt}
+          taskActivity.value = reduceTaskActivity(taskActivity.value, snapshotEvent)
+        } else if (status.value === 'idle' && taskActivity.value.running) {
+          const persistedStatus = String(msg.taskState?.status || 'idle')
+          if (persistedStatus === 'succeeded') {
+            taskActivity.value = reduceTaskActivity(taskActivity.value, {type: 'task_completed', detail: msg.taskState?.detail})
+          } else if (persistedStatus === 'stopped') {
+            taskActivity.value = reduceTaskActivity(taskActivity.value, {type: 'generation_stopped'})
+          } else if (['failed', 'incomplete', 'interrupted', 'review_paused'].includes(persistedStatus)) {
+            taskActivity.value = reduceTaskActivity(taskActivity.value, {type: 'task_failed', detail: msg.taskState?.detail})
+          } else {
+            taskActivity.value = createTaskActivityState()
+          }
+        }
         if (msg.taskState?.status === 'interrupted' && msg.taskState?.resumable && fg && !wasThinking
             && !messages.value.some(item => item.taskResult?.resumable && item.taskResult.continuationReason === 'execution_error')) {
           const draftKey = sessionDraftKey(draftIdentity(tab))
@@ -2617,6 +2792,27 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         break
       }
 
+      case 'task_decision': {
+        taskDecision.value = {
+          version: msg.version,
+          action: msg.action,
+          complexity: msg.complexity,
+          risk: msg.risk,
+          modelTier: msg.modelTier,
+          model: msg.model,
+          modelMode: msg.modelMode === 'fixed' ? 'fixed' : 'auto',
+          workflow: msg.workflow,
+          finalReview: msg.finalReview,
+          reasons: Array.isArray(msg.reasons) ? msg.reasons.slice(0, 8) : [],
+          hardTriggers: Array.isArray(msg.hardTriggers) ? msg.hardTriggers.slice(0, 8) : [],
+          fallbackReason: msg.fallbackReason || null,
+        }
+        modelMode.value = taskDecision.value.modelMode || 'auto'
+        if (typeof msg.model === 'string' && msg.model) model.value = msg.model
+        if (fg && msg.fallbackReason) showToast(describeTaskDecision(taskDecision.value))
+        break
+      }
+
       case 'message_duplicate': {
         const messageId = String(msg.messageId || '')
         const duplicateInput = pendingInputTexts.get(messageId)
@@ -2636,15 +2832,23 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         if (rejectedInput?.text) saveDraftForTab(tab, rejectedInput.text, true)
         if (rejectedInput?.attachments?.length) {
           const merged = new Map(pendingAttachments.value.map(a => [a.id, a]))
-          for (const attachment of rejectedInput.attachments) merged.set(attachment.id, attachment)
+          for (const attachment of rejectedInput.attachments) {
+            if (!attachment.autoGenerated) merged.set(attachment.id, attachment)
+          }
           pendingAttachments.value = [...merged.values()]
         }
         status.value = 'idle'
+        taskActivity.value = reduceTaskActivity(taskActivity.value, {
+          type: 'task_failed',
+          detail: msg.message || msg.code || '消息未接受',
+        })
         stopTaskDurationTimer()
         pendingTools.value = []
-        const reason = msg.code === 'input_queue_full'
-            ? '当前会话队列已满，请稍后重试'
-            : `消息未接受${msg.code ? `（${msg.code}）` : ''}`
+        const reason = typeof msg.message === 'string' && msg.message.trim()
+            ? msg.message.trim()
+            : msg.code === 'input_queue_full'
+              ? '当前会话队列已满，请稍后重试'
+              : `消息未接受${msg.code ? `（${msg.code}）` : ''}`
         messages.value.push({role: 'error', text: reason, time: Date.now()})
         if (fg) showToast(reason)
         break
@@ -2661,16 +2865,6 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
           restoreDraftForTab(tab)
           if (fg) activeSessionId.value = historySessionId
 
-          // SIDE_EFFECT: SDK 会话 ID 只有在 init 事件到达后才确定，此时立即写入侧栏，
-          // 避免等待下一次磁盘扫描或用户手动刷新。
-          _projectsEpoch++
-          projects.value = upsertProjectSession(projects.value, {
-            workDir: tab.projectPath,
-            encodedDir: encodeProjectName(tab.projectPath),
-            sessionId: historySessionId,
-          })
-          expandedProjects.value = new Set([...expandedProjects.value, tab.projectPath])
-          persistWorkspaceShell()
         }
         if (msg.contextWindow) {
           const provisional = normalizeContextUiState({
@@ -2683,6 +2877,24 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
           rawMaxTokens.value = provisional.rawMaxTokens || 0
         }
         if (msg.pricing) pricing.value = msg.pricing
+        break
+      }
+
+      case 'session_visible': {
+        const historySessionId = typeof msg.historySessionId === 'string' ? msg.historySessionId.trim() : ''
+        if (!historySessionId) break
+        tab.historySessionId = historySessionId
+        refreshTabLabel(tab)
+        migrateGatewayDraftToSdk(tab)
+        if (fg) activeSessionId.value = historySessionId
+        // SIDE_EFFECT: 只有桌面输入框或 IM 首条任务通过 Gateway 校验后，才加入左侧会话列表。
+        _projectsEpoch++
+        projects.value = applySessionVisibilityEvent(projects.value, msg, {
+          workDir: tab.projectPath,
+          encodedDir: encodeProjectName(tab.projectPath),
+        })
+        expandedProjects.value = new Set([...expandedProjects.value, tab.projectPath])
+        persistWorkspaceShell()
         break
       }
 
@@ -2711,6 +2923,14 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
             text: msg.trigger === 'manual' ? '正在压缩上下文' : '上下文达到阈值，正在自动压缩',
             time: Date.now(),
             compact: {trigger: msg.trigger || 'auto'},
+          })
+        }
+        if (msg.taskState?.status === 'review_paused' && msg.taskState?.resumable && fg
+            && !messages.value.some(item => item.role === 'system' && item.text === String(msg.taskState.detail || ''))) {
+          messages.value.push({
+            role: 'system',
+            text: String(msg.taskState.detail || '最终审查已中断，请继续当前任务。'),
+            time: Date.now(),
           })
         }
         break
@@ -2888,9 +3108,14 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
       case 'remote_user_message':
         // IM 平台（微信/飞书/钉钉）注入的消息，前缀标注来源后插入对话流
         turnThinkingText = ''
-        const srcName = {wechat: '微信', feishu: '飞书', dingtalk: '钉钉'}[msg.source] || msg.source
+        const source = String(msg.source || '')
+        const srcName = ({wechat: '微信', feishu: '飞书', dingtalk: '钉钉'} as Record<string, string>)[source] || source
+        const wasTaskRunning = taskActivity.value.running
         messages.value.push({role: 'user', text: `[${srcName}] ${msg.content}`, time: Date.now()})
         status.value = 'thinking'
+        taskActivity.value = wasTaskRunning
+          ? reduceTaskActivity(taskActivity.value, {type: 'task_input_added', source: srcName})
+          : reduceTaskActivity(createTaskActivityState(), {type: 'task_started'})
         if (fg) nextTick(() => scrollDown())
         break
 
@@ -2927,7 +3152,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         break
 
       case 'result': {
-        // 一轮对话完成：清算 token 消耗、费用、刷新记录点和文件树
+        // SDK result 只代表主回合结束；父任务可能仍在最终审查或自动修复，成功语义由 task_completed 事件产生。
         pendingTools.value = []
         const inp = msg.usage?.input_tokens || 0
         const rawOut = msg.usage?.output_tokens || 0
@@ -2948,18 +3173,11 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
           rawMaxTokens.value = resolved.rawMaxTokens || 0
         }
         const taskResult = normalizeTaskResult(msg)
-        tabTaskState.value = {
-          status: taskResult.outcome === 'succeeded' ? 'succeeded' : taskResult.outcome === 'incomplete' ? 'incomplete' : 'failed',
-          outcome: taskResult.outcome,
-          continuationReason: taskResult.continuationReason,
-          resumable: taskResult.resumable,
-          subtype: msg.subtype || null,
-          numTurns: msg.num_turns || 0,
-          detail: String(msg.result || '').trim(),
-          updatedAt: Date.now(),
-        }
+        const reduced = reduceParentTaskUi(parentTaskUi.value, msg)
+        parentTaskUi.value = reduced.state
+        if (msg.taskState && typeof msg.taskState === 'object') tabTaskState.value = msg.taskState as PersistedTaskState
         const resultText = taskResult.messageKey === 'sys.done'
-          ? t('sys.done', {turns: msg.num_turns, ms: msg.duration_ms, in: inp, think, out: pureOut})
+          ? t('sys.done', {turns: msg.num_turns, duration: formatDuration(msg.duration_ms || 0), in: inp, think, out: pureOut})
           : t(taskResult.messageKey, {
               turns: msg.num_turns,
               detail: String(msg.result || '').trim() || t('sys.noErrorDetail'),
@@ -2976,7 +3194,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
             originalTask,
           },
         }
-        messages.value.push(resultMessage)
+        _pendingResultMessage = resultMessage
         if (taskResult.outcome !== 'succeeded' && originalTask) {
           saveDraftForTab(activeTab.value, originalTask, true)
         }
@@ -2992,34 +3210,86 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
           loadBalance()
           checkCostLimit()  // 费用达余额阈值时提醒一次
         }
-        // result 标志本轮回合结束。若子 Agent 还在跑，暂不切 idle，
-        // 设 _turnCompleted 标记，等最后一个子 Agent done 时再切 idle 并清队列。
-        // 避免用户看到 idle 就发新消息打断正在运行的子 Agent。
-        if (runningAgentTotal.value > 0) {
-          _turnCompleted = true
-        } else {
-          status.value = 'idle'
-          if (fg) void flushMsgQueue()
-        }
-        if (fg && runningAgentTotal.value === 0 && taskResult.outcome === 'succeeded') {
-          syncPetState('success', { message: 'Done!', bubble: petPick(BUBBLE_SUCCESS, myProject) })
-          setTimeout(() => { syncPetState('idle'); petBubble.value = '' }, 3000)
-          // AI 改完文件后即时刷新：记录点始终刷新，文件树仅面板打开时（节省请求）
-          loadCheckpoints()
-          if (showFilePanel.value) loadFileTree()
-        }
-        if (fg && runningAgentTotal.value === 0 && taskResult.outcome !== 'succeeded') {
-          const message = taskResult.outcome === 'incomplete' ? t('sys.taskIncompleteShort') : resultText
-          syncPetState('error', {message: message.slice(0, 40), bubble: message.slice(0, 80)})
-          setTimeout(() => { syncPetState('idle'); petBubble.value = '' }, 3000)
-        }
+        _turnCompleted = true
+        status.value = 'thinking'
         // SDK transcript 已在本轮结束时落盘，刷新侧栏中的真实标题和文件大小。
         void loadProjects()
         break
       }
 
-      case 'generation_stopped':
+      case 'task_reviewing':
+      case 'task_started':
+      case 'primary_completed':
+      case 'task_changes_required':
+      case 'task_fixing':
+      case 'task_review_paused':
+      case 'task_failed':
+      case 'task_completed': {
+        const reduced = reduceParentTaskUi(parentTaskUi.value, msg)
+        parentTaskUi.value = reduced.state
         if (msg.taskState && typeof msg.taskState === 'object') tabTaskState.value = msg.taskState as PersistedTaskState
+        if (msg.type === 'task_started' || msg.type === 'primary_completed') {
+          if (msg.type === 'task_started') status.value = 'thinking'
+        } else if (msg.type === 'task_completed') {
+          if (!reduced.showCompletion) break
+          const totalDurationMs = Number(msg.durationMs ?? msg.taskState?.durationMs)
+            || (taskActivity.value.startedAt ? Math.max(0, Date.now() - taskActivity.value.startedAt) : 0)
+          if (_pendingResultMessage) {
+            if (_pendingResultMessage.taskResult) _pendingResultMessage.taskResult.durationMs = totalDurationMs
+            messages.value.push(_pendingResultMessage)
+            _pendingResultMessage = null
+          } else {
+            messages.value.push({
+              role: 'system',
+              text: '任务已完成',
+              time: Date.now(),
+              taskResult: {outcome: 'succeeded', continuationReason: null, resumable: false, originalTask: lastUserMessage, durationMs: totalDurationMs},
+            })
+          }
+          status.value = 'idle'
+          _turnCompleted = false
+          if (fg) {
+            syncPetState('success', {message: 'Done!', bubble: petPick(BUBBLE_SUCCESS, myProject)})
+            setTimeout(() => { syncPetState('idle'); petBubble.value = '' }, 3000)
+            loadCheckpoints()
+            if (showFilePanel.value) loadFileTree()
+            void flushMsgQueue()
+          }
+        } else if (msg.type === 'task_reviewing' || msg.type === 'task_changes_required' || msg.type === 'task_fixing') {
+          status.value = 'thinking'
+          if (fg) syncPetState('thinking', {message: msg.detail || '正在继续处理', bubble: msg.detail || '任务仍在进行中'})
+        } else {
+          const totalDurationMs = Number(msg.durationMs ?? msg.taskState?.durationMs)
+            || (taskActivity.value.startedAt ? Math.max(0, Date.now() - taskActivity.value.startedAt) : 0)
+          if (_pendingResultMessage) {
+            if (_pendingResultMessage.taskResult) _pendingResultMessage.taskResult.durationMs = totalDurationMs
+            messages.value.push(_pendingResultMessage)
+            _pendingResultMessage = null
+          }
+          status.value = 'idle'
+          _turnCompleted = false
+          if (fg) {
+            const detail = String(msg.detail || t('sys.taskIncompleteShort'))
+            syncPetState('error', {message: detail.slice(0, 40), bubble: detail.slice(0, 80)})
+            setTimeout(() => { syncPetState('idle'); petBubble.value = '' }, 3000)
+          }
+        }
+        break
+      }
+
+      case 'generation_stopped':
+        // Gateway 可能为同一停止操作逐条取消排队输入；只有携带主任务状态的终止事件生成结果气泡。
+        if (!msg.taskState && !msg.durationMs) break
+        if (msg.taskState && typeof msg.taskState === 'object') tabTaskState.value = msg.taskState as PersistedTaskState
+        messages.value.push({
+          role: 'system',
+          text: '任务已停止',
+          time: Date.now(),
+          taskResult: {
+            outcome: 'failed', continuationReason: 'stopped', resumable: true, originalTask: lastUserMessage,
+            durationMs: Number(msg.durationMs ?? msg.taskState?.durationMs) || (taskActivity.value.startedAt ? Math.max(0, Date.now() - taskActivity.value.startedAt) : 0),
+          },
+        })
         status.value = 'idle'
         break
 
@@ -3027,7 +3297,19 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         // SDK 错误：清空待处理工具，显示错误消息。同时清理 agent 追踪、turn 标记。
         pendingTools.value = []
         _turnCompleted = false
-        messages.value.push({role: 'error', text: msg.message, time: Date.now()})
+        messages.value.push({
+          role: 'error',
+          text: msg.message,
+          time: Date.now(),
+          taskResult: {
+            outcome: 'failed',
+            continuationReason: 'execution_error',
+            resumable: Boolean(tab.historySessionId),
+            originalTask: lastUserMessage,
+            durationMs: Number(msg.durationMs ?? msg.taskState?.durationMs)
+              || (taskActivity.value.startedAt ? Math.max(0, Date.now() - taskActivity.value.startedAt) : 0),
+          },
+        })
         tabTaskState.value = {
           status: 'interrupted',
           outcome: 'failed',
@@ -3037,6 +3319,10 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
           updatedAt: Date.now(),
         }
         status.value = 'idle'
+        taskActivity.value = reduceTaskActivity(taskActivity.value, {
+          type: 'task_failed',
+          detail: msg.message,
+        })
         if (fg) void flushMsgQueue()
         if (fg) {
           syncPetState('error', { message: msg.message?.slice(0, 40), bubble: petPick(BUBBLE_ERROR_SDK, myProject) + (msg.message?.slice(0, 50) || '') })
@@ -3143,7 +3429,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
           }
         }
         // 最后一个子 Agent 完成且回合已结束时，切 idle 并清队列
-        const completedTurn = _turnCompleted && runningAgentTotal.value === 0
+        const completedTurn = _turnCompleted && runningAgentTotal.value === 0 && parentTaskUi.value.phase === 'succeeded'
         if (completedTurn) {
           _turnCompleted = false
           status.value = 'idle'
@@ -3222,6 +3508,50 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         }
         break
 
+      case 'workflow_agent_started': {
+        const existing = agentRuns.value.find(a => a.id === msg.id && a.source === 'workflow')
+        const metadata = {
+          agentType: msg.agentType || msg.role || msg.id || 'Agent',
+          description: msg.task || '',
+          purpose: msg.role || msg.agentType || '',
+          task: msg.task || '',
+          phase: msg.phase || wfRunState.value?.currentPhase || '',
+          role: msg.role || '',
+          requestedModelTier: msg.requestedModelTier || null,
+          actualModel: msg.actualModel || '',
+          modelSource: msg.modelSource || '',
+          fallbackReason: msg.fallbackReason || null,
+          required: msg.required === true,
+        }
+        if (existing) {
+          Object.assign(existing, metadata, {status: 'running', startTime: msg.ts || Date.now(), eventSource: 'structured'})
+        } else {
+          agentRuns.value.push({
+            id: msg.id,
+            ...metadata,
+            scope: '', descriptionSource: 'workflow',
+            status: 'running', spawnTime: msg.ts || Date.now(), startTime: msg.ts || Date.now(), doneTime: 0,
+            progress: '', source: 'workflow', currentTool: '', currentToolElapsed: 0,
+            eventSource: 'structured',
+          })
+        }
+        break
+      }
+
+      case 'workflow_agent_done':
+      case 'workflow_agent_error': {
+        const run = agentRuns.value.find(a => a.id === msg.id && a.source === 'workflow')
+        if (run) {
+          run.status = msg.type === 'workflow_agent_done' ? 'done' : (msg.status === 'paused' ? 'paused' : 'error')
+          run.doneTime = msg.type === 'workflow_agent_done' ? (msg.ts || Date.now()) : 0
+          run.eventSource = 'structured'
+          if (msg.error) run.progress = msg.error
+          if (msg.actualModel) run.actualModel = msg.actualModel
+          if (msg.phase) run.phase = msg.phase
+        }
+        break
+      }
+
       case 'workflow_log':
         if (wfRunState.value) {
           wfRunState.value.logs.push({
@@ -3244,10 +3574,13 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
             const toolMatch = msg.message?.match(/工具:\s*(.+)/)
             const run = agentRuns.value.find(a => a.id === agInfo.id && a.source === 'workflow')
             if (run) {
-              run.status = agInfo.status
+              // 结构化事件是 Agent 生命周期的真实来源；日志仅兼容旧 Gateway，不能把运行中的门禁 Agent 提前标记完成。
+              if (run.eventSource !== 'structured') {
+                Object.assign(run, mergeWorkflowAgentLogState(run, agInfo.status))
+              }
               run.progress = msg.message
-              if (agInfo.status === 'done') run.doneTime = Date.now()
-              if (agInfo.status === 'running' && !run.startTime) run.startTime = Date.now()
+              if (run.eventSource !== 'structured' && agInfo.status === 'done') run.doneTime = Date.now()
+              if (run.eventSource !== 'structured' && agInfo.status === 'running' && !run.startTime) run.startTime = Date.now()
               if (toolMatch) {
                 run.currentTool = toolMatch[1].trim()
                 run.currentToolElapsed = 0
@@ -3255,12 +3588,13 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
             } else {
               agentRuns.value.push({
                 id: agInfo.id, agentType: resolvedType, description: agInfo.prompt || '',
-                status: agInfo.status, spawnTime: Date.now(),
+                status: normalizeWorkflowLogAgentStatus(agInfo.status), spawnTime: Date.now(),
                 startTime: agInfo.status === 'running' ? Date.now() : 0,
                 doneTime: agInfo.status === 'done' ? Date.now() : 0,
                 progress: msg.message, source: 'workflow',
                 currentTool: toolMatch ? toolMatch[1].trim() : '',
                 currentToolElapsed: 0,
+                eventSource: 'log',
               })
             }
           }
@@ -3284,7 +3618,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
           }
         }
         // Workflow 结束后检查是否所有 Agent 都已完成，若回合已结束则切 idle
-        if (_turnCompleted && runningAgentTotal.value === 0) {
+        if (_turnCompleted && runningAgentTotal.value === 0 && parentTaskUi.value.phase === 'succeeded') {
           _turnCompleted = false
           status.value = 'idle'
           if (fg) void flushMsgQueue()
@@ -3323,7 +3657,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
           }
         }
         // Workflow 异常结束，若回合已完成且无其他运行中 Agent，切 idle
-        if (_turnCompleted && runningAgentTotal.value === 0) {
+        if (_turnCompleted && runningAgentTotal.value === 0 && ['failed', 'review_paused', 'incomplete'].includes(parentTaskUi.value.phase)) {
           _turnCompleted = false
           status.value = 'idle'
           if (fg) void flushMsgQueue()
@@ -3606,8 +3940,17 @@ function runCompact() {
  * - 如果空闲：直接 dispatch 发送
  */
 async function sendMessage() {
-  const text = inputText.value.trim()
-  const attachments = pendingAttachments.value.length > 0 ? [...pendingAttachments.value] : undefined
+  const originalText = inputText.value.trim()
+  const selectedAttachments = pendingAttachments.value.length > 0 ? [...pendingAttachments.value] : undefined
+  let prepared: ReturnType<typeof prepareLargeInput>
+  try {
+    prepared = prepareLargeInput(originalText, selectedAttachments)
+  } catch (error: any) {
+    showToast(error?.message || '超长输入转换失败', 6000)
+    return
+  }
+  const text = prepared.text
+  const attachments = prepared.attachments
   if (!text && !attachments?.length) return
   if (!ws || ws.readyState !== 1) {
     showToast(t('ws.notConnected'))
@@ -3617,22 +3960,27 @@ async function sendMessage() {
   if (status.value === 'thinking' || _flushingQueue || runningAgentTotal.value > 0) {
     // thinking/队列清空中/子Agent还在跑: 新消息进入排队，避免打断正在执行的 Agent
     queueId++
-    msgQueue.value.push({id: queueId, text, time: Date.now(), attachments})
-    saveDraftForTab(activeTab.value, text, true)
+    msgQueue.value.push({id: queueId, text, originalText, time: Date.now(), attachments})
+    saveDraftForTab(activeTab.value, originalText, true)
     // 附件归属当前队列项，避免下一条消息误带上本条附件。
     if (attachments) pendingAttachments.value = []
     inputText.value = ''
+    if (prepared.converted) showToast(`输入内容较长，已自动转为 TXT 附件（${formatAttachmentSize(prepared.bytes)}）`)
     nextTick(() => scrollDown(true))
     return
   }
 
   try {
-    const sent = await dispatch(text, attachments)
-    if (sent) inputText.value = ''
+    const sent = await dispatch(text, attachments, originalText)
+    if (sent) {
+      inputText.value = ''
+      if (prepared.converted) showToast(`输入内容较长，已自动转为 TXT 附件（${formatAttachmentSize(prepared.bytes)}）`)
+    }
     else showToast(t('ws.notConnected'))
   } catch (error) {
     console.error(error)
-    saveDraftForTab(activeTab.value, text, true)
+    inputText.value = originalText
+    saveDraftForTab(activeTab.value, originalText, true)
     showToast(t('ws.attachmentUploadFailed'))
   }
 }
@@ -3737,13 +4085,13 @@ async function buildWireText(text: string, attachments?: PendingAttachment[]): P
  * 消息分发：构建 wire text（含文件引用内容），界面显示用户原文，实际发送 wire 版本。
  * 这样用户在界面上看到的是简洁的 `#文件名` 引用，但模型收到的是含文件内容的完整消息。
  */
-async function dispatch(text: string, attachments?: PendingAttachment[]): Promise<boolean> {
+async function dispatch(text: string, attachments?: PendingAttachment[], originalText = text): Promise<boolean> {
   // 捕获当前 sessionId，防止 await 期间切换会话导致跨会话发送
   const mySid = sessionId.value
   const selectedAttachments = attachments ?? (pendingAttachments.value.length > 0 ? [...pendingAttachments.value] : undefined)
   const wire = await buildWireText(text, selectedAttachments)
   if (sessionId.value !== mySid) return false
-  const sent = doSend(text, wire, selectedAttachments)
+  const sent = doSend(text, wire, selectedAttachments, originalText)
   if (sent && selectedAttachments) {
     pendingAttachments.value = pendingAttachments.value.filter(a => !selectedAttachments.includes(a))
   }
@@ -3754,30 +4102,41 @@ async function dispatch(text: string, attachments?: PendingAttachment[]): Promis
  * 底层 WebSocket 发送：标记 thinking 状态，记录用户原文（用于取消时回填），推送消息。
  * wire 为注入引用文件内容后的版本，若未提供则直接用原文。
  */
-function doSend(text: string, wire?: string, attachments?: PendingAttachment[]): boolean {
+function doSend(text: string, wire?: string, attachments?: PendingAttachment[], originalText = text): boolean {
   // buildWireText 等异步操作期间 WS 可能已断开，再次检查防止 ! 崩溃
   const socket = ws
   const inputSessionId = sessionId.value
   if (!socket || socket.readyState !== 1 || !inputSessionId) return false
+  const wasTaskRunning = status.value === 'thinking' && taskActivity.value.running
   const curModelMeta = models.value.find(m => m.id === model.value)
   const messageId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`
   const payload = {
     type: 'user_message',
     content: wire ?? text,
+    taskText: text,
+    hasAttachments: Boolean(attachments?.length),
     messageId,
     permissionMode: permissionMode.value,
     thinkingLevel: thinkingLevel.value,
-    model: model.value,
+    ...buildModelSelectionPayload({
+      mode: modelMode.value,
+      model: model.value,
+      modelMeta: curModelMeta ? {contextWindow: curModelMeta.contextWindow, pricing: pricing.value} : null,
+    }),
     maxContextTokens: contextSafetyCap.value || undefined,
-    modelMeta: curModelMeta ? {contextWindow: curModelMeta.contextWindow, pricing: pricing.value} : null
   }
   if (!sendSessionPayload(payload, socket)) return false
 
   // SIDE_EFFECT: 只有 WebSocket 接受消息后才提交本地回合状态。
   status.value = 'thinking'
   _turnCompleted = false  // 新一轮开始: 重置回合完成标记
+  parentTaskUi.value = createParentTaskUiState({phase: 'running'})
+  taskActivity.value = wasTaskRunning
+    ? reduceTaskActivity(taskActivity.value, {type: 'task_input_added', source: '桌面端'})
+    : reduceTaskActivity(createTaskActivityState(), {type: 'task_started'})
+  _pendingResultMessage = null
   startTaskDurationTimer()
-  lastUserMessage = text
+  lastUserMessage = originalText
   turnThinkingText = ''  // 新一轮开始: 清空本轮思考文本累计，result 时重新估算
   clearAgentRuns()       // 新一轮开始: 清空上一轮的 agent 运行卡片
   // resume 走 SDK，claude.exe 自带完整历史，无需前端手动注入 <context>
@@ -3797,14 +4156,15 @@ function doSend(text: string, wire?: string, attachments?: PendingAttachment[]):
   }
   messages.value.push(userMessage)  // 界面显示用户原文和附件发送状态
   pendingInputTexts.set(messageId, {
-    text,
+    text: originalText,
+    originalText,
     sessionId: inputSessionId,
     payload,
     attachments,
     message: userMessage,
     createdAt: Date.now(),
   })
-  saveDraftForTab(activeTab.value, text, true)
+  saveDraftForTab(activeTab.value, originalText, true)
   while (pendingInputTexts.size > 64) pendingInputTexts.delete(pendingInputTexts.keys().next().value!)
   nextTick(() => scrollDown(true))
   return true
@@ -3857,19 +4217,23 @@ async function cancelTask() {
     const restoredAttachments = new Map(pendingAttachments.value.map(a => [a.id, a]))
     const restoredTexts = [
       lastUserMessage,
-      ...msgQueue.value.map(item => item.text),
+      ...msgQueue.value.map(item => item.originalText || item.text),
       ...[...pendingInputTexts.values()]
         .filter(item => item.sessionId === sessionId.value)
         .map(item => item.text),
     ].map(text => String(text || '').trim()).filter(Boolean)
     for (const item of msgQueue.value) {
-      for (const attachment of item.attachments || []) restoredAttachments.set(attachment.id, attachment)
+      for (const attachment of item.attachments || []) {
+        if (!attachment.autoGenerated) restoredAttachments.set(attachment.id, attachment)
+      }
     }
     msgQueue.value = []
     for (const [messageId, pending] of pendingInputTexts) {
       if (pending.sessionId !== sessionId.value) continue
       for (const attachment of pending.message.attachments || []) attachment.status = 'failed'
-      for (const attachment of pending.attachments || []) restoredAttachments.set(attachment.id, attachment)
+      for (const attachment of pending.attachments || []) {
+        if (!attachment.autoGenerated) restoredAttachments.set(attachment.id, attachment)
+      }
       pendingInputTexts.delete(messageId)
     }
     pendingAttachments.value = [...restoredAttachments.values()]
@@ -3970,7 +4334,7 @@ async function sendQueued(item: QItem) {
     return
   }
   try {
-    if (!(await dispatch(item.text, item.attachments))) {
+    if (!(await dispatch(item.text, item.attachments, item.originalText || item.text))) {
       restoreQueueItems([item], ownerTabId)
       showToast(t('ws.notConnected'))
     }
@@ -4028,7 +4392,7 @@ async function flushMsgQueue() {
         break
       }
       try {
-        if (!(await dispatch(items[i].text, items[i].attachments))) {
+        if (!(await dispatch(items[i].text, items[i].attachments, items[i].originalText || items[i].text))) {
           restoreQueueItems(items.slice(i), ownerTabId)
           break
         }
@@ -4056,7 +4420,7 @@ async function injectNow(item: QItem) {
   msgQueue.value = msgQueue.value.filter(q => q.id !== item.id)
   if (ws && ws.readyState === 1) {
     try {
-      if (!(await dispatch(item.text, item.attachments))) {
+      if (!(await dispatch(item.text, item.attachments, item.originalText || item.text))) {
         restoreQueueItems([item], ownerTabId)
         showToast(t('ws.notConnected'))
         return
@@ -4150,11 +4514,15 @@ function notifyProjectCacheWarnings(raw: unknown) {
 
 /** 懒加载当前项目的文件列表 */
 async function loadMentionFiles() {
-  if (!sessionId.value) return
+  const targetSessionId = sessionId.value
+  const ownerTabId = activeTabId.value
+  if (!targetSessionId || !ownerTabId) return
   try {
-    const res = await fetch(`${GW}/api/sessions/${sessionId.value}/files`)
+    const res = await fetch(`${GW}/api/sessions/${targetSessionId}/files`)
+    if (activeTabId.value !== ownerTabId || sessionId.value !== targetSessionId) return
     if (res.ok) {
       const d = await res.json();
+      if (activeTabId.value !== ownerTabId || sessionId.value !== targetSessionId) return
       mentionFiles.value = (d.files || []).map((f: any) => ({path: f.path}))
       notifyProjectCacheWarnings(d.projectCacheWarnings)
     }
@@ -4377,15 +4745,17 @@ function toggleFilePanel() {
 /** 从 Gateway 加载当前会话的文件列表和快照状态，增量同步到文件树 */
 let _loadFileTreeSeq = 0
 async function loadFileTree() {
-  if (!sessionId.value) return
+  const targetSessionId = sessionId.value
+  const ownerTabId = activeTabId.value
+  if (!targetSessionId || !ownerTabId) return
   const seq = ++_loadFileTreeSeq
   fileTreeLoading.value = true
   try {
-    const res = await fetch(`${GW}/api/sessions/${sessionId.value}/files`)
-    if (seq !== _loadFileTreeSeq) return
+    const res = await fetch(`${GW}/api/sessions/${targetSessionId}/files`)
+    if (seq !== _loadFileTreeSeq || activeTabId.value !== ownerTabId || sessionId.value !== targetSessionId) return
     if (res.ok) {
       const d = await res.json()
-      if (seq !== _loadFileTreeSeq) return
+      if (seq !== _loadFileTreeSeq || activeTabId.value !== ownerTabId || sessionId.value !== targetSessionId) return
       syncFileTree(d.files || [])
       hasSnapshot.value = !!d.hasSnapshot
       snapshotAt.value = d.snapshotAt || null
@@ -4395,7 +4765,9 @@ async function loadFileTree() {
       notifyProjectCacheWarnings(d.projectCacheWarnings)
     }
   } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
-  fileTreeLoading.value = false
+  if (seq === _loadFileTreeSeq && activeTabId.value === ownerTabId && sessionId.value === targetSessionId) {
+    fileTreeLoading.value = false
+  }
 }
 
 /**
@@ -4546,6 +4918,7 @@ function onMessageClick(e: MouseEvent) {
 
 /** 通过文件路径打开内联预览 modal（非文件树点击，而是消息中的链接点击） */
 async function openFileByPath(filePath: string) {
+  modalMaximized.value = false
   modalMode.value = 'file';
   modalPath.value = filePath;
   modalLoading.value = true
@@ -4568,6 +4941,7 @@ async function openFileByPath(filePath: string) {
 /** 打开文件内容预览 modal（二进制文件和已删除文件禁止预览） */
 async function openFileModal(f: FlatFile) {
   if (f.binary || f.status === 'deleted') return
+  modalMaximized.value = false
   modalMode.value = 'file';
   modalPath.value = f.path;
   modalLoading.value = true
@@ -4588,6 +4962,7 @@ async function openFileModal(f: FlatFile) {
 /** 打开文件 Diff modal（二进制文件不支持 diff） */
 async function openDiffModal(f: FlatFile) {
   if (f.binary) return
+  modalMaximized.value = false
   modalMode.value = 'diff';
   modalPath.value = f.path;
   modalLoading.value = true;
@@ -4624,8 +4999,17 @@ function doCloseModal() {
   monacoEditor.value = null
   cachedEditorContent = ''
   modalMode.value = null
+  modalMaximized.value = false
   modalDiff.value = null
   modalFileContent.value = ''
+}
+
+function toggleModalMaximized() {
+  modalMaximized.value = !modalMaximized.value
+  nextTick(() => {
+    monacoEditor.value?.layout()
+    monacoDiffEditor.value?.layout()
+  })
 }
 
 // ═══════════════════════════════════════════
@@ -4770,6 +5154,7 @@ function doSave() {
 // 窗口隐藏（最小化/托盘）时停掉所有定时器，恢复时重启。
 // 子定时器启动/停止函数为外部闭包变量，此处直接引用。
 function resumeTimers() {
+  startActivityClock()
   if (!sessionDurationTimer && sessionStartTime.value) startSessionDurationTimer()
   if (!taskDurationTimer && taskStartTime.value) startTaskDurationTimer()
   if (!tabAutoSyncTimer && activeTabId.value) tabAutoSyncTimer = setInterval(syncCurrentTabState, 5000)
@@ -4778,6 +5163,7 @@ function resumeTimers() {
   }
 }
 function pauseTimers() {
+  stopActivityClock()
   if (sessionDurationTimer) { clearInterval(sessionDurationTimer); sessionDurationTimer = null }
   if (taskDurationTimer) { clearInterval(taskDurationTimer); taskDurationTimer = null }
   if (tabAutoSyncTimer) { clearInterval(tabAutoSyncTimer); tabAutoSyncTimer = null }
@@ -4794,6 +5180,7 @@ document.addEventListener('visibilitychange', onPageVisibility)
 
 // 组件卸载时清理 Monaco 实例及外部 model
 onBeforeUnmount(() => {
+  stopActivityClock()
   if (draftPersistTimer) { clearTimeout(draftPersistTimer); draftPersistTimer = null }
   const currentTab = activeTab.value
   if (currentTab) {
@@ -5065,12 +5452,20 @@ function toggleProject(workDir: string) {
   expandedProjects.value = s
 }
 
+function updateThinkingExpanded(msg: Message, event: Event) {
+  msg.expanded = (event.currentTarget as HTMLDetailsElement).open
+}
+
 // ═══════════════════════════════════════════
 // ── 控制栏：模型选择 / 权限模式 / 思考等级 ──
 // ═══════════════════════════════════════════
 
 /** 当前选中的模型 ID（默认空，由 loadProviderModels 从 settings 填充） */
 const model = ref('')
+/** 模型路由模式：自动按任务决策选择档位，固定完全尊重用户模型。 */
+const modelMode = ref<ModelMode>('auto')
+/** 当前回合的任务决策摘要，不保存原始 Prompt。 */
+const taskDecision = ref<TaskDecisionDisplay | null>(null)
 /** 可用模型列表（loadProviderModels 动态填充，含 id/name/contextWindow） */
 const models = ref<{id: string, name: string, contextWindow?: string}[]>([])
 /** 供应商预设列表（loadProviderModels 从 /api/config/providers 拉取） */
@@ -5507,8 +5902,8 @@ const tokenTooltip = computed(() => {
         :expanded-projects="expandedProjects"
         :show-all-sessions="showAllSessions"
         :show-all-projects="showAllProjects"
-        :active-project="activeProject"
-        :active-session-id="activeSessionId"
+        :active-project="activeProject || ''"
+        :active-session-id="activeSessionId || ''"
         :connected="connected"
         :connecting="connecting"
         :gateway-version="gatewayVersion"
@@ -5673,7 +6068,7 @@ const tokenTooltip = computed(() => {
                :style="{ animationDelay: `${Math.min(i * 20, 300)}ms` }">
             <!-- 系统消息：时间 + 文本，居中显示 -->
             <template v-if="msg.role === 'system'">
-              <div class="sys-msg" :class="{'task-incomplete': msg.taskResult?.outcome === 'incomplete'}">
+              <div class="sys-msg" :class="{'task-incomplete': msg.taskResult?.outcome === 'incomplete', 'has-task-result': !!msg.taskResult}">
                 <span class="sys-time">{{ formatTime(msg.time) }}</span>
                 <span v-if="msg.compact" class="sys-text compact-notice">
                   <strong>{{ msg.text }}</strong>
@@ -5684,6 +6079,9 @@ const tokenTooltip = computed(() => {
                   <span v-if="msg.compact.summaryExpanded" class="compact-summary">{{ msg.compact.summary }}</span>
                 </span>
                 <span v-else class="sys-text">{{ msg.text }}</span>
+                <span v-if="msg.taskResult?.durationMs" class="task-result-duration">
+                  总耗时 {{ formatDuration(msg.taskResult.durationMs) }}
+                </span>
                 <button
                     v-if="msg.taskResult?.resumable"
                     class="task-continue-btn"
@@ -5699,7 +6097,7 @@ const tokenTooltip = computed(() => {
             </template>
             <!-- 思考块：折叠面板，summary 栏展示"思考"标签 + 预览文本 -->
             <template v-else-if="msg.role === 'thinking'">
-              <details class="think-details" @toggle="msg.expanded = $event.target.open">
+              <details class="think-details" @toggle="updateThinkingExpanded(msg, $event)">
                 <summary class="think-summary">
                   <span class="think-badge">{{ t('ws.thinkBadge') }}</span>
                   <svg class="think-dot-icon" width="8" height="8" viewBox="0 0 8 8">
@@ -5718,6 +6116,9 @@ const tokenTooltip = computed(() => {
             <template v-else-if="msg.role === 'error'">
               <div class="err-msg task-result-error">
                 <span>{{ msg.text }}</span>
+                <span v-if="msg.taskResult?.durationMs" class="task-result-duration">
+                  总耗时 {{ formatDuration(msg.taskResult.durationMs) }}
+                </span>
                 <button
                     v-if="msg.taskResult?.resumable"
                     class="task-continue-btn"
@@ -5937,11 +6338,28 @@ const tokenTooltip = computed(() => {
             </div>
           </div>
 
-          <!-- Thinking 动画骨架：三个呼吸圆点，表示 AI 正在思考中 -->
-          <div v-if="status === 'thinking'" class="thinking-indicator">
-            <span class="think-dot"></span>
-            <span class="think-dot"></span>
-            <span class="think-dot"></span>
+          <!-- 当前任务活动：展示阶段、动作和事件新鲜度，便于区分持续执行与长时间无响应 -->
+          <div v-if="status === 'thinking' || taskActivity.running"
+               class="task-activity"
+               :class="`freshness-${taskActivityFresh.level}`">
+            <div class="task-activity-indicator" aria-hidden="true">
+              <span class="think-dot"></span>
+              <span class="think-dot"></span>
+              <span class="think-dot"></span>
+            </div>
+            <div class="task-activity-content">
+              <div class="task-activity-title">{{ taskActivity.title || '任务正在执行' }}</div>
+              <div v-if="taskActivity.detail" class="task-activity-detail" :title="taskActivity.detail">
+                {{ taskActivity.detail }}
+              </div>
+              <div v-if="taskActivityFresh.message" class="task-activity-hint">
+                {{ taskActivityFresh.message }}
+              </div>
+            </div>
+            <div class="task-activity-meta">
+              <span>已执行 {{ formatDuration(taskActivityElapsed) }}</span>
+              <span>{{ formatRecentActivity(taskActivity.updatedAt) }}</span>
+            </div>
           </div>
 
           <!-- 回到底部悬浮按钮：sticky 贴消息区底部，用户上滑后出现 -->
@@ -5958,10 +6376,18 @@ const tokenTooltip = computed(() => {
         <div class="controls-bar">
           <!-- 模型选择器：从 models 列表动态渲染 option -->
           <div class="control-group">
+            <span class="control-label">模式</span>
+            <select v-model="modelMode" class="control-select" title="自动按任务难度选择模型，固定使用指定模型">
+              <option value="auto">自动</option>
+              <option value="fixed">固定</option>
+            </select>
             <span class="control-label">{{ t('ws.ctlModel') }}</span>
-            <select v-model="model" class="control-select">
+            <select v-model="model" class="control-select" :disabled="modelMode === 'auto'">
               <option v-for="m in models" :key="m.id" :value="m.id">{{ m.id }}</option>
             </select>
+            <span v-if="taskDecision" class="task-decision-compact" :title="taskDecision.reasons?.join('；') || ''">
+              {{ describeTaskDecision(taskDecision) }}
+            </span>
           </div>
           <!-- 权限模式选择器 -->
           <div class="control-group">
@@ -6169,8 +6595,8 @@ const tokenTooltip = computed(() => {
               }} ({{ msgQueue.length }})</span>
             <div class="queue-chips">
               <div v-for="q in msgQueue" :key="q.id" class="queue-chip">
-                <span class="chip-text" :title="q.text">{{ q.text.slice(0, 60) }}{{
-                    q.text.length > 60 ? '...' : ''
+                <span class="chip-text" :title="q.originalText || q.text">{{ (q.originalText || q.text).slice(0, 60) }}{{
+                    (q.originalText || q.text).length > 60 ? '...' : ''
                   }}</span>
                 <button class="chip-send" :title="status === 'thinking' ? t('ws.injectNow') : t('ws.sendNow')"
                         @click="status === 'thinking' ? injectNow(q) : sendQueued(q)">
@@ -6247,6 +6673,9 @@ const tokenTooltip = computed(() => {
                 <button class="attach-remove" @click="removeAttachment(a.id)" :title="t('ws.remove')">×</button>
               </div>
             </div>
+            <div v-if="largeInputPlan.converted" class="large-input-hint">
+              内容超过 80KB，发送时将自动转为 UTF-8 TXT 附件
+            </div>
             <div class="input-wrapper">
               <input
                   ref="fileInputRef"
@@ -6290,7 +6719,7 @@ const tokenTooltip = computed(() => {
               <button
                   v-else
                   class="send-btn"
-                  :disabled="!inputText.trim()"
+                  :disabled="!inputText.trim() && pendingAttachments.length === 0"
                   @click="sendMessage"
               >
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
@@ -6519,6 +6948,18 @@ const tokenTooltip = computed(() => {
                 <span class="ag-card-desc-label">范围</span>
                 <span>{{ ag.scope }}</span>
               </div>
+              <div v-if="ag.phase" class="ag-card-desc" :title="ag.phase">
+                <span class="ag-card-desc-label">阶段</span>
+                <span>{{ ag.phase }}</span>
+              </div>
+              <div v-if="ag.actualModel || ag.requestedModelTier" class="ag-card-desc">
+                <span class="ag-card-desc-label">模型</span>
+                <span>{{ ag.actualModel || '未配置' }}<template v-if="ag.requestedModelTier"> · {{ ag.requestedModelTier }}</template></span>
+              </div>
+              <div v-if="ag.required" class="ag-card-desc">
+                <span class="ag-card-desc-label">门禁</span>
+                <span>父任务需等待此 Agent 结论</span>
+              </div>
             </div>
             <!-- 进度条 + 当前工具 -->
             <div v-if="ag.status === 'running' || ag.status === 'done'" class="ag-card-progress">
@@ -6717,7 +7158,7 @@ const tokenTooltip = computed(() => {
 
     <!-- 文件内容 / Diff Modal：v-if 直接控制挂载/卸载 -->
     <div v-if="modalMode" class="diff-overlay" @click.self="closeModal">
-      <div class="diff-modal glass">
+      <div class="diff-modal" :class="{ maximized: modalMaximized }">
         <div class="diff-modal-header">
           <span class="diff-modal-mode">{{ modalMode === 'diff' ? t('ws.diffMode') : t('ws.fileMode') }}</span>
           <code class="diff-modal-path">{{ modalPath }}</code>
@@ -6737,6 +7178,18 @@ const tokenTooltip = computed(() => {
               <polyline points="7 3 7 8 15 8"/>
             </svg>
             <span>{{ t('common.save') }}</span>
+          </button>
+          <button class="fp-icon-btn"
+                  :title="modalMaximized ? '还原窗口' : '最大化窗口'"
+                  :aria-label="modalMaximized ? '还原窗口' : '最大化窗口'"
+                  @click="toggleModalMaximized">
+            <svg v-if="modalMaximized" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="5" y="7" width="12" height="12" rx="1"/>
+              <path d="M8 7V4h12v12h-3"/>
+            </svg>
+            <svg v-else width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="4" y="4" width="16" height="16" rx="1"/>
+            </svg>
           </button>
           <button class="fp-icon-btn" :title="t('ws.close') + ' (Esc)'" @click="closeModal">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -7908,6 +8361,27 @@ const tokenTooltip = computed(() => {
   color: var(--text-secondary);
 }
 
+.sys-msg.has-task-result {
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: center;
+  max-width: min(820px, 90vw);
+}
+
+.task-result-duration {
+  flex-shrink: 0;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.large-input-hint {
+  padding: 2px 4px 6px;
+  color: var(--accent-gold);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
 .task-continue-btn {
   display: inline-flex;
   align-items: center;
@@ -7945,6 +8419,7 @@ const tokenTooltip = computed(() => {
   align-items: center;
   gap: 8px;
   max-width: min(720px, 80vw);
+  min-width: 0;
 }
 
 .compact-meta {
@@ -7966,6 +8441,9 @@ const tokenTooltip = computed(() => {
   overflow: auto;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+  word-break: break-word;
+  width: 100%;
+  min-width: 0;
   padding: 8px 10px;
   border-left: 2px solid var(--border-hover);
   color: var(--text-secondary);
@@ -8318,13 +8796,79 @@ const tokenTooltip = computed(() => {
   border-color: rgba(255, 255, 255, 0.15);
 }
 
-/* ── 思考动画骨架 Thinking skeleton ── */
-/* 三个呼吸圆点，表示 AI 正在生成回复 */
-.thinking-indicator {
+/* ── 当前任务活动 ── */
+.task-activity {
   display: flex;
-  gap: 5px;
-  padding: 12px 0;
+  align-items: center;
+  gap: 12px;
+  width: min(760px, 94%);
+  min-height: 58px;
+  padding: 10px 12px;
   align-self: flex-start;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent-blue);
+  border-radius: 8px;
+  color: var(--text-primary);
+}
+
+.task-activity.freshness-waiting {
+  border-left-color: var(--accent-gold);
+}
+
+.task-activity.freshness-stale {
+  border-left-color: var(--error);
+}
+
+.task-activity-indicator {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.task-activity-content {
+  min-width: 0;
+  flex: 1;
+}
+
+.task-activity-title {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.task-activity-detail,
+.task-activity-hint {
+  margin-top: 2px;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.45;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-activity-hint {
+  color: var(--accent-gold);
+  font-family: var(--font-body);
+  white-space: normal;
+}
+
+.freshness-stale .task-activity-hint {
+  color: var(--error);
+}
+
+.task-activity-meta {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  gap: 3px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-align: right;
+  white-space: nowrap;
 }
 
 .think-dot {
@@ -8689,6 +9233,21 @@ const tokenTooltip = computed(() => {
 
 .control-select:focus {
   border-color: var(--accent);
+}
+
+.control-select:disabled {
+  opacity: 0.58;
+  cursor: not-allowed;
+}
+
+.task-decision-compact {
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-family: var(--font-mono);
 }
 
 .spacer {
@@ -10210,7 +10769,6 @@ const tokenTooltip = computed(() => {
   bottom: 0;
   z-index: 320;
   background: rgba(0, 0, 0, 0.65);
-  backdrop-filter: blur(2px);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -10228,6 +10786,28 @@ const tokenTooltip = computed(() => {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+
+.diff-modal.maximized {
+  width: calc(100vw - 16px);
+  max-width: none;
+  height: calc(100vh - 56px);
+  border-radius: 6px;
+}
+
+@media (max-width: 720px) {
+  .task-activity {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .task-activity-meta {
+    width: 100%;
+    flex-direction: row;
+    justify-content: space-between;
+    padding-left: 30px;
+    text-align: left;
+  }
 }
 
 .diff-modal-header {

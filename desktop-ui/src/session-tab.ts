@@ -42,3 +42,13 @@ export function sessionTabIdentityKey(tab: SessionTabDescriptor): string | null 
   if (!sessionIdentity) return null
   return `${clean(tab.projectPath).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()}|${sessionIdentity}`
 }
+
+export function sessionRequestStillOwned(
+  owner: SessionTabDescriptor & {id?: string | null},
+  current: SessionTabDescriptor & {id?: string | null},
+): boolean {
+  return clean(owner.id) === clean(current.id)
+    && (!clean(owner.gatewaySessionId) || clean(owner.gatewaySessionId) === clean(current.gatewaySessionId))
+    && clean(owner.historySessionId) === clean(current.historySessionId)
+    && clean(owner.projectPath).toLowerCase() === clean(current.projectPath).toLowerCase()
+}
