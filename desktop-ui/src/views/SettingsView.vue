@@ -1367,6 +1367,54 @@ const memorySaved = ref(false)
 // ── 新建 memory 文件名输入（自动补 .md 后缀）──
 const newMemoryName = ref('')
 
+// ── 用户偏好：结构化候选确认后的全局/项目规则 ──
+const preferenceData = ref<{global: any[]; projects: any[]}>({global: [], projects: []})
+const preferenceLoading = ref(false)
+const preferenceError = ref('')
+
+async function loadPreferences() {
+  preferenceLoading.value = true
+  preferenceError.value = ''
+  try {
+    const res = await fetch(`${GW}/api/preferences`)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const data = await res.json()
+    preferenceData.value = {global: data.global || [], projects: data.projects || []}
+  } catch (error: any) {
+    preferenceError.value = error?.message || '偏好加载失败'
+  } finally {
+    preferenceLoading.value = false
+  }
+}
+
+async function togglePreference(item: any, scope: 'global' | 'project', encodedDir = '') {
+  try {
+    const res = await fetch(`${GW}/api/preferences/${scope}/${encodeURIComponent(item.id)}`, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({encodedDir, enabled: item.enabled === false}),
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    item.enabled = item.enabled === false
+  } catch (error: any) {
+    preferenceError.value = error?.message || '偏好更新失败'
+  }
+}
+
+async function deletePreference(item: any, scope: 'global' | 'project', encodedDir = '') {
+  try {
+    const res = await fetch(`${GW}/api/preferences/${scope}/${encodeURIComponent(item.id)}`, {
+      method: 'DELETE',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({encodedDir}),
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    await loadPreferences()
+  } catch (error: any) {
+    preferenceError.value = error?.message || '偏好删除失败'
+  }
+}
+
 // ── 加载 Memory 项目摘要 ──
 // 功能说明: GET /api/config/memory-summary，返回 { projects: [{encodedDir, workDir, fileCount}] }
 async function loadMemorySummary() {
@@ -2174,6 +2222,7 @@ async function retryModule(key: string) {
     skills: loadSkills, disabledSkills: loadDisabledSkills, agents: loadAgents, commands: loadCommands,
     hooks: loadHooks, rules: loadRules, memory: loadMemorySummary,
     mcp: loadMcp, disabledMcpPlugins: loadDisabledMcpPlugins, mcpServers: loadMcpServers, im: loadIM, scheduler: loadScheduledTasks,
+    preferences: loadPreferences,
   }
   if (map[key]) {
     try {
@@ -2228,6 +2277,7 @@ function loadPetOptions() {
 onMounted(() => {
   loadSettings()
   loadAllModules()
+  loadPreferences()
   loadPetOptions()
   startAutoRetryLoop()
 })
@@ -3056,6 +3106,38 @@ onUnmounted(() => {
               </button>
             </div>
             </div>
+            <section class="preference-settings-section">
+              <div class="preference-settings-header">
+                <div>
+                  <h3>用户偏好</h3>
+                  <p>仅注入与当前任务相关的已确认约束</p>
+                </div>
+                <button class="refresh-btn" :class="{ spinning: preferenceLoading }" @click="loadPreferences"
+                        :disabled="preferenceLoading" title="刷新偏好">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                       stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+                  </svg>
+                </button>
+              </div>
+              <div v-if="preferenceError" class="error-banner"><span>{{ preferenceError }}</span><button class="retry-btn" @click="loadPreferences">重试</button></div>
+              <div v-if="preferenceLoading" class="empty-hint-sm">正在加载偏好...</div>
+              <div v-else-if="!preferenceData.global.length && !preferenceData.projects.some(p => p.preferences?.length)" class="empty-hint-sm">尚未保存偏好</div>
+              <div v-else class="preference-settings-list">
+                <div v-for="item in preferenceData.global" :key="`global-${item.id}`" class="preference-setting-row">
+                  <div class="preference-setting-copy"><strong>{{ item.label }}</strong><span>全局偏好</span></div>
+                  <button class="btn-text" @click="togglePreference(item, 'global')">{{ item.enabled === false ? '启用' : '停用' }}</button>
+                  <button class="btn-danger-sm" @click="deletePreference(item, 'global')" title="删除偏好">删除</button>
+                </div>
+                <template v-for="project in preferenceData.projects" :key="project.encodedDir">
+                  <div v-for="item in project.preferences || []" :key="`${project.encodedDir}-${item.id}`" class="preference-setting-row">
+                    <div class="preference-setting-copy"><strong>{{ item.label }}</strong><span>项目：{{ project.encodedDir }}</span></div>
+                    <button class="btn-text" @click="togglePreference(item, 'project', project.encodedDir)">{{ item.enabled === false ? '启用' : '停用' }}</button>
+                    <button class="btn-danger-sm" @click="deletePreference(item, 'project', project.encodedDir)" title="删除偏好">删除</button>
+                  </div>
+                </template>
+              </div>
+            </section>
             <div v-if="memoryLoading" class="loading-state">{{ t('mem.scanning') }}</div>
             <div v-else-if="memoryProjects.length === 0" class="empty-state-lg">
               <div class="empty-icon"
@@ -4838,6 +4920,55 @@ input[type="time"].field-input::-webkit-calendar-picker-indicator {
 }
 
 /* Memory */
+.preference-settings-section {
+  margin: 0 0 18px;
+  padding: 14px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.preference-settings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.preference-settings-header h3 {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 15px;
+}
+
+.preference-settings-header p {
+  margin: 4px 0 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.preference-settings-list { display: flex; flex-direction: column; gap: 6px; }
+
+.preference-setting-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-deep);
+}
+
+.preference-setting-copy { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.preference-setting-copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-primary); font-size: 13px; }
+.preference-setting-copy span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); font-size: 11px; }
+
+@media (max-width: 700px) {
+  .preference-setting-row { align-items: flex-start; flex-wrap: wrap; }
+  .preference-setting-copy { flex-basis: 100%; }
+}
 .memory-summary-header {
   display: flex;
   justify-content: space-between;

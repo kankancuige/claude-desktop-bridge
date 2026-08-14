@@ -29,6 +29,10 @@ Incomplete: None
 | 数据保留 | transcript 沿用 Claude SDK 的本地保留策略；本地草稿限制数量、长度和保留期 | SUPPORTING / ASSUMED | 无产品保留期要求；出现磁盘/隐私要求时复核 |
 | 跨会话接力 | 显式分支继承完整 transcript；空白新会话只在首条引用性短句时读取最近有效主会话，注入文本不超过 6 KB | DRIVER / CONFIRMED | 用户要求；引用分类或 SDK fork 契约变化时复核 |
 | 上下文隔离 | 普通新问题不得自动注入旧 transcript；agent/workflow/单轮断裂会话不得成为接力来源 | DRIVER / CONFIRMED | 用户此前要求减少无关注入；项目列表过滤规则变化时复核 |
+| 统一任务入口 | desktop、wechat、feishu、dingtalk 和内部 Workflow 的任务接收必须共享校验、去重、排队、模型路由和停止语义 | DRIVER / CONFIRMED | 用户要求；新增入口或任务协议变化时复核 |
+| Bridge 事件恢复 | 已接受任务在 100ms 内写入不含正文的连续事件日志；强制重启后能投影最后任务状态 | DRIVER / ASSUMED | 本阶段目标；完成 crash smoke 后升级证据 |
+| Agent 能力协商 | 必需能力不满足时在 SDK query 启动前失败，不允许接受后忽略或静默降级 | DRIVER / CONFIRMED | 用户此前遇到 Agent 只分析不修改；新增 Provider 时复核 |
+| Provider 释放 | Gateway shutdown 后 Provider、observer、timer 和子进程必须在 2.2s 总关闭窗口内进入释放流程 | DRIVER / ASSUMED | 当前 shutdown 上限；增加长驻 Provider 时复核 |
 
 ## 数据语义与恢复
 

@@ -14,6 +14,34 @@ export type TaskActivityPhase =
   | 'failed'
   | 'stopped'
 
+export type TaskActivityEntryStatus = 'running' | 'waiting' | 'completed' | 'failed' | 'stopped'
+
+export type TaskActivityEntryKind =
+  | 'task'
+  | 'planning'
+  | 'thinking'
+  | 'tool'
+  | 'agent'
+  | 'workflow'
+  | 'waiting'
+  | 'compacting'
+  | 'response'
+  | 'review'
+
+export interface TaskActivityEntry {
+  id: string
+  kind: TaskActivityEntryKind
+  status: TaskActivityEntryStatus
+  title: string
+  detail: string
+  startedAt: number
+  updatedAt: number
+  completedAt: number
+  durationMs: number
+  eventType: string
+  expanded?: boolean
+}
+
 export interface TaskActivityState {
   phase: TaskActivityPhase
   running: boolean
@@ -22,6 +50,8 @@ export interface TaskActivityState {
   startedAt: number
   updatedAt: number
   eventType: string
+  entries: TaskActivityEntry[]
+  expanded: boolean
 }
 
 export interface TaskActivityFreshness {
@@ -30,25 +60,62 @@ export interface TaskActivityFreshness {
   message: string
 }
 
-function boundedText(value: unknown, max = 160): string {
-  return typeof value === 'string' ? value.replace(/\s+/g, ' ').trim().slice(0, max) : ''
-}
+const MAX_ENTRIES = 80
 
-function trailingText(value: unknown, max = 160): string {
+function boundedText(value: unknown, max = 200): string {
   if (typeof value !== 'string') return ''
   const normalized = value.replace(/\s+/g, ' ').trim()
-  return normalized.length > max ? normalized.slice(-max) : normalized
+  const redacted = normalized
+    .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]+=*/gi, 'Bearer [已脱敏]')
+    .replace(/\b(?:sk|key|token)-[A-Za-z0-9._-]{8,}\b/gi, '[已脱敏]')
+    .replace(/((?:api[_-]?key|access[_-]?token|auth(?:orization)?)\s*[:=]\s*)[^\s,;]+/gi, '$1[已脱敏]')
+    .replace(/(https?:\/\/)[^/@\s]+:[^/@\s]+@/gi, '$1[已脱敏]@')
+  return redacted.length > max ? `${redacted.slice(0, Math.max(0, max - 1))}…` : redacted
+}
+
+function trailingText(value: unknown, max = 200): string {
+  const normalized = boundedText(value, Math.max(max * 3, max))
+  return normalized.length > max ? `…${normalized.slice(-(max - 1))}` : normalized
 }
 
 function toolDetail(event: any): string {
   const input = event?.input && typeof event.input === 'object' ? event.input : {}
-  return boundedText(
-    input.file_path || input.path || input.command || input.query || input.pattern || event?.description,
-  )
+  const direct = input.file_path || input.path || input.query || input.pattern || input.command || event?.description
+  return boundedText(direct)
+}
+
+function toolName(event: any): string {
+  return boundedText(event?.tool_name || event?.toolName, 80) || '工具'
 }
 
 function agentName(event: any): string {
-  return boundedText(event?.agentType || event?.agentName || event?.label || event?.agentId || event?.id) || 'Agent'
+  return boundedText(event?.agentType || event?.agentName || event?.label || event?.agentId || event?.id, 80) || 'Agent'
+}
+
+function eventId(event: any, fallback: string): string {
+  return boundedText(
+    event?.tool_use_id || event?.toolUseId || event?.requestId || event?.agentId || event?.id || event?.workflowId || event?.index,
+    120,
+  ) || fallback
+}
+
+function normalizeEntry(input: Partial<TaskActivityEntry>): TaskActivityEntry {
+  const startedAt = Number.isFinite(Number(input.startedAt)) ? Number(input.startedAt) : 0
+  const updatedAt = Number.isFinite(Number(input.updatedAt)) ? Number(input.updatedAt) : startedAt
+  const completedAt = Number.isFinite(Number(input.completedAt)) ? Number(input.completedAt) : 0
+  return {
+    id: boundedText(input.id, 180),
+    kind: input.kind || 'task',
+    status: input.status || 'running',
+    title: boundedText(input.title),
+    detail: boundedText(input.detail),
+    startedAt,
+    updatedAt,
+    completedAt,
+    durationMs: Number.isFinite(Number(input.durationMs)) ? Math.max(0, Number(input.durationMs)) : 0,
+    eventType: boundedText(input.eventType, 80),
+    expanded: input.expanded === true,
+  }
 }
 
 export function createTaskActivityState(input: Partial<TaskActivityState> = {}): TaskActivityState {
@@ -60,7 +127,84 @@ export function createTaskActivityState(input: Partial<TaskActivityState> = {}):
     startedAt: Number.isFinite(Number(input.startedAt)) ? Number(input.startedAt) : 0,
     updatedAt: Number.isFinite(Number(input.updatedAt)) ? Number(input.updatedAt) : 0,
     eventType: boundedText(input.eventType, 80),
+    entries: Array.isArray(input.entries) ? input.entries.map(normalizeEntry).slice(-MAX_ENTRIES) : [],
+    expanded: input.expanded !== false,
   }
+}
+
+function completeEntries(
+  entries: TaskActivityEntry[],
+  now: number,
+  predicate: (entry: TaskActivityEntry) => boolean,
+  status: TaskActivityEntryStatus = 'completed',
+): TaskActivityEntry[] {
+  return entries.map(entry => {
+    if (!['running', 'waiting'].includes(entry.status) || !predicate(entry)) return entry
+    return {
+      ...entry,
+      status,
+      updatedAt: now,
+      completedAt: now,
+      durationMs: Math.max(entry.durationMs, now - entry.startedAt),
+    }
+  })
+}
+
+function upsertEntry(
+  state: TaskActivityState,
+  input: Partial<TaskActivityEntry> & Pick<TaskActivityEntry, 'id' | 'kind' | 'status' | 'title'>,
+  now: number,
+): TaskActivityState {
+  const entries = [...state.entries]
+  const index = entries.findIndex(entry => entry.id === input.id)
+  if (index >= 0) {
+    const current = entries[index]
+    const completedAt = input.completedAt ?? (['completed', 'failed', 'stopped'].includes(input.status) ? now : current.completedAt)
+    entries[index] = normalizeEntry({
+      ...current,
+      ...input,
+      detail: input.detail === undefined ? current.detail : input.detail,
+      startedAt: current.startedAt || input.startedAt || now,
+      updatedAt: now,
+      completedAt,
+      durationMs: input.durationMs ?? (completedAt ? Math.max(0, completedAt - (current.startedAt || now)) : current.durationMs),
+    })
+  } else {
+    entries.push(normalizeEntry({
+      ...input,
+      startedAt: input.startedAt || now,
+      updatedAt: now,
+      completedAt: input.completedAt || 0,
+      durationMs: input.durationMs || 0,
+    }))
+  }
+  return {...state, entries: entries.slice(-MAX_ENTRIES)}
+}
+
+function activityState(
+  state: TaskActivityState,
+  phase: TaskActivityPhase,
+  running: boolean,
+  title: string,
+  detail: string,
+  type: string,
+  now: number,
+): TaskActivityState {
+  return {
+    ...state,
+    phase,
+    running,
+    title: boundedText(title),
+    detail: boundedText(detail),
+    startedAt: state.startedAt || now,
+    updatedAt: now,
+    eventType: type,
+  }
+}
+
+function elapsedMs(event: any): number {
+  const seconds = Number(event?.elapsed_time_seconds ?? event?.elapsed?.elapsed_time_seconds ?? event?.elapsed)
+  return Number.isFinite(seconds) && seconds >= 0 ? Math.round(seconds * 1000) : 0
 }
 
 export function reduceTaskActivity(
@@ -68,111 +212,224 @@ export function reduceTaskActivity(
   event: any,
   now = Date.now(),
 ): TaskActivityState {
-  const state = createTaskActivityState(current)
+  let state = createTaskActivityState(current)
   const type = String(event?.type || '')
-  const start = state.startedAt || now
-  const active = (phase: TaskActivityPhase, title: string, detail = ''): TaskActivityState => ({
-    phase,
-    running: true,
-    title,
-    detail: boundedText(detail),
-    startedAt: start,
-    updatedAt: now,
-    eventType: type,
-  })
-  const terminal = (phase: TaskActivityPhase, title: string, detail = ''): TaskActivityState => ({
-    phase,
-    running: false,
-    title,
-    detail: boundedText(detail),
-    startedAt: state.startedAt,
-    updatedAt: now,
-    eventType: type,
-  })
+  const startsNewActivity = ['task_started', 'workflow_started', 'workflow_resumed'].includes(type)
+
+  // 终态事件可能因 WebSocket 排队或后台标签页恢复而迟到；只允许明确的新任务或恢复重新激活。
+  if (!state.running && ['completed', 'failed', 'stopped'].includes(state.phase) && !startsNewActivity) return state
 
   if (type === 'task_started') {
     const eventStartedAt = Number(event.startedAt ?? event.taskState?.startedAt)
-    return {
-      ...active('starting', '任务已接收，正在启动'),
-      startedAt: Number.isFinite(eventStartedAt) && eventStartedAt > 0 ? eventStartedAt : now,
-    }
+    const startedAt = Number.isFinite(eventStartedAt) && eventStartedAt > 0 ? eventStartedAt : now
+    state = createTaskActivityState({phase: 'starting', running: true, startedAt, updatedAt: now, expanded: true})
+    state = activityState(state, 'starting', true, '任务已接收，正在启动', '', type, now)
+    return upsertEntry(state, {
+      id: 'task:start', kind: 'task', status: 'completed', title: '任务已接收', startedAt,
+      completedAt: now, durationMs: Math.max(0, now - startedAt), eventType: type,
+    }, now)
   }
+
   if (type === 'task_input_added') {
-    return active(state.phase === 'idle' ? 'starting' : state.phase, '已注入补充指令，继续执行', boundedText(event.source))
+    state = activityState(state, state.phase === 'idle' ? 'starting' : state.phase, true, '已注入补充指令，继续执行', boundedText(event.source), type, now)
+    return upsertEntry(state, {
+      id: `input:${now}`, kind: 'task', status: 'completed', title: '已接收补充指令',
+      detail: boundedText(event.source), completedAt: now, eventType: type,
+    }, now)
   }
+
   if (type === 'task_decision') {
-    const tier = boundedText(event.modelTier || event.model)
-    return active('planning', '正在规划执行方式', tier ? `使用 ${tier} 档位` : '')
+    const tier = boundedText(event.modelTier || event.model, 80)
+    state = activityState(state, 'planning', true, '正在规划执行方式', tier ? `使用 ${tier} 档位` : '', type, now)
+    return upsertEntry(state, {
+      id: 'task:planning', kind: 'planning', status: 'completed', title: '执行方案已确定',
+      detail: tier ? `模型档位：${tier}` : boundedText(event.action), completedAt: now, eventType: type,
+    }, now)
   }
-  if (type === 'thinking_start') {
-    return active('thinking', '正在分析任务', boundedText(event.thinking, 160))
+
+  if (type === 'thinking_start' || type === 'thinking_delta') {
+    const id = `thinking:${eventId(event, 'current')}`
+    const existing = state.entries.find(entry => entry.id === id)
+    const detail = type === 'thinking_delta'
+      ? trailingText(`${existing?.detail || ''}${event.thinking || ''}`)
+      : boundedText(event.thinking)
+    state = activityState(state, 'thinking', true, '正在分析任务', detail, type, now)
+    return upsertEntry(state, {
+      id, kind: 'thinking', status: 'running', title: '分析与推理', detail, eventType: type,
+    }, now)
   }
-  if (type === 'thinking_delta') {
-    const previous = state.phase === 'thinking' ? state.detail : ''
-    return active('thinking', '正在分析任务', trailingText(`${previous}${event.thinking || ''}`, 160))
-  }
+
   if (type === 'tool_use_start') {
-    const tool = boundedText(event.tool_name || event.toolName) || '工具'
-    return active('tool', `正在使用 ${tool}`, toolDetail(event))
+    const name = toolName(event)
+    state.entries = completeEntries(state.entries, now, entry => entry.kind === 'thinking')
+    state = activityState(state, 'tool', true, `正在使用 ${name}`, toolDetail(event), type, now)
+    return upsertEntry(state, {
+      id: `tool:${eventId(event, `${name}:${now}`)}`, kind: 'tool', status: 'running',
+      title: name, detail: toolDetail(event), eventType: type,
+    }, now)
   }
+
   if (type === 'tool_progress') {
-    const tool = boundedText(event.tool_name || event.toolName) || boundedText(state.title.replace(/^正在使用\s*/, '')) || '工具'
-    const rawElapsed = event.elapsed_time_seconds ?? event.elapsed
-    const elapsed = Number.isFinite(Number(rawElapsed)) ? `已执行 ${Math.max(0, Math.round(Number(rawElapsed)))} 秒` : ''
-    return active('tool', `正在执行 ${tool}`, boundedText(event.detail || event.message) || elapsed)
+    const name = toolName(event)
+    const durationMs = elapsedMs(event)
+    const detail = boundedText(event.detail || event.message) || (durationMs ? `已执行 ${Math.round(durationMs / 1000)} 秒` : '')
+    state = activityState(state, 'tool', true, `正在执行 ${name}`, detail, type, now)
+    return upsertEntry(state, {
+      id: `tool:${eventId(event, name)}`, kind: 'tool', status: 'running', title: name,
+      detail, durationMs, eventType: type,
+    }, now)
   }
-  if (['subagent_start', 'agent_start', 'workflow_agent_start', 'workflow_agent_started'].includes(type)) {
+
+  if (type === 'content_block_stop') {
+    const rawId = eventId(event, '')
+    const thinking = rawId.startsWith('thought_') || String(event?.index || '').startsWith('thought_')
+    const prefix = thinking ? 'thinking:' : 'tool:'
+    const id = `${prefix}${rawId || (thinking ? 'current' : '')}`
+    const durationMs = elapsedMs(event)
+    state.entries = completeEntries(state.entries, now, entry => entry.id === id || (!rawId && entry.kind === (thinking ? 'thinking' : 'tool')))
+    if (durationMs) {
+      const index = state.entries.findIndex(entry => entry.id === id)
+      if (index >= 0) state.entries[index] = {...state.entries[index], durationMs}
+    }
+    return {...state, updatedAt: now, eventType: type}
+  }
+
+  if (['subagent_spawning', 'subagent_start', 'agent_start', 'workflow_agent_start', 'workflow_agent_started'].includes(type)) {
     const name = agentName(event)
-    return active('agent', `Agent ${name} 正在执行`, boundedText(event.task || event.description || event.progress))
+    const detail = boundedText(event.task || event.description || event.progress)
+    state = activityState(state, 'agent', true, `Agent ${name} 正在执行`, detail, type, now)
+    return upsertEntry(state, {
+      id: `agent:${eventId(event, name)}`, kind: 'agent', status: 'running', title: `Agent ${name}`,
+      detail, eventType: type,
+    }, now)
   }
+
   if (['subagent_progress', 'agent_progress'].includes(type)) {
     const name = agentName(event)
-    return active('agent', `Agent ${name} 正在执行`, boundedText(event.progress || event.currentAction || event.description))
+    const detail = boundedText(event.progress || event.currentAction || event.description)
+    state = activityState(state, 'agent', true, `Agent ${name} 正在执行`, detail, type, now)
+    return upsertEntry(state, {
+      id: `agent:${eventId(event, name)}`, kind: 'agent', status: 'running', title: `Agent ${name}`,
+      detail, eventType: type,
+    }, now)
   }
+
+  if (['subagent_done', 'workflow_agent_done', 'agent_done'].includes(type)) {
+    const name = agentName(event)
+    state = activityState(state, 'thinking', true, `Agent ${name} 已完成，继续主任务`, boundedText(event.summary), type, now)
+    return upsertEntry(state, {
+      id: `agent:${eventId(event, name)}`, kind: 'agent', status: 'completed', title: `Agent ${name}`,
+      detail: boundedText(event.summary), completedAt: now, eventType: type,
+    }, now)
+  }
+
+  if (['workflow_agent_error', 'agent_error', 'subagent_error'].includes(type)) {
+    const name = agentName(event)
+    state = activityState(state, 'agent', true, `Agent ${name} 执行失败`, boundedText(event.error || event.message), type, now)
+    return upsertEntry(state, {
+      id: `agent:${eventId(event, name)}`, kind: 'agent', status: 'failed', title: `Agent ${name}`,
+      detail: boundedText(event.error || event.message), completedAt: now, eventType: type,
+    }, now)
+  }
+
   if (type === 'permission_request' || type === 'choice_request') {
     const question = Array.isArray(event.questions) ? event.questions[0]?.question : event.question
-    const detail = type === 'permission_request'
-      ? boundedText(event.summary || event.toolName || toolDetail(event))
-      : boundedText(question)
-    return active('waiting', type === 'permission_request' ? '等待工具权限确认' : '等待方案选择', detail)
+    const permission = type === 'permission_request'
+    const detail = permission ? boundedText(event.summary || event.toolName || toolDetail(event)) : boundedText(question)
+    const title = permission ? '等待工具权限确认' : '等待方案选择'
+    state = activityState(state, 'waiting', true, title, detail, type, now)
+    return upsertEntry(state, {
+      id: `waiting:${eventId(event, type)}`, kind: 'waiting', status: 'waiting', title, detail, eventType: type,
+    }, now)
   }
-  if (type === 'context_compacting') {
-    return active('compacting', '正在压缩上下文', event.trigger === 'manual' ? '手动压缩' : '自动压缩')
+
+  if (type === 'confirmation_resolved') {
+    state.entries = completeEntries(state.entries, now, entry => entry.kind === 'waiting')
+    return {...state, updatedAt: now, eventType: type}
   }
-  if (type === 'context_compacted') {
-    return active('thinking', '上下文压缩完成，继续执行')
+
+  if (type === 'context_compacting' || type === 'context_compaction_summary' || type === 'context_compacted') {
+    const completed = type === 'context_compacted'
+    const title = completed ? '上下文压缩完成' : type === 'context_compaction_summary' ? '正在整理压缩摘要' : '正在压缩上下文'
+    const detail = type === 'context_compacting' ? (event.trigger === 'manual' ? '手动压缩' : '自动压缩') : boundedText(event.summary)
+    state = activityState(state, completed ? 'thinking' : 'compacting', true, completed ? `${title}，继续执行` : title, detail, type, now)
+    return upsertEntry(state, {
+      id: 'context:compaction', kind: 'compacting', status: completed ? 'completed' : 'running',
+      title, detail, completedAt: completed ? now : 0, eventType: type,
+    }, now)
   }
-  if (type === 'context_compaction_summary') {
-    return active('compacting', '正在整理压缩摘要')
-  }
+
   if (type === 'assistant_message' || type === 'text_delta') {
-    return active('responding', '正在整理并生成回复')
+    state.entries = completeEntries(state.entries, now, entry => entry.kind === 'thinking')
+    state = activityState(state, 'responding', true, '正在整理并生成回复', '', type, now)
+    return upsertEntry(state, {
+      id: 'task:response', kind: 'response', status: 'running', title: '整理任务结果', eventType: type,
+    }, now)
   }
-  if (type === 'primary_completed' || type === 'task_reviewing') {
-    return active('reviewing', '主任务已完成，正在审查', boundedText(event.detail))
+
+  if (type === 'primary_completed' || type === 'task_reviewing' || type === 'task_changes_required') {
+    const changes = type === 'task_changes_required'
+    const title = changes ? '审查发现需要修复的问题' : '正在进行定向审查'
+    state = activityState(state, 'reviewing', true, title, boundedText(event.detail), type, now)
+    return upsertEntry(state, {
+      id: 'task:review', kind: 'review', status: 'running', title, detail: boundedText(event.detail), eventType: type,
+    }, now)
   }
-  if (type === 'task_changes_required') {
-    return active('reviewing', '审查发现需要修复的问题', boundedText(event.detail))
-  }
+
   if (type === 'task_fixing') {
-    return active('fixing', '正在修复审查问题', boundedText(event.detail))
+    state = activityState(state, 'fixing', true, '正在修复审查问题', boundedText(event.detail), type, now)
+    return upsertEntry(state, {
+      id: 'task:fixing', kind: 'review', status: 'running', title: '修复审查问题',
+      detail: boundedText(event.detail), eventType: type,
+    }, now)
   }
+
   if (type === 'workflow_started' || type === 'workflow_resumed') {
-    return active('planning', `工作流 ${boundedText(event.name) || ''} 正在启动`.replace(/\s+/g, ' ').trim())
+    const name = boundedText(event.name) || '工作流'
+    if (type === 'workflow_started' && !state.running) state.startedAt = now
+    state = activityState(state, 'planning', true, `${name} 正在启动`, '', type, now)
+    return upsertEntry(state, {
+      id: `workflow:${eventId(event, name)}`, kind: 'workflow', status: 'running', title: name,
+      detail: type === 'workflow_resumed' ? '已恢复' : '正在启动', eventType: type,
+    }, now)
   }
-  if (type === 'workflow_phase') {
-    return active('agent', '正在执行工作流阶段', boundedText(event.phase))
+
+  if (type === 'workflow_phase' || type === 'workflow_log') {
+    const workflowId = eventId(event, 'current')
+    const phase = boundedText(event.phase || event.currentPhase, 100)
+    const detail = boundedText(event.message || event.detail || phase)
+    state = activityState(state, 'agent', true, phase ? `正在执行：${phase}` : '工作流正在执行', detail, type, now)
+    return upsertEntry(state, {
+      id: `workflow:${workflowId}:${phase || 'current'}`, kind: 'workflow', status: 'running',
+      title: phase || '工作流阶段', detail, eventType: type,
+    }, now)
   }
-  if (type === 'workflow_log') {
-    return active('agent', '工作流正在执行', boundedText(event.message))
+
+  if (['workflow_done', 'workflow_paused', 'workflow_error'].includes(type)) {
+    const status: TaskActivityEntryStatus = type === 'workflow_done' ? 'completed' : type === 'workflow_paused' ? 'waiting' : 'failed'
+    const workflowId = eventId(event, 'current')
+    state.entries = completeEntries(state.entries, now, entry => entry.kind === 'workflow' && entry.id.includes(workflowId), status)
+    return {...state, updatedAt: now, eventType: type}
   }
-  if (type === 'subagent_done') {
-    return active('thinking', `Agent ${agentName(event)} 已完成，继续主任务`, boundedText(event.summary))
+
+  const terminal = type === 'task_completed'
+    ? {phase: 'completed' as const, status: 'completed' as const, title: '任务已完成'}
+    : type === 'generation_stopped'
+      ? {phase: 'stopped' as const, status: 'stopped' as const, title: '任务已停止'}
+      : ['task_failed', 'task_review_paused', 'stream_error', 'error'].includes(type)
+        ? {phase: 'failed' as const, status: 'failed' as const, title: type === 'task_review_paused' ? '最终审查已暂停' : '任务执行失败'}
+        : null
+
+  if (terminal) {
+    const detail = boundedText(event.detail || event.message || event.error)
+    state.entries = completeEntries(state.entries, now, () => true, terminal.status)
+    state = activityState(state, terminal.phase, false, terminal.title, detail, type, now)
+    return upsertEntry(state, {
+      id: 'task:terminal', kind: 'task', status: terminal.status, title: terminal.title,
+      detail, completedAt: now, durationMs: state.startedAt ? now - state.startedAt : 0, eventType: type,
+    }, now)
   }
-  if (type === 'task_review_paused') return terminal('failed', '最终审查已暂停', boundedText(event.detail))
-  if (type === 'task_completed') return terminal('completed', '任务已完成', boundedText(event.detail))
-  if (type === 'task_failed' || type === 'stream_error') return terminal('failed', '任务执行失败', boundedText(event.detail || event.message || event.error))
-  if (type === 'generation_stopped') return terminal('stopped', '任务已停止')
+
   return state
 }
 

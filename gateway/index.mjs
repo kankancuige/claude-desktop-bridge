@@ -14,23 +14,24 @@ import {join, dirname, basename, relative, resolve} from 'node:path'
 import {fileURLToPath} from 'node:url'
 import {WebSocketServer} from 'ws'
 import {config as loadEnv} from 'dotenv'
-import {safeBasename, safeChildPath} from './path-security.mjs'
+import {safeBasename, safeChildPath} from './security/path-security.mjs'
 import {query, deleteSession, forkSession} from '@anthropic-ai/claude-agent-sdk'
-import {createLogger, logHttpRequest} from './logger.mjs'
-import {buildSessionStopResponse, hasStoppableSessionWork} from './session-stop.mjs'
-import {resolveSessionResume} from './session-resume.mjs'
-import {getSessionRuntimeState} from './session-runtime-state.mjs'
-import {classifyTranscriptFile} from './transcript-classifier.mjs'
-import {parseSessionHistory} from './session-history.mjs'
-import {findSessionTranscript, listProjectTranscriptCandidates} from './project-transcript-location.mjs'
-import {removeSessionMapEntry, resolveMappedGatewaySessionId, updateSessionMap} from './session-map-consistency.mjs'
-import {isUserSessionSource, loadSessionVisibility, markSessionVisible, migrateLegacySessionVisibility, removeSessionVisibility, sessionVisibilitySource, shouldShowSession} from './session-visibility.mjs'
-import {initialSessionIdentity, resolveSessionCreateMode} from './session-create-mode.mjs'
-import {buildProjectContinuationContext, composeContinuationPrompt} from './project-continuation-context.mjs'
-import {buildAgentDescriptor, buildAgentToolLifecycleEvent} from './agent-tool-lifecycle.mjs'
-import {startWeChatAdapter} from './wechat.mjs'
-import {startFeishuAdapter} from './feishu.mjs'
-import {startDingTalkAdapter} from './dingtalk.mjs'
+import {createLogger, logHttpRequest} from './shared/logger.mjs'
+import {buildSessionStopResponse, getSessionStopScope, hasStoppableSessionWork} from './sessions/session-stop.mjs'
+import {resolveSessionResume} from './sessions/session-resume.mjs'
+import {getSessionRuntimeState} from './sessions/session-runtime-state.mjs'
+import {classifyTranscriptFile} from './projects/transcript-classifier.mjs'
+import {parseSessionHistory} from './sessions/session-history.mjs'
+import {findSessionTranscript, listProjectTranscriptCandidates} from './projects/project-transcript-location.mjs'
+import {removeSessionMapEntry, resolveMappedGatewaySessionId, updateSessionMap} from './sessions/session-map-consistency.mjs'
+import {isUserSessionSource, loadSessionVisibility, markSessionVisible, migrateLegacySessionVisibility, removeSessionVisibility, sessionVisibilitySource, shouldShowSession} from './sessions/session-visibility.mjs'
+import {initialSessionIdentity, resolveSessionCreateMode} from './sessions/session-create-mode.mjs'
+import {createSessionRuntime} from './sessions/session-runtime.mjs'
+import {buildProjectContinuationContext, composeContinuationPrompt} from './projects/project-continuation-context.mjs'
+import {buildAgentDescriptor, buildAgentToolLifecycleEvent} from './agents/agent-tool-lifecycle.mjs'
+import {startWeChatAdapter} from './im/wechat.mjs'
+import {startFeishuAdapter} from './im/feishu.mjs'
+import {startDingTalkAdapter} from './im/dingtalk.mjs'
 import {
     setDeps,
     listWorkflows,
@@ -42,6 +43,7 @@ import {
     parseMeta,
     getRunState,
     getSessionWorkflowState,
+    getSessionWorkflowStates,
     presetRunState,
     stopWorkflow,
     stopWorkflowAgent,
@@ -49,7 +51,7 @@ import {
     resumeWorkflow,
     commitWorkflow,
     queryHistory,
-} from './workflow-runner.mjs'
+} from './workflows/workflow-runner.mjs'
 import {
     buildProjectCache,
     loadProjectCache,
@@ -58,40 +60,60 @@ import {
     isExplorationAttempt,
     buildCacheInjectionText,
     cacheFilePath
-} from './project-cache.mjs'
-import {startDeepSeekProxy, getProxyUrl, stopDeepSeekProxy, isProxyConfiguredFor} from './deepseek-proxy.mjs'
-import {startOpenCodeProxy, getOpenCodeProxyUrl, stopOpenCodeProxy, isOpenCodeProxyRunning} from './opencode-proxy.mjs'
-import {validateProviderUrl, resolveProviderUrl, resolveProviderRedirect, buildProviderModelsUrl, buildProviderFallbackUrls, createPinnedLookup} from './provider-url-security.mjs'
-import {listAdapterBindings, normalizeAdapterBindings, removeAdapterBindings, upsertAdapterBinding} from './adapter-bindings.mjs'
-import {readNotificationSummary} from './notification-outbox.mjs'
-import {scheduleSessionBackgroundInitialization} from './session-background-init.mjs'
+} from './projects/project-cache.mjs'
+import {startDeepSeekProxy, getProxyUrl, stopDeepSeekProxy, isProxyConfiguredFor} from './providers/deepseek-proxy.mjs'
+import {startOpenCodeProxy, getOpenCodeProxyUrl, stopOpenCodeProxy, isOpenCodeProxyRunning} from './providers/opencode-proxy.mjs'
+import {validateProviderUrl, resolveProviderUrl, resolveProviderRedirect, buildProviderModelsUrl, buildProviderFallbackUrls, createPinnedLookup} from './security/provider-url-security.mjs'
+import {listAdapterBindings, normalizeAdapterBindings, removeAdapterBindings, upsertAdapterBinding} from './im/adapter-bindings.mjs'
+import {readNotificationSummary} from './im/notification-outbox.mjs'
+import {scheduleSessionBackgroundInitialization} from './sessions/session-background-init.mjs'
 import {
     buildIncompleteMirrorText,
     canResumeTask,
     classifyTaskResult,
-} from './task-result-outcome.mjs'
-import {createTaskStatePatch, recoverTaskState, taskStateForClient, taskStateForError, taskStateForStop, taskStateFileId} from './task-state.mjs'
-import {clearPlatformEntries, platformEntryFilePath} from './platform-entry-store.mjs'
-import {createTurnIdentity, shouldDeliverTurnEvent, shouldRouteMirror} from './turn-routing.mjs'
-import {normalizeWeChatBaseUrl} from './wechat-url.mjs'
-import {migrateAdapterConfig, readAdapterConfig, writeAdapterConfig} from './adapter-config.mjs'
-import {configureSecurePayloadMasterKey} from './secure-payload.mjs'
-import {extractWebSocketToken} from './websocket-auth.mjs'
-import {redactSecretMap, restoreSecretMap, restoreSecretValue} from './config-redaction.mjs'
-import {buildWindowsRtkExtractArgs, buildWindowsRtkExtractEnv, selectRtkReleaseAsset, verifyRtkAssetDigest} from './rtk-archive.mjs'
-import {getCodexRelayProxyUrl, startCodexRelayProxy, stopCodexRelayProxy} from './codex-relay-proxy.mjs'
-import {BRIDGE_PROVIDER_ENV_KEYS, extractBridgeProviderSettings, normalizeBridgeProviderSettings, overlayBridgeProviderSettings} from './bridge-provider-settings.mjs'
-import {applyContextProfile, classifyContextProfile, normalizeContextProfile} from './context-profile.mjs'
-import {decideTask} from './task-decision.mjs'
-import {normalizeExplicitModel, resolveTaskModelRoute, resolveTurnModelRoute, shouldDeferAutomaticQuery, shouldValidateProviderModel, validateProviderModel} from './model-routing.mjs'
-import {resolveWorkflowFinalReviewTier, shouldAutoTriggerWorkflow} from './workflow-model-routing.mjs'
-import {createTaskCompletionState, normalizeReviewOutcome, resolveFinalReviewPlan, transitionTaskCompletion} from './task-completion.mjs'
-import {applySkillRoute, routeSkills} from './skill-router.mjs'
-import {buildSystemInitEvent} from './session-init-event.mjs'
-import {resolveRtkCommandArgs} from './rtk-command.mjs'
-import {describeAttachment, isImageAttachment} from './attachment-type.mjs'
-import {cleanupUploadDir, prepareUploadDir} from './upload-storage.mjs'
-import {parseDeepSeekBalance, resolveBalanceProvider} from './balance-provider.mjs'
+} from './tasks/task-result-outcome.mjs'
+import {createTaskStatePatch, recoverTaskState, taskStateForClient, taskStateForError, taskStateForStop, taskStateFileId} from './tasks/task-state.mjs'
+import {clearPlatformEntries, platformEntryFilePath} from './im/platform-entry-store.mjs'
+import {createTurnIdentity, shouldDeliverTurnEvent, shouldRouteMirror} from './tasks/turn-routing.mjs'
+import {normalizeWeChatBaseUrl} from './im/wechat-url.mjs'
+import {migrateAdapterConfig, readAdapterConfig, writeAdapterConfig} from './im/adapter-config.mjs'
+import {configureSecurePayloadMasterKey} from './security/secure-payload.mjs'
+import {extractWebSocketToken} from './security/websocket-auth.mjs'
+import {redactSecretMap, restoreSecretMap, restoreSecretValue} from './security/config-redaction.mjs'
+import {buildWindowsRtkExtractArgs, buildWindowsRtkExtractEnv, selectRtkReleaseAsset, verifyRtkAssetDigest} from './tools/rtk-archive.mjs'
+import {getCodexRelayProxyUrl, startCodexRelayProxy, stopCodexRelayProxy} from './providers/codex-relay-proxy.mjs'
+import {BRIDGE_PROVIDER_ENV_KEYS, extractBridgeProviderSettings, normalizeBridgeProviderSettings, overlayBridgeProviderSettings} from './providers/bridge-provider-settings.mjs'
+import {applyContextProfile, classifyContextProfile, normalizeContextProfile} from './context/context-profile.mjs'
+import {decideTask} from './tasks/task-decision.mjs'
+import {normalizeExplicitModel, resolveTaskModelRoute, resolveTurnModelRoute, shouldDeferAutomaticQuery, shouldValidateProviderModel, validateProviderModel} from './tasks/model-routing.mjs'
+import {resolveWorkflowFinalReviewTier, shouldAutoTriggerWorkflow} from './workflows/workflow-model-routing.mjs'
+import {createTaskCompletionState, normalizeReviewOutcome, resolveFinalReviewPlan, transitionTaskCompletion} from './tasks/task-completion.mjs'
+import {createTaskLifecycleSnapshot} from './tasks/task-lifecycle.mjs'
+import {createTaskCommandService} from './tasks/task-command.mjs'
+import {SessionEventJournal, journalTaskState, sessionEventStorePath} from './sessions/session-event-journal.mjs'
+import {requirementsForAgentStart} from './agents/agent-capabilities.mjs'
+import {createProviderRegistry} from './providers/provider-registry.mjs'
+import {
+    attachTaskWorkflow,
+    clearTaskWorkflowGate,
+    consumeTaskWorkflowResultTurn,
+    createTaskWorkflowGate,
+    deferPrimaryResultForTaskWorkflow,
+    finishTaskWorkflowResultTurn,
+    hasPendingTaskWorkflow,
+    noteTaskWorkflowTerminal,
+    takeDeferredPrimaryResult,
+    taskWorkflowResultIdFromMessage,
+    isInternalWorkflowResultText,
+} from './tasks/task-workflow-gate.mjs'
+import {applySkillRoute, routeSkills} from './agents/skill-router.mjs'
+import {buildSystemInitEvent} from './sessions/session-init-event.mjs'
+import {resolveRtkCommandArgs} from './tools/rtk-command.mjs'
+import {describeAttachment, isImageAttachment} from './tools/attachment-type.mjs'
+import {cleanupUploadDir, prepareUploadDir} from './tools/upload-storage.mjs'
+import {parseDeepSeekBalance, resolveBalanceProvider} from './providers/balance-provider.mjs'
+import {createUserPreferenceService} from './context/user-preferences.mjs'
+import {createImProgressReporter} from './im/im-progress-reporter.mjs'
 import {
     calculateAutoCompactWindow,
     compactBoundaryToEvent,
@@ -99,7 +121,7 @@ import {
     contextUsageEvent,
     isSyntheticCompactSummary,
     parseTokenCount,
-} from './context-lifecycle.mjs'
+} from './context/context-lifecycle.mjs'
 let _proxyStarting = null
 let _ocProxyStarting = null
 import cron from 'node-cron'
@@ -107,6 +129,30 @@ import cron from 'node-cron'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 loadEnv({path: join(__dirname, '.env'), override: true})
 const log = createLogger('gateway')
+
+const providerRegistry = createProviderRegistry({
+    onDisposeError: (error, context) => log.warn({err: error, ...context}, 'Agent Provider 释放失败'),
+})
+providerRegistry.register('agent', 'claude-sdk', {
+    start: ({prompt, options}) => query({prompt, options}),
+    // SDK query 由 Session/Workflow 持有并先行关闭，Provider 本身没有额外常驻资源。
+    dispose: async () => {},
+}, {
+    writable: true,
+    resumable: true,
+    modelOverride: true,
+    structuredOutput: true,
+    toolFiltering: true,
+    continuation: true,
+})
+const claudeAgentProvider = providerRegistry.require('agent', 'claude-sdk')
+
+function startClaudeAgent(prompt, options, requirements = {}) {
+    return claudeAgentProvider.start(
+        {prompt, options},
+        requirementsForAgentStart({options, ...requirements}),
+    )
+}
 
 // ── 版本号（读取本 package.json 的 version 字段）──
 const PKG_VERSION = (() => {
@@ -256,6 +302,10 @@ function mapModel(name) {
 }
 
 const CLAUDE_HOME = join(homedir(), '.claude')
+const userPreferences = createUserPreferenceService({
+    claudeHome: CLAUDE_HOME,
+    onWarning: (error, context) => log.warn({err: error, ...context}, '用户偏好存储降级'),
+})
 const BRIDGE_TOKEN_PATH = join(CLAUDE_HOME, 'bridge-token')
 const BRIDGE_PROVIDER_SETTINGS_PATH = join(CLAUDE_HOME, 'bridge-provider.json')
 const ADAPTER_SESSIONS_PATH = join(CLAUDE_HOME, 'adapter-sessions.json')
@@ -495,6 +545,30 @@ function taskStateStorePath(workDir, sessionId) {
     return safeId ? join(CLAUDE_HOME, 'projects', encodeProjectName(workDir), 'bridge-task-state', `${safeId}.json`) : null
 }
 
+function openSessionEventJournal(workDir, sessionId) {
+    const projectDir = join(CLAUDE_HOME, 'projects', encodeProjectName(workDir))
+    return new SessionEventJournal({
+        path: sessionEventStorePath(projectDir, sessionId),
+        onCorrupt: result => {
+            log.error({sessionId: sessionId?.slice(0, 8), code: result.code, line: result.line}, 'Session Event Journal 损坏，已隔离并回退兼容快照')
+        },
+    })
+}
+
+function appendSessionEvent(session, type, payload = {}, {critical = false} = {}) {
+    if (!session?.eventJournal) {
+        if (critical) throw Object.assign(new Error('Session Event Journal 未初始化'), {code: 'SESSION_EVENT_JOURNAL_UNAVAILABLE'})
+        return null
+    }
+    try {
+        return session.eventJournal.append(type, payload, {critical})
+    } catch (error) {
+        if (critical) throw error
+        log.warn({err: error, eventType: type}, 'Session Event Journal 写入失败')
+        return null
+    }
+}
+
 function saveTaskState(session, sessionId) {
     try {
         if (!session?.taskState || !session.workDir || !sessionId) return true
@@ -520,6 +594,7 @@ function updateTaskState(session, sessionId, next) {
     if (!session) return null
     session.taskState = createTaskStatePatch(next)
     saveTaskState(session, sessionId)
+    appendSessionEvent(session, 'task/state-changed', {taskState: journalTaskState(session.taskState)})
     return session.taskState
 }
 
@@ -541,6 +616,9 @@ function taskStateFromCompletion(session, detail = '') {
         startedAt,
         completedAt,
         durationMs: startedAt && completedAt ? Math.max(0, completedAt - startedAt) : 0,
+        finalReplyText: session?.taskFinalReplyText || session?.taskState?.finalReplyText || '',
+        finalReplyAvailable: Boolean(session?.taskFinalReplyText || session?.taskState?.finalReplyText),
+        notifications: session?.taskState?.notifications || {},
         sdkSessionId: session?.lastSessionId,
         historySessionId: session?.lastSessionId,
         taskId: session?.taskCompletionTaskId || null,
@@ -555,12 +633,44 @@ function taskStateFromCompletion(session, detail = '') {
     })
 }
 
+function updateTaskNotificationState(session, sessionId, platform, state, notificationId, lastError = '') {
+    if (!session || !platform) return
+    const notifications = {...(session.taskState?.notifications || {})}
+    notifications[platform] = {state, notificationId: String(notificationId || ''), lastError: String(lastError || ''), updatedAt: Date.now()}
+    updateTaskState(session, sessionId, taskStateFromCompletion({...session, taskState: {...session.taskState, notifications}}))
+    broadcastTaskLifecycle(sessionId)
+}
+
 function updateTaskCompletion(session, sessionId, event) {
     const transition = transitionTaskCompletion(session?.taskCompletion, event)
     if (!session) return transition
     session.taskCompletion = transition.state
     updateTaskState(session, sessionId, taskStateFromCompletion(session))
     return transition
+}
+
+function getTaskLifecycleSnapshot(sessionId, session = sessions.get(sessionId)) {
+    if (!session) return null
+    let workflows = []
+    try {
+        workflows = getSessionWorkflowStates(sessionId)
+    } catch (error) {
+        log.debug({err: error, sessionId: sessionId?.slice(0, 8)}, '读取任务生命周期 Workflow 快照失败')
+    }
+    return createTaskLifecycleSnapshot({
+        sessionId,
+        runtime: {
+            ...getSessionRuntimeState(session),
+            taskWorkflowPending: hasPendingTaskWorkflow(session._taskWorkflowGate),
+        },
+        task: taskStateForSessionClient(session),
+        workflows,
+    })
+}
+
+function broadcastTaskLifecycle(sessionId) {
+    const snapshot = getTaskLifecycleSnapshot(sessionId)
+    if (snapshot) broadcastDesktop(sessionId, {type: 'session_lifecycle_snapshot', ...snapshot})
 }
 
 function isValidSessionId(value) {
@@ -585,12 +695,13 @@ const UPLOAD_QUOTA_BYTES = 50 * 1024 * 1024
 const UPLOAD_TTL_MS = Math.min(30 * 24 * 60 * 60 * 1000, Math.max(5 * 60 * 1000,
     parseInt(process.env.BRIDGE_UPLOAD_TTL_MS || String(24 * 60 * 60 * 1000), 10) || 24 * 60 * 60 * 1000))
 
-function getUploadDir(workDir) {
-    return safeChildPath(workDir, '.bridge-uploads', {allowNested: false})
+function getUploadDir(workDir, sessionId = 'legacy') {
+    const root = safeChildPath(workDir, '.bridge-uploads', {allowNested: false})
+    return root && isValidSessionId(sessionId) ? safeChildPath(root, sessionId, {allowNested: false}) : null
 }
 
-function cleanupSessionUploads(workDir, removeAll = false) {
-    return cleanupUploadDir(getUploadDir(workDir), {
+function cleanupSessionUploads(workDir, sessionId = 'legacy', removeAll = false) {
+    return cleanupUploadDir(getUploadDir(workDir, sessionId), {
         removeAll,
         ttlMs: UPLOAD_TTL_MS,
         onError: (error, path) => log.debug({err: error, path}, '读取附件元数据失败'),
@@ -664,21 +775,33 @@ function cancelPendingSessionInputs(sessionId, s) {
 async function stopSessionGeneration(sessionId, s) {
     if (!s) return {stopped: false, cancelledInputs: 0}
     if (s._stopPromise) return s._stopPromise
-    if (!hasStoppableSessionWork(s)) return {stopped: false, cancelledInputs: 0}
+    let workflowStates = []
+    try {
+        workflowStates = getSessionWorkflowStates(sessionId)
+    } catch (error) {
+        log.debug({err: error, sessionId: sessionId?.slice(0, 8)}, '读取 Workflow 停止状态失败')
+    }
+    if (!hasStoppableSessionWork(s, workflowStates)) return {stopped: false, cancelledInputs: 0}
     const operation = (async () => {
+        const stopScope = getSessionStopScope(s, workflowStates)
+        for (const workflow of stopScope.activeWorkflows) {
+            if (workflow.wfId || workflow.name) stopWorkflow(workflow.wfId || workflow.name)
+        }
+        // 独立 Workflow 不属于父任务；停止它不能关闭 SDK runtime 或改写父任务终态。
+        if (!stopScope.primaryActive) {
+            broadcastTaskLifecycle(sessionId)
+            return {stopped: true, scope: 'workflow', cancelledInputs: 0, turnId: null}
+        }
         const stoppedTurnId = s.activeTurnId || null
         const stoppedTurnIdentity = s.activeTurnIdentity ? {...s.activeTurnIdentity} : null
-        s.taskCompletion = createTaskCompletionState({
-            ...s.taskCompletion,
-            phase: 'stopped',
-            detail: '用户已暂停任务',
-        })
+        updateTaskCompletion(s, sessionId, {type: 'user_stopped', detail: '用户已暂停任务'})
+        clearTaskWorkflowGate(s._taskWorkflowGate)
+        s._internalWorkflowResultTurnId = null
         for (const id of [...(s.pending?.keys() || [])]) settlePending(sessionId, id, {
             behavior: 'deny',
             message: '已取消',
             interrupt: true,
         }, 'stopped')
-        if (s.taskCompletion?.phase === 'reviewing') stopWorkflow(`final-review:${sessionId}`)
         await closeSessionRuntime(s, {sessionId, reason: 'stop_generation'})
         s.query = null
         s.pushStream = null
@@ -707,13 +830,19 @@ async function stopSessionGeneration(sessionId, s) {
             completedAt,
             durationMs: Math.max(0, completedAt - startedAt),
         }))
+        appendSessionEvent(s, 'runtime/stopped', {
+            turnId: stoppedTurnId,
+            cancelledInputs,
+            durationMs: s.taskState.durationMs,
+        })
         broadcastTurn(sessionId, {
             type: 'generation_stopped',
             turnId: stoppedTurnId,
             durationMs: s.taskState.durationMs,
             taskState: taskStateForClient(s.taskState),
         }, stoppedTurnIdentity)
-        return {stopped: true, cancelledInputs, turnId: stoppedTurnId}
+        broadcastTaskLifecycle(sessionId)
+        return {stopped: true, scope: 'primary', cancelledInputs, turnId: stoppedTurnId}
     })()
     s._stopPromise = operation
     try {
@@ -728,9 +857,21 @@ function markInternalInput(s, taskDecision = null) {
     s._pendingInputs.unshift({messageId: null, turnId: null, source: s.lastTurnSource || 'desktop', userId: null, taskDecision})
 }
 
+const taskCommands = createTaskCommandService({
+    submit: submitTaskCommand,
+    cancel: async sessionId => {
+        const session = sessions.get(sessionId)
+        if (!session) return {stopped: false, code: 'session_not_found'}
+        return stopSessionGeneration(sessionId, session)
+    },
+    onListenerError: (error, context) => {
+        log.warn({err: error, sessionId: context.sessionId?.slice(0, 8), eventType: context.eventType}, 'Task observer 处理失败')
+    },
+})
+
 // 活跃 Session 的附件目录定期回收；非活跃 Session 会在删除或下次上传时回收。
 setInterval(() => {
-    for (const s of sessions.values()) cleanupSessionUploads(s.workDir)
+    for (const [sessionId, s] of sessions) cleanupSessionUploads(s.workDir, sessionId)
 }, 15 * 60 * 1000).unref()
 // 每 60s 清理过期二维码（5 分钟有效期，保守清理）
 setInterval(() => {
@@ -743,6 +884,7 @@ setInterval(() => {
 // ---- 确认请求注册表（权限/方案选择双通道）----
 let reqCounter = 0
 const confirmHooks = []   // [{platform, onConfirmRequest, onConfirmResolved, findUserForSession, sendToUser}] —— 各 IM 适配器注册的钩子
+const imProgressReporters = new Map()
 const ADAPTER_STARTERS = new Map([
     ['wechat', startWeChatAdapter],
     ['feishu', startFeishuAdapter],
@@ -751,6 +893,71 @@ const ADAPTER_STARTERS = new Map([
 
 function getAdapterHook(platform) {
     return confirmHooks.find(hook => hook.platform === platform) || null
+}
+
+function imProgressReporterKey(sessionId, turnId, platform, userId) {
+    return [sessionId, turnId || 'turn', platform, userId || 'bound-user'].join(':')
+}
+
+function imProgressRecipients(sessionId, identity = null) {
+    const session = sessions.get(sessionId)
+    if (!session) return []
+    const turnIdentity = identity || session.activeTurnIdentity || session.taskCompletionIdentity || null
+    if (['wechat', 'feishu', 'dingtalk'].includes(turnIdentity?.source)) {
+        const hook = getAdapterHook(turnIdentity.source)
+        return hook ? [{hook, userId: turnIdentity.userId || null, mirrored: false}] : []
+    }
+    return confirmHooks
+        .filter(hook => session.mirrors?.[hook.platform] && shouldRouteMirror(hook.platform, turnIdentity))
+        .map(hook => ({hook, userId: turnIdentity?.userId || null, mirrored: true}))
+}
+
+function finishImProgressReporters(sessionId, turnId = null) {
+    const prefix = `${sessionId}:`
+    for (const [key, reporter] of imProgressReporters) {
+        if (!key.startsWith(prefix) || (turnId && !key.startsWith(`${sessionId}:${turnId}:`))) continue
+        reporter.finish()
+        imProgressReporters.delete(key)
+    }
+}
+
+function reportImProgressEvent(sessionId, event, identity = null) {
+    const session = sessions.get(sessionId)
+    if (!session || !event || typeof event !== 'object') return
+    const turnId = event.turnId || session.taskCompletionTurnId || session.activeTurnId || 'turn'
+    if (['task_completed', 'task_failed', 'task_review_paused', 'generation_stopped', 'stream_error', 'error'].includes(event.type)) {
+        finishImProgressReporters(sessionId, turnId)
+        return
+    }
+    for (const {hook, userId, mirrored} of imProgressRecipients(sessionId, identity)) {
+        const key = imProgressReporterKey(sessionId, turnId, hook.platform, userId)
+        let reporter = imProgressReporters.get(key)
+        if (!reporter) {
+            reporter = createImProgressReporter({
+                send: async text => {
+                    const currentSession = sessions.get(sessionId)
+                    const currentHook = getAdapterHook(hook.platform)
+                    if (!currentSession || !currentHook) return
+                    if (mirrored && !currentSession.mirrors?.[hook.platform]) return
+                    await currentHook.sendToUser(sessionId, text, userId)
+                },
+                onError: error => log.warn({err: error, platform: hook.platform, sessionId: sessionId.slice(0, 8)}, 'IM 阶段进度发送失败'),
+            })
+            imProgressReporters.set(key, reporter)
+        }
+        reporter.observe({...event, startedAt: event.startedAt || session.taskStartedAt || 0})
+    }
+}
+
+function taskStateForSessionClient(session) {
+    if (!session?.taskState) return taskStateForClient(session?.taskState)
+    const notifications = {...(session.taskState.notifications || {})}
+    for (const [platform, current] of Object.entries(notifications)) {
+        const live = getAdapterHook(platform)?.notificationState?.(current.notificationId)
+        if (!live?.state || live.state === current.state && !live.lastError) continue
+        notifications[platform] = {...current, state: live.state, lastError: live.lastError || '', updatedAt: Date.now()}
+    }
+    return taskStateForClient({...session.taskState, notifications})
 }
 
 function stopAdapter(platform) {
@@ -770,7 +977,7 @@ function startAdapter(platform) {
     const starter = ADAPTER_STARTERS.get(platform)
     if (!starter) return null
     try {
-        const hooks = starter(ADAPTER_TOKENS.get(platform))
+        const hooks = starter(ADAPTER_TOKENS.get(platform), {taskCommands})
         if (!hooks) return null
         const registered = {...hooks, platform}
         confirmHooks.push(registered)
@@ -844,6 +1051,8 @@ function broadcast(sid, msg) {
 function broadcastTurn(sid, msg, identity = null) {
     const s = sessions.get(sid)
     if (!s) return
+    taskCommands.publish(sid, msg, identity)
+    reportImProgressEvent(sid, msg, identity)
     let raw
     try {
         raw = JSON.stringify(msg)
@@ -864,8 +1073,46 @@ function broadcastDesktop(sid, msg) {
     broadcastTurn(sid, msg, null)
 }
 
+function broadcastWorkflowEvent(sid, msg) {
+    const session = sessions.get(sid)
+    const workflowState = msg?.workflowId ? getRunState(msg.workflowId) : null
+    let settlingDeferredPrimary = false
+    if (msg?.type === 'workflow_started' && workflowState?._args?._taskOwned === true) {
+        if (!session._taskWorkflowGate) session._taskWorkflowGate = createTaskWorkflowGate()
+        attachTaskWorkflow(session._taskWorkflowGate, msg.workflowId)
+    } else if (['workflow_done', 'workflow_paused', 'workflow_error'].includes(msg?.type)) {
+        const taskOwned = session?._taskWorkflowGate?.active?.has(String(msg.workflowId || ''))
+        if (taskOwned) {
+            noteTaskWorkflowTerminal(session._taskWorkflowGate, msg.workflowId, {
+                returnsToParent: msg.type === 'workflow_done' && workflowState?._args?._returnToParent !== false,
+            })
+            const deferred = takeDeferredPrimaryResult(session._taskWorkflowGate)
+            if (deferred) {
+                const transition = updateTaskCompletion(session, sid, deferred)
+                settlingDeferredPrimary = transition.effects.length > 0
+                void applyTaskCompletionEffects(sid, transition.effects).catch(error => {
+                    log.error({err: error, sessionId: sid?.slice(0, 8)}, '任务 Workflow 结束后结算父任务失败')
+                })
+            }
+        }
+    }
+    if (session && typeof msg?.type === 'string') {
+        appendSessionEvent(session, 'workflow/event', {
+            eventType: msg.type.slice(0, 120),
+            workflowId: typeof msg.workflowId === 'string' ? msg.workflowId.slice(0, 160) : null,
+            agentId: typeof msg.id === 'string' ? msg.id.slice(0, 160) : null,
+            agentType: typeof msg.agentType === 'string' ? msg.agentType.slice(0, 120) : null,
+        })
+    }
+    reportImProgressEvent(sid, msg, session?.taskCompletionIdentity || null)
+    broadcast(sid, msg)
+    if (!settlingDeferredPrimary && ['workflow_started', 'workflow_resumed', 'workflow_done', 'workflow_paused', 'workflow_error'].includes(msg?.type)) {
+        broadcastTaskLifecycle(sid)
+    }
+}
+
 // 注入依赖到 workflow-runner，供 Workflow 子进程通过受控 IPC 请求 agent() 调用
-setDeps({query, deleteSession, makeQueryOptions, loadCliSettings, loadWfConfig, PushStream, broadcast, sessions, persistSdkSessionId, removeSdkSessionId, encodeProjectName})
+setDeps({agentProvider: claudeAgentProvider, deleteSession, makeQueryOptions, loadCliSettings, loadWfConfig, PushStream, broadcast: broadcastWorkflowEvent, sessions, persistSdkSessionId, removeSdkSessionId, encodeProjectName})
 
 // 收口：任一通道响应或超时都走这里，幂等（已 settled 则忽略）
 // ── 确认请求收口（settlePending）──
@@ -966,6 +1213,7 @@ function makeCanUseTool(sessionId) {
             toolName, input, questions: isChoice ? (input?.questions || []) : undefined,
             source: turnIdentity?.source || 'desktop', userId: turnIdentity?.userId || null,
             turnId: s.activeTurnId || null,
+            expiresAt: Date.now() + 5 * 60 * 1000,
             resolve, settled: false, timeout: null,
         }
         // 5 分钟超时 → 拒绝并中断
@@ -2172,6 +2420,7 @@ function convertSdkToWs(sdkMsg, sessionId) {
             return {type: 'assistant_message', message: sdkMsg.message, error: sdkMsg.error}
         case 'user':
             if (isSyntheticCompactSummary(sdkMsg)) return null
+            if (isInternalWorkflowResultText(sdkMsg.message?.content?.find?.(block => block?.type === 'text')?.text)) return null
             return {type: 'user_message_echo', message: sdkMsg.message, timestamp: sdkMsg.timestamp}
         case 'result':
             const taskResult = classifyTaskResult(sdkMsg)
@@ -2589,10 +2838,8 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
 //   3. assistant 消息累积文本到 s.turnText（供 IM 镜像同步用）
 //   4. result 消息时：结算记录点(finalizeCheckpoint) + 镜像到 IM(maybeMirror)
 //   5. convertSdkToWs 转换为 WS 格式 → broadcast 给桌面端
-//   6. tool_use_start 消息触发 maybeMirrorProgress（工具进度镜像）
 // 关键数据流: SDK async iterator → convertSdkToWs() → broadcast(wsMsg)
 //   → 并行: finalizeCheckpoint() + maybeMirror() (result 时)
-//   → 并行: maybeMirrorProgress() (tool_use_start 时)
 //   → catch: stream_error → broadcast error
 async function refreshContextUsage(sessionId, session, reason) {
     if (!session?.query || typeof session.query.getContextUsage !== 'function') return
@@ -2673,15 +2920,23 @@ async function startStreamPump(sessionId) {
             // SDK 真正消费 user prompt 时才切换回合上下文。输入可能提前排队，不能在
             // WebSocket 到达时重置上一回合的文本和工具计数，否则镜像会串回合。
             if (sdkMsg.type === 'user') {
-                const inputMeta = s._pendingInputs?.shift()
-                const legacySource = s._pendingSources?.shift()
+                const workflowResultId = taskWorkflowResultIdFromMessage(sdkMsg.message)
+                const consumedWorkflowResult = consumeTaskWorkflowResultTurn(s._taskWorkflowGate, workflowResultId)
+                const inputMeta = consumedWorkflowResult ? null : s._pendingInputs?.shift()
+                const legacySource = consumedWorkflowResult ? null : s._pendingSources?.shift()
+                s._internalWorkflowResultTurnId = consumedWorkflowResult ? workflowResultId : null
                 s._generating = true
-                s.activeTurnId = inputMeta?.turnId || null
-                s.lastTurnSource = inputMeta?.source || legacySource || s.lastTurnSource || 'desktop'
-                s.activeTurnIdentity = createTurnIdentity(s.lastTurnSource, inputMeta?.userId, IM_SOURCES)
-                s.activeTaskDecision = inputMeta?.taskDecision || s.taskDecision || null
+                s.activeTurnId = consumedWorkflowResult ? null : inputMeta?.turnId || null
+                s.lastTurnSource = consumedWorkflowResult
+                    ? s.taskCompletionIdentity?.source || s.lastTurnSource || 'desktop'
+                    : inputMeta?.source || legacySource || s.lastTurnSource || 'desktop'
+                s.activeTurnIdentity = consumedWorkflowResult && s.taskCompletionIdentity
+                    ? {...s.taskCompletionIdentity}
+                    : createTurnIdentity(s.lastTurnSource, inputMeta?.userId, IM_SOURCES)
+                s.activeTaskDecision = consumedWorkflowResult
+                    ? s.taskCompletionDecision || s.taskDecision || null
+                    : inputMeta?.taskDecision || s.taskDecision || null
                 s.turnText = ''
-                s.turnToolCount = 0
             }
             // 累积本轮文本（assistant 消息为权威完整版，用于 IM 镜像同步）
             // assistant 覆盖 text_delta 的增量累积，保证 mirror 拿到 SDK 提供的完整文本
@@ -2707,7 +2962,7 @@ async function startStreamPump(sessionId) {
                             } else {
                                 s._wfRan = true;
                                 log.info({sessionId: sessionId?.slice(0, 8), wfName, wfArgs}, '[WF:run] 已触发');
-                                runWfScript(wfName, sessionId, wfArgs).catch(function (e) {
+                                runWfScript(wfName, sessionId, {...wfArgs, _runKey: `${wfName}:${sessionId}`}).catch(function (e) {
                                     log.error({err: e, sessionId: sessionId?.slice(0, 8), wfName}, 'Workflow 引擎错误');
                                 });
                             }
@@ -2716,7 +2971,22 @@ async function startStreamPump(sessionId) {
                 }
             }
             // result 只标志主 SDK 回合结束；父任务是否完成由 task-completion 协调器决定。
-            if (sdkMsg.type === 'result') {
+            if (sdkMsg.type === 'result' && s._internalWorkflowResultTurnId) {
+                const workflowTurn = finishTaskWorkflowResultTurn(
+                    s._taskWorkflowGate,
+                    s._internalWorkflowResultTurnId,
+                )
+                s._internalWorkflowResultTurnId = null
+                s._pendingCompletionEffects = []
+                if (workflowTurn.deferredPrimaryResult) {
+                    const transition = updateTaskCompletion(s, sessionId, workflowTurn.deferredPrimaryResult)
+                    s._pendingCompletionEffects = transition.effects
+                } else if (workflowTurn.consumed && !hasPendingTaskWorkflow(s._taskWorkflowGate)) {
+                    log.warn({sessionId: sessionId?.slice(0, 8)}, '内部 Workflow 回合结束时没有可结算的父任务结果')
+                }
+                s.turnText = ''
+                void refreshContextUsage(sessionId, s, 'workflow-result')
+            } else if (sdkMsg.type === 'result') {
                 const taskResult = classifyTaskResult(sdkMsg)
                 const completionDecision = s.activeTaskDecision || s.taskCompletionDecision || s.taskDecision || null
                 s.lastTaskResult = {
@@ -2757,7 +3027,7 @@ async function startStreamPump(sessionId) {
                 s.taskCompletionDecision = completionDecision
                 s.taskCompletionIdentity = s.activeTurnIdentity ? {...s.activeTurnIdentity} : s.taskCompletionIdentity || null
                 s.taskFinalReplyText = String(s.turnText || s.lastTaskResult.result || '').trim().slice(-100000)
-                const transition = updateTaskCompletion(s, sessionId, {
+                const primaryResultEvent = {
                     type: 'primary_result',
                     result: {
                         ...taskResult,
@@ -2765,8 +3035,14 @@ async function startStreamPump(sessionId) {
                         text: s.taskFinalReplyText,
                     },
                     reviewPlan,
-                })
-                s._pendingCompletionEffects = transition.effects
+                }
+                if (deferPrimaryResultForTaskWorkflow(s._taskWorkflowGate, primaryResultEvent)) {
+                    s._pendingCompletionEffects = []
+                } else {
+                    takeDeferredPrimaryResult(s._taskWorkflowGate)
+                    const transition = updateTaskCompletion(s, sessionId, primaryResultEvent)
+                    s._pendingCompletionEffects = transition.effects
+                }
                 taskCompletionEventForClient(s, sessionId, 'primary_completed', {
                     primaryOutcome: taskResult.outcome,
                     detail: s.lastTaskResult.result || '',
@@ -2795,12 +3071,7 @@ async function startStreamPump(sessionId) {
             if (wsMsg?.type === 'text_delta' && wsMsg.text) {
                 s.turnText = ((s.turnText || '') + wsMsg.text).slice(-100000)
             }
-            // 镜像工具进度到所有已开启 mirror 的 IM 平台
             if (wsMsg?.type === 'tool_use_start') {
-                try {
-                    maybeMirrorProgress(sessionId, wsMsg.tool_name)
-                } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
-                ;
                 try {
                     maybeInjectProjectCache(sessionId, s, wsMsg)
                 } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
@@ -2814,6 +3085,15 @@ async function startStreamPump(sessionId) {
         const failedSession = sessions.get(sessionId)
         const failedTurnIdentity = failedSession?.activeTurnIdentity ? {...failedSession.activeTurnIdentity} : null
         if (failedSession?.query === myQuery) {
+            clearTaskWorkflowGate(failedSession._taskWorkflowGate)
+            failedSession._internalWorkflowResultTurnId = null
+            const transition = updateTaskCompletion(failedSession, sessionId, {
+                type: 'runtime_failed',
+                detail: String(e?.message || e || '任务执行异常中断'),
+            })
+            void applyTaskCompletionEffects(sessionId, transition.effects).catch(error => {
+                log.error({err: error, sessionId: sessionId?.slice(0, 8)}, 'runtime 异常后的父任务失败通知处理失败')
+            })
             failedSession._generating = false
             failedSession.activeTurnId = null
             failedSession.activeTurnIdentity = null
@@ -2828,6 +3108,11 @@ async function startStreamPump(sessionId) {
                 completedAt,
                 durationMs: Math.max(0, completedAt - startedAt),
             }))
+            appendSessionEvent(failedSession, 'runtime/failed', {
+                turnId: failedSession.taskState.turnId,
+                code: typeof e?.code === 'string' ? e.code.slice(0, 120) : 'stream_error',
+                durationMs: failedSession.taskState.durationMs,
+            })
         }
         if (e.message !== 'cancelled') broadcastTurn(sessionId, {
             type: 'error',
@@ -2836,6 +3121,7 @@ async function startStreamPump(sessionId) {
             durationMs: failedSession?.taskState?.durationMs || 0,
             taskState: taskStateForClient(failedSession?.taskState),
         }, failedTurnIdentity)
+        if (failedSession) broadcastTaskLifecycle(sessionId)
     } finally {
         const s2 = sessions.get(sessionId);
         // 仅当 query 未被重建替换时才置空，避免覆盖新 pump 持有的 query
@@ -2853,6 +3139,7 @@ async function startStreamPump(sessionId) {
         // 定时任务临时 session (无固定 sessionId) 完成后自动清理，防止累积
         if (s2?._autoDelete && !s2.clients?.size) {
             markSessionDeleted(sessionId)
+            finishImProgressReporters(sessionId)
             sessions.delete(sessionId)
             clearAdapterBindingsForSessions(sessionId, s2.lastSessionId)
             if (focusedSessionId === sessionId) focusedSessionId = null
@@ -2948,41 +3235,35 @@ async function sendWeChatChunks(bn, token, userId, contextToken, fullText) {
 //   → check s.mirrors[hook.platform] → hook.sendToUser(sid, text) → IM 平台
 async function maybeMirror(sid, taskResult = {outcome: 'succeeded'}, notificationId = null) {
     const s = sessions.get(sid)
-    if (!s) return
+    if (!s) return {attempted: 0, sent: 0, pending: 0, failed: 0}
     const text = buildIncompleteMirrorText(s.turnText || s.taskFinalReplyText, taskResult)
-    if (!text) return
+    if (!text) return {attempted: 0, sent: 0, pending: 0, failed: 0}
     const turnIdentity = s.activeTurnIdentity ? {...s.activeTurnIdentity} : null
+    const summary = {attempted: 0, sent: 0, pending: 0, failed: 0}
     for (const hook of confirmHooks) {
         if (!s.mirrors[hook.platform]) continue
         if (!shouldRouteMirror(hook.platform, turnIdentity)) continue
+        summary.attempted++
+        updateTaskNotificationState(s, sid, hook.platform, 'pending', notificationId)
         try {
-            await hook.sendToUser(sid, text, turnIdentity?.userId || null, notificationId)
+            const result = await hook.sendToUser(sid, text, turnIdentity?.userId || null, notificationId)
+            if (result === true || result?.sent === true) {
+                summary.sent++
+                updateTaskNotificationState(s, sid, hook.platform, 'sent', notificationId)
+            } else if (result?.queued === true) {
+                summary.pending++
+                updateTaskNotificationState(s, sid, hook.platform, 'pending', notificationId, result.error || 'queued_for_retry')
+            } else {
+                summary.failed++
+                updateTaskNotificationState(s, sid, hook.platform, 'failed', notificationId, result?.error || 'send_failed')
+            }
         } catch (e) {
+            summary.failed++
+            updateTaskNotificationState(s, sid, hook.platform, 'failed', notificationId, e?.message || e)
             log.warn({err: e, platform: hook.platform, sessionId: sid?.slice(0, 8)}, 'mirror sendToUser 失败')
         }
     }
-}
-
-// 镜像工具进度到所有已开启 mirror 的 IM 平台
-// ── 工具进度镜像（maybeMirrorProgress）──
-// 功能说明: 每个 tool_use_start 事件触发时，将进度信息推送到已开启 mirror 的 IM 平台（如 "⏳ [2] 🔧 Read..."）
-// 实现方式: 递增 s.turnToolCount 计数器，遍历 confirmHooks 检查 mirror 状态，调用 sendToUser 推送进度文本
-// 关键数据流: tool_use_start → maybeMirrorProgress(sid, toolName) → confirmHooks[mirror=true] → sendToUser(进度文本)
-function maybeMirrorProgress(sid, toolName) {
-    const s = sessions.get(sid)
-    if (!s) return
-    s.turnToolCount = (s.turnToolCount || 0) + 1
-    const turnIdentity = s.activeTurnIdentity ? {...s.activeTurnIdentity} : null
-    for (const hook of confirmHooks) {
-        if (!s.mirrors[hook.platform]) continue
-        if (!shouldRouteMirror(hook.platform, turnIdentity)) continue
-        try {
-            Promise.resolve(hook.sendToUser(sid, `⏳ [${s.turnToolCount}] 🔧 ${toolName || '工具'}...`, turnIdentity?.userId || null))
-                .catch(error => log.warn({err: error, platform: hook.platform, sessionId: sid?.slice(0, 8)}, 'mirror 进度发送失败'))
-        } catch (error) {
-            log.warn({err: error, platform: hook.platform, sessionId: sid?.slice(0, 8)}, 'mirror 进度发送失败')
-        }
-    }
+    return summary
 }
 
 // ── 项目结构缓存注入（maybeInjectProjectCache）──
@@ -3190,7 +3471,7 @@ function taskCompletionEventForClient(s, sessionId, type, extra = {}) {
         s.taskCompletedAt = Date.now()
     }
     updateTaskState(s, sessionId, taskStateFromCompletion(s))
-    const taskState = taskStateForClient(s?.taskState)
+    const taskState = taskStateForSessionClient(s)
     broadcastTurn(sessionId, {
         type,
         taskId,
@@ -3206,6 +3487,7 @@ function taskCompletionEventForClient(s, sessionId, type, extra = {}) {
         taskState,
         ...extra,
     }, identity)
+    broadcastTaskLifecycle(sessionId)
 }
 
 async function applyTaskCompletionEffects(sessionId, effects = []) {
@@ -3258,14 +3540,16 @@ async function applyTaskCompletionEffects(sessionId, effects = []) {
             await new Promise(resolve => setImmediate(resolve))
         } else if (effect.type === 'complete') {
             if (s.taskCompletion?.notificationEmitted) continue
-            s.taskCompletion.notificationEmitted = true
             updateTaskState(s, sessionId, taskStateFromCompletion(s, effect.detail))
             taskCompletionEventForClient(s, sessionId, 'task_completed', {
-                reply: s.taskFinalReplyText || '',
+                reply: s.taskFinalReplyText || s.taskState?.finalReplyText || '',
                 review: s.taskCompletion?.reviewOutcome || null,
             })
             try {
-                await maybeMirror(sessionId, {outcome: 'succeeded'}, `${s.taskCompletionTaskId || sessionId}:task_completed`)
+                const notification = await maybeMirror(sessionId, {outcome: 'succeeded'}, `${s.taskCompletionTaskId || sessionId}:task_completed`)
+                if (notification.failed === 0 && notification.pending === 0) {
+                    updateTaskCompletion(s, sessionId, {type: 'notification_sent'})
+                }
             } catch (error) {
                 log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '最终完成镜像失败')
             }
@@ -3290,29 +3574,38 @@ async function applyTaskCompletionEffects(sessionId, effects = []) {
  * checkpoint、IM echo 和前端气泡仍保留用户原文。
  */
 function resolveSdkInputContent(sessionId, session, prompt) {
-    if (!session || session.hasUserTurns || session._continuationResolved) return prompt
-    session._continuationResolved = true
+    if (!session) return prompt
+    let content = prompt
+    if (!session.hasUserTurns && !session._continuationResolved) {
+        session._continuationResolved = true
+        try {
+            const transcripts = listProjectTranscriptCandidates({
+                claudeHome: CLAUDE_HOME,
+                encodedDir: encodeProjectName(session.workDir),
+                workDir: session.workDir,
+            })
+            const context = buildProjectContinuationContext({
+                prompt,
+                currentSessionId: session.lastSessionId || null,
+                transcripts,
+            })
+            if (context) {
+                log.info({
+                    sessionId: sessionId?.slice(0, 8),
+                    sourceSessionId: context.sourceSessionId?.slice(0, 8),
+                    contextLength: context.text.length,
+                }, '已按需注入项目会话接力上下文')
+                content = composeContinuationPrompt(prompt, context)
+            }
+        } catch (error) {
+            log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '项目会话接力上下文读取失败，已按原消息继续')
+        }
+    }
     try {
-        const transcripts = listProjectTranscriptCandidates({
-            claudeHome: CLAUDE_HOME,
-            encodedDir: encodeProjectName(session.workDir),
-            workDir: session.workDir,
-        })
-        const context = buildProjectContinuationContext({
-            prompt,
-            currentSessionId: session.lastSessionId || null,
-            transcripts,
-        })
-        if (!context) return prompt
-        log.info({
-            sessionId: sessionId?.slice(0, 8),
-            sourceSessionId: context.sourceSessionId?.slice(0, 8),
-            contextLength: context.text.length,
-        }, '已按需注入项目会话接力上下文')
-        return composeContinuationPrompt(prompt, context)
+        return userPreferences.inject(session.workDir, content, prompt)
     } catch (error) {
-        log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '项目会话接力上下文读取失败，已按原消息继续')
-        return prompt
+        log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '用户偏好读取失败，已按原消息继续')
+        return content
     }
 }
 
@@ -3383,8 +3676,10 @@ async function executeScheduledTask(id) {
     }
     if (task.sessionId) opts.resume = task.sessionId
     let q
+    let eventJournal
     try {
-        q = query({prompt: pushStream, options: opts})
+        eventJournal = openSessionEventJournal(task.workDir, sessionId)
+        q = startClaudeAgent(pushStream, opts)
     } catch (error) {
         finishScheduledRun(id)
         throw error
@@ -3404,35 +3699,35 @@ async function executeScheduledTask(id) {
         }
         old.query = null
         old.pushStream = null
+        old.eventJournal?.close()
     }
-    const scheduledSession = {
-        query: q, workDir: task.workDir,
-        pushStream, clients: new Set(),
-        createdAt: Date.now(), pending: new Map(),
-        permissionMode: opts.permissionMode || 'default',
+    const scheduledSession = createSessionRuntime({
+        query: q,
+        pushStream,
+        workDir: task.workDir,
+        opts,
+        identity: task.sessionId || null,
         thinkingLevel: task.thinkingLevel || 'auto',
         modelMode: opts.bridgeModelMode || 'fixed',
-        mirrors: {wechat: false, feishu: false, dingtalk: false},
-        queryOpts: opts,
-        runtimeEnv: opts.runtimeEnv,  // 保存当前会话供应商环境，不污染 process.env
-        providerBaseUrl: opts.bridgeProviderBaseUrl || '',
-        providerApiKey: opts.bridgeProviderApiKey || '',
-        taskDecision: opts.bridgeTaskDecision || null,
-        modelTier: opts.bridgeModelTier || null,
-        parentSessionId: null, agentName: 'scheduler',
-        taskId: null, children: new Set(), depth: 0,
-                turnText: '', turnToolCount: 0,
-                _pendingSources: [],
-                _pendingTurns: [],
-                _pendingInputs: [],
-                _inputIds: new Map(),
-                activeTurnId: null,
-                activeTurnIdentity: null,
-        _onPumpDone: () => finishScheduledRun(id),
-        _autoDelete: !task.sessionId  // 无固定 sessionId 的临时任务完成后自动清理
-    }
+        agentName: 'scheduler',
+        extra: {
+            eventJournal,
+            _onPumpDone: () => finishScheduledRun(id),
+            _autoDelete: !task.sessionId,
+        },
+    })
     sessions.set(sessionId, scheduledSession)
-    markInternalInput(scheduledSession)
+    scheduledSession.taskStartedAt = Date.now()
+    scheduledSession.taskCompletion = createTaskCompletionState({phase: 'running'})
+    scheduledSession.taskCompletionDecision = scheduledSession.taskDecision
+    scheduledSession.taskCompletionTurnId = crypto.randomUUID()
+    scheduledSession.taskCompletionTaskId = `${sessionId}:${scheduledSession.taskCompletionTurnId}`
+    appendSessionEvent(scheduledSession, 'task/accepted', {
+        source: 'scheduled', turnId: scheduledSession.taskCompletionTurnId, taskId: scheduledSession.taskCompletionTaskId,
+    }, {critical: true})
+    scheduledSession._taskCompletionSequence = 0
+    updateTaskState(scheduledSession, sessionId, taskStateFromCompletion(scheduledSession))
+    markInternalInput(scheduledSession, scheduledSession.taskDecision)
     pushStream.push({
         type: 'user', session_id: sessionId,
         message: {role: 'user', content: [{type: 'text', text: task.prompt}]},
@@ -3548,7 +3843,11 @@ async function autoTriggerWorkflow(sessionId, msgContent, taskDecision = null) {
     try {
         // 先预注册真实运行状态，广播的 ID 与 runWfScript 内部使用的 ID 保持一致；
         // 同名 Workflow 已在运行时直接跳过，避免自动触发覆盖手工运行。
-        wfId = presetRunState(matchedWf)
+        wfId = presetRunState(matchedWf, `${matchedWf}:${sessionId}`, sessionId)
+        const session = sessions.get(sessionId)
+        if (!session._taskWorkflowGate) session._taskWorkflowGate = createTaskWorkflowGate()
+        attachTaskWorkflow(session._taskWorkflowGate, wfId)
+        broadcastTaskLifecycle(sessionId)
     } catch (error) {
         if (error?.code !== 'WORKFLOW_ALREADY_RUNNING') {
             log.warn({err: error, sessionId: sessionId?.slice(0, 8), workflow: matchedWf}, '自动 Workflow 预注册失败')
@@ -3577,6 +3876,8 @@ async function autoTriggerWorkflow(sessionId, msgContent, taskDecision = null) {
             ? sessions.get(sessionId)?.queryOpts?.model || null
             : null,
         _taskDecision: taskDecision || null,
+        _taskOwned: true,
+        _runKey: `${matchedWf}:${sessionId}`,
     }).catch(e => {
         log.error({err: e, sessionId: sessionId?.slice(0, 8), workflow: matchedWf}, '自动 workflow 失败')
     })
@@ -3893,13 +4194,67 @@ async function handleHttpRequest(req, res) {
         return
     }
 
+    // 用户偏好管理：偏好与规则文件分离，避免一次性要求污染长期规则。
+    if (req.method === 'GET' && url.pathname === '/api/preferences') {
+        res.writeHead(200)
+        res.end(JSON.stringify(userPreferences.listAll()))
+        return
+    }
+    const prefSuggestionM = url.pathname.match(/^\/api\/preferences\/suggestions\/([^/]+)\/respond$/)
+    if (req.method === 'POST' && prefSuggestionM) {
+        const body = await readBody(req)
+        if (body._bodyTooLarge || body._bodyError || body._parseError || !isDirectoryPath(body.projectDir)) {
+            res.writeHead(400)
+            res.end(JSON.stringify({error: 'invalid preference request'}))
+            return
+        }
+        try {
+            const result = userPreferences.respond({
+                projectDir: body.projectDir,
+                suggestionId: safeDecodeURIComponent(prefSuggestionM[1]),
+                action: body.action,
+            })
+            res.writeHead(200)
+            res.end(JSON.stringify(result))
+        } catch (error) {
+            res.writeHead(error.code === 'PREFERENCE_SUGGESTION_NOT_FOUND' ? 404 : 400)
+            res.end(JSON.stringify({error: error.message, code: error.code || 'PREFERENCE_RESPONSE_FAILED'}))
+        }
+        return
+    }
+    const prefM = url.pathname.match(/^\/api\/preferences\/(global|project)\/([^/]+)$/)
+    if ((req.method === 'PUT' || req.method === 'DELETE') && prefM) {
+        const scope = prefM[1]
+        const id = safeDecodeURIComponent(prefM[2])
+        const body = (req.method === 'PUT' || req.method === 'DELETE') ? await readBody(req) : {}
+        const encodedDir = scope === 'project'
+            ? safeDecodeURIComponent(body.encodedDir || url.searchParams.get('encodedDir') || '')
+            : ''
+        if (scope === 'project' && (!encodedDir || basename(encodedDir) !== encodedDir)) {
+            res.writeHead(400)
+            res.end(JSON.stringify({error: 'project preference requires encodedDir'}))
+            return
+        }
+        try {
+            const result = req.method === 'PUT'
+                ? userPreferences.update({scope, id, enabled: body.enabled !== false, encodedDir})
+                : userPreferences.remove({scope, id, encodedDir})
+            res.writeHead(200)
+            res.end(JSON.stringify({ok: true, preference: result}))
+        } catch (error) {
+            res.writeHead(error.code === 'PREFERENCE_NOT_FOUND' ? 404 : 400)
+            res.end(JSON.stringify({error: error.message, code: error.code || 'PREFERENCE_MUTATION_FAILED'}))
+        }
+        return
+    }
+
     // ── POST /api/sessions —— 创建/恢复会话 ──
     // 功能说明: 创建一个新的 Claude Code SDK query 会话，或通过 resume 恢复已有会话
     //   完成以下初始化链：PushStream → query() → sessions Map → 文件快照基线 → 记录点恢复 → startStreamPump
     // 实现方式:
     //   1. body.workDir 必填，sessionId = body.resume 或 crypto.randomUUID()
     //   2. loadCliSettings + makeQueryOptions 组装 SDK query options
-    //   3. 创建 PushStream 作为 prompt 输入，调用 query({prompt: pushStream, options})
+    //   3. 创建 PushStream 作为 prompt 输入，通过 Agent Provider 启动 SDK query
     //   4. 存入 sessions Map（含 query/工作目录/pending/权限模式/mirrors 等）
     //   5. 恢复或新建文件快照基线（loadSnapshot / buildFileSnapshot）
     //   6. 恢复历史记录点（loadCheckpoints）
@@ -4051,54 +4406,41 @@ async function handleHttpRequest(req, res) {
                 hasTaskDecision: Boolean(opts.bridgeTaskDecision),
                 hasConversationTarget: false,
             })
-            const q = deferAutomaticQuery ? null : query({prompt: pushStream, options: opts})
+            const eventJournal = openSessionEventJournal(workDir, sessionId)
+            const q = deferAutomaticQuery ? null : startClaudeAgent(pushStream, opts)
             // 清理已死的旧会话资源
             if (oldSess) {
                 await closeSessionRuntime(oldSess, {sessionId, reason: 'replace_stale_session'})
                 oldSess.query = null
                 oldSess.pushStream = null
+                oldSess.eventJournal?.close()
             }
-            sessions.set(sessionId, {
+            sessions.set(sessionId, createSessionRuntime({
                 query: q,
-                workDir,
                 pushStream: deferAutomaticQuery ? null : pushStream,
-                clients: new Set(),
-                createdAt: Date.now(),
-                pending: new Map(),
-                permissionMode: opts.permissionMode,
+                workDir,
+                opts,
+                identity: resumeSid,
                 thinkingLevel: body.thinkingLevel || 'auto',
                 modelMode: opts.bridgeModelMode || (body.model ? 'fixed' : 'auto'),
-                providerBaseUrl: opts.bridgeProviderBaseUrl || body.baseUrl || '',
-                providerApiKey: opts.bridgeProviderApiKey || '',
-                mirrors: {wechat: false, feishu: false, dingtalk: false},
-                queryOpts: opts,
-                runtimeEnv: opts.runtimeEnv,  // 保存当前会话供应商环境，不污染 process.env
-                contextProfile: opts.bridgeContextProfile || 'full',
-                taskDecision: opts.bridgeTaskDecision || null,
-                taskCompletion: createTaskCompletionState(),
-                skillRoute: opts.bridgeSkillRoute || [],
-                ...initialSessionIdentity(resumeSid),
-                forkedFrom,
-                parentSessionId: null,
                 agentName: body._agentName || 'main',
-                taskId: null,
-                children: new Set(),
-                turnText: '', turnToolCount: 0,
-                _pendingSources: [],
-                _pendingTurns: [],
-                _pendingInputs: [],
-                _inputIds: new Map(),
-                activeTurnId: null,
-                activeTurnIdentity: null,
                 depth: body._depth || 0,
-                modelMeta: body.modelMeta || null,  // 前端传入的 model contextWindow/pricing，供 lookupModelInfo 回退
-                _gitContext: null,  // git 仓库上下文，由响应后的后台初始化填充
-                snapshotReady: false,
-                checkpointsLoaded: false,
-            })
+                extra: {
+                    eventJournal,
+                    providerBaseUrl: opts.bridgeProviderBaseUrl || body.baseUrl || '',
+                    forkedFrom,
+                    modelMeta: body.modelMeta || null,
+                    _gitContext: null,
+                    snapshotReady: false,
+                    checkpointsLoaded: false,
+                },
+            }))
             const createdSession = sessions.get(sessionId)
+            const journalTaskProjection = resumeSid
+                ? createdSession.eventJournal.projectTaskState({recoverRunning: true})
+                : null
             const persistedTaskState = resumeSid
-                ? (loadTaskState(workDir, sessionId) || loadTaskState(workDir, resumeSid))
+                ? (journalTaskProjection || loadTaskState(workDir, sessionId) || loadTaskState(workDir, resumeSid))
                 : null
             createdSession.taskState = persistedTaskState || createTaskStatePatch({
                 status: 'idle',
@@ -4376,6 +4718,7 @@ async function handleHttpRequest(req, res) {
                 interrupt: true
             }, 'deleted');
             await closeSessionRuntime(s, {sessionId: id, reason: 'delete_session'})
+            s.eventJournal?.close()
             // 断开引用让 GC 回收，帮助 SDK 底层释放文件句柄
             s.query = null
             s.pushStream = null
@@ -4392,7 +4735,11 @@ async function handleHttpRequest(req, res) {
         markSessionDeleted(delParam)
         if (s?.workDir) removeVisibleSession(s.workDir, id, s.lastSessionId || delParam)
         else removeVisibleSessionEverywhere(id, delParam)
-        if (s) { sessions.delete(id); invalidateProjectsCache() }
+        if (s) {
+            finishImProgressReporters(id)
+            sessions.delete(id)
+            invalidateProjectsCache()
+        }
         clearAdapterBindingsForSessions(delParam, id, s?.lastSessionId)
         if (focusedSessionId === id) focusedSessionId = null;
         res.writeHead(200);
@@ -4455,6 +4802,7 @@ async function handleHttpRequest(req, res) {
                 }, 'deleted')
                 await closeSessionRuntime(s, {sessionId: id, reason: 'batch_delete_session'})
                 s.query = null; s.pushStream = null
+                s.eventJournal?.close()
                 for (const ws of [...s.clients]) {
                     try {
                         ws.close(4001, JSON.stringify({error: 'session deleted'}))
@@ -4462,11 +4810,12 @@ async function handleHttpRequest(req, res) {
                         log.debug({err: error, sessionId: id?.slice(0, 8)}, '关闭批量删除 Session 的 WebSocket 失败')
                     }
                 }
+                finishImProgressReporters(id)
                 sessions.delete(id)
                 removeVisibleSession(s.workDir, id, s.lastSessionId || rawId)
                 clearAdapterBindingsForSessions(rawId, id, s.lastSessionId)
                 if (focusedSessionId === id) focusedSessionId = null
-                cleanupSessionUploads(s.workDir, deleteFiles)
+                cleanupSessionUploads(s.workDir, id, deleteFiles)
             }
             markSessionDeleted(rawId)
             if (!s) removeVisibleSessionEverywhere(rawId, rawId)
@@ -4556,7 +4905,7 @@ async function handleHttpRequest(req, res) {
             const file = files?.file
             if (!file) { res.writeHead(400); res.end(JSON.stringify({error: 'no file'})); return }
 
-            const uploadDir = getUploadDir(s.workDir)
+            const uploadDir = getUploadDir(s.workDir, sid)
             if (!uploadDir) { res.writeHead(400); res.end(JSON.stringify({error: 'invalid upload directory'})); return }
             prepareUploadDir(uploadDir, {
                 ttlMs: UPLOAD_TTL_MS,
@@ -7371,8 +7720,10 @@ async function handleHttpRequest(req, res) {
                 res.end(JSON.stringify({error: 'Workflow 功能已禁用，请在 Workflow 面板开启'}));
                 return
             }
-            presetRunState(name)
-            runWfScript(name, sid, body.args || {}).catch(e => {
+            const runKey = `${name}:${sid}`
+            presetRunState(name, runKey, sid)
+            broadcastTaskLifecycle(sid)
+            runWfScript(name, sid, {...(body.args || {}), _runKey: runKey, _taskOwned: false}).catch(e => {
                 broadcast(sid, {type: 'workflow_error', workflowName: name, error: e.message})
             })
             res.writeHead(202);
@@ -7395,9 +7746,12 @@ async function handleHttpRequest(req, res) {
     if (req.method === 'POST' && wfStopM) {
         const name = safeDecodeURIComponent(wfStopM[1])
         const body = await readBody(req).catch(() => ({}))
+        const sid = typeof body.sessionId === 'string' && sessions.has(body.sessionId) ? body.sessionId : null
+        const runKey = sid ? `${name}:${sid}` : name
         if (body.mode === 'commit') {
             try {
-                const r = await commitWorkflow(name)
+                const r = await commitWorkflow(runKey)
+                if (sid) broadcastTaskLifecycle(sid)
                 res.writeHead(200)
                 res.end(JSON.stringify({ok: true, name, ...r}))
             } catch (e) {
@@ -7406,7 +7760,8 @@ async function handleHttpRequest(req, res) {
             }
             return
         }
-        const ok = stopWorkflow(name)
+        const ok = stopWorkflow(runKey)
+        if (sid) broadcastTaskLifecycle(sid)
         res.writeHead(ok ? 200 : 404);
         res.end(JSON.stringify(ok ? {ok: true, name, status: 'paused'} : {error: 'not running'}))
         return
@@ -7434,10 +7789,12 @@ async function handleHttpRequest(req, res) {
                 res.end(JSON.stringify({error: 'Workflow 功能已禁用，请在 Workflow 面板开启'}));
                 return
             }
-            presetRunState(name)
+            const runKey = `${name}:${sid}`
+            presetRunState(name, runKey, sid)
+            broadcastTaskLifecycle(sid)
             const override = {}
             if (body.budgetMax != null) override.budgetMax = Number(body.budgetMax)
-            resumeWorkflow(name, sid, override).catch(e => {
+            resumeWorkflow(name, sid, override, runKey).catch(e => {
                 broadcast(sid, {type: 'workflow_error', workflowName: name, error: e.message})
             })
             res.writeHead(202);
@@ -7453,7 +7810,8 @@ async function handleHttpRequest(req, res) {
     if (req.method === 'POST' && wfAgentStopM) {
         const wfName = safeDecodeURIComponent(wfAgentStopM[1])
         const agentLabel = safeDecodeURIComponent(wfAgentStopM[2])
-        const state = getRunState(wfName)
+        const body = await readBody(req).catch(() => ({}))
+        const state = getRunState(typeof body.workflowId === 'string' ? body.workflowId : wfName)
         if (!state) { res.writeHead(404); res.end(JSON.stringify({error: 'workflow 未运行'})); return }
         const wfId = state.wfId
         const ok = stopWorkflowAgent(wfId, agentLabel)
@@ -7466,7 +7824,8 @@ async function handleHttpRequest(req, res) {
     if (req.method === 'POST' && wfAgentResumeM) {
         const wfName = safeDecodeURIComponent(wfAgentResumeM[1])
         const agentLabel = safeDecodeURIComponent(wfAgentResumeM[2])
-        const state = getRunState(wfName)
+        const body = await readBody(req).catch(() => ({}))
+        const state = getRunState(typeof body.workflowId === 'string' ? body.workflowId : wfName)
         if (!state) { res.writeHead(404); res.end(JSON.stringify({error: 'workflow 未运行'})); return }
         const ok = resumeWorkflowAgent(state.wfId, agentLabel)
         res.writeHead(ok ? 200 : 404)
@@ -7563,7 +7922,10 @@ async function autoTriggerFinalReview(sessionId, taskDecision, checkpoint, revie
     }
     let wfId
     const runKey = `${workflow}:${sessionId}`
-    try { wfId = presetRunState(workflow, runKey) } catch (error) {
+    try {
+        wfId = presetRunState(workflow, runKey, sessionId)
+        broadcastTaskLifecycle(sessionId)
+    } catch (error) {
         const detail = error?.code === 'WORKFLOW_ALREADY_RUNNING' ? '已有最终审查正在运行' : String(error?.message || error)
         if (error?.code !== 'WORKFLOW_ALREADY_RUNNING') log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '最终复核预注册失败')
         const transition = updateTaskCompletion(s, sessionId, {type: 'review_error', detail})
@@ -7596,7 +7958,7 @@ async function autoTriggerFinalReview(sessionId, taskDecision, checkpoint, revie
             await applyTaskCompletionEffects(sessionId, transition.effects)
             return
         }
-        const outcome = normalizeReviewOutcome(result, plan)
+        const outcome = normalizeReviewOutcome(result, plan, {files: checkpoint.files})
         const transition = updateTaskCompletion(s, sessionId, {type: 'review_result', outcome})
         await applyTaskCompletionEffects(sessionId, transition.effects)
     } catch (error) {
@@ -7626,6 +7988,303 @@ httpServer.maxRequestsPerSocket = 1_000
 // ---- WebSocket ----
 // 控制通道客户端池：独立于 session，用于接收 nudge 等全局事件
 const controlClients = new Set()
+
+async function submitTaskCommand(command) {
+    const sessionId = command.sessionId
+    const s = sessions.get(sessionId)
+    if (!s) return {type: 'message_rejected', messageId: command.messageId, code: 'session_not_found'}
+    if (s._stopPromise) await s._stopPromise
+
+    const source = command.source
+    const userId = command.userId || null
+    const desktopInput = !IM_SOURCES.has(source)
+    const activeTurnInput = Boolean(s._generating || s.activeTurnId || s._pendingInputs?.length)
+    let acceptedInput = null
+    let acceptedEventPersisted = false
+    try {
+        // 供应商只在回合边界刷新，避免补充消息中断正在执行的工具。
+        if (!activeTurnInput) {
+            const fresh = loadCliSettings()
+            const key = fresh.env?.ANTHROPIC_AUTH_TOKEN || fresh.env?.ANTHROPIC_API_KEY || ''
+            const url = fresh.env?.ANTHROPIC_BASE_URL || ''
+            const prevUrl = s.providerBaseUrl || ''
+            const prevKey = s.providerApiKey || ''
+            if ((url && url !== prevUrl) || (key && key !== prevKey)) {
+                if (s.queryOpts) s.queryOpts.model = null
+                s.runtimeEnv = s.runtimeEnv || {}
+                s.runtimeEnv.ANTHROPIC_BASE_URL = url
+                s.runtimeEnv.ANTHROPIC_AUTH_TOKEN = key
+                s.providerBaseUrl = url
+                s.providerApiKey = key
+                log.info({sessionId: sessionId.slice(0, 8), baseUrl: url?.slice(0, 40)}, '厂商配置变更，将重建 query')
+            }
+        }
+
+        const cliSettingsForDecision = loadCliSettings()
+        const requestedModelMode = desktopInput && VALID_MODEL_MODES.has(command.modelMode)
+            ? command.modelMode
+            : (s.modelMode || (command.model ? 'fixed' : 'auto'))
+        const taskDecision = activeTurnInput && s.taskDecision
+            ? s.taskDecision
+            : decideTask({
+                text: desktopInput && command.taskText?.trim() ? command.taskText : command.content,
+                previousDecision: s.taskDecision,
+                diffRisk: s.lastDiffRisk,
+                attachmentEvidence: desktopInput && command.hasAttachments,
+            })
+        const taskRoute = resolveTurnModelRoute({
+            activeTurn: activeTurnInput,
+            currentMode: s.modelMode,
+            currentModel: s.queryOpts?.model,
+            currentTier: s.modelTier,
+            modelMode: requestedModelMode,
+            explicitModel: requestedModelMode === 'fixed' ? (command.model || s.queryOpts?.model) : '',
+            decision: taskDecision,
+            modelTiers: loadWfConfig().modelTiers,
+            defaultModel: cliSettingsForDecision.model || s.queryOpts?.model || MODEL,
+        })
+        if (taskRoute.blockingReason) {
+            return {
+                type: 'message_rejected', messageId: command.messageId, code: taskRoute.blockingReason,
+                message: taskRoute.blockingReason === 'power_model_required'
+                    ? '当前高风险任务需要先配置 Power 模型'
+                    : '当前供应商没有可用模型',
+            }
+        }
+        const providerBaseUrl = cliSettingsForDecision.env?.ANTHROPIC_BASE_URL || s.providerBaseUrl || ''
+        const compatibilityError = activeTurnInput ? null : validateProviderModel({baseUrl: providerBaseUrl, model: taskRoute.model})
+        if (compatibilityError) {
+            return {
+                type: 'message_rejected', messageId: command.messageId, code: compatibilityError,
+                message: '当前 Codex Relay 不支持所选模型，请在设置中为该档位配置 Codex 模型',
+            }
+        }
+        if (!activeTurnInput) s.providerBaseUrl = providerBaseUrl
+
+        const previousModelMode = s.modelMode || (s.queryOpts?.model ? 'fixed' : 'auto')
+        acceptedInput = acceptSessionInput(s, source, command.messageId, userId, taskDecision)
+        if (!acceptedInput.ok) {
+            return acceptedInput.duplicate
+                ? {type: 'message_duplicate', messageId: acceptedInput.messageId}
+                : {type: 'message_rejected', messageId: command.messageId, code: acceptedInput.error, queuePosition: acceptedInput.queuePosition || 0}
+        }
+        try {
+            appendSessionEvent(s, 'task/accepted', {
+                source,
+                messageId: acceptedInput.messageId,
+                turnId: acceptedInput.turnId,
+                queuePosition: acceptedInput.queuePosition,
+            }, {critical: true})
+            acceptedEventPersisted = true
+        } catch (error) {
+            rollbackSessionInput(s, acceptedInput)
+            acceptedInput = null
+            log.error({err: error, sessionId: sessionId.slice(0, 8), source}, '任务接收事件持久化失败，已拒绝输入')
+            return {
+                type: 'message_rejected', messageId: command.messageId, code: 'session_event_persist_failed',
+                message: '任务状态无法持久化，请检查磁盘后重试',
+            }
+        }
+
+        if (!s.visibleSource && isUserSessionSource(source)) {
+            if (!markVisibleSession(s.workDir, sessionId, s.lastSessionId, source)) {
+                rollbackSessionInput(s, acceptedInput)
+                appendSessionEvent(s, 'task/rolled-back', {turnId: acceptedInput.turnId, reason: 'session_visibility_persist_failed'})
+                acceptedInput = null
+                return {type: 'message_rejected', messageId: command.messageId, code: 'session_visibility_persist_failed'}
+            }
+            s.visibleSource = source
+            if (s.lastSessionId) {
+                broadcastDesktop(sessionId, {
+                    type: 'session_visible', sessionId, historySessionId: s.lastSessionId, source,
+                })
+            }
+        }
+
+        if (!activeTurnInput) {
+            s.taskStartedAt = Date.now()
+            s.taskCompletedAt = 0
+            s.taskCompletion = createTaskCompletionState({phase: 'running'})
+            s.taskCompletionDecision = taskDecision
+            s.taskCompletionIdentity = createTurnIdentity(source, userId, IM_SOURCES)
+            s.taskFinalReplyText = ''
+            s.taskReviewFiles = []
+            s.taskReviewCheckpointId = null
+            s._finalReviewKey = null
+            s.taskCompletionTurnId = acceptedInput.turnId
+            s.taskCompletionTaskId = `${sessionId}:${acceptedInput.turnId}`
+            s._taskCompletionSequence = 0
+            s._taskWorkflowGate = createTaskWorkflowGate()
+            s._internalWorkflowResultTurnId = null
+        }
+
+        // 只在新任务入口观察候选；同一执行中的补充消息不能把一次要求误计为多次偏好。
+        let preferenceSuggestions = []
+        if (!activeTurnInput) {
+            try {
+                preferenceSuggestions = userPreferences.observe({
+                    projectDir: s.workDir,
+                    taskId: s.taskCompletionTaskId || acceptedInput.turnId,
+                    sessionId,
+                    source,
+                    text: desktopInput && command.taskText?.trim() ? command.taskText : command.content,
+                })
+            } catch (error) {
+                log.warn({err: error, sessionId: sessionId.slice(0, 8)}, '用户偏好候选观察失败，继续执行任务')
+            }
+        }
+
+        updateTaskState(s, sessionId, {
+            status: 'running', outcome: null, continuationReason: null,
+            resumable: Boolean(s.lastSessionId), sdkSessionId: s.lastSessionId, historySessionId: s.lastSessionId,
+            taskId: s.taskCompletionTaskId || null, turnId: s.taskCompletionTurnId || null,
+            sequence: s._taskCompletionSequence || 0, startedAt: s.taskStartedAt || Date.now(),
+            completedAt: 0, durationMs: 0,
+        })
+        if (!activeTurnInput) {
+            taskCompletionEventForClient(s, sessionId, 'task_started', {
+                modelTier: taskDecision.modelTier, risk: taskDecision.risk,
+            })
+        }
+        s.taskDecision = taskDecision
+        s.modelTier = taskRoute.tier || null
+        broadcast(sessionId, {
+            type: 'task_decision', version: taskDecision.version, action: taskDecision.action,
+            complexity: taskDecision.complexity, risk: taskDecision.risk, modelTier: taskDecision.modelTier,
+            model: taskRoute.model, modelMode: taskRoute.mode, workflow: taskDecision.workflow,
+            finalReview: taskDecision.finalReview, reasons: taskDecision.reasons,
+            hardTriggers: taskDecision.hardTriggers, fallbackReason: taskRoute.fallbackReason,
+            inheritedFromActiveTurn: taskRoute.inheritedFromActiveTurn, ts: Date.now(),
+        })
+        log.info({sessionId: sessionId.slice(0, 8), source, textLength: command.content.length}, '← 用户消息')
+        if (IM_SOURCES.has(source)) {
+            broadcastDesktop(sessionId, {type: 'remote_user_message', source, content: command.content})
+        }
+        for (const suggestion of preferenceSuggestions) {
+            broadcastDesktop(sessionId, {type: 'preference_suggestion', suggestion})
+        }
+        s._pendingSources = s._pendingSources || []
+        s._pendingSources.push(source)
+
+        const srcLabel = IM_SOURCES.has(source) ? `[${source}] ` : ''
+        const newPerm = IM_SOURCES.has(source) ? 'default' : command.permissionMode
+        const newThink = command.thinkingLevel
+        const newModel = taskRoute.model
+        const nextProfile = taskDecision.contextProfile
+        const permChanged = newPerm && newPerm !== s.permissionMode
+        const thinkChanged = newThink && newThink !== s.thinkingLevel
+        const modelChanged = newModel && newModel !== s.queryOpts?.model
+        const modeChanged = taskRoute.mode !== previousModelMode
+        const contextChanged = nextProfile !== (s.contextProfile || 'full')
+        const sdkInputContent = resolveSdkInputContent(sessionId, s, command.content)
+        const nextSkillRoute = routeSkills({text: sdkInputContent, workDir: s.workDir, profile: nextProfile})
+        const skillRouteChanged = JSON.stringify(nextSkillRoute) !== JSON.stringify(s.skillRoute || [])
+        beginTurn(sessionId, srcLabel + command.content)
+
+        if (permChanged || thinkChanged || modelChanged || modeChanged || contextChanged || skillRouteChanged) {
+            if (permChanged) s.permissionMode = newPerm
+            if (thinkChanged) s.thinkingLevel = newThink
+            if (modelChanged) {
+                s.queryOpts.model = newModel
+                if (command.modelMeta) s.modelMeta = command.modelMeta
+            }
+            if (contextChanged) s.contextProfile = nextProfile
+            if (skillRouteChanged) s.skillRoute = nextSkillRoute
+            await closeSessionRuntime(s, {sessionId, reason: 'runtime_settings_changed'})
+            s.query = null
+            s.pushStream = null
+            s._rebuildPromise = null
+            s._rebuildId = null
+            if (s._hasConversation) s.lastSessionId = s.lastSessionId || sessionId
+        }
+        s.modelMode = taskRoute.mode
+
+        if (!s.query) {
+            if (s._rebuildPromise) {
+                if (!s._pendingMessages) s._pendingMessages = []
+                s._pendingMessages.push(sdkInputContent)
+            } else {
+                s._pendingMessages = [sdkInputContent]
+                const myRebuildId = Symbol('rebuild')
+                s._rebuildId = myRebuildId
+                s._rebuildPromise = (async () => {
+                    const cliS = loadCliSettings()
+                    const rebuildPushStream = new PushStream()
+                    s.pushStream = rebuildPushStream
+                    const bodyOverride = {
+                        resume: s.hasUserTurns ? (s.lastSessionId || undefined) : undefined,
+                        model: s.queryOpts?.model, modelMode: s.modelMode || 'fixed',
+                        taskDecision: s.taskDecision || null, permissionMode: s.permissionMode,
+                        thinkingLevel: s.thinkingLevel, contextProfile: s.contextProfile || 'full',
+                        skillRoute: s.skillRoute || [], modelMeta: command.modelMeta,
+                    }
+                    if (s.providerBaseUrl) bodyOverride.baseUrl = s.providerBaseUrl
+                    if (s.providerApiKey) bodyOverride.apiKey = s.providerApiKey
+                    const opts = await makeQueryOptions(bodyOverride, s.workDir, cliS, {}, sessionId)
+                    if (s._rebuildId !== myRebuildId || s.pushStream !== rebuildPushStream) return
+                    if (bodyOverride.resume) opts.resume = bodyOverride.resume
+                    s.query = startClaudeAgent(rebuildPushStream, opts)
+                    s.runtimeEnv = opts.runtimeEnv
+                    s.providerBaseUrl = opts.bridgeProviderBaseUrl || s.providerBaseUrl
+                    s.providerApiKey = opts.bridgeProviderApiKey || s.providerApiKey
+                    s.queryOpts = opts
+                    startStreamPump(sessionId)
+                    const pending = s._pendingMessages || []
+                    s._pendingMessages = null
+                    for (const content of pending) {
+                        rebuildPushStream.push({
+                            type: 'user', session_id: sessionId,
+                            message: {role: 'user', content: [{type: 'text', text: content}]},
+                            parent_tool_use_id: null,
+                        })
+                        s.hasUserTurns = true
+                    }
+                    s._rebuildPromise = null
+                    s._rebuildId = null
+                })().catch(error => {
+                    if (s._rebuildId !== myRebuildId) {
+                        log.debug({err: error, sessionId: sessionId.slice(0, 8)}, '已过期 rebuild 失败，忽略其状态清理')
+                        return
+                    }
+                    log.error({err: error, sessionId: sessionId.slice(0, 8)}, 'rebuild 失败')
+                    s._rebuildPromise = null
+                    s._rebuildId = null
+                    s._pendingMessages = null
+                    failPendingSessionInputs(sessionId, s, error)
+                })
+            }
+        } else {
+            s.pushStream.push({
+                type: 'user', session_id: sessionId,
+                message: {role: 'user', content: [{type: 'text', text: sdkInputContent}]},
+                parent_tool_use_id: null,
+            })
+            s.hasUserTurns = true
+        }
+
+        if (!command.noWorkflow && !activeTurnInput) {
+            autoTriggerWorkflow(sessionId, command.content, taskDecision).catch(error => {
+                log.warn({err: error, sessionId: sessionId.slice(0, 8)}, 'autoTriggerWorkflow 异常')
+            })
+        }
+        const result = {
+            type: 'message_accepted', messageId: acceptedInput.messageId,
+            turnId: acceptedInput.turnId, queuePosition: acceptedInput.queuePosition,
+        }
+        acceptedInput = null
+        return result
+    } catch (error) {
+        if (acceptedInput && rollbackSessionInput(s, acceptedInput)) {
+            const sourceIndex = s._pendingSources?.lastIndexOf(source) ?? -1
+            if (sourceIndex >= 0) s._pendingSources.splice(sourceIndex, 1)
+            if (acceptedEventPersisted) appendSessionEvent(s, 'task/rolled-back', {
+                turnId: acceptedInput.turnId,
+                reason: typeof error?.code === 'string' ? error.code.slice(0, 120) : 'submit_failed',
+            })
+        }
+        throw error
+    }
+}
 
 const wss = new WebSocketServer({noServer: true, maxPayload: 1048576})
 
@@ -7756,7 +8415,12 @@ wss.on('connection', (ws, req) => {
         mirrorEnabled: IM_SOURCES.has(source) ? !!s.mirrors?.[source] : false,
     }))
     if (params.source === 'desktop') {
-        ws.send(JSON.stringify({type: 'session_state_snapshot', ...getSessionRuntimeState(s), taskState: taskStateForClient(s.taskState)}))
+        ws.send(JSON.stringify({type: 'session_state_snapshot', ...getSessionRuntimeState(s), taskState: taskStateForSessionClient(s)}))
+        const lifecycleSnapshot = getTaskLifecycleSnapshot(sessionId, s)
+        if (lifecycleSnapshot) ws.send(JSON.stringify({type: 'session_lifecycle_snapshot', ...lifecycleSnapshot}))
+        for (const suggestion of userPreferences.pending(s.workDir)) {
+            ws.send(JSON.stringify({type: 'preference_suggestion', suggestion}))
+        }
     }
     // 切换 tab 重连时发送当前 workflow/agent 运行态快照，供前端恢复 agent 面板
     if (params.source === 'desktop') {
@@ -7776,7 +8440,6 @@ wss.on('connection', (ws, req) => {
     }, 'WS 已连接')
 
     ws.on('message', (raw) => {
-        let acceptedInput = null
         void (async () => {
         let msg;
         try {
@@ -7785,7 +8448,26 @@ wss.on('connection', (ws, req) => {
             return
         }
         if (msg.type === 'stop_generation') {
-            await stopSessionGeneration(sessionId, s)
+            await taskCommands.cancelTask(sessionId, {source: ws._source, userId: ws._adapterUserId || null})
+            return
+        }
+        if (msg.type === 'preference_response') {
+            if (IM_SOURCES.has(ws._source)) return
+            try {
+                const result = userPreferences.respond({
+                    projectDir: s.workDir,
+                    suggestionId: msg.suggestionId,
+                    action: msg.action,
+                })
+                broadcastDesktop(sessionId, {type: 'preference_suggestion_resolved', ...result})
+            } catch (error) {
+                ws.send(JSON.stringify({
+                    type: 'preference_error',
+                    suggestionId: msg.suggestionId,
+                    code: error.code || 'PREFERENCE_RESPONSE_FAILED',
+                    message: '偏好保存失败，请稍后重试',
+                }))
+            }
             return
         }
         // 即时权限切换: 更新 session 并自动通过所有 pending 权限请求
@@ -7821,337 +8503,24 @@ wss.on('connection', (ws, req) => {
             return
         }
         if (msg.type === 'user_message') {
-            // 停止流程会清空旧一代 pending；新输入必须等它完成后再进入下一代。
-            if (s._stopPromise) await s._stopPromise
-            const desktopInput = !IM_SOURCES.has(ws._source)
-            if (typeof msg.content !== 'string' || !msg.content.trim() || Buffer.byteLength(msg.content, 'utf8') > 900_000
-                || (desktopInput && msg.taskText !== undefined && (typeof msg.taskText !== 'string' || Buffer.byteLength(msg.taskText, 'utf8') > 100_000))
-                || (desktopInput && msg.hasAttachments !== undefined && typeof msg.hasAttachments !== 'boolean')
-                || (desktopInput && msg.permissionMode !== undefined && !VALID_PERMISSION_MODES.has(msg.permissionMode))
-                || (desktopInput && msg.thinkingLevel !== undefined && !VALID_THINKING_LEVELS.has(msg.thinkingLevel))
-                || (desktopInput && msg.modelMode !== undefined && !VALID_MODEL_MODES.has(msg.modelMode))
-                || (desktopInput && msg.model !== undefined && (typeof msg.model !== 'string' || msg.model.length > 256))) {
-                ws.send(JSON.stringify({type: 'message_rejected', messageId: String(msg.messageId || ''), code: 'invalid_input'}))
-                return
-            }
-            const activeTurnInput = Boolean(s._generating || s.activeTurnId || s._pendingInputs?.length)
-            // 仅在回合边界刷新供应商；执行中的补充消息不能关闭当前 Query。
-            if (!activeTurnInput) (() => {
-                const fresh = loadCliSettings()
-                const key = fresh.env?.ANTHROPIC_AUTH_TOKEN || fresh.env?.ANTHROPIC_API_KEY || ''
-                const url = fresh.env?.ANTHROPIC_BASE_URL || ''
-                // provider 变更检测: 比较当前 session runtimeEnv 与最新 settings
-                const prevUrl = s.providerBaseUrl || ''
-                const prevKey = s.providerApiKey || ''
-                if ((url && url !== prevUrl) || (key && key !== prevKey)) {
-                    // 厂商/API Key 变了，使 modelChanged 路径触发 query 重建
-                    if (s.queryOpts) s.queryOpts.model = null
-                    s.runtimeEnv = s.runtimeEnv || {}
-                    s.runtimeEnv.ANTHROPIC_BASE_URL = url
-                    s.runtimeEnv.ANTHROPIC_AUTH_TOKEN = key
-                    s.providerBaseUrl = url
-                    s.providerApiKey = key
-                    log.info({sessionId: sessionId?.slice(0,8), baseUrl: url?.slice(0,40)}, '厂商配置变更，将重建 query')
-                }
-            })()
-            const cliSettingsForDecision = loadCliSettings()
-            const requestedModelMode = desktopInput && VALID_MODEL_MODES.has(msg.modelMode)
-                ? msg.modelMode
-                : (s.modelMode || (msg.model ? 'fixed' : 'auto'))
-            const taskDecision = activeTurnInput && s.taskDecision
-                ? s.taskDecision
-                : decideTask({
-                    text: desktopInput && typeof msg.taskText === 'string' && msg.taskText.trim()
-                        ? msg.taskText
-                        : msg.content,
-                    previousDecision: s.taskDecision,
-                    diffRisk: s.lastDiffRisk,
-                    attachmentEvidence: desktopInput && msg.hasAttachments === true,
-                })
-            const taskRoute = resolveTurnModelRoute({
-                activeTurn: activeTurnInput,
-                currentMode: s.modelMode,
-                currentModel: s.queryOpts?.model,
-                currentTier: s.modelTier,
-                modelMode: requestedModelMode,
-                explicitModel: requestedModelMode === 'fixed' ? (msg.model || s.queryOpts?.model) : '',
-                decision: taskDecision,
-                modelTiers: loadWfConfig().modelTiers,
-                defaultModel: cliSettingsForDecision.model || s.queryOpts?.model || MODEL,
-            })
-            if (taskRoute.blockingReason) {
-                ws.send(JSON.stringify({
-                    type: 'message_rejected',
-                    messageId: String(msg.messageId || ''),
-                    code: taskRoute.blockingReason,
-                    message: taskRoute.blockingReason === 'power_model_required'
-                        ? '当前高风险任务需要先配置 Power 模型'
-                        : '当前供应商没有可用模型',
-                }))
-                return
-            }
-            const providerBaseUrl = cliSettingsForDecision.env?.ANTHROPIC_BASE_URL || s.providerBaseUrl || ''
-            const compatibilityError = activeTurnInput
-                ? null
-                : validateProviderModel({baseUrl: providerBaseUrl, model: taskRoute.model})
-            if (compatibilityError) {
-                ws.send(JSON.stringify({
-                    type: 'message_rejected',
-                    messageId: String(msg.messageId || ''),
-                    code: compatibilityError,
-                    message: '当前 Codex Relay 不支持所选模型，请在设置中为该档位配置 Codex 模型',
-                }))
-                return
-            }
-            if (!activeTurnInput) s.providerBaseUrl = providerBaseUrl
-            const previousModelMode = s.modelMode || (s.queryOpts?.model ? 'fixed' : 'auto')
-            const inputAccepted = acceptSessionInput(s, ws._source, msg.messageId, ws._adapterUserId || null, taskDecision)
-            if (!inputAccepted.ok) {
-                ws.send(JSON.stringify(inputAccepted.duplicate
-                    ? {type: 'message_duplicate', messageId: inputAccepted.messageId}
-                    : {type: 'message_rejected', code: inputAccepted.error, queuePosition: inputAccepted.queuePosition || 0}))
-                return
-            }
-            acceptedInput = inputAccepted
-            if (!s.visibleSource && isUserSessionSource(ws._source)) {
-                const visibleSource = ws._source
-                if (!markVisibleSession(s.workDir, sessionId, s.lastSessionId, visibleSource)) {
-                    rollbackSessionInput(s, inputAccepted)
-                    acceptedInput = null
-                    ws.send(JSON.stringify({type: 'message_rejected', messageId: inputAccepted.messageId, code: 'session_visibility_persist_failed'}))
-                    return
-                }
-                s.visibleSource = visibleSource
-                if (s.lastSessionId) {
-                    broadcastDesktop(sessionId, {
-                        type: 'session_visible',
-                        sessionId,
-                        historySessionId: s.lastSessionId,
-                        source: visibleSource,
-                    })
-                }
-            }
-            if (!activeTurnInput) {
-                s.taskStartedAt = Date.now()
-                s.taskCompletedAt = 0
-                s.taskCompletion = createTaskCompletionState({phase: 'running'})
-                s.taskCompletionDecision = taskDecision
-                s.taskCompletionIdentity = createTurnIdentity(ws._source, ws._adapterUserId || null, IM_SOURCES)
-                s.taskFinalReplyText = ''
-                s.taskReviewFiles = []
-                s.taskReviewCheckpointId = null
-                s._finalReviewKey = null
-                s.taskCompletionTurnId = inputAccepted.turnId
-                s.taskCompletionTaskId = `${sessionId}:${inputAccepted.turnId}`
-                s._taskCompletionSequence = 0
-            }
-            ws.send(JSON.stringify({
-                type: 'message_accepted',
-                messageId: inputAccepted.messageId,
-                turnId: inputAccepted.turnId,
-                queuePosition: inputAccepted.queuePosition,
-            }))
-            updateTaskState(s, sessionId, {
-                status: 'running',
-                outcome: null,
-                continuationReason: null,
-                resumable: Boolean(s.lastSessionId),
-                sdkSessionId: s.lastSessionId,
-                historySessionId: s.lastSessionId,
-                taskId: s.taskCompletionTaskId || null,
-                turnId: s.taskCompletionTurnId || null,
-                sequence: s._taskCompletionSequence || 0,
-                startedAt: s.taskStartedAt || Date.now(),
-                completedAt: 0,
-                durationMs: 0,
-            })
-            if (!activeTurnInput) {
-                taskCompletionEventForClient(s, sessionId, 'task_started', {
-                    modelTier: taskDecision.modelTier,
-                    risk: taskDecision.risk,
-                })
-            }
-            s.taskDecision = taskDecision
-            s.modelTier = taskRoute.tier || null
-            broadcast(sessionId, {
-                type: 'task_decision',
-                version: taskDecision.version,
-                action: taskDecision.action,
-                complexity: taskDecision.complexity,
-                risk: taskDecision.risk,
-                modelTier: taskDecision.modelTier,
-                model: taskRoute.model,
-                modelMode: taskRoute.mode,
-                workflow: taskDecision.workflow,
-                finalReview: taskDecision.finalReview,
-                reasons: taskDecision.reasons,
-                hardTriggers: taskDecision.hardTriggers,
-                fallbackReason: taskRoute.fallbackReason,
-                inheritedFromActiveTurn: taskRoute.inheritedFromActiveTurn,
-                ts: Date.now(),
-            })
-            log.info({
-                sessionId: sessionId?.slice(0, 8),
+            const result = await taskCommands.submitTask({
+                sessionId,
                 source: ws._source,
-                textLength: msg.content?.length || 0
-            }, '← 用户消息')
-            // IM 平台注入时，把消息 echo 给桌面端，让 desktop 窗口能看到
-            if (IM_SOURCES.has(ws._source)) broadcastDesktop(sessionId, {
-                type: 'remote_user_message',
-                source: ws._source,
-                content: msg.content
+                userId: ws._adapterUserId || null,
+                messageId: msg.messageId,
+                content: msg.content,
+                taskText: msg.taskText,
+                permissionMode: msg.permissionMode,
+                thinkingLevel: msg.thinkingLevel,
+                modelMode: msg.modelMode,
+                model: msg.model,
+                modelMeta: msg.modelMeta,
+                hasAttachments: msg.hasAttachments,
+                noWorkflow: msg._noWorkflow,
             })
-            // 记录本轮来源（desktop / wechat / feishu / dingtalk）+ 清空本轮回复累积/工具计数
-            s._pendingSources = s._pendingSources || []
-            s._pendingSources.push(ws._source)
-            // 回合开始：拍「修改前」快照，本轮 result 时结算为记录点
-            const srcLabel = IM_SOURCES.has(ws._source) ? `[${ws._source}] ` : ''
-            // 意图和 Skill 路由在下方完成后再开始记录本轮。
-            // 检测权限/思考/模型设置是否变更，若变更则更新 session 并重建 query
-            const newPerm = IM_SOURCES.has(ws._source) ? 'default' : msg.permissionMode
-            const newThink = msg.thinkingLevel
-            const newModel = taskRoute.model
-            const newMM = msg.modelMeta
-            const nextProfile = taskDecision.contextProfile
-            const permChanged = newPerm && newPerm !== s.permissionMode
-            const thinkChanged = newThink && newThink !== s.thinkingLevel
-            const modelChanged = newModel && newModel !== s.queryOpts?.model
-            const modeChanged = taskRoute.mode !== previousModelMode
-            const contextChanged = nextProfile !== (s.contextProfile || 'full')
-            const sdkInputContent = resolveSdkInputContent(sessionId, s, msg.content)
-            const nextSkillRoute = routeSkills({text: sdkInputContent, workDir: s.workDir, profile: nextProfile})
-            const skillRouteChanged = JSON.stringify(nextSkillRoute) !== JSON.stringify(s.skillRoute || [])
-            beginTurn(sessionId, srcLabel + msg.content)
-            if (permChanged || thinkChanged || modelChanged || modeChanged || contextChanged || skillRouteChanged) {
-                if (permChanged) {
-                    s.permissionMode = newPerm;
-                    log.info({sessionId: sessionId?.slice(0, 8), permissionMode: newPerm}, 'permissionMode 变更')
-                }
-                if (thinkChanged) {
-                    s.thinkingLevel = newThink;
-                    log.info({sessionId: sessionId?.slice(0, 8), thinkingLevel: newThink}, 'thinkingLevel 变更')
-                }
-                if (modelChanged) {
-                    s.queryOpts.model = newModel;
-                    if (newMM) s.modelMeta = newMM;
-                    log.info({sessionId: sessionId?.slice(0, 8), model: newModel}, 'model 变更')
-                }
-                if (modeChanged) {
-                    log.info({sessionId: sessionId?.slice(0, 8), modelMode: taskRoute.mode, tier: taskRoute.tier}, '模型模式变更')
-                }
-                if (contextChanged) {
-                    s.contextProfile = nextProfile
-                    log.info({sessionId: sessionId?.slice(0, 8), contextProfile: nextProfile}, '上下文 profile 已更新')
-                }
-                if (skillRouteChanged) {
-                    s.skillRoute = nextSkillRoute
-                    log.info({sessionId: sessionId?.slice(0, 8), skills: nextSkillRoute}, 'Skill 路由已更新')
-                }
-                await closeSessionRuntime(s, {sessionId, reason: 'runtime_settings_changed'})
-                s.query = null;
-                s.pushStream = null;
-                // 失效重建状态: 若 _rebuildPromise 残留，后续消息进 if(s._rebuildPromise)
-                //   会把消息追加到旧 pending 却无人消费。设置变更应触发新重建，清旧状态。
-                s._rebuildPromise = null
-                s._rebuildId = null
-                // 仅当有实际 conversation 时才记 lastSessionId 用于 resume
-                // 模型首次变更时 SDK 还没创建 conversation，设了会导致 resume 到不存在的会话
-                if (s._hasConversation) s.lastSessionId = s.lastSessionId || sessionId
-            }
-            s.modelMode = taskRoute.mode
-            // query 为 null（被中止过或设置变更重建）→ 懒重建，resume 续接原会话
-            if (!s.query) {
-                // 防并发重建：不同 WS 连接可能同时进入此处，用 _rebuildPromise 互斥
-                if (s._rebuildPromise) {
-                    if (!s._pendingMessages) s._pendingMessages = []
-                    s._pendingMessages.push(sdkInputContent)
-                    if (!msg._noWorkflow && !activeTurnInput) autoTriggerWorkflow(sessionId, msg.content, taskDecision).catch(e => {
-                        log.warn({err: e, sessionId: sessionId?.slice(0, 8)}, 'autoTriggerWorkflow 异常')
-                    })
-                    acceptedInput = null
-                    return
-                }
-                s._pendingMessages = [sdkInputContent]
-                // rebuild 代际 ID: stop_generation 或新 rebuild 启动时旧 rebuild 的 finally
-                //   见此 ID 不匹配 → 不消费 pending（防止旧 rebuild 覆盖新 rebuild 的积压）
-                const myRebuildId = Symbol('rebuild')
-                s._rebuildId = myRebuildId
-                s._rebuildPromise = (async () => {
-                    const cliS = loadCliSettings()
-                    const rebuildPushStream = new PushStream()
-                    s.pushStream = rebuildPushStream
-                    const bodyOverride = {
-                        resume: s.hasUserTurns ? (s.lastSessionId || undefined) : undefined,
-                        model: s.queryOpts?.model,
-                        modelMode: s.modelMode || 'fixed',
-                        taskDecision: s.taskDecision || null,
-                        permissionMode: s.permissionMode,
-                        thinkingLevel: s.thinkingLevel,
-                        contextProfile: s.contextProfile || 'full',
-                        skillRoute: s.skillRoute || [],
-                    }
-                    // 厂商变更检测: session runtimeEnv 已刷新，携带最新 baseUrl/apiKey 避免回退到 cliS.env
-                    if (s.providerBaseUrl) bodyOverride.baseUrl = s.providerBaseUrl
-                    if (s.providerApiKey) bodyOverride.apiKey = s.providerApiKey
-                    const opts = await makeQueryOptions(bodyOverride, s.workDir, cliS, {}, sessionId)
-                    // stop 或更新的 rebuild 已使本代际失效，禁止重新创建后台 query。
-                    if (s._rebuildId !== myRebuildId || s.pushStream !== rebuildPushStream) return
-                    if (bodyOverride.resume) opts.resume = bodyOverride.resume
-                    s.query = query({prompt: rebuildPushStream, options: opts})
-                    s.runtimeEnv = opts.runtimeEnv  // 模型变更重建后刷新 runtimeEnv
-                    s.providerBaseUrl = opts.bridgeProviderBaseUrl || s.providerBaseUrl
-                    s.providerApiKey = opts.bridgeProviderApiKey || s.providerApiKey
-                    s.queryOpts = opts
-                    startStreamPump(sessionId)
-
-                    const pending = s._pendingMessages || []
-                    s._pendingMessages = null
-                    for (const content of pending) {
-                        rebuildPushStream.push({
-                            type: 'user', session_id: sessionId,
-                            message: {role: 'user', content: [{type: 'text', text: content}]},
-                            parent_tool_use_id: null
-                        })
-                        s.hasUserTurns = true
-                    }
-                    s._rebuildPromise = null
-                    s._rebuildId = null
-                })().catch(e => {
-                    if (s._rebuildId !== myRebuildId) {
-                        log.debug({err: e, sessionId: sessionId?.slice(0, 8)}, '已过期 rebuild 失败，忽略其状态清理')
-                        return
-                    }
-                    log.error({err: e, sessionId: sessionId?.slice(0, 8)}, 'rebuild 失败')
-                    s._rebuildPromise = null
-                    s._rebuildId = null
-                    s._pendingMessages = null
-                    failPendingSessionInputs(sessionId, s, e)
-                })
-                if (!msg._noWorkflow && !activeTurnInput) autoTriggerWorkflow(sessionId, msg.content, taskDecision).catch(e => {
-                    log.warn({err: e, sessionId: sessionId?.slice(0, 8)}, 'autoTriggerWorkflow 异常')
-                })
-                acceptedInput = null
-            } else {
-                s.pushStream.push({
-                    type: 'user',
-                    session_id: sessionId,
-                        message: {role: 'user', content: [{type: 'text', text: sdkInputContent}]},
-                    parent_tool_use_id: null
-                })
-                s.hasUserTurns = true
-                acceptedInput = null
-                if (!msg._noWorkflow && !activeTurnInput) {
-                    autoTriggerWorkflow(sessionId, msg.content, taskDecision).catch(e => {
-                        log.warn({err: e, sessionId: sessionId?.slice(0, 8)}, 'autoTriggerWorkflow 异常')
-                    })
-                }
-            }
+            if (ws.readyState === 1) ws.send(JSON.stringify(result))
         }
         })().catch(error => {
-            if (acceptedInput && rollbackSessionInput(s, acceptedInput)) {
-                const sourceIndex = s._pendingSources?.lastIndexOf(ws._source) ?? -1
-                if (sourceIndex >= 0) s._pendingSources.splice(sourceIndex, 1)
-            }
             log.error({err: error, sessionId: sessionId?.slice(0, 8), source: ws._source}, 'WebSocket 消息处理异常')
             if (ws.readyState === 1) {
                 try {
@@ -8190,6 +8559,7 @@ async function shutdownGateway(reason, exitCode = 0) {
         }
     }
     for (const [sessionId, session] of sessions) {
+        finishImProgressReporters(sessionId)
         for (const requestId of [...(session.pending?.keys() || [])]) {
             settlePending(sessionId, requestId, {behavior: 'deny', message: 'Gateway 正在关闭', interrupt: true}, 'shutdown')
         }
@@ -8202,7 +8572,13 @@ async function shutdownGateway(reason, exitCode = 0) {
         } catch (error) {
             log.debug({err: error, sessionId: sessionId?.slice(0, 8)}, '关闭 Session query 失败')
         }
+        appendSessionEvent(session, 'runtime/shutdown', {reason: String(reason || 'shutdown').slice(0, 120)})
+        session.eventJournal?.close()
     }
+    taskCommands.dispose()
+    closers.push(providerRegistry.disposeAll().catch(error => {
+        log.warn({err: error}, 'Agent Provider Registry 关闭不完整')
+    }))
     try {
         const closing = stopDeepSeekProxy()
         if (closing && typeof closing.then === 'function') closers.push(closing)
@@ -8357,6 +8733,7 @@ function cleanupOrphanSessionDirs() {
                     if (entry.endsWith('.jsonl') || entry.startsWith('.trash-') || entry === 'bridge-session-map.json'
                         || entry === 'bridge-session-visibility.json'
                         || entry === 'bridge-snapshot' || entry === 'bridge-checkpoints' || entry === 'bridge-task-state'
+                        || entry === 'bridge-session-events'
                         || entry === 'bridge-deleted-sessions.json' || entry === 'bridge-scheduled-tasks.json'
                         || entry === 'bridge-workflow-history.jsonl' || entry === 'bridge-config.json') continue
                     const entryPath = join(projectDir, entry)
@@ -8657,6 +9034,7 @@ async function deleteSessionFiles(sessionId, relatedSessionIds = []) {
                 join(sdkDir, 'bridge-snapshot', targetId + '.json'),
                 join(sdkDir, 'bridge-checkpoints', targetId + '.json'),
                 join(sdkDir, 'bridge-task-state', targetId + '.json'),
+                join(sdkDir, 'bridge-session-events', targetId + '.jsonl'),
             ]
             for (const artifact of artifacts) {
                 if (!existsSync(artifact)) continue

@@ -26,6 +26,14 @@ Incomplete: None
 | 8 统一任务决策 | 现有模型和 Context Profile 测试通过 | 新增纯函数 `TaskDecision`，旧分类器改为适配层 | 决策表测试覆盖硬风险和用户约束 | 同一输入产生不稳定结果 | 保留旧函数入口，停用新决策调用即可回滚 |
 | 9 自动模型模式 | 决策事件和模型档位校验通过 | 新客户端发送 `modelMode:auto`，Gateway 在回合边界选择模型 | 自动与固定模式契约测试；不会在执行中切换 | 重复执行消息或恢复到错误会话 | UI 默认切回 fixed；旧客户端路径不变 |
 | 10 Workflow 与审查收敛 | 自动模型模式稳定 | Workflow/Agent 消费统一决策；实施任务由主会话唯一写入；高风险成功回合基于真实 checkpoint 使用 Power 只读复核 | Workflow 模型继承、重复写入抑制和审查升级测试 | Power 不可用却错误报告成功，或主会话与 Workflow 并行写入 | 禁用自动 Workflow；主会话与旧手工 Workflow 保持可用 |
+| 11 TaskCommand 收口 | 旧 WebSocket 协议测试通过 | desktop 成为薄适配器，三个 IM 改用进程内提交/观察服务 | TaskCommand、IM runner、turn routing 和 queue 测试 | IM 消息重复执行或跨用户串台 | 保留旧协议形状，回退 adapter 调用但不迁移持久数据 |
+| 12 Session Event Journal | task-state 恢复测试通过 | 新增不含正文的逐 Session JSONL；accepted 关键写入后才 ACK | 连续序号、半行、中间损坏、容量和敏感字段测试 | accepted 未落盘却返回成功，或 journal 出现正文/凭据 | 停止读取 journal，回退 `bridge-task-state`；保留隔离文件供诊断 |
+| 13 Agent 能力与 Provider | SDK query 启动点已盘点 | 注册 `agent/claude-sdk`，主/定时/重建/Workflow 统一 Provider handle | 能力缺失前置失败、重复注册、disposer 隔离和接线守卫测试 | Provider 绕过能力校验或 shutdown 泄漏常驻资源 | 将调用恢复到 Claude Provider 适配器；Registry 不持有 transcript 数据 |
+| 14 稳定观察 | Gateway/前端全量门禁通过 | desktop、停止、重连、journal crash 和真实 IM smoke | runtime 日志、可见 UI 状态和端到端通知 | 任务状态分裂、通知提前或恢复重复执行 | 保留旧协议和 task-state 兼容窗口，按入口逐项关闭新接线 |
+| 15 Gateway 叶子模块归类 | 既有 Gateway/desktop 测试全绿 | 迁移 `shared/`、`security/`、`providers/`，只调整内部 import | 全量测试、所有 MJS 语法检查、入口导入 smoke | 任一 Provider 或启动导入失败 | 将对应目录文件移回根目录并恢复相对 import；不涉及数据回滚 |
+| 16 Gateway 领域模块归类 | 阶段 15 全绿 | 迁移 `sessions/`、`projects/`、`tasks/`、`context/`、`tools/` | 对应单测与全量门禁；持久化路径断言不变 | Session 恢复、journal 或任务门禁契约变化 | 按目录移回；现有 transcript/journal 不迁移、不删除 |
+| 17 Gateway 边界模块归类 | 阶段 16 全绿 | 迁移 `im/`、`agents/`、`workflows/`，保留根 `index.mjs` | 三个平台接线守卫、Workflow/Agent 测试和打包构建 | IM 重复提交、Workflow 状态或 Electron 启动路径变化 | 按目录移回，继续使用原根入口和原协议 |
+| 18 组合根瘦身 | 目录归类稳定且有 runtime smoke | 从 `index.mjs` 依次提取 HTTP router、Session coordinator、SDK stream adapter 和 project repository | 每个提取步骤独立测试；根入口只负责配置、组合、启动和 shutdown | 提取后出现共享可变状态分叉或生命周期重复 | 保留上一阶段 coordinator；逐个恢复调用，不批量回滚数据 |
 
 ## 兼容、数据与删除
 
@@ -38,3 +46,8 @@ Incomplete: None
 - `modelTiers` 保持原 JSON 结构；新增 `modelMode` 默认只影响新桌面端。旧客户端显式 `model` 继续视为 fixed，不需要批量迁移会话。
 - 自动路由失败不能重复提交已经接受的用户消息；切换失败返回不完整/可重试状态，由用户决定重发。
 - 回滚自动模式只需让桌面端恢复发送 fixed；不删除决策日志、transcript 或已完成任务结果。
+- `bridge-session-events` 是 additive sidecar；迁移期始终保留 `bridge-task-state` 双写和旧 WebSocket 请求形状。只有 crash/IM runtime 验收稳定后才讨论移除兼容路径。
+- journal 损坏文件只隔离不自动删除；显式删除 Session 时与 snapshot、checkpoint、task-state 一并清理。
+- Provider 回滚不涉及数据迁移；任何第二 Provider 上线前必须补齐六项能力声明、释放测试和协议兼容证据。
+- Gateway 目录迁移只改变内部模块位置，不修改 Electron `extraResources` 递归打包规则、`node gateway/index.mjs` 启动契约、HTTP/WebSocket 接口、配置键或持久化文件位置。
+- 历史 implementation plan 保留旧路径作为当时证据；README、当前架构文档、静态 wiring 测试和有效源码引用随迁移同步更新。

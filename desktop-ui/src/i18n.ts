@@ -352,7 +352,7 @@ const messages: Record<Locale, Record<string, string>> = {
     'im.noPlatform': '暂无 IM 平台配置',
     'im.noteTitle': '绑定说明',
     'im.note1': 'IM 连接通过 ~/.claude/adapters.json 管理。微信使用 iLink Bot API，飞书/钉钉需在开放平台创建应用获取凭证。',
-    'im.note2': '当前微信适配器已集成在 Gateway 中（wechat.mjs），启动 Gateway 后自动开始轮询微信消息。',
+    'im.note2': '当前微信适配器已集成在 Gateway 中（im/wechat.mjs），启动 Gateway 后自动开始轮询微信消息。',
 
     // ────────────────────────────────────────────────────────────────────────
     // 工作区侧栏（ws. 前缀的多个子区域）
@@ -818,7 +818,7 @@ const messages: Record<Locale, Record<string, string>> = {
     'im.noPlatform': 'No IM platform configured',
     'im.noteTitle': 'Binding notes',
     'im.note1': 'IM connections are managed in ~/.claude/adapters.json. WeChat uses the iLink Bot API; Feishu/DingTalk need an app created on their open platform.',
-    'im.note2': 'The WeChat adapter is built into the Gateway (wechat.mjs) and starts polling automatically once the Gateway runs.',
+    'im.note2': 'The WeChat adapter is built into the Gateway (im/wechat.mjs) and starts polling automatically once the Gateway runs.',
 
     // ── Workspace sidebar ──
     'ws.searchPlaceholder': 'Search projects...',

@@ -1,0 +1,61 @@
+import {initialSessionIdentity} from './session-create-mode.mjs'
+import {createTaskCompletionState} from '../tasks/task-completion.mjs'
+import {createTaskStatePatch} from '../tasks/task-state.mjs'
+import {createTaskWorkflowGate} from '../tasks/task-workflow-gate.mjs'
+
+export function createSessionRuntime({
+    query = null,
+    pushStream = null,
+    workDir,
+    opts = {},
+    identity = null,
+    modelMode = null,
+    thinkingLevel = 'auto',
+    agentName = 'main',
+    depth = 0,
+    extra = {},
+} = {}) {
+    return {
+        query,
+        pushStream,
+        workDir,
+        clients: new Set(),
+        createdAt: Date.now(),
+        pending: new Map(),
+        permissionMode: opts.permissionMode || 'default',
+        thinkingLevel,
+        modelMode: modelMode || opts.bridgeModelMode || 'auto',
+        providerBaseUrl: opts.bridgeProviderBaseUrl || '',
+        providerApiKey: opts.bridgeProviderApiKey || '',
+        mirrors: {wechat: false, feishu: false, dingtalk: false},
+        queryOpts: opts,
+        runtimeEnv: opts.runtimeEnv,
+        contextProfile: opts.bridgeContextProfile || 'full',
+        taskDecision: opts.bridgeTaskDecision || null,
+        modelTier: opts.bridgeModelTier || null,
+        taskCompletion: createTaskCompletionState(),
+        taskState: createTaskStatePatch({
+            status: 'idle', outcome: null, continuationReason: null, resumable: false,
+            sdkSessionId: identity, historySessionId: identity,
+        }),
+        eventJournal: null,
+        _taskWorkflowGate: createTaskWorkflowGate(),
+        skillRoute: opts.bridgeSkillRoute || [],
+        ...initialSessionIdentity(identity),
+        forkedFrom: null,
+        parentSessionId: null,
+        agentName,
+        taskId: null,
+        children: new Set(),
+        turnText: '',
+        turnToolCount: 0,
+        _pendingSources: [],
+        _pendingTurns: [],
+        _pendingInputs: [],
+        _inputIds: new Map(),
+        activeTurnId: null,
+        activeTurnIdentity: null,
+        depth,
+        ...extra,
+    }
+}

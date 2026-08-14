@@ -1,7 +1,7 @@
 {
   "name": "desktop-ui",
   "private": true,
-  "version": "1.4.0",
+  "version": "1.4.1",
   "bridgeUpdateTrust": {
     "signed": false
   },
@@ -73,7 +73,7 @@
           "!bridge-logs/**",
           "!**/*.log",
           "!**/*.test.mjs",
-          "!test.mjs",
+          "!smoke/**",
           "!coverage/**",
           "!builtin-skills/**",
           "!.gitignore",

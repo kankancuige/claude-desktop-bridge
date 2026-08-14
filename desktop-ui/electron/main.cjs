@@ -51,6 +51,28 @@ app.on('second-instance', () => {
 let _logQueue = []
 let _logDraining = false
 const MAX_LOG_QUEUE = 2000  // 日志队列上限，防止异常刷屏时内存无限增长
+const MAX_LOG_BYTES = 10 * 1024 * 1024
+const MAX_LOG_FILES = 7
+let _logDay = ''
+
+function rotateGatewayLogIfNeeded(incomingBytes = 0) {
+  if (!GATEWAY_LOG) return
+  const today = new Date().toISOString().slice(0, 10)
+  let currentSize = 0
+  try { currentSize = fs.statSync(GATEWAY_LOG).size } catch (error) {
+    if (error?.code !== 'ENOENT') console.error('[main] gateway 日志状态读取失败:', error.message)
+  }
+  if (_logDay && _logDay !== today || currentSize + incomingBytes > MAX_LOG_BYTES) {
+    for (let index = MAX_LOG_FILES - 1; index >= 1; index--) {
+      const source = `${GATEWAY_LOG}.${index}`
+      const target = `${GATEWAY_LOG}.${index + 1}`
+      try { if (fs.existsSync(source)) fs.renameSync(source, target) } catch (error) { console.error('[main] gateway 日志轮转失败:', error.message) }
+    }
+    try { if (fs.existsSync(GATEWAY_LOG)) fs.renameSync(GATEWAY_LOG, `${GATEWAY_LOG}.1`) } catch (error) { console.error('[main] gateway 日志归档失败:', error.message) }
+  }
+  _logDay = today
+}
+
 function logToFile(msg) {
   if (!GATEWAY_LOG) return
   const line = `[${new Date().toISOString()}] ${msg}\n`
@@ -65,6 +87,7 @@ function drainLogQueue() {
     if (_logQueue.length === 0) { _logDraining = false; return }
     const batch = _logQueue
     _logQueue = []
+    rotateGatewayLogIfNeeded(Buffer.byteLength(batch.join('')))
     fs.appendFile(GATEWAY_LOG, batch.join(''), (err) => {
       if (err) console.error('[main] gateway 日志写入失败:', err.message)
       setImmediate(next)

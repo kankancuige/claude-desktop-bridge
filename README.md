@@ -77,7 +77,7 @@
        │ (HTTP 长轮询)    │ (WS 长连接)       │ (Stream 模式)
 ┌──────▼──────┐  ┌────────▼──────┐  ┌────────▼──────┐
 │  WeChat 适配器│  │  Feishu 适配器 │  │ DingTalk 适配器│
-│  (wechat.mjs)│  │  (feishu.mjs) │  │(dingtalk.mjs) │
+│(im/wechat.mjs)│  │(im/feishu.mjs)│  │(im/dingtalk.mjs)│
 └──────┬──────┘  └───────┬──────┘  └───────┬──────┘
        │                 │                 │
 ┌──────▼──────┐  ┌───────▼──────┐  ┌───────▼──────┐
@@ -88,9 +88,9 @@
 ### 数据流
 
 ```
-用户消息（桌面/微信/飞书/钉钉）
-  → Gateway WebSocket 注入
-  → PushStream → SDK query()
+用户消息（桌面 WebSocket / 微信 / 飞书 / 钉钉）
+  → 协议适配器 → TaskCommandService（校验、去重、排队、路由）
+  → Session PushStream → SDK query()
   → Claude Code CLI (或 DeepSeek/OpenAI 等兼容 API)
   → SDK 流式响应 → stream_event → broadcast (WebSocket)
   → 桌面端实时渲染 + IM 平台 mirror 同步
@@ -185,18 +185,22 @@ SDK 触发工具调用 → canUseTool 回调 → 广播确认请求
 claude-desktop-bridge/
 ├── .github/workflows/build.yml    # GitHub Actions 三平台自动构建
 ├── gateway/                        # Node.js Gateway 后端
-│   ├── index.mjs                   # 主入口: HTTP + WebSocket + session 管理
-│   ├── logger.mjs                  # 统一日志模块 (pino + pino-roll)
-│   ├── wechat.mjs                  # 微信适配器 (iLink Bot 长轮询)
-│   ├── feishu.mjs                  # 飞书适配器 (WS 长连接)
-│   ├── dingtalk.mjs                # 钉钉适配器 (Stream 模式)
-│   ├── im-commands.mjs             # IM 自定义命令引擎 (9条远程控制命令)
-│   ├── workflow-runner.mjs         # Workflow 多 Agent 编排与父子进程生命周期
-│   ├── workflow-child.mjs          # Workflow 子进程与受限 VM context
-│   ├── deepseek-proxy.mjs          # DeepSeek 兼容代理 (thinking/reasoning_content)
-│   ├── project-cache.mjs           # 项目结构缓存 (tree-sitter AST + 依赖图)
-│   ├── test.mjs                    # 手动集成测试脚本
+│   ├── index.mjs                   # 唯一组合根: 配置、HTTP/WS、启动和 shutdown
+│   ├── shared/                     # 日志、内部客户端、文本等基础能力
+│   ├── security/                   # 路径、URL、WebSocket 与敏感数据边界
+│   ├── providers/                  # Provider registry、协议转换和上游代理
+│   ├── sessions/                   # Session runtime、身份、历史、journal 和停止
+│   ├── projects/                   # 项目缓存、transcript 定位和跨会话接力
+│   ├── tasks/                      # TaskCommand、决策、状态、生命周期和完成门禁
+│   ├── agents/                     # Agent 能力、元数据、工具生命周期和 Skill 路由
+│   ├── workflows/                  # Workflow 编排、子进程与最终审查
+│   ├── im/                         # 微信/飞书/钉钉、IM 命令、进度和通知
+│   ├── context/                    # Bridge 规则、上下文档位、压缩和用户偏好
+│   ├── tools/                      # 附件、上传和 RTK 支持
+│   ├── smoke/                      # 不随应用打包的人工运行验证脚本
+│   │   └── manual-gateway-smoke.mjs
 │   ├── builtin-skills/caveman/     # 内置 Caveman 压缩技能
+│   ├── README.md                   # Gateway 模块职责与依赖方向
 │   ├── package.json                # npm 依赖
 │   ├── .env                        # 环境变量（不提交 Git）
 │   └── .env.example                # 环境变量模板
@@ -410,7 +414,7 @@ Code → Actions → 最新一次 Workflow run → Artifacts
 
 ### 项目结构缓存
 
-Gateway 内置项目结构分析引擎（`project-cache.mjs`）：
+Gateway 内置项目结构分析引擎（`gateway/projects/project-cache.mjs`）：
 
 - **13 语言 AST 解析**：JS/TS/Vue/Python/Java/Go/C#/Rust/C/C++/Ruby/PHP/Kotlin/Swift，基于 tree-sitter + 正则回退
 - **依赖图构建**：提取 import/export，计算文件间依赖边 + 置信度
@@ -538,7 +542,7 @@ Gateway 每次启动时为每个已连接的平台生成一个 6 位**配对码*
 | **定时任务** | Cron 定时任务 CRUD，可视化频率选择（每天/工作日/每周/每月/自定义），手动触发 |
 | **开源** | Caveman 压缩配置 / RTK 压缩配置 / 桌面宠物选择 |
 
-Bridge 会话使用仓库内的 `gateway/BRIDGE_RULES.md` 作为长期规则。Claude Agent SDK 以
+Bridge 会话使用仓库内的 `gateway/context/BRIDGE_RULES.md` 作为长期规则。Claude Agent SDK 以
 `settingSources: []` 运行，不隐式加载用户或项目目录的 `CLAUDE.md`、`AGENTS.md` 和
 `.claude/settings*.json`。供应商、API Key、MCP、Skills 与 Agents 仍由 Gateway 配置层按需读取并显式传入；
 简单问答不加载这些扩展，执行型任务才升级为完整上下文。

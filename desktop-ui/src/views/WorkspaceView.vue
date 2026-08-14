@@ -65,12 +65,15 @@ import {
   taskActivityFreshness,
   type TaskActivityState,
 } from '../task-activity'
+import {isTaskBusy} from '../task-busy'
+import {createSessionLifecycleState, reduceSessionLifecycle, type SessionLifecycleState} from '../task-lifecycle'
 import {
   buildContinuationPrompt,
   normalizeTaskResult,
   type ContinuationReason,
 } from '../task-result-outcome'
 import DOMPurify from 'dompurify'
+import TaskActivityTimeline from '../components/TaskActivityTimeline.vue'
 const PhaserPet = defineAsyncComponent(() => import('./PhaserPet.vue'))
 const GlobalToast = defineAsyncComponent(() => import('../components/GlobalToast.vue'))
 const SidebarLeft = defineAsyncComponent(() => import('../components/SidebarLeft.vue'))
@@ -102,7 +105,7 @@ interface ToolUse {
 
 // 消息数据结构：涵盖所有消息角色（用户/AI/思考/系统/错误）
 interface Message {
-  role: 'user' | 'assistant' | 'thinking' | 'system' | 'error'
+  role: 'user' | 'assistant' | 'thinking' | 'system' | 'error' | 'activity'
   text: string
   time: number
   /** 思考块展开后的完整文本内容 */
@@ -136,6 +139,10 @@ interface Message {
     originalTask: string
     durationMs?: number
   }
+  /** 当前任务的结构化执行轨迹；跟随消息列表进入标签页快照。 */
+  activity?: TaskActivityState
+  /** activity 是否已放到对应用户消息之后，用于区分 IM 首条任务和后续补充指令。 */
+  activityUserLinked?: boolean
 }
 
 interface PersistedTaskState {
@@ -150,6 +157,14 @@ interface PersistedTaskState {
   startedAt?: number
   completedAt?: number
   durationMs?: number
+  finalReplyText?: string
+  finalReplyAvailable?: boolean
+  notifications?: Partial<Record<'wechat' | 'feishu' | 'dingtalk', {
+    state: 'pending' | 'sent' | 'failed' | 'dead'
+    notificationId: string
+    lastError: string
+    updatedAt: number
+  }>>
   review?: {
     round: number
     tier: 'balanced' | 'power' | null
@@ -425,27 +440,36 @@ async function confirmCloseTab() {
   const tabSessionId = tab?.id === activeTabId.value ? sessionId.value : tab?.state.sessionId
   if (tabSessionId && tabStatus === 'thinking') {
     const stopped = await requestStopSession(tabSessionId)
-    if (!stopped) return
+    if (!stopped.ok) return
   }
   doCloseTab(tabId)
   pendingCloseTabId.value = null
 }
 
-async function requestStopSession(sid: string): Promise<boolean> {
+interface StopSessionResult {
+  ok: boolean
+  scope: 'primary' | 'workflow' | 'none'
+}
+
+async function requestStopSession(sid: string): Promise<StopSessionResult> {
   try {
     const response = await apiFetch(`${GW}/api/sessions/${encodeURIComponent(sid)}/stop`, {method: 'POST'})
-    if (response.ok) return true
-    if (response.status === 404) return true
+    if (response.ok) {
+      const body = await response.json().catch(() => ({}))
+      const scope = body?.scope === 'primary' ? 'primary' : body?.scope === 'workflow' ? 'workflow' : 'none'
+      return {ok: true, scope}
+    }
+    if (response.status === 404) return {ok: true, scope: 'none'}
     let message = `停止会话失败（HTTP ${response.status}）`
     try {
       const body = await response.json()
       if (body?.error) message = String(body.error)
     } catch (error) { console.debug('读取停止会话错误响应失败', error) }
     showToast(message, 6000)
-    return false
+    return {ok: false, scope: 'none'}
   } catch (error: any) {
     showToast(`停止会话失败：${error?.message || 'Gateway 不可用'}`, 6000)
-    return false
+    return {ok: false, scope: 'none'}
   }
 }
 
@@ -566,6 +590,7 @@ const status = ref('idle')
 const tabTaskState = ref<PersistedTaskState | null>(null)
 const parentTaskUi = ref<ParentTaskUiState>(createParentTaskUiState())
 const taskActivity = ref<TaskActivityState>(createTaskActivityState())
+const sessionLifecycle = ref<SessionLifecycleState>(createSessionLifecycleState())
 const activityClock = ref(Date.now())
 let activityClockTimer: ReturnType<typeof setInterval> | null = null
 const taskActivityFresh = computed(() => taskActivityFreshness(taskActivity.value, activityClock.value))
@@ -598,6 +623,46 @@ let _pendingResultMessage: Message | null = null
 /** 当前会话的消息列表（按时间序追加） */
 const messages = ref<Message[]>([])
 
+function currentActivityMessage(): Message | null {
+  return [...messages.value].reverse().find(message => message.role === 'activity' && message.activity) || null
+}
+
+function syncTaskActivityMessage({forceNew = false, placeAfterLatestUser = false} = {}) {
+  if (!taskActivity.value.entries.length) return
+  let message = forceNew ? null : currentActivityMessage()
+  if (!message || (!message.activity?.running && taskActivity.value.running && message.activity?.startedAt !== taskActivity.value.startedAt)) {
+    message = {role: 'activity', text: '', time: taskActivity.value.startedAt || Date.now(), activity: taskActivity.value}
+    messages.value.push(message)
+  } else {
+    message.activity = taskActivity.value
+  }
+
+  if (!placeAfterLatestUser) return
+  const messageIndex = messages.value.indexOf(message)
+  const userIndex = messages.value.findLastIndex(item => item.role === 'user')
+  if (messageIndex >= 0 && userIndex >= 0 && messageIndex < userIndex) {
+    messages.value.splice(messageIndex, 1)
+    const nextUserIndex = messages.value.findLastIndex(item => item.role === 'user')
+    messages.value.splice(nextUserIndex + 1, 0, message)
+  }
+  if (userIndex >= 0) message.activityUserLinked = true
+}
+
+function applyTaskActivityEvent(event: any, options: {forceNew?: boolean; placeAfterLatestUser?: boolean} = {}) {
+  const wasRunning = taskActivity.value.running
+  taskActivity.value = reduceTaskActivity(taskActivity.value, event)
+  syncTaskActivityMessage({
+    forceNew: options.forceNew === true || (event?.type === 'task_started' && !wasRunning),
+    placeAfterLatestUser: options.placeAfterLatestUser === true,
+  })
+}
+
+function setActivityExpanded(message: Message, expanded: boolean) {
+  if (!message.activity) return
+  message.activity.expanded = expanded
+  if (message.activity.startedAt === taskActivity.value.startedAt) taskActivity.value.expanded = expanded
+}
+
 // ── 多会话标签页 ──
 /** 标签页状态快照——所有需要在切换时保存/恢复的运行时状态 */
 interface TabState {
@@ -618,6 +683,7 @@ interface TabState {
   pendingTools: any[]
   pendingPermission: any
   pendingChoice: any
+  preferenceSuggestions: any[]
   thinkingLevel: string
   permissionMode: string
   modelMode: ModelMode
@@ -628,10 +694,10 @@ interface TabState {
   turnThinkingText: string
   lastUserMessage: string
   mirrorState: Record<string, boolean>
-  turnCompleted: boolean
   taskState: PersistedTaskState | null
   parentTaskUi: ParentTaskUiState
   taskActivity: TaskActivityState
+  sessionLifecycle: SessionLifecycleState
   pendingResultMessage: Message | null
 }
 
@@ -655,6 +721,7 @@ function initialTabState(): TabState {
     pendingTools: [],
     pendingPermission: null,
     pendingChoice: null,
+    preferenceSuggestions: [],
     thinkingLevel: 'auto',
     permissionMode: 'default',
     modelMode: 'auto',
@@ -665,10 +732,10 @@ function initialTabState(): TabState {
     turnThinkingText: '',
     lastUserMessage: '',
     mirrorState: { wechat: false, feishu: false, dingtalk: false },
-    turnCompleted: false,
     taskState: null,
     parentTaskUi: createParentTaskUiState(),
     taskActivity: createTaskActivityState(),
+    sessionLifecycle: createSessionLifecycleState(),
     pendingResultMessage: null,
   }
 }
@@ -693,6 +760,7 @@ function snapshotTabState(): TabState {
     pendingTools: [...pendingTools.value],
     pendingPermission: pendingPermission.value,
     pendingChoice: pendingChoice.value,
+    preferenceSuggestions: [...preferenceSuggestions.value],
     thinkingLevel: thinkingLevel.value,
     permissionMode: permissionMode.value,
     modelMode: modelMode.value,
@@ -703,10 +771,10 @@ function snapshotTabState(): TabState {
     turnThinkingText,
     lastUserMessage,
     mirrorState: { ...mirrorState.value },
-    turnCompleted: _turnCompleted,
     taskState: tabTaskState.value,
     parentTaskUi: {...parentTaskUi.value},
     taskActivity: {...taskActivity.value},
+    sessionLifecycle: {...sessionLifecycle.value},
     pendingResultMessage: _pendingResultMessage ? {..._pendingResultMessage} : null,
   }
 }
@@ -730,6 +798,7 @@ function restoreTabState(s: TabState) {
   pendingTools.value = s.pendingTools
   pendingPermission.value = s.pendingPermission
   pendingChoice.value = s.pendingChoice
+  preferenceSuggestions.value = Array.isArray(s.preferenceSuggestions) ? s.preferenceSuggestions : []
   thinkingLevel.value = s.thinkingLevel
   permissionMode.value = s.permissionMode
   modelMode.value = s.modelMode === 'fixed' ? 'fixed' : 'auto'
@@ -740,10 +809,10 @@ function restoreTabState(s: TabState) {
   turnThinkingText = s.turnThinkingText
   lastUserMessage = s.lastUserMessage
   mirrorState.value = { ...s.mirrorState }
-  _turnCompleted = s.turnCompleted
   tabTaskState.value = s.taskState || null
   parentTaskUi.value = createParentTaskUiState(s.parentTaskUi)
   taskActivity.value = createTaskActivityState(s.taskActivity)
+  sessionLifecycle.value = createSessionLifecycleState(s.sessionLifecycle)
   _pendingResultMessage = s.pendingResultMessage ? {...s.pendingResultMessage} : null
 }
 
@@ -1567,6 +1636,7 @@ interface PendingChoice {
 
 const pendingPermission = ref<PendingPermission | null>(null)
 const pendingChoice = ref<PendingChoice | null>(null)
+const preferenceSuggestions = ref<any[]>([])
 
 // ── Agent 运行记录（内联卡片用，统一 native Task agent 和 workflow agent）──
 interface AgentRun {
@@ -2485,6 +2555,7 @@ async function loadHistory(encodedDir: string, sId: string, mode: 'append' | 're
           time: new Date(m.time).getTime(),
           thinkingContent: m.thinkingContent,
           tools: Array.isArray(m.tools) ? m.tools : undefined,
+          attachments: Array.isArray(m.attachments) ? m.attachments : undefined,
           expanded: m.role === 'thinking' ? false : undefined,
         })
       }
@@ -2715,8 +2786,46 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         if (_saved) { try { restoreTabState(_saved!) } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) } }
         return
       }
-      taskActivity.value = reduceTaskActivity(taskActivity.value, msg)
+      applyTaskActivityEvent(msg)
+      const lifecycleBeforeEvent = sessionLifecycle.value
+      sessionLifecycle.value = reduceSessionLifecycle(sessionLifecycle.value, msg)
       switch (msg.type) {
+      case 'session_lifecycle_snapshot': {
+        if (msg.task && typeof msg.task === 'object') {
+          tabTaskState.value = msg.task as PersistedTaskState
+          const persistedStatus = String(msg.task.status || 'idle')
+          parentTaskUi.value = createParentTaskUiState({
+            phase: (['running', 'reviewing', 'changes_required', 'fixing', 'review_paused', 'succeeded', 'incomplete', 'failed'].includes(persistedStatus)
+              ? persistedStatus
+              : 'idle') as ParentTaskUiState['phase'],
+            completionShown: persistedStatus === 'succeeded',
+            detail: String(msg.task.detail || ''),
+            taskId: String(msg.task.taskId || ''),
+            sequence: Number(msg.sequence || msg.task.sequence || 0),
+          })
+        }
+        const currentWorkflow = msg.currentWorkflow
+        if (currentWorkflow) {
+          wfRunState.value = {
+            name: currentWorkflow.name,
+            status: currentWorkflow.status,
+            phases: currentWorkflow.phases || [],
+            currentPhase: currentWorkflow.currentPhase || '',
+            logs: [],
+            agents: currentWorkflow.agents || [],
+            tokenSpent: currentWorkflow.tokenSpent || 0,
+            wfId: currentWorkflow.wfId,
+            startedAt: currentWorkflow.startedAt,
+          }
+        } else if (!msg.active) {
+          wfRunState.value = null
+        }
+        status.value = msg.active === true ? 'thinking' : 'idle'
+        if (msg.active !== true && msg.capabilities?.canSend === true && fg) {
+          nextTick(() => { void flushMsgQueue() })
+        }
+        break
+      }
       case 'session_state_snapshot': {
         const wasThinking = status.value === 'thinking'
         if (msg.taskState && typeof msg.taskState === 'object') {
@@ -2730,6 +2839,24 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
             detail: String(msg.taskState.detail || ''),
           })
         }
+        if (fg && Array.isArray(msg.pendingConfirmations) && msg.pendingConfirmations.length > 0) {
+          const pending = msg.pendingConfirmations.find((item: any) => Number(item.expiresAt || 0) > Date.now())
+          if (pending?.type === 'choice' && pendingChoice.value?.requestId !== pending.requestId) {
+            pendingChoice.value = {
+              requestId: String(pending.requestId),
+              question: String(pending.question || `请确认工具 ${pending.toolName || ''}`),
+              options: Array.isArray(pending.options) ? pending.options : [],
+              customInputActive: false,
+              customInputText: '',
+            }
+          } else if (pending?.type === 'permission' && pendingPermission.value?.requestId !== pending.requestId) {
+            pendingPermission.value = {
+              requestId: String(pending.requestId),
+              toolName: String(pending.toolName || ''),
+              summary: `工具：${String(pending.toolName || '未知工具')}`,
+            }
+          }
+        }
         status.value = msg.generating === true || ['running', 'reviewing', 'changes_required', 'fixing'].includes(String(msg.taskState?.status || ''))
           ? 'thinking'
           : 'idle'
@@ -2742,15 +2869,15 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
             : persistedStatus === 'fixing'
               ? {type: 'task_fixing', detail: msg.taskState?.detail}
               : {type: 'task_started', startedAt: msg.taskState?.startedAt}
-          taskActivity.value = reduceTaskActivity(taskActivity.value, snapshotEvent)
+          applyTaskActivityEvent(snapshotEvent)
         } else if (status.value === 'idle' && taskActivity.value.running) {
           const persistedStatus = String(msg.taskState?.status || 'idle')
           if (persistedStatus === 'succeeded') {
-            taskActivity.value = reduceTaskActivity(taskActivity.value, {type: 'task_completed', detail: msg.taskState?.detail})
+            applyTaskActivityEvent({type: 'task_completed', detail: msg.taskState?.detail})
           } else if (persistedStatus === 'stopped') {
-            taskActivity.value = reduceTaskActivity(taskActivity.value, {type: 'generation_stopped'})
+            applyTaskActivityEvent({type: 'generation_stopped'})
           } else if (['failed', 'incomplete', 'interrupted', 'review_paused'].includes(persistedStatus)) {
-            taskActivity.value = reduceTaskActivity(taskActivity.value, {type: 'task_failed', detail: msg.taskState?.detail})
+            applyTaskActivityEvent({type: 'task_failed', detail: msg.taskState?.detail})
           } else {
             taskActivity.value = createTaskActivityState()
           }
@@ -2813,6 +2940,34 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         break
       }
 
+      case 'preference_suggestion': {
+        const suggestion = msg.suggestion
+        if (suggestion?.id && !preferenceSuggestions.value.some(item => item.id === suggestion.id)) {
+          preferenceSuggestions.value.push(suggestion)
+        }
+        break
+      }
+
+      case 'preference_suggestion_resolved': {
+        if (msg.suggestionId) {
+          preferenceSuggestions.value = preferenceSuggestions.value.filter(item => item.id !== msg.suggestionId)
+        }
+        if (fg) {
+          if (msg.action === 'project') showToast('已保存为本项目偏好')
+          else if (msg.action === 'global') showToast('已保存为全局偏好')
+          else if (msg.action === 'once') showToast('本次继续使用，不保存偏好')
+          else showToast('已忽略该偏好候选')
+        }
+        break
+      }
+
+      case 'preference_error':
+        for (const item of preferenceSuggestions.value) {
+          if (!msg.suggestionId || item.id === msg.suggestionId) item.saving = false
+        }
+        if (fg) showToast(msg.message || '偏好保存失败', 5000)
+        break
+
       case 'message_duplicate': {
         const messageId = String(msg.messageId || '')
         const duplicateInput = pendingInputTexts.get(messageId)
@@ -2837,13 +2992,15 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
           }
           pendingAttachments.value = [...merged.values()]
         }
-        status.value = 'idle'
-        taskActivity.value = reduceTaskActivity(taskActivity.value, {
-          type: 'task_failed',
-          detail: msg.message || msg.code || '消息未接受',
-        })
-        stopTaskDurationTimer()
-        pendingTools.value = []
+        if (lifecycleBeforeEvent.awaitingAcceptance) {
+          status.value = 'idle'
+          applyTaskActivityEvent({
+            type: 'task_failed',
+            detail: msg.message || msg.code || '消息未接受',
+          })
+          stopTaskDurationTimer()
+          pendingTools.value = []
+        }
         const reason = typeof msg.message === 'string' && msg.message.trim()
             ? msg.message.trim()
             : msg.code === 'input_queue_full'
@@ -3110,12 +3267,18 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         turnThinkingText = ''
         const source = String(msg.source || '')
         const srcName = ({wechat: '微信', feishu: '飞书', dingtalk: '钉钉'} as Record<string, string>)[source] || source
-        const wasTaskRunning = taskActivity.value.running
+        const activityMessage = currentActivityMessage()
+        const awaitingInitialUser = Boolean(activityMessage?.activity?.running && !activityMessage.activityUserLinked)
         messages.value.push({role: 'user', text: `[${srcName}] ${msg.content}`, time: Date.now()})
         status.value = 'thinking'
-        taskActivity.value = wasTaskRunning
-          ? reduceTaskActivity(taskActivity.value, {type: 'task_input_added', source: srcName})
-          : reduceTaskActivity(createTaskActivityState(), {type: 'task_started'})
+        if (!awaitingInitialUser) {
+          applyTaskActivityEvent(
+            taskActivity.value.running ? {type: 'task_input_added', source: srcName} : {type: 'task_started'},
+            {placeAfterLatestUser: true},
+          )
+        } else {
+          syncTaskActivityMessage({placeAfterLatestUser: true})
+        }
         if (fg) nextTick(() => scrollDown())
         break
 
@@ -3210,7 +3373,6 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
           loadBalance()
           checkCostLimit()  // 费用达余额阈值时提醒一次
         }
-        _turnCompleted = true
         status.value = 'thinking'
         // SDK transcript 已在本轮结束时落盘，刷新侧栏中的真实标题和文件大小。
         void loadProjects()
@@ -3234,10 +3396,18 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
           if (!reduced.showCompletion) break
           const totalDurationMs = Number(msg.durationMs ?? msg.taskState?.durationMs)
             || (taskActivity.value.startedAt ? Math.max(0, Date.now() - taskActivity.value.startedAt) : 0)
+          const terminalReply = typeof msg.reply === 'string' ? msg.reply.trim() : ''
           if (_pendingResultMessage) {
             if (_pendingResultMessage.taskResult) _pendingResultMessage.taskResult.durationMs = totalDurationMs
             messages.value.push(_pendingResultMessage)
             _pendingResultMessage = null
+          } else if (terminalReply) {
+            messages.value.push({
+              role: 'assistant',
+              text: terminalReply,
+              time: Date.now(),
+              taskResult: {outcome: 'succeeded', continuationReason: null, resumable: false, originalTask: lastUserMessage, durationMs: totalDurationMs},
+            })
           } else {
             messages.value.push({
               role: 'system',
@@ -3247,7 +3417,6 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
             })
           }
           status.value = 'idle'
-          _turnCompleted = false
           if (fg) {
             syncPetState('success', {message: 'Done!', bubble: petPick(BUBBLE_SUCCESS, myProject)})
             setTimeout(() => { syncPetState('idle'); petBubble.value = '' }, 3000)
@@ -3267,7 +3436,6 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
             _pendingResultMessage = null
           }
           status.value = 'idle'
-          _turnCompleted = false
           if (fg) {
             const detail = String(msg.detail || t('sys.taskIncompleteShort'))
             syncPetState('error', {message: detail.slice(0, 40), bubble: detail.slice(0, 80)})
@@ -3296,7 +3464,6 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
       case 'error':
         // SDK 错误：清空待处理工具，显示错误消息。同时清理 agent 追踪、turn 标记。
         pendingTools.value = []
-        _turnCompleted = false
         messages.value.push({
           role: 'error',
           text: msg.message,
@@ -3319,7 +3486,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
           updatedAt: Date.now(),
         }
         status.value = 'idle'
-        taskActivity.value = reduceTaskActivity(taskActivity.value, {
+        applyTaskActivityEvent({
           type: 'task_failed',
           detail: msg.message,
         })
@@ -3428,19 +3595,8 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
             break
           }
         }
-        // 最后一个子 Agent 完成且回合已结束时，切 idle 并清队列
-        const completedTurn = _turnCompleted && runningAgentTotal.value === 0 && parentTaskUi.value.phase === 'succeeded'
-        if (completedTurn) {
-          _turnCompleted = false
-          status.value = 'idle'
-          if (fg) void flushMsgQueue()
-        }
         if (fg) {
-          if (completedTurn) {
-            syncPetState('success', {message: 'Done!', bubble: petPick(BUBBLE_SUCCESS, myProject)})
-          } else {
-            syncPetState('thinking', {message: 'Agent running', bubble: `${myProject} 还有 Agent 正在执行`})
-          }
+          syncPetState('thinking', {message: 'Agent finished', bubble: `${myProject} 的 Agent 已完成，正在等待父任务结算`})
         }
         break
       }
@@ -3617,12 +3773,6 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
             ag.doneTime = Date.now()
           }
         }
-        // Workflow 结束后检查是否所有 Agent 都已完成，若回合已结束则切 idle
-        if (_turnCompleted && runningAgentTotal.value === 0 && parentTaskUi.value.phase === 'succeeded') {
-          _turnCompleted = false
-          status.value = 'idle'
-          if (fg) void flushMsgQueue()
-        }
         break
 
       case 'workflow_paused':
@@ -3655,12 +3805,6 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
             ag.status = 'error';
             ag.doneTime = Date.now()
           }
-        }
-        // Workflow 异常结束，若回合已完成且无其他运行中 Agent，切 idle
-        if (_turnCompleted && runningAgentTotal.value === 0 && ['failed', 'review_paused', 'incomplete'].includes(parentTaskUi.value.phase)) {
-          _turnCompleted = false
-          status.value = 'idle'
-          if (fg) void flushMsgQueue()
         }
         break
 
@@ -3746,14 +3890,14 @@ async function stopWf(mode: 'pause' | 'commit') {
   await apiFetch(`${GW}/api/workflows/${encodeURIComponent(name)}/stop`, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({mode}),
+    body: JSON.stringify({mode, sessionId: sessionId.value}),
   })
 }
 
 async function resumeWf() {
   const name = wfRunState.value?.name
   if (!name) return
-  const body: any = {sessionId: activeSessionId.value}
+  const body: any = {sessionId: sessionId.value}
   if (wfNewBudget.value > 0) body.budgetMax = wfNewBudget.value
   await apiFetch(`${GW}/api/workflows/${encodeURIComponent(name)}/resume`, {
     method: 'POST',
@@ -3767,6 +3911,8 @@ async function stopAgent(agentLabel: string) {
   if (!name) return
   await apiFetch(`${GW}/api/workflows/${encodeURIComponent(name)}/agents/${encodeURIComponent(agentLabel)}/stop`, {
     method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({workflowId: wfRunState.value?.wfId}),
   })
 }
 
@@ -3775,6 +3921,8 @@ async function resumeAgent(agentLabel: string) {
   if (!name) return
   await apiFetch(`${GW}/api/workflows/${encodeURIComponent(name)}/agents/${encodeURIComponent(agentLabel)}/resume`, {
     method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({workflowId: wfRunState.value?.wfId}),
   })
 }
 
@@ -3927,7 +4075,7 @@ function runCompact() {
     showToast(t('ws.notConnected'));
     return
   }
-  if (status.value === 'thinking' || runningAgentTotal.value > 0) {
+  if (taskBusy.value) {
     showToast(t('ws.thinkingWait'));
     return
   }
@@ -3957,7 +4105,7 @@ async function sendMessage() {
     return
   }
 
-  if (status.value === 'thinking' || _flushingQueue || runningAgentTotal.value > 0) {
+  if (taskBusy.value) {
     // thinking/队列清空中/子Agent还在跑: 新消息进入排队，避免打断正在执行的 Agent
     queueId++
     msgQueue.value.push({id: queueId, text, originalText, time: Date.now(), attachments})
@@ -4107,7 +4255,7 @@ function doSend(text: string, wire?: string, attachments?: PendingAttachment[], 
   const socket = ws
   const inputSessionId = sessionId.value
   if (!socket || socket.readyState !== 1 || !inputSessionId) return false
-  const wasTaskRunning = status.value === 'thinking' && taskActivity.value.running
+  const wasTaskRunning = taskBusy.value
   const curModelMeta = models.value.find(m => m.id === model.value)
   const messageId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`
   const payload = {
@@ -4129,11 +4277,11 @@ function doSend(text: string, wire?: string, attachments?: PendingAttachment[], 
 
   // SIDE_EFFECT: 只有 WebSocket 接受消息后才提交本地回合状态。
   status.value = 'thinking'
-  _turnCompleted = false  // 新一轮开始: 重置回合完成标记
+  sessionLifecycle.value = reduceSessionLifecycle(sessionLifecycle.value, {type: 'local_task_submitted'})
   parentTaskUi.value = createParentTaskUiState({phase: 'running'})
-  taskActivity.value = wasTaskRunning
-    ? reduceTaskActivity(taskActivity.value, {type: 'task_input_added', source: '桌面端'})
-    : reduceTaskActivity(createTaskActivityState(), {type: 'task_started'})
+  applyTaskActivityEvent(
+    wasTaskRunning ? {type: 'task_input_added', source: '桌面端'} : {type: 'task_started'},
+  )
   _pendingResultMessage = null
   startTaskDurationTimer()
   lastUserMessage = originalText
@@ -4155,6 +4303,7 @@ function doSend(text: string, wire?: string, attachments?: PendingAttachment[], 
     })),
   }
   messages.value.push(userMessage)  // 界面显示用户原文和附件发送状态
+  syncTaskActivityMessage({placeAfterLatestUser: true})
   pendingInputTexts.set(messageId, {
     text: originalText,
     originalText,
@@ -4183,7 +4332,7 @@ function sendSessionPayload(payload: Record<string, unknown>, socket: WebSocket 
 
 async function continueIncompleteTask(message: Message) {
   const result = message.taskResult
-  if (!result?.resumable || status.value === 'thinking') return
+  if (!result?.resumable || taskBusy.value) return
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     showToast(t('ws.notConnected'))
     return
@@ -4209,7 +4358,11 @@ async function cancelTask() {
   stoppingTask.value = true
   const sid = sessionId.value
   const stopped = await requestStopSession(sid)
-  if (!stopped) {
+  if (!stopped.ok) {
+    stoppingTask.value = false
+    return
+  }
+  if (stopped.scope !== 'primary') {
     stoppingTask.value = false
     return
   }
@@ -4244,7 +4397,6 @@ async function cancelTask() {
     }
   }
   status.value = 'idle'
-  _turnCompleted = false  // 取消任务: 重置回合完成标记
   if (lastUserMessage && !inputText.value.trim()) {
     inputText.value = lastUserMessage
   }
@@ -4323,6 +4475,16 @@ function respondChoiceCustom() {
   nextTick(() => scrollDown(true))
 }
 
+/** 保存或忽略偏好候选；候选处理不写入会话消息，避免污染上下文。 */
+function respondPreference(suggestion: any, action: 'project' | 'global' | 'once' | 'dismiss') {
+  if (!suggestion?.id || suggestion.saving) return
+  if (!sendSessionPayload({type: 'preference_response', suggestionId: suggestion.id, action})) {
+    showToast(t('ws.notConnected'))
+    return
+  }
+  suggestion.saving = true
+}
+
 // ── 消息队列操作 ──
 /** 发送排队消息：从队列移除后正常 dispatch（此时 status 已变为 idle） */
 async function sendQueued(item: QItem) {
@@ -4367,17 +4529,15 @@ function removeQueued(item: QItem) {
   msgQueue.value = msgQueue.value.filter(q => q.id !== item.id)
 }
 
-/** flushMsgQueue 重入互斥锁：防止 result+sendMessage 并发交织消息 */
-let _flushingQueue = false
-/** 标记本轮已收到 result（回合完成），但子 Agent 可能还在执行中。在最后一个子 Agent done 且此标记为 true 时才切 idle */
-let _turnCompleted = false
-
+/** flushMsgQueue 重入互斥锁：同时参与 UI 忙碌态计算，必须保持响应式。 */
+const flushingQueue = ref(false)
 /** thinking 结束后自动发送所有排队消息，逐条 dispatch 避免并发乱序 */
 async function flushMsgQueue() {
-  if (_flushingQueue) return
+  if (flushingQueue.value) return
+  if (taskBusy.value) return
   const ownerTabId = activeTabId.value
   const ownerSessionId = sessionId.value
-  _flushingQueue = true
+  flushingQueue.value = true
   try {
     const items = [...msgQueue.value]
     msgQueue.value = []
@@ -4388,6 +4548,10 @@ async function flushMsgQueue() {
       }
       if (!ws || ws.readyState !== 1) {
         // WS 断开: 剩余消息回填队列头部，等重连后再发
+        restoreQueueItems(items.slice(i), ownerTabId)
+        break
+      }
+      if (taskBusy.value && i > 0) {
         restoreQueueItems(items.slice(i), ownerTabId)
         break
       }
@@ -4403,9 +4567,9 @@ async function flushMsgQueue() {
       }
     }
   } finally {
-    _flushingQueue = false
+    flushingQueue.value = false
     if (activeTabId.value !== ownerTabId && ws?.readyState === WebSocket.OPEN
-        && status.value === 'idle' && msgQueue.value.length > 0) {
+        && !taskBusy.value && msgQueue.value.length > 0) {
       void flushMsgQueue()
     }
   }
@@ -4436,6 +4600,18 @@ async function injectNow(item: QItem) {
     showToast(t('ws.notConnected'))
   }
 }
+
+// 输入区、队列和停止操作必须共享同一个任务忙碌判断，避免主回合结束而 Workflow 仍运行时状态分裂。
+const taskBusy = computed(() => isTaskBusy({
+  lifecycleActive: sessionLifecycle.value.active,
+  lifecycleReceived: sessionLifecycle.value.received,
+  status: status.value,
+  activityRunning: taskActivity.value.running,
+  runningAgentTotal: runningAgentTotal.value,
+  workflowStatus: wfRunState.value?.status,
+  parentPhase: parentTaskUi.value.phase,
+  flushingQueue: flushingQueue.value,
+}))
 
 // ═══════════════════════════════════════════
 // ── 斜杠命令自动补全（/）──
@@ -5962,7 +6138,7 @@ const tokenTooltip = computed(() => {
           :state="petState"
           :message="petMessage"
           :bubble="petBubble"
-          :is-thinking="status === 'thinking'"
+          :is-thinking="taskBusy"
           :session-duration="sessionDurationMinutes"
           :pet-id="petId"
           @switch-pet="onSwitchPet"
@@ -6018,9 +6194,9 @@ const tokenTooltip = computed(() => {
           </div>
           <div class="chat-header-right">
             <!-- 状态指示器：空闲(绿) / 思考中(橙，呼吸动画) / 离线(灰) -->
-            <span class="status-dot" :class="status"></span>
+            <span class="status-dot" :class="taskBusy ? 'thinking' : status"></span>
             <span class="status-label">{{
-                status === 'thinking' ? t('ws.statusThinking') : status === 'idle' && connected ? t('ws.statusReady') : t('ws.statusOffline')
+                taskBusy ? t('ws.statusThinking') : status === 'idle' && connected ? t('ws.statusReady') : t('ws.statusOffline')
               }}</span>
             <!-- IM 平台镜像开关按钮组（微信/飞书/钉钉） -->
             <button v-for="p in imPlatformLabels" :key="p.id"
@@ -6085,7 +6261,7 @@ const tokenTooltip = computed(() => {
                 <button
                     v-if="msg.taskResult?.resumable"
                     class="task-continue-btn"
-                    :disabled="status === 'thinking'"
+                    :disabled="taskBusy"
                     @click="continueIncompleteTask(msg)"
                 >
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -6094,6 +6270,13 @@ const tokenTooltip = computed(() => {
                   {{ t('ws.continueTask') }}
                 </button>
               </div>
+            </template>
+            <template v-else-if="msg.role === 'activity' && msg.activity">
+              <TaskActivityTimeline
+                  :state="msg.activity"
+                  :now="activityClock"
+                  @toggle="setActivityExpanded(msg, $event)"
+              />
             </template>
             <!-- 思考块：折叠面板，summary 栏展示"思考"标签 + 预览文本 -->
             <template v-else-if="msg.role === 'thinking'">
@@ -6122,7 +6305,7 @@ const tokenTooltip = computed(() => {
                 <button
                     v-if="msg.taskResult?.resumable"
                     class="task-continue-btn"
-                    :disabled="status === 'thinking'"
+                    :disabled="taskBusy"
                     @click="continueIncompleteTask(msg)"
                 >
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -6339,7 +6522,7 @@ const tokenTooltip = computed(() => {
           </div>
 
           <!-- 当前任务活动：展示阶段、动作和事件新鲜度，便于区分持续执行与长时间无响应 -->
-          <div v-if="status === 'thinking' || taskActivity.running"
+          <div v-if="taskBusy"
                class="task-activity"
                :class="`freshness-${taskActivityFresh.level}`">
             <div class="task-activity-indicator" aria-hidden="true">
@@ -6533,6 +6716,18 @@ const tokenTooltip = computed(() => {
 
         <!-- 输入区域：确认横幅 + 排队消息 + 补全菜单 + textarea + 发送按钮 -->
         <div class="input-area">
+          <div v-if="preferenceSuggestions.length" class="preference-banner">
+            <div class="preference-banner-copy">
+              <strong>检测到重复的任务约束</strong>
+              <span>{{ preferenceSuggestions[0].label }}（{{ preferenceSuggestions[0].occurrences }} 次）</span>
+            </div>
+            <div class="preference-banner-actions">
+              <button class="preference-btn primary" :disabled="preferenceSuggestions[0].saving" @click="respondPreference(preferenceSuggestions[0], 'project')">本项目</button>
+              <button class="preference-btn" :disabled="preferenceSuggestions[0].saving" @click="respondPreference(preferenceSuggestions[0], 'global')">全局</button>
+              <button class="preference-btn" :disabled="preferenceSuggestions[0].saving" @click="respondPreference(preferenceSuggestions[0], 'once')">仅本次</button>
+              <button class="preference-btn muted" :disabled="preferenceSuggestions[0].saving" @click="respondPreference(preferenceSuggestions[0], 'dismiss')">不再提示</button>
+            </div>
+          </div>
           <!-- 权限确认横幅：工具名 + 操作摘要 + 允许/拒绝按钮 -->
           <div v-if="pendingPermission" class="confirm-banner">
             <div class="confirm-banner-info">
@@ -6591,15 +6786,15 @@ const tokenTooltip = computed(() => {
           <!-- 排队消息栏：thinking 期间输入的消息在此排队，可手动发送/注入/删除 -->
           <div v-if="msgQueue.length > 0" class="queue-bar">
             <span class="queue-label">{{
-                status === 'thinking' ? t('ws.queueSupplement') : t('ws.queuePending')
+                taskBusy ? t('ws.queueSupplement') : t('ws.queuePending')
               }} ({{ msgQueue.length }})</span>
             <div class="queue-chips">
               <div v-for="q in msgQueue" :key="q.id" class="queue-chip">
                 <span class="chip-text" :title="q.originalText || q.text">{{ (q.originalText || q.text).slice(0, 60) }}{{
                     (q.originalText || q.text).length > 60 ? '...' : ''
                   }}</span>
-                <button class="chip-send" :title="status === 'thinking' ? t('ws.injectNow') : t('ws.sendNow')"
-                        @click="status === 'thinking' ? injectNow(q) : sendQueued(q)">
+                <button class="chip-send" :title="taskBusy ? t('ws.injectNow') : t('ws.sendNow')"
+                        @click="taskBusy ? injectNow(q) : sendQueued(q)">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                        stroke-linecap="round" stroke-linejoin="round">
                     <line x1="22" y1="2" x2="11" y2="13"/>
@@ -6697,7 +6892,7 @@ const tokenTooltip = computed(() => {
               -->
               <textarea
                   v-model="inputText"
-                  :placeholder="status === 'thinking' ? t('ws.inputThinking') : t('ws.inputPlaceholder')"
+                  :placeholder="taskBusy ? t('ws.inputThinking') : t('ws.inputPlaceholder')"
                   rows="1"
                   @keydown="handleKeydown"
                   @paste="onPaste"
@@ -6705,7 +6900,7 @@ const tokenTooltip = computed(() => {
               ></textarea>
               <!-- thinking 且输入框为空时：显示红色停止按钮（回填用户原文） -->
               <button
-                  v-if="!inputText.trim() && status === 'thinking'"
+                  v-if="!inputText.trim() && taskBusy"
                   class="send-btn stop-btn"
                   :disabled="stoppingTask"
                   @click="cancelTask"
@@ -8085,6 +8280,8 @@ const tokenTooltip = computed(() => {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
+  overflow: hidden;
   position: relative;
   background: radial-gradient(ellipse 80% 50% at 50% -20%, rgba(233, 69, 96, 0.03), transparent),
   var(--bg-deep);
@@ -8289,6 +8486,8 @@ const tokenTooltip = computed(() => {
 /* ── 消息列表 Messages ── */
 .messages {
   flex: 1;
+  min-height: 0;
+  min-width: 0;
   overflow-y: auto;
   padding: 28px 32px;
   display: flex;
@@ -8334,8 +8533,12 @@ const tokenTooltip = computed(() => {
   justify-content: flex-start;
 }
 
-.msg-row.system, .msg-row.thinking {
+.msg-row.system, .msg-row.thinking, .msg-row.activity {
   justify-content: center;
+}
+
+.msg-row.activity {
+  width: 100%;
 }
 
 .msg-row.error {
@@ -8344,6 +8547,7 @@ const tokenTooltip = computed(() => {
 
 .sys-msg {
   display: flex;
+  min-width: 0;
   gap: 8px;
   font-size: 13px;
   color: var(--text-muted);
@@ -8365,7 +8569,10 @@ const tokenTooltip = computed(() => {
   align-items: center;
   flex-wrap: wrap;
   justify-content: center;
+  width: min(100%, 820px);
   max-width: min(820px, 90vw);
+  box-sizing: border-box;
+  line-height: 1.5;
 }
 
 .task-result-duration {
@@ -8451,7 +8658,14 @@ const tokenTooltip = computed(() => {
 }
 
 .sys-time {
+  flex-shrink: 0;
   opacity: 0.5;
+}
+
+.sys-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .err-msg {
@@ -9187,6 +9401,7 @@ const tokenTooltip = computed(() => {
 
 /* ── 控制栏 Controls ── */
 .controls-bar {
+  flex-shrink: 0;
   display: flex;
   gap: 20px;
   padding: 10px 24px;
@@ -9547,6 +9762,7 @@ const tokenTooltip = computed(() => {
 
 /* ── 输入区域 Input ── */
 .input-area {
+  flex-shrink: 0;
   padding: 10px 24px 18px;
   background: var(--bg-base);
   border-top: 1px solid var(--border);
@@ -10101,6 +10317,67 @@ const tokenTooltip = computed(() => {
 }
 
 /* 双通道确认横幅：内嵌在输入区上方，permission_request / choice_request 时显示 */
+.preference-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  margin-bottom: 10px;
+  background: var(--bg-raised);
+  border: 1px solid rgba(212, 168, 83, 0.55);
+  border-radius: 10px;
+}
+
+.preference-banner-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.preference-banner-copy strong {
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.preference-banner-copy span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.preference-banner-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.preference-btn {
+  min-height: 28px;
+  padding: 4px 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-deep);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.preference-btn:hover { border-color: var(--accent); color: var(--text-primary); }
+.preference-btn.primary { border-color: var(--accent); color: var(--accent); }
+.preference-btn.muted { color: var(--text-muted); }
+.preference-btn:disabled { cursor: wait; opacity: 0.55; }
+
+@media (max-width: 700px) {
+  .preference-banner { align-items: stretch; flex-direction: column; }
+  .preference-banner-actions { justify-content: flex-start; }
+}
+
 .confirm-banner {
   display: flex;
   align-items: center;

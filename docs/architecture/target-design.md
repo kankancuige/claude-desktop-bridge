@@ -89,6 +89,23 @@ interface BridgeNotice {
 - runtime：新建回合 -> 暂停 -> 退出 -> 重启 -> 历史正文和草稿恢复 -> 继续发送；断开 Gateway 时出现提示，恢复后消失。
 - runtime：源会话 -> 显式分支 -> 新 SDK ID 保留源历史；空白新会话发送“加上”时命中最近有效会话，普通独立问题不注入。
 
+## 统一任务命令、事件日志与 Provider
+
+- Gateway 提供进程内 `TaskCommandService`，desktop WebSocket 与三个 IM adapter 只负责协议转换；提交、观察和取消不再由 adapter 各自解释。
+- Claude SDK transcript 继续拥有用户和 assistant 正文。Bridge 另外保存不含正文的 append-only Session Event Journal，只记录任务接收、状态转换、Agent/Workflow 生命周期、停止和 runtime 失败。
+- `bridge-task-state` 在迁移期保留；恢复优先从 journal 投影，journal 缺失或损坏时才回退旧快照。
+- Agent Provider 注册六项能力：`writable`、`resumable`、`modelOverride`、`structuredOutput`、`toolFiltering`、`continuation`。调用前验证 requirements，不支持时返回 `AGENT_CAPABILITY_UNSUPPORTED`。
+- Provider registry 负责注册、查找和释放。Claude SDK 作为首个 `agent/claude-sdk` Provider，Gateway shutdown 统一调用 `disposeAll()`。
+- 详细取舍、失败恢复和兼容策略见 ADR 0006。
+
+## 统一任务生命周期聚合
+
+- Gateway 输出版本化 `session_lifecycle_snapshot`，聚合父任务、runtime、全部 Workflow 和操作能力。
+- 桌面端通过 reducer/store 消费快照；活动文字、Agent 卡片和 Workflow 面板只做展示投影。
+- SDK `result`、单个 Agent 完成或单个 Workflow 完成都不能产生父任务成功；只有 `task_completed` 可触发成功气泡、队列清理和 IM 最终通知。
+- 停止命令提交 `user_stopped` 父任务事件，并取消主 runtime、确认请求、已接受输入与所有活跃 Workflow。
+- 迁移完成后，普通、恢复、scheduled 和 Agent Session 使用统一 runtime 工厂；IM adapter 使用统一 command API，不再各自解释完整 WebSocket 生命周期。
+
 ## 统一任务决策与模型路由
 
 ### 目标边界
@@ -140,3 +157,23 @@ interface TaskDecision {
 | 分类器不可用 | 使用本地确定性规则，不阻塞任务 |
 | Workflow 不存在或已运行 | 主会话继续执行，记录 Workflow 跳过原因 |
 | Power 不可用 | 高风险任务不得降级后宣称完成；返回可重试的不完整状态 |
+
+## Gateway 模块目录与依赖边界
+
+Gateway 保持单进程 modular monolith。`gateway/index.mjs` 是唯一组合根和兼容启动入口，领域实现按职责放入下列目录：
+
+| 目录 | 职责 | 允许依赖 |
+|---|---|---|
+| `shared/` | 日志、文本分片、内部客户端和无领域归属的小型基础能力 | Node 标准库和第三方基础库 |
+| `security/` | 路径、URL、WebSocket、配置脱敏和安全载荷边界 | `shared/` |
+| `providers/` | 上游 Provider、协议转换、代理生命周期和 Agent Provider registry | `shared/`、`security/`、`agents/` |
+| `sessions/` | Session 身份、runtime、历史、事件 journal、可见性和停止 | `shared/`、`security/`、`tasks/`、`context/` |
+| `projects/` | 项目缓存、transcript 定位/分类和跨会话接力 | `shared/`、`security/`、`sessions/` |
+| `tasks/` | 任务命令、决策、状态、生命周期、完成门禁和模型路由 | `shared/` |
+| `agents/` | Agent 能力、运行元数据、工具生命周期和 skill 路由 | `shared/`、`tasks/` |
+| `workflows/` | Workflow 脚本、运行状态、子进程和最终审查编排 | `shared/`、`tasks/`、`agents/`、`providers/` |
+| `im/` | 微信、飞书、钉钉适配器、IM 命令、进度和通知投递 | `shared/`、`tasks/`、`sessions/` |
+| `context/` | Bridge 规则、上下文档位、压缩生命周期和结构化偏好 | `shared/`、`security/`、`tasks/` |
+| `tools/` | 附件、上传和 RTK 等可复用工具支持 | `shared/`、`security/` |
+
+`shared/` 不得反向依赖任何领域目录；IM adapter 不直接修改 Session 内部状态；Workflow 不解释 HTTP、WebSocket 或 IM 协议。跨领域行为由 `index.mjs` 组合，后续再提取显式 coordinator，目录迁移本身不改变公开 API、持久化格式或运行进程数。
