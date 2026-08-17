@@ -2340,6 +2340,21 @@ async function handleNewSession(workDir: string, encodedDir?: string, histSessio
   return promise
 }
 
+/** 在系统文件管理器中打开项目目录，不改变当前项目或会话。 */
+async function openProjectDirectory(workDir: string) {
+  const api = window.electronAPI
+  if (!api?.openDirectory) {
+    showToast(t('ws.openProjectDirectoryUnavailable'), 5000)
+    return
+  }
+  try {
+    const result = await api.openDirectory(workDir)
+    if (!result?.ok) showToast(t('ws.openProjectDirectoryFailed'), 5000)
+  } catch {
+    showToast(t('ws.openProjectDirectoryFailed'), 5000)
+  }
+}
+
 /** 从已有 SDK conversation 创建独立分支；源 tab 和源 WebSocket 保持不变。 */
 async function handleForkSession(workDir: string, encodedDir: string, sourceSessionId: string) {
   workDir = normW(workDir)
@@ -6359,6 +6374,7 @@ const tokenTooltip = computed(() => {
         @add-project="addProject"
         @load-projects="loadProjects"
         @toggle-project="toggleProject"
+        @open-project-directory="openProjectDirectory"
         @new-session="(workDir: string, encodedDir: string, sid?: string) => handleNewSession(workDir, encodedDir, sid)"
         @fork-session="(workDir: string, encodedDir: string, sid: string) => handleForkSession(workDir, encodedDir, sid)"
         @delete-session="deleteSession"

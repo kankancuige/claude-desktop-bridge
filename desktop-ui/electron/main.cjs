@@ -17,6 +17,7 @@ const fs = require('fs')
 const os = require('os')
 const { pathToFileURL } = require('url')
 const {normalizeExternalUrl} = require('./external-url.cjs')
+const {openDirectoryInShell} = require('./open-directory.cjs')
 const { checkForUpdates, downloadUpdate, quitAndInstall } = require('./updater.cjs')
 
 // ── 全局状态 ──
@@ -358,7 +359,7 @@ function createWindow() {
   ]) ipcMain.removeAllListeners(channel)
   for (const channel of [
     'window:isMaximized', 'getAppVersion', 'update:check', 'update:download',
-    'getGatewayLogPath', 'getBridgeToken', 'shell:openExternal', 'dialog:selectDirectory',
+    'getGatewayLogPath', 'getBridgeToken', 'shell:openExternal', 'shell:openDirectory', 'dialog:selectDirectory',
   ]) ipcMain.removeHandler(channel)
 
   const isTrustedIpcEvent = (event) => {
@@ -472,6 +473,13 @@ function createWindow() {
       logToFile(`[WARN] open external URL failed: ${error.message}`)
       return false
     })
+  })
+
+  // ── IPC: 在系统文件管理器中打开项目目录 ──
+  trustedHandle('shell:openDirectory', async (directory) => {
+    const result = await openDirectoryInShell(directory, target => shell.openPath(target))
+    if (!result.ok) logToFile(`[WARN] open project directory failed: ${result.error}`)
+    return result
   })
 
   trustedHandle('dialog:selectDirectory', async () => {

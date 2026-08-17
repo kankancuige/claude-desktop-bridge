@@ -361,6 +361,9 @@ const messages: Record<Locale, Record<string, string>> = {
     // ────────────────────────────────────────────────────────────────────────
     'ws.searchPlaceholder': '搜索项目...',
     'ws.projects': '项目',
+    'ws.openProjectDirectory': '在文件资源管理器中打开',
+    'ws.openProjectDirectoryFailed': '无法打开项目目录，请确认目录仍然存在',
+    'ws.openProjectDirectoryUnavailable': '浏览器模式不支持打开本地目录',
     'ws.addProject': '新增项目（选择文件夹）',
     'ws.noMatch': '无匹配项目',
     'ws.notFound': '未找到项目',
@@ -823,6 +826,9 @@ const messages: Record<Locale, Record<string, string>> = {
     // ── Workspace sidebar ──
     'ws.searchPlaceholder': 'Search projects...',
     'ws.projects': 'Projects',
+    'ws.openProjectDirectory': 'Open in file manager',
+    'ws.openProjectDirectoryFailed': 'Unable to open the project directory. Check that it still exists.',
+    'ws.openProjectDirectoryUnavailable': 'Opening local folders is unavailable in browser mode.',
     'ws.addProject': 'Add project (pick folder)',
     'ws.noMatch': 'No matching projects',
     'ws.notFound': 'No projects found',

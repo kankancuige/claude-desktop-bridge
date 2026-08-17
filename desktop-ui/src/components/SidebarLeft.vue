@@ -62,6 +62,7 @@ const emit = defineEmits<{
   (e: 'addProject'): void
   (e: 'loadProjects', reorder: boolean): void
   (e: 'toggleProject', workDir: string): void
+  (e: 'openProjectDirectory', workDir: string): void
   (e: 'newSession', workDir: string, encodedDir: string, sid?: string): void
   (e: 'forkSession', workDir: string, encodedDir: string, sid: string): void
   (e: 'deleteSession', sid: string): void
@@ -202,18 +203,26 @@ function visibleSessions(p: Project, showAllSessions: Set<string>, pageSize: num
             </div>
           </div>
           <div v-if="activeProject === p.workDir && connected" class="active-dot" :title="t('ws.activeConn')"></div>
-          <button class="add-session-btn" @click.stop="emit('newSession', p.workDir, p.encodedDir)" :title="t('ws.newSession')">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
-            </svg>
-          </button>
-          <button class="project-hide" @click.stop="emit('hideProject', p.workDir)" :title="t('ws.hideProject')">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/>
-              <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/>
-              <line x1="1" y1="1" x2="23" y2="23"/>
-            </svg>
-          </button>
+          <div class="project-actions">
+            <button class="project-action project-open" @click.stop="emit('openProjectDirectory', p.workDir)" :title="t('ws.openProjectDirectory')" :aria-label="t('ws.openProjectDirectory')">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M3 6h6l2 2h10v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+                <path d="M3 12h18"/>
+              </svg>
+            </button>
+            <button class="project-action add-session-btn" @click.stop="emit('newSession', p.workDir, p.encodedDir)" :title="t('ws.newSession')" :aria-label="t('ws.newSession')">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+              </svg>
+            </button>
+            <button class="project-action project-hide" @click.stop="emit('hideProject', p.workDir)" :title="t('ws.hideProject')" :aria-label="t('ws.hideProject')">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/>
+                <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/>
+                <line x1="1" y1="1" x2="23" y2="23"/>
+              </svg>
+            </button>
+          </div>
         </div>
 
         <!-- 批量模式全选按钮 -->
@@ -282,12 +291,20 @@ function visibleSessions(p: Project, showAllSessions: Set<string>, pageSize: num
               <span class="hidden-item-name">{{ dirName(p.workDir) }}</span>
               <span class="hidden-item-path">{{ p.workDir }}</span>
             </div>
-            <button class="hidden-show-btn" @click.stop="emit('showProject', p.workDir)" :title="t('ws.showProject')">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
-                <circle cx="12" cy="12" r="3"/>
-              </svg>
-            </button>
+            <div class="hidden-item-actions">
+              <button class="hidden-action-btn" @click.stop="emit('openProjectDirectory', p.workDir)" :title="t('ws.openProjectDirectory')" :aria-label="t('ws.openProjectDirectory')">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M3 6h6l2 2h10v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+                  <path d="M3 12h18"/>
+                </svg>
+              </button>
+              <button class="hidden-action-btn" @click.stop="emit('showProject', p.workDir)" :title="t('ws.showProject')" :aria-label="t('ws.showProject')">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                  <circle cx="12" cy="12" r="3"/>
+                </svg>
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -421,22 +438,24 @@ function visibleSessions(p: Project, showAllSessions: Set<string>, pageSize: num
   background: var(--success); flex-shrink: 0;
 }
 
-.add-session-btn {
+.project-actions {
+  display: flex; align-items: center; gap: 2px; flex-shrink: 0;
+}
+.project-action {
   background: none; border: none; color: var(--text-muted);
-  cursor: pointer; padding: 4px; border-radius: 6px;
-  display: flex; align-items: center; opacity: 0;
+  cursor: pointer; padding: 0; border-radius: 6px;
+  width: 24px; height: 24px; flex: 0 0 24px;
+  display: flex; align-items: center; justify-content: center; opacity: 0;
   transition: all .12s;
 }
-.project-card:hover .add-session-btn { opacity: 1; }
+.project-card:hover .project-action, .project-action:focus-visible { opacity: 1; }
+.project-action:focus-visible { outline: 2px solid var(--accent-blue); outline-offset: 1px; }
+.project-open:hover { color: var(--text-primary); background: var(--bg-deep); }
 .add-session-btn:hover { color: var(--accent-blue); background: var(--bg-deep); }
 
 .project-hide {
-  background: none; border: none; color: var(--text-muted);
-  cursor: pointer; padding: 4px; border-radius: 6px;
-  display: flex; align-items: center; opacity: 0;
-  transition: all .12s;
+  color: var(--text-muted);
 }
-.project-card:hover .project-hide { opacity: 1; }
 .project-hide:hover { color: var(--accent); background: var(--bg-deep); }
 
 /* ── 批量管理 ── */
@@ -561,14 +580,17 @@ function visibleSessions(p: Project, showAllSessions: Set<string>, pageSize: num
 .hidden-item-info { flex: 1; min-width: 0; }
 .hidden-item-name { font-size: 13px; color: var(--text-secondary); }
 .hidden-item-path { font-size: 11px; font-family: var(--font-mono); color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.hidden-show-btn {
+.hidden-item-actions { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
+.hidden-action-btn {
   background: none; border: none; color: var(--text-muted);
-  cursor: pointer; padding: 4px; border-radius: 6px;
-  display: flex; align-items: center; opacity: 0;
+  cursor: pointer; padding: 0; border-radius: 6px;
+  width: 24px; height: 24px; flex: 0 0 24px;
+  display: flex; align-items: center; justify-content: center; opacity: 0;
   transition: all .12s;
 }
-.hidden-item:hover .hidden-show-btn { opacity: 1; }
-.hidden-show-btn:hover { color: var(--accent-blue); background: var(--bg-deep); }
+.hidden-item:hover .hidden-action-btn, .hidden-action-btn:focus-visible { opacity: 1; }
+.hidden-action-btn:hover { color: var(--accent-blue); background: var(--bg-deep); }
+.hidden-action-btn:focus-visible { outline: 2px solid var(--accent-blue); outline-offset: 1px; }
 
 .sidebar-bottom {
   padding: 10px 16px; border-top: 1px solid var(--border);

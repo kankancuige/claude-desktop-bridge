@@ -53,6 +53,9 @@ if (process.isMainFrame) contextBridge.exposeInMainWorld('electronAPI', {
   // ── 用系统默认浏览器打开外部链接 ──
   openExternal: (url) => ipcRenderer.invoke('shell:openExternal', url),
 
+  // ── 在系统文件管理器中打开已存在的项目目录 ──
+  openDirectory: (directory) => ipcRenderer.invoke('shell:openDirectory', directory),
+
   // ── 窗口状态控制（托盘模式）──
   showWindow: () => ipcRenderer.send('window:show'),
   quitApp: () => ipcRenderer.send('app:quit'),

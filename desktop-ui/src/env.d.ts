@@ -13,6 +13,7 @@ declare global {
     getGatewayLogPath: () => Promise<string>
     selectDirectory: () => Promise<string | null>
     openExternal: (url: string) => Promise<boolean>
+    openDirectory: (directory: string) => Promise<{ok: boolean; error?: string}>
     showWindow: () => void
     quitApp: () => void
     isMaximized: () => Promise<boolean>
