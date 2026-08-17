@@ -391,8 +391,31 @@ export function reduceTaskActivity(
   }
 
   if (type === 'confirmation_resolved') {
-    state.entries = completeEntries(state.entries, now, entry => entry.kind === 'waiting')
-    return {...state, updatedAt: now, eventType: type}
+    const waitingId = `waiting:${eventId(event, 'confirmation')}`
+    state.entries = completeEntries(state.entries, now, entry => entry.id === waitingId)
+    const remaining = [...state.entries].reverse().find(entry => entry.kind === 'waiting' && entry.status === 'waiting')
+    if (remaining) {
+      return activityState(state, 'waiting', true, remaining.title, remaining.detail, type, now)
+    }
+
+    if (event.confirmationType === 'permission') {
+      const action = toolTitle(toolName(event))
+      const allowed = event.decision !== 'deny'
+      const detail = event.wonBy === 'auto' ? '已切换为全部自动' : allowed ? '已允许本次操作' : '已拒绝本次操作'
+      return activityState(
+        state,
+        allowed ? 'tool' : 'thinking',
+        true,
+        allowed
+          ? `${event.wonBy === 'auto' ? '权限已自动允许' : '权限已允许'}，正在${action}`
+          : `已拒绝${action}，正在继续处理`,
+        detail,
+        type,
+        now,
+      )
+    }
+
+    return activityState(state, 'thinking', true, '方案已确认，正在继续执行', '', type, now)
   }
 
   if (type === 'context_compacting' || type === 'context_compacted') {

@@ -88,6 +88,7 @@ import {getCodexRelayProxyUrl, startCodexRelayProxy, stopCodexRelayProxy} from '
 import {BRIDGE_PROVIDER_ENV_KEYS, extractBridgeProviderSettings, normalizeBridgeProviderSettings, overlayBridgeProviderSettings} from './providers/bridge-provider-settings.mjs'
 import {applyContextProfile, classifyContextProfile, normalizeContextProfile} from './context/context-profile.mjs'
 import {decideTask} from './tasks/task-decision.mjs'
+import {shouldCaptureTurnCheckpoint} from './tasks/turn-checkpoint-policy.mjs'
 import {normalizeExplicitModel, resolveTaskModelRoute, resolveTurnModelRoute, shouldDeferAutomaticQuery, shouldValidateProviderModel, validateProviderModel} from './tasks/model-routing.mjs'
 import {resolveWorkflowFinalReviewTier, shouldAutoTriggerWorkflow} from './workflows/workflow-model-routing.mjs'
 import {createTaskCompletionState, normalizeReviewOutcome, resolveFinalReviewPlan, transitionTaskCompletion} from './tasks/task-completion.mjs'
@@ -1300,8 +1301,25 @@ function settlePending(sessionId, requestId, result, wonBy) {
     try {
         entry.resolve(result)
     } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
+    log.info({
+        sessionId: sessionId?.slice(0, 8),
+        requestId,
+        type: entry.type,
+        toolName: entry.toolName,
+        decision: result?.behavior || 'unknown',
+        wonBy,
+        pendingCount: s.pending.size,
+    }, '确认请求已结算')
     // 通知 desktop 弹框关闭 + 所有适配器清除挂起
-    broadcastTurn(sessionId, {type: 'confirmation_resolved', requestId, wonBy, turnId: entry.turnId || null},
+    broadcastTurn(sessionId, {
+        type: 'confirmation_resolved',
+        requestId,
+        confirmationType: entry.type,
+        toolName: entry.toolName,
+        decision: result?.behavior || 'unknown',
+        wonBy,
+        turnId: entry.turnId || null,
+    },
         entry.userId ? {source: entry.source, userId: entry.userId} : null)
     for (const hook of confirmHooks) {
         try {
@@ -3262,7 +3280,9 @@ async function startStreamPump(sessionId) {
                         userId: s._autoContinuationRequest.userId,
                         taskDecision: completionDecision,
                     })
-                    beginTurn(sessionId, continuation.prompt)
+                    beginTurn(sessionId, continuation.prompt, {
+                        captureFiles: shouldCaptureTurnCheckpoint(completionDecision),
+                    })
                     appendSessionEvent(s, 'task/auto-continuing', {
                         turnId: s._autoContinuationRequest.turnId,
                         attempt: continuation.attempt,
@@ -8543,7 +8563,9 @@ async function submitTaskCommand(command) {
         const sdkInputContent = resolveSdkInputContent(sessionId, s, command.content)
         const nextSkillRoute = routeSkills({text: sdkInputContent, workDir: s.workDir, profile: nextProfile})
         const skillRouteChanged = JSON.stringify(nextSkillRoute) !== JSON.stringify(s.skillRoute || [])
-        beginTurn(sessionId, srcLabel + command.content)
+        beginTurn(sessionId, srcLabel + command.content, {
+            captureFiles: shouldCaptureTurnCheckpoint(taskDecision),
+        })
 
         if (permChanged || thinkChanged || modelChanged || modeChanged || contextChanged || skillRouteChanged) {
             if (permChanged) s.permissionMode = newPerm
@@ -10063,18 +10085,20 @@ function saveCheckpoints(s, sessionId) {
 //   供 finalizeCheckpoint 在回合结束时对比 diff，生成记录点
 // 实现方式: 先占位 pendingTurn（含 prompt + time）→ 消息立即入队 SDK →
 //   setImmediate 异步构建 buildFileSnapshot → 填入 preSnapshot
-//   构建失败时 pendingTurn=null，后续 finalizeCheckpoint 会跳过
+//   构建失败时推进 pendingTurn，后续 finalizeCheckpoint 会跳过该失败回合
 // 关键设计: preSnapshot 只在 result 事件时需要（通常几秒后），
 //   没必要在消息处理路径上同步阻塞事件循环（大项目 buildFileSnapshot 可达数百 ms）
 // SIDE_EFFECT: mutates session.pendingTurn（分两次：同步写 prompt/time，异步写 preSnapshot）
-function beginTurn(sessionId, prompt) {
+function beginTurn(sessionId, prompt, options = {}) {
     const s = sessions.get(sessionId);
     if (!s) return
+    const captureFiles = options.captureFiles !== false
     // 同步占位：prompt + time + _turnId 先落盘，消息立即入队 SDK 不受阻
     const turnId = Symbol('turn')
     const turn = {
         prompt: String(prompt || '').slice(0, 500),
         preSnapshot: null,
+        captureFiles,
         time: Date.now(),
         _turnId: turnId
     }
@@ -10084,6 +10108,10 @@ function beginTurn(sessionId, prompt) {
         return
     }
     s.pendingTurn = turn
+    if (!captureFiles) {
+        log.info({sessionId: sessionId?.slice(0, 8)}, '[beginTurn] 轻量问答跳过文件快照')
+        return
+    }
     // 异步构建快照：增量以 s.snapshot 为 baseline，只重读 mtime/size 变动的文件
     // 用 setImmediate 推迟到当前事件循环 tick 结束后执行，保证消息先入队
     // CAS 守护 _turnId: stop 后立即新消息时，旧 setImmediate 看到 _turnId 不匹配则跳过
@@ -10114,6 +10142,7 @@ function beginTurn(sessionId, prompt) {
 //   6. 同步更新 session.snapshot 为当前状态（作为新一轮的基线）
 // SIDE_EFFECT: mutates session.checkpoints/snapshot/pendingTurn + 落盘 bridge-checkpoints/<sessionId>.json
 function schedulePendingTurnSnapshot(sessionId, snapSession, turn) {
+    if (turn.captureFiles === false) return
     setImmediate(() => {
         try {
             if (snapSession.pendingTurn?._turnId !== turn._turnId) return
@@ -10136,6 +10165,11 @@ function advancePendingTurn(sessionId, session) {
 function finalizeCheckpoint(sessionId) {
     const s = sessions.get(sessionId);
     if (!s || !s.pendingTurn) { log.info({sessionId: sessionId?.slice(0,8), hasSession: !!s, hasPendingTurn: !!s?.pendingTurn}, '[ckpt] 跳过: 无会话或无 pendingTurn'); return null }
+    if (s.pendingTurn.captureFiles === false) {
+        log.info({sessionId: sessionId?.slice(0, 8)}, '[ckpt] 轻量问答跳过文件 checkpoint')
+        advancePendingTurn(sessionId, s)
+        return null
+    }
     if (!s.pendingTurn.preSnapshot) {
         try {
             s.pendingTurn.preSnapshot = buildFileSnapshot(s.workDir, s.snapshot)

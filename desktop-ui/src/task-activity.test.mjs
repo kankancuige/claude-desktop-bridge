@@ -59,8 +59,25 @@ test('Agent、工作流、上下文压缩和权限等待形成可更新步骤', 
 
   state = reduceTaskActivity(state, {type: 'permission_request', requestId: 'p1', summary: '执行构建'}, 500)
   assert.equal(state.entries.at(-1).status, 'waiting')
-  state = reduceTaskActivity(state, {type: 'confirmation_resolved', requestId: 'p1'}, 550)
+  state = reduceTaskActivity(state, {
+    type: 'confirmation_resolved', requestId: 'p1', confirmationType: 'permission', toolName: 'Bash', wonBy: 'auto',
+  }, 550)
   assert.equal(state.entries.find(entry => entry.id === 'waiting:p1').status, 'completed')
+  assert.equal(state.phase, 'tool')
+  assert.equal(state.title, '权限已自动允许，正在运行命令')
+  assert.equal(state.detail, '已切换为全部自动')
+})
+
+test('确认结算只关闭对应的等待步骤，不误关闭并发确认', () => {
+  let state = reduceTaskActivity(createTaskActivityState(), {type: 'task_started'}, 100)
+  state = reduceTaskActivity(state, {type: 'permission_request', requestId: 'p1', toolName: 'Read'}, 200)
+  state = reduceTaskActivity(state, {type: 'choice_request', requestId: 'c1', question: '选择方案'}, 300)
+  state = reduceTaskActivity(state, {
+    type: 'confirmation_resolved', requestId: 'p1', confirmationType: 'permission', toolName: 'Read', wonBy: 'desktop',
+  }, 400)
+
+  assert.equal(state.entries.find(entry => entry.id === 'waiting:p1').status, 'completed')
+  assert.equal(state.entries.find(entry => entry.id === 'waiting:c1').status, 'waiting')
 })
 
 test('工具摘要会截断并脱敏凭据', () => {
