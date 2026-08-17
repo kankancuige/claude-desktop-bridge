@@ -542,7 +542,8 @@ Gateway 每次启动时为每个已连接的平台生成一个 6 位**配对码*
 | **定时任务** | Cron 定时任务 CRUD，可视化频率选择（每天/工作日/每周/每月/自定义），手动触发 |
 | **开源** | Caveman 压缩配置 / RTK 压缩配置 / 桌面宠物选择 |
 
-Bridge 会话使用仓库内的 `gateway/context/BRIDGE_RULES.md` 作为长期规则。Claude Agent SDK 以
+Bridge 只使用仓库内的 `gateway/context/BRIDGE_RULES.md` 作为唯一长期规则来源，不读取或合并用户机器上的
+Claude/Codex 全局规则。Claude Agent SDK 以
 `settingSources: []` 运行，不隐式加载用户或项目目录的 `CLAUDE.md`、`AGENTS.md` 和
 `.claude/settings*.json`。供应商、API Key、MCP、Skills 与 Agents 仍由 Gateway 配置层按需读取并显式传入；
 简单问答不加载这些扩展，执行型任务才升级为完整上下文。

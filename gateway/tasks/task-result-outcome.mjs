@@ -5,9 +5,24 @@ const RESULT_REASONS = new Map([
     ['error_max_structured_output_retries', 'structured_output'],
 ])
 
+export function looksLikeIncompleteTransportFailure(value) {
+    const text = String(value || '').trim()
+    return /(?:API\s+Error\s*:\s*)?(?:Connection closed mid-response|response above may be incomplete)/i.test(text)
+}
+
 export function classifyTaskResult(sdkMsg = {}) {
     const subtype = String(sdkMsg?.subtype || '')
     if (subtype === 'success' && sdkMsg?.is_error !== true) {
+        // 部分中转站会把断流文本包装在 success result 中；不能仅凭 subtype 判定任务成功。
+        const transportText = [sdkMsg?.result, sdkMsg?.finalText, ...(Array.isArray(sdkMsg?.errors) ? sdkMsg.errors : [])]
+            .filter(Boolean).join('\n')
+        if (looksLikeIncompleteTransportFailure(transportText)) {
+            return {
+                outcome: 'failed',
+                continuationReason: 'execution_error',
+                incomplete: false,
+            }
+        }
         return {
             outcome: 'succeeded',
             continuationReason: null,

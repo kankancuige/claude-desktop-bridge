@@ -4,6 +4,7 @@ import {getSessionRuntimeState} from './session-runtime-state.mjs'
 
 test('空闲的长连接 runtime 不应被标记为正在生成', () => {
     assert.deepEqual(getSessionRuntimeState({query: {}, pushStream: {}, _generating: false, _pendingInputs: []}), {
+        permissionMode: 'default',
         runtimeReady: true,
         running: true,
         generating: false,
@@ -39,4 +40,9 @@ test('runtime snapshot exposes sanitized pending confirmation summaries', () => 
         requestId: 'r1', type: 'choice', toolName: 'AskUserQuestion', turnId: 't1', source: 'desktop', userId: 'u1',
         expiresAt: 123, question: '选择方案', options: [{label: 'A'}, {label: 'B'}],
     })
+})
+
+test('runtime snapshot exposes the session permission mode', () => {
+    assert.equal(getSessionRuntimeState({permissionMode: 'acceptEdits'}).permissionMode, 'acceptEdits')
+    assert.equal(getSessionRuntimeState({permissionMode: 'invalid'}).permissionMode, 'default')
 })

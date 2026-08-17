@@ -14,6 +14,9 @@ test('所有 Session 类型共享队列、资源、父任务和生命周期不�
     assert.equal(runtime.taskCompletion.phase, 'idle')
     assert.equal(runtime.taskState.status, 'idle')
     assert.equal(runtime._taskWorkflowGate.active.size, 0)
+    assert.equal(runtime.autoContinuationCount, 0)
+    assert.equal(runtime.autoContinuationTurns, 0)
+    assert.equal(runtime._autoContinuationRequest, null)
 })
 
 test('恢复身份和 Session 类型特有字段由同一工厂叠加', () => {

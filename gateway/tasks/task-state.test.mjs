@@ -31,6 +31,7 @@ test('running state becomes an interrupted resumable task after gateway restart'
         outcome: 'failed',
         continuationReason: 'execution_error',
         resumable: true,
+        permissionMode: 'default',
         subtype: null,
         sdkSessionId: 'sdk-1',
         historySessionId: null,
@@ -55,6 +56,7 @@ test('detail is bounded and client projection excludes session identity', () => 
     const client = taskStateForClient(state)
     assert.equal(client.detail.length, 2000)
     assert.equal('sdkSessionId' in client, false)
+    assert.equal(client.permissionMode, 'default')
     assert.deepEqual(client.review, {round: 0, tier: null, summary: '', blockingCount: 0, blockingFindings: []})
 })
 

@@ -80,7 +80,10 @@ function trailingText(value: unknown, max = 200): string {
 
 function toolDetail(event: any): string {
   const input = event?.input && typeof event.input === 'object' ? event.input : {}
-  const direct = input.file_path || input.path || input.query || input.pattern || input.command || event?.description
+  const direct = input.file_path || input.path || input.query || input.pattern || input.command
+    || input.url || input.description || event?.description
+    || (typeof input.partial_json === 'string' ? input.partial_json : '')
+    || (typeof event?.partial_json === 'string' ? event.partial_json : '')
   return boundedText(direct)
 }
 
@@ -88,15 +91,33 @@ function toolName(event: any): string {
   return boundedText(event?.tool_name || event?.toolName, 80) || '工具'
 }
 
+function toolTitle(name: string): string {
+  const titles: Record<string, string> = {
+    Read: '读取文件',
+    Write: '写入文件',
+    Edit: '编辑文件',
+    Bash: '运行命令',
+    Grep: '搜索代码',
+    Glob: '查找文件',
+    Skill: '加载技能',
+    EnterPlanMode: '进入规划模式',
+    ExitPlanMode: '完成规划',
+    WebFetch: '读取网页',
+    WebSearch: '搜索资料',
+    Task: '启动 Agent',
+    TaskCreate: '创建任务',
+  }
+  return titles[name] || `使用 ${name}`
+}
+
 function agentName(event: any): string {
   return boundedText(event?.agentType || event?.agentName || event?.label || event?.agentId || event?.id, 80) || 'Agent'
 }
 
 function eventId(event: any, fallback: string): string {
-  return boundedText(
-    event?.tool_use_id || event?.toolUseId || event?.requestId || event?.agentId || event?.id || event?.workflowId || event?.index,
-    120,
-  ) || fallback
+  const raw = event?.tool_use_id || event?.toolUseId || event?.requestId || event?.agentId
+    || event?.id || event?.workflowId || event?.index
+  return boundedText(raw == null ? '' : String(raw), 120) || fallback
 }
 
 function normalizeEntry(input: Partial<TaskActivityEntry>): TaskActivityEntry {
@@ -238,6 +259,20 @@ export function reduceTaskActivity(
     }, now)
   }
 
+  if (type === 'task_auto_continuing') {
+    const attempt = Math.max(1, Math.trunc(Number(event.attempt) || 1))
+    const maxAttempts = Math.max(attempt, Math.trunc(Number(event.maxAttempts) || attempt))
+    const completedTurns = Math.max(0, Math.trunc(Number(event.completedTurns) || 0))
+    const parts = [`第 ${attempt}/${maxAttempts} 次`]
+    if (completedTurns) parts.push(`累计 ${completedTurns} 轮`)
+    const detail = parts.join(' · ')
+    state = activityState(state, 'starting', true, '已达到单段轮数上限，正在自动续跑', detail, type, now)
+    return upsertEntry(state, {
+      id: `task:auto-continue:${attempt}`, kind: 'task', status: 'running',
+      title: '自动续跑当前任务', detail, eventType: type,
+    }, now)
+  }
+
   if (type === 'task_decision') {
     const tier = boundedText(event.modelTier || event.model, 80)
     state = activityState(state, 'planning', true, '正在规划执行方式', tier ? `使用 ${tier} 档位` : '', type, now)
@@ -262,21 +297,33 @@ export function reduceTaskActivity(
   if (type === 'tool_use_start') {
     const name = toolName(event)
     state.entries = completeEntries(state.entries, now, entry => entry.kind === 'thinking')
-    state = activityState(state, 'tool', true, `正在使用 ${name}`, toolDetail(event), type, now)
+    state = activityState(state, 'tool', true, `正在${toolTitle(name)}`, toolDetail(event), type, now)
     return upsertEntry(state, {
       id: `tool:${eventId(event, `${name}:${now}`)}`, kind: 'tool', status: 'running',
-      title: name, detail: toolDetail(event), eventType: type,
+      title: toolTitle(name), detail: toolDetail(event), eventType: type,
     }, now)
   }
 
   if (type === 'tool_progress') {
     const name = toolName(event)
     const durationMs = elapsedMs(event)
-    const detail = boundedText(event.detail || event.message) || (durationMs ? `已执行 ${Math.round(durationMs / 1000)} 秒` : '')
-    state = activityState(state, 'tool', true, `正在执行 ${name}`, detail, type, now)
+    const entryId = `tool:${eventId(event, name)}`
+    const previousDetail = state.entries.find(entry => entry.id === entryId)?.detail || ''
+    const detail = boundedText(event.detail || event.message) || previousDetail || (durationMs ? `已执行 ${Math.round(durationMs / 1000)} 秒` : '')
+    state = activityState(state, 'tool', true, `正在${toolTitle(name)}`, detail, type, now)
     return upsertEntry(state, {
-      id: `tool:${eventId(event, name)}`, kind: 'tool', status: 'running', title: name,
+      id: entryId, kind: 'tool', status: 'running', title: toolTitle(name),
       detail, durationMs, eventType: type,
+    }, now)
+  }
+
+  if (type === 'tool_input_update') {
+    const name = toolName(event)
+    const detail = toolDetail(event) || '正在准备工具参数'
+    state = activityState(state, 'tool', true, `正在${toolTitle(name)}`, detail, type, now)
+    return upsertEntry(state, {
+      id: `tool:${eventId(event, name)}`, kind: 'tool', status: 'running', title: toolTitle(name),
+      detail, eventType: type,
     }, now)
   }
 
@@ -348,10 +395,10 @@ export function reduceTaskActivity(
     return {...state, updatedAt: now, eventType: type}
   }
 
-  if (type === 'context_compacting' || type === 'context_compaction_summary' || type === 'context_compacted') {
+  if (type === 'context_compacting' || type === 'context_compacted') {
     const completed = type === 'context_compacted'
-    const title = completed ? '上下文压缩完成' : type === 'context_compaction_summary' ? '正在整理压缩摘要' : '正在压缩上下文'
-    const detail = type === 'context_compacting' ? (event.trigger === 'manual' ? '手动压缩' : '自动压缩') : boundedText(event.summary)
+    const title = completed ? '上下文压缩完成' : '正在压缩上下文'
+    const detail = type === 'context_compacting' ? (event.trigger === 'manual' ? '手动压缩' : '自动压缩') : ''
     state = activityState(state, completed ? 'thinking' : 'compacting', true, completed ? `${title}，继续执行` : title, detail, type, now)
     return upsertEntry(state, {
       id: 'context:compaction', kind: 'compacting', status: completed ? 'completed' : 'running',

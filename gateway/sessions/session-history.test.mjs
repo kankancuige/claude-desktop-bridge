@@ -35,6 +35,14 @@ test('历史消息隐藏 Bridge 内部 Workflow 结果回灌', () => {
     assert.deepEqual(parseSessionHistory(content).map(item => item.text), ['面向用户的最终答复'])
 })
 
+test('历史消息隐藏自动续跑内部提示', () => {
+    const content = [
+        JSON.stringify({type: 'user', message: {content: [{type: 'text', text: '[Bridge 自动续跑]\n继续当前尚未完成的任务'}]}}),
+        JSON.stringify({type: 'assistant', message: {content: [{type: 'text', text: '任务继续执行后的回复'}]}}),
+    ].join('\n')
+    assert.deepEqual(parseSessionHistory(content).map(item => item.text), ['任务继续执行后的回复'])
+})
+
 test('历史消息恢复附件名称、类型、路径和已发送状态', () => {
     const content = JSON.stringify({type: 'user', message: {content: [
         {type: 'text', text: '[系统] 用户发送了 2 个附件。\n- 需求.docx | 类型: document | 路径: .bridge-uploads/s1/upload-1.docx\n===== 图片: 截图.png (.bridge-uploads/s1/upload-2.png) =====\n===== 用户消息 =====\n请处理'},

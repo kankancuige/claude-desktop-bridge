@@ -36,3 +36,15 @@ export function formatCompactSummary({preTokens = 0, postTokens = 0, durationMs 
   const duration = minutes > 0 ? `${minutes}分${seconds}秒` : `${seconds}秒`
   return `${formatTokens(preTokens)} → ${formatTokens(postTokens)} · ${duration}`
 }
+
+export function isSyntheticCompactUiMessage(raw: any): boolean {
+  if (raw?.isCompactSummary === true || raw?.isVisibleInTranscriptOnly === true
+    || raw?.message?.isCompactSummary === true || raw?.message?.isVisibleInTranscriptOnly === true) return true
+  const content = raw?.message?.content ?? raw?.text ?? raw?.content
+  const text = typeof content === 'string'
+    ? content
+    : Array.isArray(content)
+      ? content.filter(block => block?.type === 'text').map(block => block.text || '').join('\n')
+      : ''
+  return /^\s*(?:This session is being continued(?: from a previous conversation that ran out of context)?\.?|The conversation has been compacted|Context compacted)/i.test(text)
+}

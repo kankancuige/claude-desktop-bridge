@@ -55,6 +55,22 @@ export function reduceSessionLifecycle(current: SessionLifecycleState, event: an
     if (!state.awaitingAcceptance) return state
     return {...state, active: false, canSend: true, canStop: false, canContinue: false, awaitingAcceptance: false}
   }
+  // 流式响应中断时，Gateway 会同时携带终态 taskState；即使生命周期快照稍后到达，也必须先释放输入区。
+  // 这里仅接受明确的终态状态，避免普通 SDK/工具错误把仍在运行的父任务误判为空闲。
+  if (['error', 'stream_error'].includes(event?.type)) {
+    const status = String(event?.taskState?.status || '')
+    if (['succeeded', 'interrupted', 'failed', 'incomplete', 'stopped', 'review_paused'].includes(status)) {
+      return {
+        ...state,
+        received: true,
+        active: false,
+        canSend: true,
+        canStop: false,
+        canContinue: status !== 'succeeded' && event.taskState?.resumable === true,
+        awaitingAcceptance: false,
+      }
+    }
+  }
   if (['task_completed', 'task_failed', 'task_review_paused'].includes(event?.type)) {
     // 新版 Gateway 会紧接着发送聚合快照；终态事件只渲染结果，不能在快照前抢先释放队列。
     if (state.received) return state

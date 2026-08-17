@@ -21,12 +21,17 @@ test('任务事件按开始、思考、工具、回复和审查阶段更新活�
   assert.equal(state.entries.filter(entry => entry.kind === 'thinking').length, 1)
 
   state = reduceTaskActivity(state, {type: 'tool_use_start', tool_name: 'Read', tool_use_id: 'tool_1', input: {file_path: 'src/main.ts'}}, 300)
-  assert.equal(state.title, '正在使用 Read')
+  assert.equal(state.title, '正在读取文件')
   assert.equal(state.entries.find(entry => entry.id === 'thinking:thought_1').status, 'completed')
   assert.equal(state.entries.find(entry => entry.id === 'tool:tool_1').detail, 'src/main.ts')
 
   state = reduceTaskActivity(state, {type: 'tool_progress', tool_name: 'Read', tool_use_id: 'tool_1', elapsed_time_seconds: 12}, 400)
   assert.equal(state.entries.find(entry => entry.id === 'tool:tool_1').durationMs, 12_000)
+  state = reduceTaskActivity(state, {
+    type: 'tool_input_update', tool_name: 'Read', tool_use_id: 'tool_1', input: {file_path: 'src/main.ts'},
+  }, 450)
+  assert.equal(state.title, '正在读取文件')
+  assert.equal(state.entries.find(entry => entry.id === 'tool:tool_1').detail, 'src/main.ts')
   assert.equal(state.entries.filter(entry => entry.id === 'tool:tool_1').length, 1)
 
   state = reduceTaskActivity(state, {type: 'content_block_stop', index: 'tool_1'}, 500)
@@ -104,4 +109,17 @@ test('补充指令不重置任务开始时间，长时间无事件分级提示',
   assert.equal(taskActivityFreshness(continued, 30_000).level, 'active')
   assert.equal(taskActivityFreshness(continued, 70_000).level, 'waiting')
   assert.equal(taskActivityFreshness(continued, 200_000).level, 'stale')
+})
+
+test('达到单段轮数上限后自动续跑仍保持同一父任务运行', () => {
+  let state = reduceTaskActivity(createTaskActivityState(), {type: 'task_started'}, 1_000)
+  state = reduceTaskActivity(state, {
+    type: 'task_auto_continuing', attempt: 2, maxAttempts: 3, tier: 'power', completedTurns: 80,
+  }, 2_000)
+  assert.equal(state.running, true)
+  assert.equal(state.phase, 'starting')
+  assert.equal(state.startedAt, 1_000)
+  assert.equal(state.title, '已达到单段轮数上限，正在自动续跑')
+  assert.match(state.entries.at(-1).detail, /第 2\/3 次/)
+  assert.match(state.entries.at(-1).detail, /累计 80 轮/)
 })

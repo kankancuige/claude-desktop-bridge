@@ -27,6 +27,7 @@ import {removeSessionMapEntry, resolveMappedGatewaySessionId, updateSessionMap} 
 import {isUserSessionSource, loadSessionVisibility, markSessionVisible, migrateLegacySessionVisibility, removeSessionVisibility, sessionVisibilitySource, shouldShowSession} from './sessions/session-visibility.mjs'
 import {initialSessionIdentity, resolveSessionCreateMode} from './sessions/session-create-mode.mjs'
 import {createSessionRuntime} from './sessions/session-runtime.mjs'
+import {getPersistedMirrors, mirrorSessionIds, mirrorStorePath, removePersistedMirrors, setPersistedMirror, setPersistedMirrors} from './sessions/session-mirror-state.mjs'
 import {buildProjectContinuationContext, composeContinuationPrompt} from './projects/project-continuation-context.mjs'
 import {buildAgentDescriptor, buildAgentToolLifecycleEvent} from './agents/agent-tool-lifecycle.mjs'
 import {startWeChatAdapter} from './im/wechat.mjs'
@@ -71,7 +72,9 @@ import {
     buildIncompleteMirrorText,
     canResumeTask,
     classifyTaskResult,
+    looksLikeIncompleteTransportFailure,
 } from './tasks/task-result-outcome.mjs'
+import {isAutoContinuationPrompt, resolveAutoContinuation} from './tasks/task-auto-continuation.mjs'
 import {createTaskStatePatch, recoverTaskState, taskStateForClient, taskStateForError, taskStateForStop, taskStateFileId} from './tasks/task-state.mjs'
 import {clearPlatformEntries, platformEntryFilePath} from './im/platform-entry-store.mjs'
 import {createTurnIdentity, shouldDeliverTurnEvent, shouldRouteMirror} from './tasks/turn-routing.mjs'
@@ -111,18 +114,34 @@ import {buildSystemInitEvent} from './sessions/session-init-event.mjs'
 import {resolveRtkCommandArgs} from './tools/rtk-command.mjs'
 import {describeAttachment, isImageAttachment} from './tools/attachment-type.mjs'
 import {cleanupUploadDir, prepareUploadDir} from './tools/upload-storage.mjs'
+import {mapStreamEvent} from './sessions/stream-event-mapper.mjs'
 import {parseDeepSeekBalance, resolveBalanceProvider} from './providers/balance-provider.mjs'
 import {createUserPreferenceService} from './context/user-preferences.mjs'
 import {createImProgressReporter} from './im/im-progress-reporter.mjs'
 import {
     calculateAutoCompactWindow,
     compactBoundaryToEvent,
-    compactSummaryForDisplay,
     contextUsageEvent,
     isSyntheticCompactSummary,
     parseTokenCount,
 } from './context/context-lifecycle.mjs'
 let _proxyStarting = null
+// 同一项目只允许一个后台索引任务，避免连续新建会话重复扫描同一目录。
+const projectCacheBuilds = new Map()
+
+function scheduleProjectCacheBuild(workDir) {
+    const projectCachePath = cacheFilePath(workDir)
+    if (!projectCachePath || existsSync(projectCachePath) || projectCacheBuilds.has(workDir)) return
+
+    const job = new Promise(resolve => setImmediate(resolve))
+        .then(() => buildProjectCache(workDir))
+        .then(cache => {
+            if (cache) saveProjectCache(workDir, cache)
+        })
+        .catch(error => log.warn({err: error, workDir}, '后台 project-cache 构建失败'))
+        .finally(() => projectCacheBuilds.delete(workDir))
+    projectCacheBuilds.set(workDir, job)
+}
 let _ocProxyStarting = null
 import cron from 'node-cron'
 
@@ -295,6 +314,10 @@ function getClaudeExe() {
 }
 
 const MODEL = process.env.ANTHROPIC_MODEL || 'deepseek-v4-pro'
+// SDK 长时间没有任何事件时收口为可恢复中断，避免上游断流后 async iterator 永久挂起。
+// 可用 BRIDGE_STREAM_IDLE_TIMEOUT_MS 调整，默认 3 分钟；工具有持续 progress 事件时不会触发。
+const STREAM_IDLE_TIMEOUT_MS = Math.min(30 * 60 * 1000, Math.max(30 * 1000,
+    Number.parseInt(process.env.BRIDGE_STREAM_IDLE_TIMEOUT_MS || '180000', 10) || 180000))
 
 // 模型名直传，不做映射；缺失值必须保持为空，由调用点按当前 Bridge 供应商配置回退。
 function mapModel(name) {
@@ -545,6 +568,58 @@ function taskStateStorePath(workDir, sessionId) {
     return safeId ? join(CLAUDE_HOME, 'projects', encodeProjectName(workDir), 'bridge-task-state', `${safeId}.json`) : null
 }
 
+function sessionMirrorStorePath(workDir) {
+    return mirrorStorePath(join(CLAUDE_HOME, 'projects', encodeProjectName(workDir)))
+}
+
+function sessionMirrorIds(session, sessionId = null) {
+    return mirrorSessionIds(sessionId, session?.lastSessionId, session?.taskState?.sdkSessionId,
+        session?.taskState?.historySessionId, session?.queryOpts?.resume)
+}
+
+function restoreSessionMirrors(session, sessionId = null) {
+    if (!session?.workDir) return false
+    try {
+        const path = sessionMirrorStorePath(session.workDir)
+        session.mirrors = getPersistedMirrors(readJSON(path), sessionMirrorIds(session, sessionId))
+        return true
+    } catch (error) {
+        log.warn({err: error, sessionId: sessionId?.slice?.(0, 8)}, 'Session 镜像状态恢复失败')
+        return false
+    }
+}
+
+function persistSessionMirrors(session, sessionId = null, platform = null, enabled = null) {
+    if (!session?.workDir) return false
+    try {
+        const path = sessionMirrorStorePath(session.workDir)
+        const ids = sessionMirrorIds(session, sessionId)
+        if (ids.length === 0) return false
+        let next = readJSON(path)
+        next = platform ? setPersistedMirror(next, ids, platform, enabled === true) : setPersistedMirrors(next, ids, session.mirrors)
+        writeJSON(path, next)
+        return true
+    } catch (error) {
+        log.warn({err: error, workDir: session.workDir, sessionId: sessionId?.slice?.(0, 8)}, 'Session 镜像状态保存失败')
+        return false
+    }
+}
+
+function removePersistedSessionMirrors(workDir, ids) {
+    try {
+        const path = sessionMirrorStorePath(workDir)
+        const current = readJSON(path)
+        if (!current) return true
+        const next = removePersistedMirrors(current, ids)
+        if (JSON.stringify(next) === JSON.stringify(current)) return true
+        writeJSON(path, next)
+        return true
+    } catch (error) {
+        log.warn({err: error, workDir}, 'Session 镜像状态清理失败')
+        return false
+    }
+}
+
 function openSessionEventJournal(workDir, sessionId) {
     const projectDir = join(CLAUDE_HOME, 'projects', encodeProjectName(workDir))
     return new SessionEventJournal({
@@ -592,7 +667,11 @@ function loadTaskState(workDir, sessionId) {
 
 function updateTaskState(session, sessionId, next) {
     if (!session) return null
-    session.taskState = createTaskStatePatch(next)
+    // 权限属于会话级设置，但随任务状态同一份安全快照落盘，确保 Gateway 重启后可恢复。
+    session.taskState = createTaskStatePatch({
+        ...(next && typeof next === 'object' ? next : {}),
+        permissionMode: next?.permissionMode || session.permissionMode || session.taskState?.permissionMode || 'default',
+    })
     saveTaskState(session, sessionId)
     appendSessionEvent(session, 'task/state-changed', {taskState: journalTaskState(session.taskState)})
     return session.taskState
@@ -619,6 +698,7 @@ function taskStateFromCompletion(session, detail = '') {
         finalReplyText: session?.taskFinalReplyText || session?.taskState?.finalReplyText || '',
         finalReplyAvailable: Boolean(session?.taskFinalReplyText || session?.taskState?.finalReplyText),
         notifications: session?.taskState?.notifications || {},
+        permissionMode: session?.permissionMode || session?.taskState?.permissionMode || 'default',
         sdkSessionId: session?.lastSessionId,
         historySessionId: session?.lastSessionId,
         taskId: session?.taskCompletionTaskId || null,
@@ -647,6 +727,21 @@ function updateTaskCompletion(session, sessionId, event) {
     session.taskCompletion = transition.state
     updateTaskState(session, sessionId, taskStateFromCompletion(session))
     return transition
+}
+
+function repairPersistedTaskState(state) {
+    if (!state || state.status !== 'succeeded') return state
+    const text = [state.detail, state.finalReplyText].filter(Boolean).join('\n')
+    if (!looksLikeIncompleteTransportFailure(text)) return state
+    // 兼容旧版本已把中转站断流文本写成 succeeded 的记录，恢复时纠正为可继续的失败态。
+    return {
+        ...state,
+        status: 'failed',
+        outcome: 'failed',
+        continuationReason: 'execution_error',
+        resumable: Boolean(state.historySessionId || state.sdkSessionId),
+        detail: state.detail || state.finalReplyText,
+    }
 }
 
 function getTaskLifecycleSnapshot(sessionId, session = sessions.get(sessionId)) {
@@ -772,6 +867,68 @@ function cancelPendingSessionInputs(sessionId, s) {
     return pending.length
 }
 
+function clearStreamWatchdog(session, query = null) {
+    if (!session) return
+    if (query && session._streamWatchdogQuery && session._streamWatchdogQuery !== query) return
+    if (session._streamWatchdogTimer) clearTimeout(session._streamWatchdogTimer)
+    session._streamWatchdogTimer = null
+    session._streamWatchdogQuery = null
+}
+
+function armStreamWatchdog(sessionId, session, query) {
+    if (!session || !query || session.query !== query || STREAM_IDLE_TIMEOUT_MS <= 0) return
+    clearStreamWatchdog(session)
+    session._streamWatchdogQuery = query
+    session._streamWatchdogTimer = setTimeout(() => {
+        if (sessions.get(sessionId) !== session || session.query !== query || !session._generating) return
+        session._streamWatchdogTriggered = query
+        const detail = `API 超过 ${Math.round(STREAM_IDLE_TIMEOUT_MS / 1000)} 秒未返回新事件，已自动中断当前执行；已有修改和会话上下文已保留，可继续执行。`
+        const timeoutIdentity = session.activeTurnIdentity ? {...session.activeTurnIdentity} : null
+        log.error({sessionId: sessionId?.slice(0, 8), timeoutMs: STREAM_IDLE_TIMEOUT_MS}, 'SDK 流长时间无事件，自动收口')
+        const transition = updateTaskCompletion(session, sessionId, {type: 'runtime_failed', detail})
+        void applyTaskCompletionEffects(sessionId, transition.effects).catch(error => {
+            log.error({err: error, sessionId: sessionId?.slice(0, 8)}, 'SDK 流超时后的任务收口失败')
+        })
+        session._generating = false
+        session.activeTurnId = null
+        session.activeTurnIdentity = null
+        failPendingSessionInputs(sessionId, session, new Error(detail))
+        const completedAt = Date.now()
+        session.taskCompletedAt = completedAt
+        const startedAt = Number(session.taskStartedAt || session.taskState?.startedAt || completedAt)
+        updateTaskState(session, sessionId, taskStateForError(new Error(detail), {
+            sdkSessionId: session.lastSessionId,
+            historySessionId: session.lastSessionId,
+            startedAt,
+            completedAt,
+            durationMs: Math.max(0, completedAt - startedAt),
+        }))
+        appendSessionEvent(session, 'runtime/failed', {
+            turnId: session.taskState.turnId,
+            code: 'stream_idle_timeout',
+            durationMs: session.taskState.durationMs,
+        })
+        broadcastTurn(sessionId, {
+            type: 'error',
+            code: 'stream_idle_timeout',
+            message: detail,
+            durationMs: session.taskState.durationMs,
+            taskState: taskStateForClient(session.taskState),
+        }, timeoutIdentity)
+        broadcastTaskLifecycle(sessionId)
+        // 先断开 Session 对挂起 query 的引用，允许用户点击“继续执行”时创建新的 SDK query。
+        if (session.query === query) session.query = null
+        try { session.pushStream?.close() } catch (error) {
+            log.debug({err: error, sessionId: sessionId?.slice(0, 8)}, 'SDK 流超时输入流关闭失败')
+        }
+        session.pushStream = null
+        Promise.resolve(query.return?.()).catch(error => {
+            log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, 'SDK 流超时关闭失败')
+        })
+    }, STREAM_IDLE_TIMEOUT_MS)
+    session._streamWatchdogTimer.unref?.()
+}
+
 async function stopSessionGeneration(sessionId, s) {
     if (!s) return {stopped: false, cancelledInputs: 0}
     if (s._stopPromise) return s._stopPromise
@@ -783,6 +940,7 @@ async function stopSessionGeneration(sessionId, s) {
     }
     if (!hasStoppableSessionWork(s, workflowStates)) return {stopped: false, cancelledInputs: 0}
     const operation = (async () => {
+        clearStreamWatchdog(s)
         const stopScope = getSessionStopScope(s, workflowStates)
         for (const workflow of stopScope.activeWorkflows) {
             if (workflow.wfId || workflow.name) stopWorkflow(workflow.wfId || workflow.name)
@@ -797,6 +955,12 @@ async function stopSessionGeneration(sessionId, s) {
         updateTaskCompletion(s, sessionId, {type: 'user_stopped', detail: '用户已暂停任务'})
         clearTaskWorkflowGate(s._taskWorkflowGate)
         s._internalWorkflowResultTurnId = null
+        s._autoContinuationRequest = null
+        s.autoContinuationCount = 0
+        s.autoContinuationTurns = 0
+        // 先失效异步 rebuild token，再等待 SDK 关闭；否则 makeQueryOptions 完成后可能复活已停止任务。
+        s._rebuildId = null
+        s._pendingMessages = null
         for (const id of [...(s.pending?.keys() || [])]) settlePending(sessionId, id, {
             behavior: 'deny',
             message: '已取消',
@@ -812,8 +976,6 @@ async function stopSessionGeneration(sessionId, s) {
         }
         s.pendingTurn = null
         s._rebuildPromise = null
-        s._rebuildId = null
-        s._pendingMessages = null
         const cancelledInputs = cancelPendingSessionInputs(sessionId, s)
         s._pendingTurns = []
         s._generating = false
@@ -2420,7 +2582,8 @@ function convertSdkToWs(sdkMsg, sessionId) {
             return {type: 'assistant_message', message: sdkMsg.message, error: sdkMsg.error}
         case 'user':
             if (isSyntheticCompactSummary(sdkMsg)) return null
-            if (isInternalWorkflowResultText(sdkMsg.message?.content?.find?.(block => block?.type === 'text')?.text)) return null
+            const userText = sdkMsg.message?.content?.find?.(block => block?.type === 'text')?.text
+            if (isInternalWorkflowResultText(userText) || isAutoContinuationPrompt(userText)) return null
             return {type: 'user_message_echo', message: sdkMsg.message, timestamp: sdkMsg.timestamp}
         case 'result':
             const taskResult = classifyTaskResult(sdkMsg)
@@ -2448,40 +2611,6 @@ function convertSdkToWs(sdkMsg, sessionId) {
         default:
             return null
     }
-}
-
-// 功能说明: 映射 SDK stream_event 的细分事件类型为前端 WS 消息
-// 实现方式: content_block_start 区分 tool_use/thinking → 提取对应字段；content_block_delta 提取 text_delta/thinking_delta
-//   不认识的类型返回 null（不广播），减少前端噪音
-// 关键数据流: stream_event → type 分支 → {type, tool_name/text/thinking, ...} 或 null
-function mapStreamEvent(event) {
-    if (event.type === 'content_block_start') {
-        const b = event.content_block;
-        if (b.type === 'tool_use') return {
-            type: 'tool_use_start',
-            tool_name: b.name,
-            tool_use_id: b.id,
-            input: b.input
-        };
-        if (b.type === 'thinking') return {type: 'thinking_start', index: event.index, thinking: b.thinking || ''};
-        return {type: 'content_block_start'}
-    }
-    if (event.type === 'content_block_delta') {
-        const d = event.delta;
-        if (d.type === 'text_delta') return {type: 'text_delta', text: d.text};
-        if (d.type === 'thinking_delta') return {
-            type: 'thinking_delta',
-            index: event.index,
-            thinking: d.thinking || ''
-        };
-        return null
-    }
-    if (event.type === 'message_start') return {
-        type: 'message_start',
-        model: event.message.model,
-        usage: event.message.usage
-    }
-    return null
 }
 
 // ── SDK query 选项组装（makeQueryOptions）──
@@ -2782,18 +2911,6 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
                     return {}
                 }]
             }],
-            PostCompact: [{
-                matcher: '', timeout: 30, hooks: [(input) => {
-                    // 摘要仅供用户按需展开，不能进入普通用户消息气泡。
-                    broadcast(sessionId, {
-                        type: 'context_compaction_summary',
-                        trigger: input.trigger || 'auto',
-                        summary: compactSummaryForDisplay(input.compact_summary),
-                        ts: Date.now(),
-                    })
-                    return {}
-                }]
-            }],
         }
     }
     // 暴露本次生效的 env 给同进程兼容路径，替代写 process.env 全局
@@ -2846,8 +2963,12 @@ async function refreshContextUsage(sessionId, session, reason) {
     if (session._contextUsageInFlight) return session._contextUsageInFlight
     session._contextUsageInFlight = (async () => {
         try {
-            const usage = await session.query.getContextUsage()
-            const event = contextUsageEvent(usage, {reason})
+            const usage = await withTimeout(Promise.resolve(session.query.getContextUsage()), 5_000)
+            const configuredThreshold = parseTokenCount(session.queryOpts?.settings?.autoCompactWindow)
+            const event = contextUsageEvent(usage, {
+                reason,
+                ...(configuredThreshold ? {autoCompactThreshold: configuredThreshold} : {}),
+            })
             session.contextUsage = event
             broadcast(sessionId, event)
         } catch (error) {
@@ -2859,15 +2980,119 @@ async function refreshContextUsage(sessionId, session, reason) {
     return session._contextUsageInFlight
 }
 
+function maybeRefreshContextUsage(sessionId, session, reason) {
+    if (!session?.query || typeof session.query.getContextUsage !== 'function') return
+    const now = Date.now()
+    if (now - Number(session._lastContextUsageAt || 0) < 5_000) return
+    session._lastContextUsageAt = now
+    void refreshContextUsage(sessionId, session, reason)
+}
+
+async function startAutoContinuation(sessionId, session, request) {
+    if (!session || sessions.get(sessionId) !== session || session._autoContinuationRequest !== request
+        || !request?.prompt || !session.lastSessionId
+        || !['running', 'fixing'].includes(session.taskCompletion?.phase)) return false
+    const rebuildId = Symbol('auto-continuation')
+    const pushStream = new PushStream()
+    session._rebuildId = rebuildId
+    session._pendingMessages = [request.prompt]
+    session._rebuildPromise = (async () => {
+        const cliS = loadCliSettings()
+        session.pushStream = pushStream
+        const bodyOverride = {
+            resume: session.lastSessionId,
+            model: session.queryOpts?.model,
+            modelMode: session.modelMode || 'fixed',
+            taskDecision: session.taskDecision || request.taskDecision || null,
+            permissionMode: session.permissionMode,
+            thinkingLevel: session.thinkingLevel,
+            contextProfile: session.contextProfile || 'full',
+            skillRoute: session.skillRoute || [],
+            modelMeta: session.modelMeta || null,
+            maxContextTokens: session.queryOpts?.bridgeContextSafetyCap || undefined,
+            maxTurns: session.queryOpts?.maxTurns,
+        }
+        if (session.providerBaseUrl) bodyOverride.baseUrl = session.providerBaseUrl
+        if (session.providerApiKey) bodyOverride.apiKey = session.providerApiKey
+        const opts = await makeQueryOptions(bodyOverride, session.workDir, cliS, {}, sessionId)
+        if (session._rebuildId !== rebuildId || session.pushStream !== pushStream
+            || session._autoContinuationRequest !== request) return false
+        opts.resume = session.lastSessionId
+        session.query = startClaudeAgent(pushStream, opts)
+        session.runtimeEnv = opts.runtimeEnv
+        session.queryOpts = opts
+        session.providerBaseUrl = opts.bridgeProviderBaseUrl || session.providerBaseUrl
+        session.providerApiKey = opts.bridgeProviderApiKey || session.providerApiKey
+        startStreamPump(sessionId)
+        // query 已经接管续跑请求；后续追加消息只通过 _rebuildPromise 排队。
+        session._autoContinuationRequest = null
+        const pending = session._pendingMessages || []
+        session._pendingMessages = null
+        for (const content of pending) {
+            pushStream.push({
+                type: 'user', session_id: sessionId,
+                message: {role: 'user', content: [{type: 'text', text: content}]},
+                parent_tool_use_id: null,
+            })
+            session.hasUserTurns = true
+        }
+        session._rebuildPromise = null
+        session._rebuildId = null
+        return true
+    })().catch(error => {
+        if (session._rebuildId !== rebuildId) return false
+        session._autoContinuationRequest = null
+        session._rebuildPromise = null
+        session._rebuildId = null
+        session._pendingMessages = null
+        session.pushStream = null
+        session.query = null
+        const detail = `自动续跑启动失败：${String(error?.message || error || '未知错误')}`
+        log.error({err: error, sessionId: sessionId?.slice(0, 8)}, detail)
+        const transition = updateTaskCompletion(session, sessionId, {type: 'runtime_failed', detail})
+        void applyTaskCompletionEffects(sessionId, transition.effects).catch(effectError => {
+            log.error({err: effectError, sessionId: sessionId?.slice(0, 8)}, '自动续跑失败后的任务收口失败')
+            broadcastTurn(sessionId, {
+                type: 'error', code: 'auto_continuation_failed', message: detail,
+                durationMs: session.taskState?.durationMs || 0,
+                taskState: taskStateForClient(session.taskState),
+            }, request.identity || session.taskCompletionIdentity || null)
+        })
+        session._generating = false
+        session.activeTurnId = null
+        session.activeTurnIdentity = null
+        const completedAt = Date.now()
+        session.taskCompletedAt = completedAt
+        const startedAt = Number(session.taskStartedAt || session.taskState?.startedAt || completedAt)
+        updateTaskState(session, sessionId, taskStateForError(error, {
+            sdkSessionId: session.lastSessionId,
+            historySessionId: session.lastSessionId,
+            startedAt,
+            completedAt,
+            durationMs: Math.max(0, completedAt - startedAt),
+        }))
+        return false
+    })
+    await session._rebuildPromise
+    return Boolean(session.query)
+}
+
 async function startStreamPump(sessionId) {
     const s = sessions.get(sessionId);
     if (!s) return
     const myQuery = s.query  // 记录此 pump 持有的 query 对象引用
+    armStreamWatchdog(sessionId, s, myQuery)
     try {
         for await (const sdkMsg of myQuery) {
+            armStreamWatchdog(sessionId, s, myQuery)
+            maybeRefreshContextUsage(sessionId, s, `running:${sdkMsg.type || 'event'}`)
             if (sdkMsg.type === 'system' && sdkMsg.subtype === 'init') {
                 if (sdkMsg.session_id) {
                     s.lastSessionId = sdkMsg.session_id; s._hasConversation = true
+                    // SDK ID 到达后补写别名，保证 Gateway 重启/resume 后仍能恢复镜像开关。
+                    if (!persistSessionMirrors(s, sessionId)) {
+                        log.warn({sessionId: sessionId?.slice(0, 8)}, 'Session 镜像别名未持久化')
+                    }
                     if (s.taskState?.status === 'running') {
                         updateTaskState(s, sessionId, {
                             ...s.taskState,
@@ -2987,14 +3212,96 @@ async function startStreamPump(sessionId) {
                 s.turnText = ''
                 void refreshContextUsage(sessionId, s, 'workflow-result')
             } else if (sdkMsg.type === 'result') {
-                const taskResult = classifyTaskResult(sdkMsg)
+                const taskResult = classifyTaskResult({...sdkMsg, finalText: s.turnText})
                 const completionDecision = s.activeTaskDecision || s.taskCompletionDecision || s.taskDecision || null
+                const segmentTurns = Math.max(0, Math.trunc(Number(sdkMsg.num_turns) || 0))
+                const totalTurns = Math.max(0, Number(s.autoContinuationTurns || 0)) + segmentTurns
+                const continuation = resolveAutoContinuation({
+                    result: taskResult,
+                    decision: completionDecision,
+                    attempt: s.autoContinuationCount,
+                    hasConversation: Boolean(s.lastSessionId || sdkMsg.session_id),
+                    taskActive: ['running', 'fixing'].includes(s.taskCompletion?.phase),
+                })
+                if (continuation.shouldContinue) {
+                    try {
+                        maybeUpdateProjectCache(sessionId, s)
+                    } catch (error) {
+                        log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '自动续跑前更新 project-cache 失败')
+                    }
+                    try {
+                        finalizeCheckpoint(sessionId)
+                    } catch (error) {
+                        log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '自动续跑前保存 checkpoint 失败')
+                    }
+                    s.autoContinuationCount = continuation.attempt
+                    s.autoContinuationTurns = totalTurns
+                    s.lastTaskResult = {
+                        ...taskResult,
+                        subtype: sdkMsg.subtype,
+                        resumable: true,
+                        result: `达到单段轮数上限，正在自动续跑（第 ${continuation.attempt}/${continuation.maxAttempts} 次）`,
+                        rawResult: sdkMsg.result || sdkMsg.errors?.join('\n') || '',
+                        numTurns: totalTurns,
+                        at: Date.now(),
+                    }
+                    const continuationIdentity = s.activeTurnIdentity ? {...s.activeTurnIdentity} : s.taskCompletionIdentity || null
+                    s._autoContinuationRequest = {
+                        ...continuation,
+                        taskDecision: completionDecision,
+                        turnId: s.activeTurnId || s.taskCompletionTurnId || null,
+                        source: continuationIdentity?.source || s.lastTurnSource || 'desktop',
+                        userId: continuationIdentity?.userId || null,
+                        identity: continuationIdentity,
+                    }
+                    if (!Array.isArray(s._pendingInputs)) s._pendingInputs = []
+                    s._pendingInputs.unshift({
+                        messageId: null,
+                        turnId: s._autoContinuationRequest.turnId,
+                        source: s._autoContinuationRequest.source,
+                        userId: s._autoContinuationRequest.userId,
+                        taskDecision: completionDecision,
+                    })
+                    beginTurn(sessionId, continuation.prompt)
+                    appendSessionEvent(s, 'task/auto-continuing', {
+                        turnId: s._autoContinuationRequest.turnId,
+                        attempt: continuation.attempt,
+                        maxAttempts: continuation.maxAttempts,
+                        tier: continuation.tier,
+                        completedTurns: totalTurns,
+                    })
+                    updateTaskState(s, sessionId, {
+                        ...s.taskState,
+                        status: s.taskCompletion?.phase === 'fixing' ? 'fixing' : 'running',
+                        outcome: null,
+                        continuationReason: null,
+                        resumable: true,
+                        numTurns: totalTurns,
+                        detail: `达到单段轮数上限，正在自动续跑（第 ${continuation.attempt}/${continuation.maxAttempts} 次）`,
+                        completedAt: 0,
+                        durationMs: 0,
+                    })
+                    taskCompletionEventForClient(s, sessionId, 'task_auto_continuing', {
+                        attempt: continuation.attempt,
+                        maxAttempts: continuation.maxAttempts,
+                        tier: continuation.tier,
+                        completedTurns: totalTurns,
+                    })
+                    s.turnText = ''
+                    s._generating = false
+                    // 结束已达上限的 SDK 输入流，pump 收口后再用同一 session 重建下一段。
+                    try { s.pushStream?.close() } catch (error) {
+                        log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '自动续跑关闭旧输入流失败')
+                    }
+                    void refreshContextUsage(sessionId, s, 'max-turns')
+                    continue
+                }
                 s.lastTaskResult = {
                     ...taskResult,
                     subtype: sdkMsg.subtype,
                     resumable: canResumeTask(taskResult, Boolean(s.lastSessionId || sdkMsg.session_id)),
                     result: sdkMsg.result || sdkMsg.errors?.join('\n') || '',
-                    numTurns: sdkMsg.num_turns || 0,
+                    numTurns: totalTurns,
                     at: Date.now(),
                 }
                 // maybeUpdateProjectCache 必须在 finalizeCheckpoint 之前调用：
@@ -3048,10 +3355,14 @@ async function startStreamPump(sessionId) {
                     detail: s.lastTaskResult.result || '',
                 })
                 s.turnText = ''
+                s.autoContinuationTurns = 0
                 void refreshContextUsage(sessionId, s, 'result')
             }
             if (sdkMsg.type === 'result') s._generating = false
-            const wsMsg = convertSdkToWs(sdkMsg, sessionId)
+            const clientSdkMsg = sdkMsg.type === 'result' && s.lastTaskResult?.numTurns
+                ? {...sdkMsg, num_turns: s.lastTaskResult.numTurns}
+                : sdkMsg
+            const wsMsg = convertSdkToWs(clientSdkMsg, sessionId)
             if (wsMsg) broadcastTurn(sessionId, {
                 ...wsMsg,
                 turnId: s.activeTurnId || null,
@@ -3084,7 +3395,8 @@ async function startStreamPump(sessionId) {
         log.error({err: e, sessionId: sessionId?.slice(0, 8)}, 'pump 异常')
         const failedSession = sessions.get(sessionId)
         const failedTurnIdentity = failedSession?.activeTurnIdentity ? {...failedSession.activeTurnIdentity} : null
-        if (failedSession?.query === myQuery) {
+        const watchdogTriggered = failedSession?._streamWatchdogTriggered === myQuery
+        if (failedSession?.query === myQuery && !watchdogTriggered) {
             clearTaskWorkflowGate(failedSession._taskWorkflowGate)
             failedSession._internalWorkflowResultTurnId = null
             const transition = updateTaskCompletion(failedSession, sessionId, {
@@ -3114,7 +3426,7 @@ async function startStreamPump(sessionId) {
                 durationMs: failedSession.taskState.durationMs,
             })
         }
-        if (e.message !== 'cancelled') broadcastTurn(sessionId, {
+        if (e.message !== 'cancelled' && !watchdogTriggered) broadcastTurn(sessionId, {
             type: 'error',
             message: e.message,
             code: 'stream_error',
@@ -3124,12 +3436,21 @@ async function startStreamPump(sessionId) {
         if (failedSession) broadcastTaskLifecycle(sessionId)
     } finally {
         const s2 = sessions.get(sessionId);
+        if (s2?._streamWatchdogQuery === myQuery) clearStreamWatchdog(s2, myQuery)
+        if (s2?._streamWatchdogTriggered === myQuery) s2._streamWatchdogTriggered = null
+        const autoContinuationRequest = s2?.query === myQuery ? s2._autoContinuationRequest : null
         // 仅当 query 未被重建替换时才置空，避免覆盖新 pump 持有的 query
         if (s2 && s2.query === myQuery) {
             s2._generating = false
             s2.query = null
+            if (autoContinuationRequest) {
+                try { s2.pushStream?.close() } catch (error) {
+                    log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '关闭已达轮数上限的输入流失败')
+                }
+                s2.pushStream = null
+            }
         }
-        if (s2 && s2.query === null && s2._onPumpDone) {
+        if (s2 && s2.query === null && !autoContinuationRequest && s2._onPumpDone) {
             const onPumpDone = s2._onPumpDone
             s2._onPumpDone = null
             try { onPumpDone() } catch (e) {
@@ -3137,7 +3458,7 @@ async function startStreamPump(sessionId) {
             }
         }
         // 定时任务临时 session (无固定 sessionId) 完成后自动清理，防止累积
-        if (s2?._autoDelete && !s2.clients?.size) {
+        if (s2?._autoDelete && !autoContinuationRequest && !s2.clients?.size) {
             markSessionDeleted(sessionId)
             finishImProgressReporters(sessionId)
             sessions.delete(sessionId)
@@ -3147,6 +3468,10 @@ async function startStreamPump(sessionId) {
             deleteSessionFiles(sessionId, [s2.lastSessionId]).catch(error => {
                 log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '清理临时 Session 文件失败')
             })
+        }
+        if (autoContinuationRequest && sessions.get(sessionId) === s2) {
+            // 立即建立 rebuildPromise，避免用户追加消息与自动续跑各自启动一个 query。
+            void startAutoContinuation(sessionId, s2, autoContinuationRequest)
         }
     }
 }
@@ -4366,6 +4691,19 @@ async function handleHttpRequest(req, res) {
             sessionId = resolution.gatewaySessionId
             resumeSid = resolution.sdkSessionId
         }
+        // 重启后前端旧快照通常仍会带 default；已有会话的非 default 权限以服务端持久化值为准。
+        // 用户在会话中主动切回 default 后，持久化值也会变为 default，不会阻止后续切换。
+        const persistedPermissionState = createMode.mode === 'resume'
+            ? (loadTaskState(workDir, resumeSid || body.resume) || null)
+            : createMode.mode === 'fork'
+                ? (loadTaskState(workDir, forkSourceId) || null)
+                : null
+        const persistedPermissionMode = VALID_PERMISSION_MODES.has(persistedPermissionState?.permissionMode)
+            ? persistedPermissionState.permissionMode
+            : null
+        if (persistedPermissionMode && persistedPermissionMode !== 'default' && body.permissionMode === 'default') {
+            body.permissionMode = persistedPermissionMode
+        }
         try {
             const cliS = loadCliSettings();
             const pushStream = new PushStream()
@@ -4394,9 +4732,11 @@ async function handleHttpRequest(req, res) {
             // 直接复用，不销毁重建——否则会中断正在进行的对话 + 导致重复 session
             const oldSess = sessions.get(sessionId)
             if (oldSess?.query && oldSess?.pushStream) {
+                restoreSessionMirrors(oldSess, sessionId)
                 focusedSessionId = sessionId
                 res.writeHead(200);
                 res.end(JSON.stringify({sessionId, workDir, resumed: true, historySessionId: oldSess.lastSessionId || resumeSid,
+                    permissionMode: oldSess.permissionMode || 'default',
                     taskState: taskStateForClient(oldSess.taskState),
                     gitInfo: sessions.get(sessionId)?.snapshot?.gitHead || null}));
                 return
@@ -4439,9 +4779,9 @@ async function handleHttpRequest(req, res) {
             const journalTaskProjection = resumeSid
                 ? createdSession.eventJournal.projectTaskState({recoverRunning: true})
                 : null
-            const persistedTaskState = resumeSid
+            const persistedTaskState = repairPersistedTaskState(resumeSid
                 ? (journalTaskProjection || loadTaskState(workDir, sessionId) || loadTaskState(workDir, resumeSid))
-                : null
+                : null)
             createdSession.taskState = persistedTaskState || createTaskStatePatch({
                 status: 'idle',
                 outcome: null,
@@ -4449,6 +4789,16 @@ async function handleHttpRequest(req, res) {
                 resumable: false,
                 sdkSessionId: resumeSid,
                 historySessionId: resumeSid,
+                permissionMode: createdSession.permissionMode,
+            })
+            if (VALID_PERMISSION_MODES.has(persistedTaskState?.permissionMode)
+                && persistedTaskState.permissionMode !== 'default'
+                && body.permissionMode === 'default') {
+                createdSession.permissionMode = persistedTaskState.permissionMode
+            }
+            createdSession.taskState = createTaskStatePatch({
+                ...createdSession.taskState,
+                permissionMode: createdSession.permissionMode,
             })
             if (persistedTaskState && ['reviewing', 'changes_required', 'fixing', 'review_paused'].includes(persistedTaskState.status)) {
                 const recoveredPhase = persistedTaskState.status === 'reviewing' || persistedTaskState.status === 'fixing'
@@ -4479,6 +4829,7 @@ async function handleHttpRequest(req, res) {
             createdSession.taskCompletionTaskId = persistedTaskState?.taskId || null
             createdSession.taskCompletionTurnId = persistedTaskState?.turnId || null
             createdSession._taskCompletionSequence = persistedTaskState?.sequence || 0
+            restoreSessionMirrors(createdSession, sessionId)
             createdSession.visibleSource = sessionVisibilitySource(getProjectVisibility(workDir), sessionId, resumeSid)
             if (resumeSid && createdSession.taskState.status === 'running') {
                 createdSession.taskState = recoverTaskState(createdSession.taskState)
@@ -4489,19 +4840,15 @@ async function handleHttpRequest(req, res) {
             }
             focusedSessionId = sessionId
             if (q) startStreamPump(sessionId)
-            // 后台异步构建项目结构缓存（仅首次，后续会话直接复用）
-            const projectCachePath = cacheFilePath(workDir)
-            if (projectCachePath && !existsSync(projectCachePath)) {
-                buildProjectCache(workDir).then(c => {
-                    if (c) saveProjectCache(workDir, c)
-                }).catch(e => log.warn({err: e, workDir}, '后台 project-cache 构建失败'))
-            }
             invalidateProjectsCache()
             res.writeHead(201);
             res.end(JSON.stringify({sessionId, workDir, resumed: createMode.mode === 'resume', forked: createMode.mode === 'fork', forkedFrom,
+                permissionMode: sessions.get(sessionId)?.permissionMode || 'default',
                 historySessionId: resumeSid,
                 taskState: taskStateForClient(sessions.get(sessionId)?.taskState),
                 gitInfo: sessions.get(sessionId)?.snapshot?.gitHead || null}))
+            // 响应并建立会话后再构建项目索引，不能让首次扫描阻塞 WebSocket/focus。
+            scheduleProjectCacheBuild(workDir)
             const backgroundSession = sessions.get(sessionId)
             scheduleSessionBackgroundInitialization({
                 sessionId,
@@ -5228,7 +5575,12 @@ async function handleHttpRequest(req, res) {
             // toggle → 翻转
             enabled = !s.mirrors[platform]
         }
-        s.mirrors[platform] = enabled
+        const previousMirrors = {...s.mirrors}
+        s.mirrors[platform] = enabled   // SIDE_EFFECT: mutates session.mirrors
+        if (!persistSessionMirrors(s, focusedSessionId, platform, enabled)) {
+            s.mirrors = previousMirrors
+            res.writeHead(500); res.end(JSON.stringify({error: 'session mirror state persistence failed'})); return
+        }
         // nudge 桌面端同步按钮状态
         const nudge = {type: 'nudge', action: 'toggle_mirror', args: {platform, enabled}, nudgeId: crypto.randomUUID(), source: 'adapter'}
         for (const ws of controlClients) {
@@ -5271,7 +5623,15 @@ async function handleHttpRequest(req, res) {
                 return
             }
             s.mirrors = s.mirrors || {wechat: false, feishu: false, dingtalk: false}
-            s.mirrors[b.platform] = !!b.enabled   // SIDE_EFFECT: mutates session.mirrors
+            const previousMirrors = {...s.mirrors}
+            const enabled = b.enabled === true
+            s.mirrors[b.platform] = enabled   // SIDE_EFFECT: mutates session.mirrors
+            if (!persistSessionMirrors(s, mirrorM[1], b.platform, enabled)) {
+                s.mirrors = previousMirrors
+                res.writeHead(500)
+                res.end(JSON.stringify({error: 'session mirror state persistence failed'}))
+                return
+            }
             res.writeHead(200);
             res.end(JSON.stringify({ok: true, platform: b.platform, enabled: s.mirrors[b.platform]}));
             return
@@ -8116,6 +8476,10 @@ async function submitTaskCommand(command) {
             s._taskCompletionSequence = 0
             s._taskWorkflowGate = createTaskWorkflowGate()
             s._internalWorkflowResultTurnId = null
+            s._autoContinuationRequest = null
+            s.autoContinuationCount = 0
+            s.autoContinuationTurns = 0
+            s._lastContextUsageAt = 0
         }
 
         // 只在新任务入口观察候选；同一执行中的补充消息不能把一次要求误计为多次偏好。
@@ -8413,6 +8777,7 @@ wss.on('connection', (ws, req) => {
         type: 'connected',
         sessionId,
         mirrorEnabled: IM_SOURCES.has(source) ? !!s.mirrors?.[source] : false,
+        mirrors: s.mirrors || {wechat: false, feishu: false, dingtalk: false},
     }))
     if (params.source === 'desktop') {
         ws.send(JSON.stringify({type: 'session_state_snapshot', ...getSessionRuntimeState(s), taskState: taskStateForSessionClient(s)}))
@@ -8480,6 +8845,7 @@ wss.on('connection', (ws, req) => {
             }
             if (newPerm && newPerm !== s.permissionMode) {
                 s.permissionMode = newPerm
+                updateTaskState(s, sessionId, {...(s.taskState || {}), permissionMode: newPerm})
                 log.info({sessionId: sessionId?.slice(0,8), permissionMode: newPerm}, 'permissionMode 变更 (即时)')
                 if (newPerm === 'bypassPermissions' && s.pending) {
                     for (const [rid, entry] of s.pending) {
@@ -9045,6 +9411,9 @@ async function deleteSessionFiles(sessionId, relatedSessionIds = []) {
                     log.warn({err: error, sessionId: targetId?.slice(0, 8), path: artifact}, '清理 Session 元数据失败')
                 }
             }
+        }
+        if (!removePersistedSessionMirrors(workDir, targetIds)) {
+            failures.push(new Error(`清理 Session 镜像状态失败: ${workDir}`))
         }
     }
 

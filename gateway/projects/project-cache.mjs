@@ -1344,6 +1344,8 @@ export function saveProjectCache(workDir, cache) {
 // 功能说明: 扫描项目 → 检测技术栈 → 构建文件树 → 提取所有文件符号 → 计算依赖图
 //   返回完整缓存对象；失败返回 null
 export async function buildProjectCache(workDir) {
+    // 首次扫描可能涉及数千个文件；先把控制权交还 Gateway，避免阻塞会话连接。
+    await new Promise(resolve => setImmediate(resolve))
     const scan = scanSourceFiles(workDir)
     if (scan.missing) return null
 
@@ -1355,6 +1357,8 @@ export async function buildProjectCache(workDir) {
     const fileCache = {}
     const batchSize = 8
     for (let i = 0; i < scan.files.length; i += batchSize) {
+        // 每批解析后让出一次事件循环，保证 WebSocket、IM 和 API 请求可以及时处理。
+        if (i > 0) await new Promise(resolve => setImmediate(resolve))
         const batch = scan.files.slice(i, i + batchSize)
         const results = await Promise.all(batch.map(async (f) => {
             const abs = join(workDir, f.path)

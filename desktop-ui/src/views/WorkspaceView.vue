@@ -57,12 +57,13 @@ import {
 import {buildModelSelectionPayload, describeTaskDecision} from '../model-routing.mjs'
 import type {TaskDecisionDisplay, ModelMode} from '../model-routing.mjs'
 import {mergeWorkflowAgentLogState, normalizeWorkflowLogAgentStatus} from '../agent-event-state.mjs'
-import {formatCompactSummary, normalizeContextUiState} from '../context-usage'
+import {formatCompactSummary, isSyntheticCompactUiMessage, normalizeContextUiState} from '../context-usage'
 import {createParentTaskUiState, reduceParentTaskUi, type ParentTaskUiState} from '../task-completion'
 import {
   createTaskActivityState,
   reduceTaskActivity,
   taskActivityFreshness,
+  type TaskActivityEntry,
   type TaskActivityState,
 } from '../task-activity'
 import {isTaskBusy} from '../task-busy'
@@ -73,7 +74,6 @@ import {
   type ContinuationReason,
 } from '../task-result-outcome'
 import DOMPurify from 'dompurify'
-import TaskActivityTimeline from '../components/TaskActivityTimeline.vue'
 const PhaserPet = defineAsyncComponent(() => import('./PhaserPet.vue'))
 const GlobalToast = defineAsyncComponent(() => import('../components/GlobalToast.vue'))
 const SidebarLeft = defineAsyncComponent(() => import('../components/SidebarLeft.vue'))
@@ -97,6 +97,10 @@ interface ToolUse {
   tool_name: string
   tool_use_id: string
   input: Record<string, any>
+  /** Claude 流式 content block 的索引，用于拼接 input_json_delta。 */
+  streamIndex?: number | string
+  /** 尚未完成 JSON 参数的增量缓冲。 */
+  inputJson?: string
   /** 工具执行耗时（秒），由 tool_progress / content_block_stop 事件更新 */
   elapsed?: number
   /** 工具调用详情展开/折叠状态 */
@@ -105,7 +109,7 @@ interface ToolUse {
 
 // 消息数据结构：涵盖所有消息角色（用户/AI/思考/系统/错误）
 interface Message {
-  role: 'user' | 'assistant' | 'thinking' | 'system' | 'error' | 'activity'
+  role: 'user' | 'assistant' | 'thinking' | 'system' | 'error' | 'activity' | 'task_step'
   text: string
   time: number
   /** 思考块展开后的完整文本内容 */
@@ -129,8 +133,6 @@ interface Message {
     preTokens?: number
     postTokens?: number
     durationMs?: number
-    summary?: string
-    summaryExpanded?: boolean
   }
   taskResult?: {
     outcome: 'succeeded' | 'incomplete' | 'failed'
@@ -141,6 +143,9 @@ interface Message {
   }
   /** 当前任务的结构化执行轨迹；跟随消息列表进入标签页快照。 */
   activity?: TaskActivityState
+  /** 单步执行气泡；只追加关键节点，不被后续 progress/delta 原地覆盖。 */
+  taskStep?: TaskActivityEntry
+  activityStepKey?: string
   /** activity 是否已放到对应用户消息之后，用于区分 IM 首条任务和后续补充指令。 */
   activityUserLinked?: boolean
 }
@@ -172,6 +177,7 @@ interface PersistedTaskState {
     blockingCount: number
     blockingFindings: Array<{severity: string, title: string, file: string, line: number | null, description: string}>
   }
+  permissionMode?: string
 }
 
 interface MessageAttachment {
@@ -592,21 +598,8 @@ const parentTaskUi = ref<ParentTaskUiState>(createParentTaskUiState())
 const taskActivity = ref<TaskActivityState>(createTaskActivityState())
 const sessionLifecycle = ref<SessionLifecycleState>(createSessionLifecycleState())
 const activityClock = ref(Date.now())
+let suppressPermissionSync = false
 let activityClockTimer: ReturnType<typeof setInterval> | null = null
-const taskActivityFresh = computed(() => taskActivityFreshness(taskActivity.value, activityClock.value))
-const taskActivityElapsed = computed(() => {
-  if (!taskActivity.value.startedAt) return 0
-  const end = taskActivity.value.running ? activityClock.value : taskActivity.value.updatedAt
-  return Math.max(0, end - taskActivity.value.startedAt)
-})
-
-function formatRecentActivity(updatedAt: number): string {
-  if (!updatedAt) return '等待首个执行事件'
-  const seconds = Math.max(0, Math.floor((activityClock.value - updatedAt) / 1000))
-  if (seconds < 5) return '刚刚收到事件'
-  if (seconds < 60) return `${seconds} 秒前收到事件`
-  return `${Math.floor(seconds / 60)} 分钟前收到事件`
-}
 
 function startActivityClock() {
   if (activityClockTimer) return
@@ -619,9 +612,23 @@ function stopActivityClock() {
   clearInterval(activityClockTimer)
   activityClockTimer = null
 }
+const taskActivityElapsed = computed(() => {
+  if (!taskActivity.value.startedAt) return 0
+  const end = taskActivity.value.running ? activityClock.value : taskActivity.value.updatedAt
+  return Math.max(0, end - taskActivity.value.startedAt)
+})
+const taskActivityFreshnessState = computed(() => taskActivityFreshness(taskActivity.value, activityClock.value))
 let _pendingResultMessage: Message | null = null
 /** 当前会话的消息列表（按时间序追加） */
 const messages = ref<Message[]>([])
+/** 活动总览由底部悬浮框统一展示；聊天区只保留用户、回复和独立执行步骤。 */
+const renderedMessages = computed(() => messages.value.filter(message => message.role !== 'activity'))
+
+function clearStaleContinuationActions() {
+  for (const item of messages.value) {
+    if (item.taskResult?.continuationReason === 'execution_error') item.taskResult.resumable = false
+  }
+}
 
 function currentActivityMessage(): Message | null {
   return [...messages.value].reverse().find(message => message.role === 'activity' && message.activity) || null
@@ -648,6 +655,141 @@ function syncTaskActivityMessage({forceNew = false, placeAfterLatestUser = false
   if (userIndex >= 0) message.activityUserLinked = true
 }
 
+function activityEventIdentity(event: any, fallback = 'current'): string {
+  const value = event?.tool_use_id || event?.requestId || event?.workflowId || event?.agentId
+    || event?.id || event?.index || event?.turnId || fallback
+  return String(value || fallback).replace(/[^A-Za-z0-9_.:-]/g, '_').slice(0, 120)
+}
+
+function activityToolDetail(event: any): string {
+  const input = event?.input && typeof event.input === 'object' ? event.input : {}
+  const direct = input.command || input.file_path || input.path || input.pattern || input.query
+    || input.url || input.skill || input.description || input.subagent_type || event?.description
+  if (typeof direct === 'string' && direct.trim()) return direct.trim().slice(0, 800)
+  return ''
+}
+
+function activityToolActionTitle(toolName: unknown, completed = false): string {
+  const name = String(toolName || '')
+  const titles: Record<string, string> = {
+    Bash: '运行了命令',
+    Read: '读取了文件',
+    Edit: '编辑了文件',
+    Write: '写入了文件',
+    Grep: '搜索了代码',
+    Glob: '查找了文件',
+    Skill: '使用了技能',
+    Task: '启动了 Agent',
+  }
+  const title = titles[name] || `执行了 ${name || '工具'}`
+  return completed ? `${title}（完成）` : title
+}
+
+/**
+ * 将关键执行节点转换为一次性的聊天气泡。
+ * thinking_delta/tool_progress/workflow_log 等高频事件只更新总览，避免消息列表被实时刷新淹没。
+ */
+function taskStepForEvent(event: any, state: TaskActivityState): {key: string; entry: TaskActivityEntry; title: string} | null {
+  const type = String(event?.type || '')
+  const taskKey = String(state.startedAt || state.updatedAt || Date.now())
+  const entryById = (id: string) => state.entries.find(entry => entry.id === id)
+  const latest = (predicate: (entry: TaskActivityEntry) => boolean) => [...state.entries].reverse().find(predicate)
+  let key = ''
+  let entry: TaskActivityEntry | undefined
+  let title = ''
+
+  if (type === 'task_started') {
+    key = 'task:start'; entry = entryById('task:start'); title = '任务已开始'
+  } else if (type === 'task_input_added') {
+    key = `task:input:${activityEventIdentity(event, String(state.updatedAt))}`
+    entry = latest(item => item.kind === 'task' && item.id !== 'task:terminal')
+    title = '已接收补充指令'
+  } else if (type === 'task_decision') {
+    key = 'task:decision'; entry = entryById('task:planning'); title = '执行方案已确定'
+  } else if (type === 'task_auto_continuing') {
+    key = `task:auto-continue:${activityEventIdentity(event, String(event?.attempt || state.updatedAt))}`
+    entry = latest(item => item.id.startsWith('task:auto-continue:')); title = '正在自动续跑'
+  } else if (type === 'thinking_start') {
+    const id = activityEventIdentity(event)
+    key = `thinking:start:${id}`; entry = entryById(`thinking:${id}`); title = '开始分析与推理'
+  } else if (type === 'tool_use_start') {
+    const id = activityEventIdentity(event)
+    key = `tool:start:${id}`; entry = entryById(`tool:${id}`); title = activityToolActionTitle(event?.tool_name, false)
+  } else if (type === 'tool_input_update') {
+    const id = activityEventIdentity(event)
+    const detail = activityToolDetail(event)
+    // input_json_delta 可能连续产生半截 JSON；只有完整参数解析后才追加一条详细步骤。
+    if (!detail || event?.input?.partial_json) return null
+    key = `tool:detail:${id}`
+    entry = entryById(`tool:${id}`)
+    if (!entry) return null
+    title = activityToolActionTitle(event?.tool_name, false)
+  } else if (type === 'content_block_stop') {
+    const id = activityEventIdentity(event, '')
+    const tool = event?.tool_use_id || event?.tool_name ? entryById(`tool:${id}`) : undefined
+    const thinking = !tool && (String(event?.index || '').startsWith('thought_') || String(event?.id || '').startsWith('thought_'))
+    entry = tool || (thinking ? entryById(`thinking:${id}`) : latest(item => ['tool', 'thinking'].includes(item.kind) && item.status === 'completed'))
+    if (!entry) return null
+    key = `${entry.kind}:complete:${id || entry.id}`
+    title = `${entry.title}已完成`
+  } else if (['subagent_spawning', 'subagent_start', 'agent_start', 'workflow_agent_start', 'workflow_agent_started'].includes(type)) {
+    const id = activityEventIdentity(event)
+    key = `agent:start:${id}`; entry = entryById(`agent:${id}`); title = entry ? `启动${entry.title}` : '启动 Agent'
+  } else if (['subagent_done', 'workflow_agent_done', 'agent_done'].includes(type)) {
+    const id = activityEventIdentity(event)
+    key = `agent:done:${id}`; entry = entryById(`agent:${id}`); title = entry ? `${entry.title}已完成` : 'Agent 已完成'
+  } else if (['workflow_agent_error', 'agent_error', 'subagent_error'].includes(type)) {
+    const id = activityEventIdentity(event)
+    key = `agent:error:${id}`; entry = entryById(`agent:${id}`); title = entry ? `${entry.title}失败` : 'Agent 执行失败'
+  } else if (type === 'permission_request' || type === 'choice_request') {
+    const id = activityEventIdentity(event, type)
+    key = `wait:start:${id}`; entry = entryById(`waiting:${id}`); title = entry?.title || '等待确认'
+  } else if (type === 'confirmation_resolved') {
+    const id = activityEventIdentity(event, 'confirmation')
+    entry = latest(item => item.kind === 'waiting' && item.status === 'completed')
+    if (!entry) return null
+    key = `wait:done:${id}:${entry.id}`; title = '确认已完成，继续执行'
+  } else if (type === 'context_compacting' || type === 'context_compacted') {
+    key = `context:${type}`; entry = entryById('context:compaction'); title = entry?.title || '上下文处理'
+  } else if (type === 'primary_completed' || type === 'task_reviewing' || type === 'task_changes_required') {
+    key = `review:start:${type}`; entry = entryById('task:review'); title = entry?.title || '开始定向审查'
+  } else if (type === 'task_fixing') {
+    key = 'review:fixing'; entry = entryById('task:fixing'); title = entry?.title || '开始修复审查问题'
+  } else if (type === 'workflow_started' || type === 'workflow_resumed') {
+    const id = activityEventIdentity(event)
+    key = `workflow:start:${id}`; entry = latest(item => item.kind === 'workflow' && item.id.includes(id)); title = entry?.title || '工作流已启动'
+  } else if (type === 'workflow_phase') {
+    const id = activityEventIdentity(event)
+    const phase = String(event?.phase || event?.currentPhase || 'current')
+    key = `workflow:phase:${id}:${phase}`; entry = latest(item => item.kind === 'workflow' && item.id.includes(`${id}:${phase}`)); title = entry?.title || `工作流：${phase}`
+  } else if (['workflow_done', 'workflow_paused', 'workflow_error'].includes(type)) {
+    const id = activityEventIdentity(event)
+    key = `workflow:end:${type}:${id}`; entry = latest(item => item.kind === 'workflow'); title = type === 'workflow_done' ? '工作流已完成' : type === 'workflow_paused' ? '工作流已暂停' : '工作流执行失败'
+  } else if (['task_completed', 'generation_stopped', 'task_failed', 'task_review_paused', 'stream_error', 'error'].includes(type)) {
+    key = `task:end:${type}`; entry = entryById('task:terminal'); title = entry?.title || '任务已结束'
+  } else {
+    return null
+  }
+
+  if (!entry) {
+    entry = latest(item => item.updatedAt === state.updatedAt) || state.entries.at(-1)
+  }
+  if (!entry) return null
+  return {key: `${taskKey}:${key}`, entry, title}
+}
+
+function appendTaskActivityStep(event: any) {
+  const step = taskStepForEvent(event, taskActivity.value)
+  if (!step || messages.value.some(message => message.role === 'task_step' && message.activityStepKey === step.key)) return
+  messages.value.push({
+    role: 'task_step',
+    text: step.entry.detail || '',
+    time: step.entry.completedAt || step.entry.updatedAt || Date.now(),
+    taskStep: {...step.entry, title: step.title},
+    activityStepKey: step.key,
+  })
+}
+
 function applyTaskActivityEvent(event: any, options: {forceNew?: boolean; placeAfterLatestUser?: boolean} = {}) {
   const wasRunning = taskActivity.value.running
   taskActivity.value = reduceTaskActivity(taskActivity.value, event)
@@ -655,12 +797,7 @@ function applyTaskActivityEvent(event: any, options: {forceNew?: boolean; placeA
     forceNew: options.forceNew === true || (event?.type === 'task_started' && !wasRunning),
     placeAfterLatestUser: options.placeAfterLatestUser === true,
   })
-}
-
-function setActivityExpanded(message: Message, expanded: boolean) {
-  if (!message.activity) return
-  message.activity.expanded = expanded
-  if (message.activity.startedAt === taskActivity.value.startedAt) taskActivity.value.expanded = expanded
+  appendTaskActivityStep(event)
 }
 
 // ── 多会话标签页 ──
@@ -784,7 +921,7 @@ function restoreTabState(s: TabState) {
   sessionId.value = s.sessionId
   connected.value = s.connected
   status.value = s.status
-  messages.value = s.messages
+  messages.value = s.messages.filter(message => !isSyntheticCompactUiMessage(message))
   inputText.value = s.inputText
   usage.value = { ...s.usage }
   costTotal.value = s.costTotal
@@ -800,7 +937,8 @@ function restoreTabState(s: TabState) {
   pendingChoice.value = s.pendingChoice
   preferenceSuggestions.value = Array.isArray(s.preferenceSuggestions) ? s.preferenceSuggestions : []
   thinkingLevel.value = s.thinkingLevel
-  permissionMode.value = s.permissionMode
+  suppressPermissionSync = true
+  try { permissionMode.value = s.permissionMode } finally { suppressPermissionSync = false }
   modelMode.value = s.modelMode === 'fixed' ? 'fixed' : 'auto'
   model.value = s.model
   taskDecision.value = s.taskDecision || null
@@ -1038,6 +1176,7 @@ async function switchToTab(tabId: string, validateCurrentRuntime = false) {
       if (activeTabId.value !== tab.id) return
       syncCurrentTabState()
       void focusSessionForIm(existingSessionId)
+      void loadSessionMirrors(existingSessionId)
       return
     } catch (error: any) {
       if (tab.historySessionId && sessionMissing) {
@@ -2296,6 +2435,11 @@ async function _doHandleNewSession(workDir: string, encodedDir?: string, histSes
     if (!res.ok) throw new Error(data.error)
     sessionCreated = true
     tabTaskState.value = data.taskState || null
+    suppressPermissionSync = true
+    try {
+      if (typeof data.permissionMode === 'string') permissionMode.value = data.permissionMode
+      else if (typeof data.taskState?.permissionMode === 'string') permissionMode.value = data.taskState.permissionMode
+    } finally { suppressPermissionSync = false }
     sessionId.value = data.sessionId
     tab.state.sessionId = data.sessionId
     if (typeof data.historySessionId === 'string' && data.historySessionId) {
@@ -2542,12 +2686,15 @@ async function loadHistory(encodedDir: string, sId: string, mode: 'append' | 're
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const data = await res.json()
     if (seq !== _loadHistorySeq || !stillOwned()) return false
-    if (data.messages?.length) {
+    const visibleHistory = Array.isArray(data.messages)
+      ? data.messages.filter((message: any) => !isSyntheticCompactUiMessage(message))
+      : []
+    if (visibleHistory.length) {
       _loadedHistoryTexts = new Set()
       const loadedMessages: Message[] = [
-        {role: 'system', text: t('sys.history', {n: data.messages.length}), time: Date.now()},
+        {role: 'system', text: t('sys.history', {n: visibleHistory.length}), time: Date.now()},
       ]
-      for (const m of data.messages) {
+      for (const m of visibleHistory) {
         _loadedHistoryTexts.add(m.text)
         loadedMessages.push({
           role: m.role,
@@ -2786,10 +2933,38 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         if (_saved) { try { restoreTabState(_saved!) } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) } }
         return
       }
+      if (msg.type === 'content_block_stop') {
+        const streamTool = pendingTools.value.find(item => item.streamIndex === msg.index)
+        if (streamTool) {
+          msg = {...msg, tool_use_id: streamTool.tool_use_id, tool_name: streamTool.tool_name}
+        }
+      }
       applyTaskActivityEvent(msg)
       const lifecycleBeforeEvent = sessionLifecycle.value
       sessionLifecycle.value = reduceSessionLifecycle(sessionLifecycle.value, msg)
       switch (msg.type) {
+      case 'connected': {
+        // Gateway 在连接握手中返回当前会话的镜像状态；刷新/重连时以服务端持久化值覆盖本地快照。
+        const connectedMirrors = msg.mirrors && typeof msg.mirrors === 'object' ? msg.mirrors : null
+        if (connectedMirrors) {
+          for (const p of IM_PLATFORMS) {
+            if (typeof connectedMirrors[p.id] !== 'boolean') continue
+            mirrorState.value[p.id] = connectedMirrors[p.id]
+            try { localStorage.setItem(`bridge-mirror-${p.id}`, connectedMirrors[p.id] ? '1' : '0') } catch (error) {
+              dispatchBridgeNotice(classifyBridgeFailure({error, source: 'storage', path: `bridge-mirror-${p.id}`}))
+            }
+          }
+        } else if (typeof msg.mirrorEnabled === 'boolean') {
+          const source = String(msg.source || '')
+          if (source && Object.prototype.hasOwnProperty.call(mirrorState.value, source)) {
+            mirrorState.value[source] = msg.mirrorEnabled
+            try { localStorage.setItem(`bridge-mirror-${source}`, msg.mirrorEnabled ? '1' : '0') } catch (error) {
+              dispatchBridgeNotice(classifyBridgeFailure({error, source: 'storage', path: `bridge-mirror-${source}`}))
+            }
+          }
+        }
+        break
+      }
       case 'session_lifecycle_snapshot': {
         if (msg.task && typeof msg.task === 'object') {
           tabTaskState.value = msg.task as PersistedTaskState
@@ -2803,6 +2978,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
             taskId: String(msg.task.taskId || ''),
             sequence: Number(msg.sequence || msg.task.sequence || 0),
           })
+          if (persistedStatus === 'succeeded') clearStaleContinuationActions()
         }
         const currentWorkflow = msg.currentWorkflow
         if (currentWorkflow) {
@@ -2828,6 +3004,11 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
       }
       case 'session_state_snapshot': {
         const wasThinking = status.value === 'thinking'
+        if (['default', 'acceptEdits', 'plan', 'bypassPermissions'].includes(String(msg.permissionMode))) {
+          suppressPermissionSync = true
+          try { permissionMode.value = msg.permissionMode } finally { suppressPermissionSync = false }
+          if (tab) tab.state.permissionMode = msg.permissionMode
+        }
         if (msg.taskState && typeof msg.taskState === 'object') {
           tabTaskState.value = msg.taskState as PersistedTaskState
           const persistedStatus = String(msg.taskState.status || 'idle')
@@ -2838,6 +3019,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
             completionShown: persistedStatus === 'succeeded',
             detail: String(msg.taskState.detail || ''),
           })
+          if (persistedStatus === 'succeeded') clearStaleContinuationActions()
         }
         if (fg && Array.isArray(msg.pendingConfirmations) && msg.pendingConfirmations.length > 0) {
           const pending = msg.pendingConfirmations.find((item: any) => Number(item.expiresAt || 0) > Date.now())
@@ -3093,13 +3275,6 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         break
       }
 
-      case 'context_compaction_summary': {
-        pendingCompactSummary = typeof msg.summary === 'string' ? msg.summary : ''
-        const notice = [...messages.value].reverse().find(item => item.compact)
-        if (notice?.compact) notice.compact.summary = pendingCompactSummary
-        break
-      }
-
       case 'context_compacted': {
         contextCompacting.value = false
         contextWarningLevel = 0
@@ -3119,10 +3294,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
           preTokens: msg.preTokens || 0,
           postTokens: msg.postTokens || 0,
           durationMs: msg.durationMs || 0,
-          summary: notice.compact?.summary || pendingCompactSummary,
-          summaryExpanded: false,
         }
-        pendingCompactSummary = ''
         saveUsage()
         break
       }
@@ -3130,12 +3302,52 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
       case 'assistant_message': {
         // AI 回复：遍历 content 数组，text 块渲染为 assistant 气泡，
         // thinking 块累计到 turnThinkingText 并渲染为可展开思考块
+        for (const block of msg.message?.content || []) {
+          if (block.type !== 'tool_use' || !block.id || !block.input || typeof block.input !== 'object') continue
+          const tool = pendingTools.value.find(item => item.tool_use_id === block.id)
+          if (!tool) continue
+          tool.input = block.input
+          applyTaskActivityEvent({
+            type: 'tool_input_update',
+            tool_name: tool.tool_name,
+            tool_use_id: tool.tool_use_id,
+            input: block.input,
+          })
+        }
         const tools = pendingTools.value.length > 0 ? [...pendingTools.value] : undefined
         pendingTools.value = []
-        for (const block of msg.message?.content || []) {
+        const assistantBlocks = Array.isArray(msg.message?.content) ? msg.message.content : []
+        const hasToolCall = Boolean(tools?.length)
+        for (const [blockIndex, block] of assistantBlocks.entries()) {
           if (block.type === 'text' && block.text) {
-            const tk = estimateTokens(block.text)
-            messages.value.push({role: 'assistant', text: block.text, time: Date.now(), tools, tokens: tk, cost: estCost(tk)})
+            const messageTime = Date.now()
+            if (hasToolCall) {
+              // 带工具调用的文本是执行中的计划/说明，不应伪装成最终 AI 回复气泡。
+              // 作为一次性步骤保留完整 Markdown，后续命令和工具结果继续追加独立节点。
+              const stepKey = `assistant-note:${msg.message?.id || messageTime}:${blockIndex}`
+              messages.value.push({
+                role: 'task_step',
+                text: block.text,
+                time: messageTime,
+                taskStep: {
+                  id: stepKey,
+                  kind: 'planning',
+                  status: 'completed',
+                  title: '执行说明',
+                  detail: block.text,
+                  startedAt: messageTime,
+                  updatedAt: messageTime,
+                  completedAt: messageTime,
+                  durationMs: 0,
+                  eventType: 'assistant_message',
+                  expanded: false,
+                },
+                activityStepKey: stepKey,
+              })
+            } else {
+              const tk = estimateTokens(block.text)
+              messages.value.push({role: 'assistant', text: block.text, time: messageTime, tools, tokens: tk, cost: estCost(tk)})
+            }
           } else if (block.type === 'thinking' && block.thinking) {
             turnThinkingText += block.thinking  // 累计本轮思考文本, result 时估算思考 token
             const tk = estimateTokens(block.thinking)
@@ -3162,6 +3374,8 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
           tool_name: msg.tool_name,
           tool_use_id: msg.tool_use_id,
           input: msg.input || {},
+          streamIndex: msg.index,
+          inputJson: '',
           elapsed: 0,
         })
         // 同步更新运行中 agent 的进度文字
@@ -3188,6 +3402,30 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         break
       }
 
+      case 'tool_input_delta': {
+        const tool = pendingTools.value.find(item => item.streamIndex === msg.index)
+        if (!tool) break
+        tool.inputJson = `${tool.inputJson || ''}${typeof msg.partial_json === 'string' ? msg.partial_json : ''}`
+        let parsedInput: Record<string, any> | null = null
+        try {
+          const candidate = JSON.parse(tool.inputJson)
+          if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) {
+            parsedInput = candidate
+            tool.input = candidate
+          }
+        } catch {
+          // 参数仍在流式传输时，先展示脱敏后的 JSON 片段；完整 JSON 到达后再替换为结构化字段。
+        }
+        applyTaskActivityEvent({
+          ...msg,
+          type: 'tool_input_update',
+          tool_name: tool.tool_name,
+          tool_use_id: tool.tool_use_id,
+          input: parsedInput || {partial_json: tool.inputJson},
+        })
+        break
+      }
+
       case 'tool_progress': {
         // 工具执行进度：更新对应工具的耗时（秒）
         const t = pendingTools.value.find(x => x.tool_use_id === msg.tool_use_id)
@@ -3202,8 +3440,9 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
       }
 
       case 'content_block_stop': {
-        // 区分工具块与思考块: SDK 对 tool_use 和 thinking 都发此事件，通过 index 前缀区分
-        if (typeof msg.index === 'string' && msg.index.startsWith('thought_')) {
+        // SDK 的 block index 通常是数字；优先按已记录的工具索引识别，否则按思考块处理。
+        const completedTool = pendingTools.value.find(x => x.tool_use_id === msg.tool_use_id || x.streamIndex === msg.index)
+        if (!completedTool) {
           // 思考块结束：计算 token/费用，改标签为"思考完成"
           const tmm = [...messages.value].reverse().find(m => m.role === 'thinking' && m.thinkingId === msg.index)
           if (tmm) {
@@ -3214,20 +3453,18 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
           }
         } else {
           // 工具执行完成：更新最终耗时
-          const t = pendingTools.value.find(x => x.tool_use_id === msg.index)
-          if (t) t.elapsed = msg.elapsed?.elapsed_time_seconds || t.elapsed
+          completedTool.elapsed = msg.elapsed?.elapsed_time_seconds || completedTool.elapsed
         }
         break
       }
 
       case 'user_message_echo': {
-        if (msg.message?.isCompactSummary || msg.message?.isVisibleInTranscriptOnly) break
+        if (isSyntheticCompactUiMessage(msg)) break
         // resume 时 SDK 重放历史用户消息，若 loadHistory 已加载则跳过
         const text = typeof msg.message?.content === 'string'
             ? msg.message.content
             : msg.message?.content?.map((b: any) => b.type === 'text' ? b.text : '').join(' ') || ''
         const trimmed = text.trim()
-        if (/^This session is being continued\.\.\./i.test(trimmed)) break
         if (trimmed) {
           if (_loadedHistoryTexts?.has(trimmed)) break
           const ts = msg.timestamp ? new Date(msg.timestamp).getTime() : Date.now()
@@ -3461,23 +3698,29 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         status.value = 'idle'
         break
 
-      case 'error':
+      case 'error': {
         // SDK 错误：清空待处理工具，显示错误消息。同时清理 agent 追踪、turn 标记。
         pendingTools.value = []
+        const eventTaskState = msg.taskState && typeof msg.taskState === 'object' ? msg.taskState as PersistedTaskState : null
+        const eventStatus = String(eventTaskState?.status || '')
+        const terminalTaskState = ['succeeded', 'failed', 'incomplete', 'interrupted', 'stopped', 'review_paused'].includes(eventStatus)
+        const resumableFromState = terminalTaskState
+          ? eventStatus !== 'succeeded' && eventTaskState?.resumable === true
+          : Boolean(tab.historySessionId)
         messages.value.push({
-          role: 'error',
+          role: eventStatus === 'succeeded' ? 'system' : 'error',
           text: msg.message,
           time: Date.now(),
           taskResult: {
-            outcome: 'failed',
-            continuationReason: 'execution_error',
-            resumable: Boolean(tab.historySessionId),
+            outcome: eventStatus === 'succeeded' ? 'succeeded' : 'failed',
+            continuationReason: eventStatus === 'succeeded' ? null : 'execution_error',
+            resumable: resumableFromState,
             originalTask: lastUserMessage,
             durationMs: Number(msg.durationMs ?? msg.taskState?.durationMs)
               || (taskActivity.value.startedAt ? Math.max(0, Date.now() - taskActivity.value.startedAt) : 0),
           },
         })
-        tabTaskState.value = {
+        tabTaskState.value = eventTaskState || {
           status: 'interrupted',
           outcome: 'failed',
           continuationReason: 'execution_error',
@@ -3487,15 +3730,25 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         }
         status.value = 'idle'
         applyTaskActivityEvent({
-          type: 'task_failed',
+          type: eventStatus === 'succeeded' ? 'task_completed' : 'task_failed',
           detail: msg.message,
         })
+        if (eventStatus === 'succeeded') {
+          // 断流错误晚于成功聚合态到达时，历史错误气泡不能继续提供恢复按钮。
+          clearStaleContinuationActions()
+        }
         if (fg) void flushMsgQueue()
         if (fg) {
-          syncPetState('error', { message: msg.message?.slice(0, 40), bubble: petPick(BUBBLE_ERROR_SDK, myProject) + (msg.message?.slice(0, 50) || '') })
+          syncPetState(eventStatus === 'succeeded' ? 'success' : 'error', {
+            message: msg.message?.slice(0, 40),
+            bubble: eventStatus === 'succeeded'
+              ? petPick(BUBBLE_SUCCESS, myProject)
+              : petPick(BUBBLE_ERROR_SDK, myProject) + (msg.message?.slice(0, 50) || ''),
+          })
           setTimeout(() => { syncPetState('idle'); petBubble.value = '' }, 3000)
         }
         break
+      }
 
         // ── 子 Agent 事件（内联卡片追踪）──
       case 'subagent_spawning': {
@@ -4003,15 +4256,21 @@ async function loadIMStatus() {
 }
 
 /** 从 Gateway 加载当前 session 的镜像开关状态 */
-async function loadSessionMirrors() {
-  if (!sessionId.value) return
+async function loadSessionMirrors(targetSessionId = sessionId.value) {
+  const sid = targetSessionId
+  if (!sid) return
   try {
-    const r = await fetch(`${GW}/api/sessions/${sessionId.value}/mirror`)
+    const r = await fetch(`${GW}/api/sessions/${sid}/mirror`)
     if (!r.ok) throw new Error(`HTTP ${r.status}`)
     const d = await r.json()
-    if (d.mirrors) {
+    if (d.mirrors && sessionId.value === sid) {
       for (const p of IM_PLATFORMS) {
-        if (typeof d.mirrors[p.id] === 'boolean') mirrorState.value[p.id] = d.mirrors[p.id]
+        if (typeof d.mirrors[p.id] === 'boolean') {
+          mirrorState.value[p.id] = d.mirrors[p.id]
+          try { localStorage.setItem(`bridge-mirror-${p.id}`, d.mirrors[p.id] ? '1' : '0') } catch (error) {
+            dispatchBridgeNotice(classifyBridgeFailure({error, source: 'storage', path: `bridge-mirror-${p.id}`}))
+          }
+        }
       }
     }
   } catch (error: any) {
@@ -4279,6 +4538,7 @@ function doSend(text: string, wire?: string, attachments?: PendingAttachment[], 
   status.value = 'thinking'
   sessionLifecycle.value = reduceSessionLifecycle(sessionLifecycle.value, {type: 'local_task_submitted'})
   parentTaskUi.value = createParentTaskUiState({phase: 'running'})
+  clearStaleContinuationActions()
   applyTaskActivityEvent(
     wasTaskRunning ? {type: 'task_input_added', source: '桌面端'} : {type: 'task_started'},
   )
@@ -4341,7 +4601,8 @@ async function continueIncompleteTask(message: Message) {
     originalTask: result.originalTask,
     reason: result.continuationReason,
   })
-  if (!doSend(t('ws.continueTask'), prompt)) {
+  // 界面显示“继续执行”，但保留原始任务作为本地恢复上下文，后续再次中断时仍能生成正确的续跑提示。
+  if (!doSend(t('ws.continueTask'), prompt, undefined, result.originalTask)) {
     showToast(t('ws.notConnected'))
     return
   }
@@ -5672,14 +5933,16 @@ const thinkings = computed(() => [
   {value: 'max', label: t('think.max')},
 ])
 
-// 即时权限切换: mid-response 切换时通知后端立即生效，无需重建 query
+// 会话权限切换: 空闲和执行中都写入 Gateway；Gateway 同步落盘，重启后仍按会话恢复。
 watch(permissionMode, (newVal, oldVal) => {
-  if (status.value !== 'thinking') return
-  if (!ws || ws.readyState !== 1) return
+  if (suppressPermissionSync) return
   if (newVal === oldVal) return
-  if (!sendSessionPayload({type: 'setting_change', permissionMode: newVal})) {
+  const tab = activeTab.value
+  if (tab) tab.state.permissionMode = newVal
+  if (ws && ws.readyState === 1 && !sendSessionPayload({type: 'setting_change', permissionMode: newVal})) {
     showToast(t('ws.notConnected'))
   }
+  syncCurrentTabState()
 })
 
 // ═══════════════════════════════════════════
@@ -5692,7 +5955,6 @@ const contextPercentKnown = ref(false)
 const contextCompacting = ref(false)
 const contextSafetyCap = ref(0)
 const rawMaxTokens = ref(0)
-let pendingCompactSummary = ''
 let contextWarningLevel = 0
 /** 本轮 token 消耗明细：input=输入 / output=纯输出(不含思考) / thinking=思考估算 / total=总量(含思考) */
 const usage = ref({input: 0, output: 0, thinking: 0, total: 0})
@@ -6240,7 +6502,7 @@ const tokenTooltip = computed(() => {
         <!-- 消息列表区域：v-for 遍历 messages，按 role 切换渲染模板 -->
         <div ref="chatRef" class="messages" @click="onMessageClick" @scroll="onMessagesScroll">
           <!-- 每条消息行：根据 role 控制对齐方向和动画延迟 -->
-          <div v-for="(msg, i) in messages" :key="(msg.time || 0) + '-' + i + '-' + msg.role" class="msg-row" :class="msg.role"
+          <div v-for="(msg, i) in renderedMessages" :key="(msg.time || 0) + '-' + i + '-' + msg.role" class="msg-row" :class="msg.role"
                :style="{ animationDelay: `${Math.min(i * 20, 300)}ms` }">
             <!-- 系统消息：时间 + 文本，居中显示 -->
             <template v-if="msg.role === 'system'">
@@ -6249,10 +6511,6 @@ const tokenTooltip = computed(() => {
                 <span v-if="msg.compact" class="sys-text compact-notice">
                   <strong>{{ msg.text }}</strong>
                   <span v-if="msg.compact.preTokens" class="compact-meta">{{ formatCompactSummary(msg.compact) }}</span>
-                  <button v-if="msg.compact.summary" class="compact-summary-toggle" @click="msg.compact.summaryExpanded = !msg.compact.summaryExpanded">
-                    {{ msg.compact.summaryExpanded ? '收起摘要' : '查看摘要' }}
-                  </button>
-                  <span v-if="msg.compact.summaryExpanded" class="compact-summary">{{ msg.compact.summary }}</span>
                 </span>
                 <span v-else class="sys-text">{{ msg.text }}</span>
                 <span v-if="msg.taskResult?.durationMs" class="task-result-duration">
@@ -6271,12 +6529,19 @@ const tokenTooltip = computed(() => {
                 </button>
               </div>
             </template>
-            <template v-else-if="msg.role === 'activity' && msg.activity">
-              <TaskActivityTimeline
-                  :state="msg.activity"
-                  :now="activityClock"
-                  @toggle="setActivityExpanded(msg, $event)"
-              />
+            <!-- 关键执行节点：每一步独立气泡，后续 progress/delta 不覆盖历史步骤。 -->
+            <template v-else-if="msg.role === 'task_step' && msg.taskStep">
+              <div class="task-step-bubble" :class="msg.taskStep.status">
+                <span class="task-step-mark" aria-hidden="true"></span>
+                <div class="task-step-content">
+                  <div class="task-step-head">
+                    <strong>{{ msg.taskStep.title }}</strong>
+                    <span class="task-step-time">{{ formatTime(msg.time) }}</span>
+                  </div>
+                  <div v-if="msg.taskStep.detail" class="task-step-detail" v-html="renderMarkdown(msg.taskStep.detail)"></div>
+                  <div v-if="msg.taskStep.durationMs" class="task-step-duration">耗时 {{ formatDuration(msg.taskStep.durationMs) }}</div>
+                </div>
+              </div>
             </template>
             <!-- 思考块：折叠面板，summary 栏展示"思考"标签 + 预览文本 -->
             <template v-else-if="msg.role === 'thinking'">
@@ -6521,30 +6786,6 @@ const tokenTooltip = computed(() => {
             </div>
           </div>
 
-          <!-- 当前任务活动：展示阶段、动作和事件新鲜度，便于区分持续执行与长时间无响应 -->
-          <div v-if="taskBusy"
-               class="task-activity"
-               :class="`freshness-${taskActivityFresh.level}`">
-            <div class="task-activity-indicator" aria-hidden="true">
-              <span class="think-dot"></span>
-              <span class="think-dot"></span>
-              <span class="think-dot"></span>
-            </div>
-            <div class="task-activity-content">
-              <div class="task-activity-title">{{ taskActivity.title || '任务正在执行' }}</div>
-              <div v-if="taskActivity.detail" class="task-activity-detail" :title="taskActivity.detail">
-                {{ taskActivity.detail }}
-              </div>
-              <div v-if="taskActivityFresh.message" class="task-activity-hint">
-                {{ taskActivityFresh.message }}
-              </div>
-            </div>
-            <div class="task-activity-meta">
-              <span>已执行 {{ formatDuration(taskActivityElapsed) }}</span>
-              <span>{{ formatRecentActivity(taskActivity.updatedAt) }}</span>
-            </div>
-          </div>
-
           <!-- 回到底部悬浮按钮：sticky 贴消息区底部，用户上滑后出现 -->
           <button v-if="userScrolledUp" class="scroll-bottom-btn" @click="scrollDown(true)" :title="t('ws.scrollBottom')">
             <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
@@ -6553,9 +6794,60 @@ const tokenTooltip = computed(() => {
             </svg>
           </button>
 
-        </div>
+          </div>
 
-        <!-- 控制栏：模型选择器 / 权限模式 / 思考等级 / Agent 面板入口 / 记录点下拉 / token 迷你条 / 上下文圆环 -->
+          <!-- 底部当前任务总览：常驻摘要，悬停或聚焦时向上展开完整步骤。 -->
+          <div v-if="taskActivity.running && taskActivity.startedAt" class="task-activity"
+               :class="`freshness-${taskActivityFreshnessState.level}`"
+               tabindex="0"
+               role="group"
+               aria-label="当前任务进度，悬停或聚焦查看全部步骤">
+            <div class="task-activity-summary">
+              <div class="task-activity-indicator" aria-hidden="true">
+                <span class="think-dot"></span><span class="think-dot"></span><span class="think-dot"></span>
+              </div>
+              <div class="task-activity-summary-copy">
+                <div class="task-activity-title" :title="taskActivity.title || '任务执行中'">
+                  {{ taskActivity.title || '任务执行中' }}
+                </div>
+                <div v-if="taskActivityFreshnessState.level !== 'active'" class="task-activity-hint">
+                  {{ taskActivityFreshnessState.message }}
+                </div>
+              </div>
+              <div class="task-activity-meta" aria-label="任务统计">
+                <span>{{ taskActivity.entries.length }} 步</span>
+                <span>{{ formatDuration(taskActivityElapsed) }}</span>
+                <span>{{ fmtTok(usage.total) }} Token</span>
+              </div>
+              <span class="task-activity-chevron" aria-hidden="true"></span>
+            </div>
+
+            <section class="task-activity-popover" aria-label="当前任务全部步骤">
+              <div class="task-activity-popover-head">
+                <strong>当前任务</strong>
+                <span>{{ taskActivity.entries.length }} 个步骤</span>
+              </div>
+              <div v-if="taskActivity.detail" class="task-activity-detail">{{ taskActivity.detail }}</div>
+              <div v-if="taskActivity.entries.length" class="task-activity-steps">
+                <div v-for="entry in taskActivity.entries" :key="entry.id"
+                     class="task-activity-step" :class="entry.status">
+                  <span class="task-activity-step-mark" aria-hidden="true"></span>
+                  <div class="task-activity-step-content">
+                    <div class="task-activity-step-head">
+                      <span class="task-activity-step-title">{{ entry.title }}</span>
+                      <span class="task-activity-step-time">
+                        {{ formatDuration(entry.durationMs || (['running', 'waiting'].includes(entry.status) ? Math.max(0, activityClock - entry.startedAt) : 0)) }}
+                      </span>
+                    </div>
+                    <div v-if="entry.detail" class="task-activity-step-detail">{{ entry.detail }}</div>
+                  </div>
+                </div>
+              </div>
+              <div v-else class="task-activity-empty">任务已启动，正在等待首个执行步骤</div>
+            </section>
+          </div>
+
+          <!-- 控制栏：模型选择器 / 权限模式 / 思考等级 / Agent 面板入口 / 记录点下拉 / token 迷你条 / 上下文圆环 -->
         <div class="controls-bar">
           <!-- 模型选择器：从 models 列表动态渲染 option -->
           <div class="control-group">
@@ -8279,6 +8571,7 @@ const tokenTooltip = computed(() => {
   flex: 1;
   display: flex;
   flex-direction: column;
+  container-type: inline-size;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
@@ -8523,6 +8816,8 @@ const tokenTooltip = computed(() => {
 
 .msg-row {
   display: flex;
+  width: 100%;
+  min-width: 0;
 }
 
 .msg-row.user {
@@ -8533,12 +8828,8 @@ const tokenTooltip = computed(() => {
   justify-content: flex-start;
 }
 
-.msg-row.system, .msg-row.thinking, .msg-row.activity {
+.msg-row.system, .msg-row.thinking {
   justify-content: center;
-}
-
-.msg-row.activity {
-  width: 100%;
 }
 
 .msg-row.error {
@@ -8632,29 +8923,6 @@ const tokenTooltip = computed(() => {
 .compact-meta {
   font-family: var(--font-mono);
   color: var(--text-secondary);
-}
-
-.compact-summary-toggle {
-  border: 0;
-  padding: 0;
-  background: transparent;
-  color: var(--accent-blue);
-  cursor: pointer;
-}
-
-.compact-summary {
-  flex-basis: 100%;
-  max-height: 180px;
-  overflow: auto;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  word-break: break-word;
-  width: 100%;
-  min-width: 0;
-  padding: 8px 10px;
-  border-left: 2px solid var(--border-hover);
-  color: var(--text-secondary);
-  line-height: 1.5;
 }
 
 .sys-time {
@@ -8776,6 +9044,9 @@ const tokenTooltip = computed(() => {
 
 /* 表格外层滚动容器 */
 :deep(.md-table-wrap) {
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
   overflow-x: auto;
   margin: 10px 0;
   border-radius: var(--radius-btn);
@@ -8839,6 +9110,9 @@ const tokenTooltip = computed(() => {
 :deep(.md-code) {
   position: relative;
   display: block;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
   margin: 10px 0;
   padding: 12px 16px;
   background: var(--bg-deep);
@@ -9011,19 +9285,95 @@ const tokenTooltip = computed(() => {
 }
 
 /* ── 当前任务活动 ── */
-.task-activity {
+.task-step-bubble {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
+  gap: 10px;
+  width: min(760px, calc(100% - 20px));
+  max-width: 100%;
+  box-sizing: border-box;
+  margin: 4px 0 8px;
+  padding: 9px 12px;
+  align-self: flex-start;
+  color: var(--text-primary);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent-blue);
+  border-radius: 8px;
+  animation: fadeIn 0.15s var(--ease-out);
+}
+
+.task-step-bubble.completed { border-left-color: var(--success); }
+.task-step-bubble.failed { border-left-color: var(--error); }
+.task-step-bubble.stopped { border-left-color: var(--text-muted); }
+.task-step-bubble.waiting { border-left-color: var(--accent-gold); }
+
+.task-step-mark {
+  width: 8px;
+  height: 8px;
+  margin-top: 5px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--warning);
+}
+
+.task-step-bubble.completed .task-step-mark { background: var(--success); }
+.task-step-bubble.failed .task-step-mark { background: var(--error); }
+.task-step-bubble.stopped .task-step-mark { background: var(--text-muted); }
+
+.task-step-content { min-width: 0; flex: 1; }
+.task-step-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
   gap: 12px;
-  width: min(760px, 94%);
-  min-height: 58px;
-  padding: 10px 12px;
+  min-width: 0;
+}
+.task-step-head strong {
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.task-step-time,
+.task-step-duration {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  white-space: nowrap;
+}
+.task-step-detail {
+  margin-top: 3px;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.task-step-duration { margin-top: 4px; }
+
+.task-activity {
+  position: relative;
+  z-index: 30;
+  width: fit-content;
+  max-width: min(680px, calc(100% - 48px));
+  box-sizing: border-box;
+  margin: 0 24px 8px;
   align-self: flex-start;
   background: var(--bg-raised);
   border: 1px solid var(--border);
   border-left: 3px solid var(--accent-blue);
   border-radius: 8px;
   color: var(--text-primary);
+  box-shadow: var(--shadow-sm);
+  outline: none;
+}
+
+.task-activity:focus-visible {
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 0 2px var(--bg-deep), 0 0 0 4px var(--accent-blue);
 }
 
 .task-activity.freshness-waiting {
@@ -9040,32 +9390,192 @@ const tokenTooltip = computed(() => {
   flex-shrink: 0;
 }
 
-.task-activity-content {
+.task-activity-summary {
+  min-height: 38px;
+  display: grid;
+  grid-template-columns: auto minmax(140px, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  cursor: default;
+}
+
+.task-activity-summary-copy {
   min-width: 0;
-  flex: 1;
 }
 
 .task-activity-title {
-  font-size: 13px;
-  font-weight: 600;
-  line-height: 1.4;
-}
-
-.task-activity-detail,
-.task-activity-hint {
-  margin-top: 2px;
+  min-width: 0;
+  max-width: 360px;
   overflow: hidden;
-  color: var(--text-secondary);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  line-height: 1.45;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.35;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.task-activity-detail,
 .task-activity-hint {
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.task-activity-detail {
+  flex-shrink: 0;
+  max-height: 72px;
+  overflow-y: auto;
+  padding: 8px 12px;
+  background: var(--bg-deep);
+  border-bottom: 1px solid var(--border);
+  font-family: var(--font-mono);
+}
+
+.task-activity-popover {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  left: -3px;
+  bottom: calc(100% + 8px);
+  width: min(620px, calc(100cqw - 48px));
+  max-height: min(360px, calc(100vh - 220px));
+  overflow: hidden;
+  color: var(--text-primary);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--shadow-md);
+  pointer-events: none;
+  visibility: hidden;
+  transform: translateY(6px);
+  transition: transform 160ms var(--ease-out), visibility 0s linear 160ms;
+}
+
+.task-activity:hover .task-activity-popover,
+.task-activity:focus-within .task-activity-popover {
+  pointer-events: auto;
+  visibility: visible;
+  transform: translateY(0);
+  transition-delay: 0s;
+}
+
+.task-activity-popover-head {
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.task-activity-popover-head strong {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.task-activity-popover-head span {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.task-activity-steps {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  gap: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 6px 12px 8px;
+}
+
+.task-activity-step {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+  min-width: 0;
+  padding: 5px 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.task-activity-step-mark {
+  width: 7px;
+  height: 7px;
+  margin-top: 5px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+
+.task-activity-step.running .task-activity-step-mark,
+.task-activity-step.waiting .task-activity-step-mark {
+  background: var(--accent-gold);
+}
+
+.task-activity-step.completed .task-activity-step-mark {
+  background: var(--accent-green, var(--success));
+}
+
+.task-activity-step.failed .task-activity-step-mark {
+  background: var(--error);
+}
+
+.task-activity-step-content {
+  min-width: 0;
+}
+
+.task-activity-step-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.task-activity-step-title {
+  min-width: 0;
+  color: var(--text-primary);
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.task-activity-step-detail {
+  min-width: 0;
+  margin-top: 2px;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.task-activity-step-time {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.task-activity-empty {
+  padding: 14px 12px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.task-activity-hint {
+  margin-top: 2px;
   color: var(--accent-gold);
   font-family: var(--font-body);
+  font-size: 10px;
   white-space: normal;
 }
 
@@ -9075,14 +9585,28 @@ const tokenTooltip = computed(() => {
 
 .task-activity-meta {
   display: flex;
-  flex-direction: column;
   flex-shrink: 0;
-  gap: 3px;
+  align-items: center;
+  gap: 8px;
   color: var(--text-muted);
   font-family: var(--font-mono);
   font-size: 10px;
-  text-align: right;
   white-space: nowrap;
+}
+
+.task-activity-chevron {
+  width: 7px;
+  height: 7px;
+  margin: 2px 2px 0 0;
+  border-top: 1.5px solid var(--text-muted);
+  border-left: 1.5px solid var(--text-muted);
+  transform: rotate(45deg);
+  transition: transform 160ms var(--ease-out);
+}
+
+.task-activity:hover .task-activity-chevron,
+.task-activity:focus-within .task-activity-chevron {
+  transform: rotate(225deg) translate(-2px, -2px);
 }
 
 .think-dot {
@@ -9105,8 +9629,10 @@ const tokenTooltip = computed(() => {
 /* 用户气泡：右对齐，品牌色背景白色文字；AI 气泡：左对齐，深色背景边框 */
 .bubble {
   position: relative;
+  box-sizing: border-box;
   max-width: 94%;
-  min-width: 100px;
+  min-width: min(100px, 100%);
+  overflow: hidden;
   padding: 14px 18px;
   font-size: 15px;
   line-height: 1.65;
@@ -9195,9 +9721,17 @@ const tokenTooltip = computed(() => {
 }
 
 .bubble-text {
+  min-width: 0;
+  max-width: 100%;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
   word-break: break-word;
   line-height: 1.7;
+}
+
+.bubble-text :deep(*) {
+  max-width: 100%;
+  box-sizing: border-box;
 }
 
 .message-attachments {
@@ -11073,17 +11607,60 @@ const tokenTooltip = computed(() => {
 }
 
 @media (max-width: 720px) {
-  .task-activity {
+  .task-step-bubble {
+    width: calc(100% - 20px);
+  }
+
+  .task-step-head {
     align-items: flex-start;
-    flex-wrap: wrap;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .task-activity {
+    width: calc(100% - 24px);
+    max-width: calc(100% - 24px);
+    margin: 0 12px 8px;
+  }
+
+  .task-activity-summary {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    gap: 8px;
   }
 
   .task-activity-meta {
-    width: 100%;
-    flex-direction: row;
-    justify-content: space-between;
-    padding-left: 30px;
-    text-align: left;
+    grid-column: 2 / -1;
+    grid-row: 2;
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .task-activity-chevron {
+    grid-column: 3;
+    grid-row: 1;
+  }
+
+  .task-activity-title {
+    max-width: none;
+  }
+
+  .task-activity-popover {
+    left: 0;
+    width: calc(100cqw - 24px);
+    max-height: min(320px, calc(100vh - 200px));
+  }
+
+  .task-activity-step-head {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 2px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .task-activity-popover,
+  .task-activity-chevron {
+    transition: none;
   }
 }
 

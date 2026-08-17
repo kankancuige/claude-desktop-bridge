@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import {createImProgressReporter} from './im-progress-reporter.mjs'
+import {classifyImProgressEvent, createImProgressReporter} from './im-progress-reporter.mjs'
 
 function fakeClock() {
     let current = 1
@@ -91,4 +91,12 @@ test('进度消息遵守数量上限', () => {
     clock.advance(120_000)
     assert.equal(sent.length, 2)
     assert.equal(reporter.snapshot().scheduled, false)
+})
+
+test('自动续跑是长任务进度而不是终态', () => {
+    assert.deepEqual(classifyImProgressEvent({type: 'task_auto_continuing', attempt: 2, maxAttempts: 3}), {
+        key: 'auto-continue:2',
+        title: '已达到单段轮数上限，正在自动续跑',
+        detail: '第 2/3 次',
+    })
 })

@@ -88,6 +88,7 @@ export function journalTaskState(state) {
         outcome: normalized.outcome,
         continuationReason: normalized.continuationReason,
         resumable: normalized.resumable,
+        permissionMode: normalized.permissionMode,
         subtype: normalized.subtype,
         sdkSessionId: normalized.sdkSessionId,
         historySessionId: normalized.historySessionId,

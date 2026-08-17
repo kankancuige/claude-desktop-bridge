@@ -5,6 +5,7 @@ const STATUSES = new Set(['idle', 'running', 'reviewing', 'changes_required', 'f
 const OUTCOMES = new Set(['succeeded', 'incomplete', 'failed'])
 const REASONS = new Set(['max_turns', 'max_budget', 'execution_error', 'structured_output', 'stopped', 'unknown_error', null])
 const NOTIFICATION_STATES = new Set(['pending', 'sent', 'failed', 'dead'])
+const PERMISSION_MODES = new Set(['default', 'acceptEdits', 'plan', 'bypassPermissions'])
 
 function text(value, max = MAX_DETAIL_LENGTH) {
     return typeof value === 'string' ? value.trim().slice(0, max) : ''
@@ -52,6 +53,7 @@ export function normalizeTaskState(raw = {}, {recoverRunning = false, now = Date
         outcome,
         continuationReason: reason,
         resumable,
+        permissionMode: PERMISSION_MODES.has(input.permissionMode) ? input.permissionMode : 'default',
         subtype: text(input.subtype, 120) || null,
         sdkSessionId: text(input.sdkSessionId, 160) || null,
         historySessionId: text(input.historySessionId, 160) || null,
@@ -181,6 +183,7 @@ export function taskStateForClient(state) {
         outcome: normalized.outcome,
         continuationReason: normalized.continuationReason,
         resumable: normalized.resumable,
+        permissionMode: normalized.permissionMode,
         subtype: normalized.subtype,
         taskId: normalized.taskId,
         turnId: normalized.turnId,

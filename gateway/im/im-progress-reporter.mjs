@@ -31,6 +31,11 @@ export function classifyImProgressEvent(event = {}) {
     const type = String(event?.type || '')
     if (TERMINAL_EVENTS.has(type)) return {terminal: true}
     if (type === 'task_started') return {key: 'starting', title: '任务已开始处理', detail: ''}
+    if (type === 'task_auto_continuing') {
+        const attempt = Math.max(1, Math.trunc(Number(event.attempt) || 1))
+        const maxAttempts = Math.max(attempt, Math.trunc(Number(event.maxAttempts) || attempt))
+        return {key: `auto-continue:${attempt}`, title: '已达到单段轮数上限，正在自动续跑', detail: `第 ${attempt}/${maxAttempts} 次`}
+    }
     if (type === 'task_decision') return {key: 'planning', title: '正在规划执行方案', detail: boundedText(event.modelTier || event.model)}
     if (type === 'thinking_start' || type === 'thinking_delta') return {key: 'thinking', title: '正在分析任务', detail: ''}
     if (type === 'tool_use_start' || type === 'tool_progress') return toolPhase(event)
@@ -44,7 +49,7 @@ export function classifyImProgressEvent(event = {}) {
         const phase = boundedText(event.phase || event.currentPhase || event.message)
         return {key: `workflow:${phase || 'running'}`, title: phase ? `正在执行：${phase}` : '工作流正在执行', detail: ''}
     }
-    if (type === 'context_compacting' || type === 'context_compaction_summary') {
+    if (type === 'context_compacting') {
         return {key: 'compacting', title: '正在压缩并整理上下文', detail: ''}
     }
     if (type === 'task_reviewing' || type === 'primary_completed') {

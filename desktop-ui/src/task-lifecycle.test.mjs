@@ -54,6 +54,35 @@ test('Gateway 拒绝本地乐观发送时立即恢复可发送状态', () => {
   assert.equal(rejected.canSend, true)
 })
 
+test('流式响应中断携带终态 taskState 时立即释放 busy 状态', () => {
+  const running = reduceSessionLifecycle(createSessionLifecycleState({
+    received: true, active: true, canSend: false, canStop: true,
+  }), {type: 'task_started'})
+  const failed = reduceSessionLifecycle(running, {
+    type: 'error',
+    message: 'Connection closed mid-response',
+    taskState: {status: 'interrupted', resumable: true},
+  })
+  assert.equal(failed.active, false)
+  assert.equal(failed.canSend, true)
+  assert.equal(failed.canStop, false)
+  assert.equal(failed.canContinue, true)
+})
+
+test('错误事件携带成功终态时不能重新显示继续执行', () => {
+  const running = reduceSessionLifecycle(createSessionLifecycleState({
+    received: true, active: true, canSend: false, canStop: true,
+  }), {type: 'task_started'})
+  const completed = reduceSessionLifecycle(running, {
+    type: 'stream_error',
+    message: 'Connection closed mid-response',
+    taskState: {status: 'succeeded', resumable: false},
+  })
+  assert.equal(completed.active, false)
+  assert.equal(completed.canSend, true)
+  assert.equal(completed.canContinue, false)
+})
+
 test('执行中补充指令被拒绝不能解除真实父任务忙碌', () => {
   const running = reduceSessionLifecycle(createSessionLifecycleState({received: true}), {type: 'task_started'})
   const supplemental = reduceSessionLifecycle(running, {type: 'local_task_submitted'})

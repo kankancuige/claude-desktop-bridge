@@ -481,6 +481,7 @@ async function saveSettings() {
   }
   // Ensure token is parsed before save
   onTokenBlur()
+  settings.value.maxTurns = Math.min(100, Math.max(1, Math.trunc(Number(settings.value.maxTurns) || 40)))
   try {
     const res = await fetch(`${GW}/api/config/settings`, {
       method: 'PUT',
@@ -2526,7 +2527,7 @@ onUnmounted(() => {
                 </div>
                 <div class="field">
                   <label>{{ t('gen.maxTurns') }}</label>
-                  <input v-model.number="settings.maxTurns" type="number" min="1" max="500" class="field-input mono"
+                  <input v-model.number="settings.maxTurns" type="number" min="1" max="100" class="field-input mono"
                          placeholder="40"/>
                   <span class="field-hint">{{ t('gen.maxTurnsHint') }}</span>
                 </div>

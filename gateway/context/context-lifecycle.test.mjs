@@ -1,14 +1,17 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import {readFileSync} from 'node:fs'
 import {
     calculateAutoCompactWindow,
-    compactSummaryForDisplay,
     compactBoundaryToEvent,
     isSyntheticCompactSummary,
     normalizeContextUsage,
     parseTokenCount,
     resolveContextWindow,
+    contextUsageEvent,
 } from './context-lifecycle.mjs'
+
+const gatewaySource = readFileSync(new URL('../index.mjs', import.meta.url), 'utf8')
 
 test('parseTokenCount supports K/M suffixes and rejects invalid values', () => {
     assert.equal(parseTokenCount('256K'), 256000)
@@ -53,6 +56,26 @@ test('SDK context usage is normalized without treating one-turn usage as context
     })
 })
 
+test('context usage event carries the effective auto compact threshold', () => {
+    const event = contextUsageEvent({
+        totalTokens: 180000,
+        maxTokens: 256000,
+        rawMaxTokens: 256000,
+        percentage: 70,
+    }, {autoCompactThreshold: 230400, reason: 'running'})
+    assert.equal(event.autoCompactThreshold, 230400)
+    assert.equal(event.reason, 'running')
+})
+
+test('Gateway 上下文采样有超时且不会永久占用 in-flight 状态', () => {
+    const start = gatewaySource.indexOf('async function refreshContextUsage')
+    const end = gatewaySource.indexOf('function maybeRefreshContextUsage', start)
+    assert.ok(start >= 0 && end > start)
+    const source = gatewaySource.slice(start, end)
+    assert.match(source, /withTimeout\(Promise\.resolve\(session\.query\.getContextUsage\(\)\), 5_000\)/)
+    assert.match(source, /finally \{\s*session\._contextUsageInFlight = null/)
+})
+
 test('compact boundary becomes a compact UI event', () => {
     assert.deepEqual(compactBoundaryToEvent({
         type: 'system',
@@ -71,14 +94,12 @@ test('synthetic compact summaries are hidden from normal transcript bubbles', ()
     assert.equal(isSyntheticCompactSummary({message: {isCompactSummary: true}}), true)
     assert.equal(isSyntheticCompactSummary({isCompactSummary: true, message: {content: 'internal'}}), true)
     assert.equal(isSyntheticCompactSummary({message: {content: [{type: 'text', text: 'This session is being continued...'}]}}), true)
+    assert.equal(isSyntheticCompactSummary({message: {content: 'This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion.'}}), true)
     assert.equal(isSyntheticCompactSummary({message: {content: 'The conversation has been compacted for continuation.'}}), true)
     assert.equal(isSyntheticCompactSummary({message: {content: [{type: 'text', text: 'normal user message'}]}}), false)
 })
 
-test('压缩摘要展示有硬上限并保留首尾关键信息', () => {
-    const summary = compactSummaryForDisplay(`HEAD-${'x'.repeat(6000)}-TAIL`, 1000)
-    assert.ok(summary.length <= 1050)
-    assert.match(summary, /^HEAD-/)
-    assert.match(summary, /-TAIL$/)
-    assert.match(summary, /已省略中间内容/)
+test('Gateway 不再向界面广播压缩摘要正文', () => {
+    assert.doesNotMatch(gatewaySource, /context_compaction_summary/)
+    assert.doesNotMatch(gatewaySource, /compact_summary/)
 })

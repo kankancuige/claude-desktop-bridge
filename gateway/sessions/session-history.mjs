@@ -1,5 +1,6 @@
 import {isSyntheticCompactSummary} from '../context/context-lifecycle.mjs'
 import {isInternalWorkflowResultText} from '../tasks/task-workflow-gate.mjs'
+import {isAutoContinuationPrompt} from '../tasks/task-auto-continuation.mjs'
 
 function visibleUserText(raw) {
     let text = typeof raw === 'string'
@@ -52,7 +53,7 @@ export function parseSessionHistory(content) {
         if (entry.type === 'user' && entry.message?.content) {
             if (isSyntheticCompactSummary(entry)) continue
             const text = visibleUserText(entry.message.content)
-            if (isInternalWorkflowResultText(text)) continue
+            if (isInternalWorkflowResultText(text) || isAutoContinuationPrompt(text)) continue
             const attachments = attachmentMetadata(entry.message.content)
             if (text || attachments.length) messages.push({role: 'user', text, ...(attachments.length ? {attachments} : {}), time})
             continue
