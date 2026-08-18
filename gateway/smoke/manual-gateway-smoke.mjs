@@ -17,13 +17,13 @@
 import WebSocket from 'ws'
 import {readFileSync} from 'node:fs'
 import {join} from 'node:path'
-import {homedir} from 'node:os'
+import {BRIDGE_HOME} from '../config/bridge-home.mjs'
 
 if (process.env.BRIDGE_RUN_INTEGRATION_TEST !== '1') {
     console.log('Gateway 手动集成测试已跳过；设置 BRIDGE_RUN_INTEGRATION_TEST=1 后运行。')
 } else {
 const BASE = 'http://127.0.0.1:3456'
-const token = readFileSync(join(homedir(), '.claude', 'bridge-token'), 'utf8').trim()
+const token = readFileSync(join(BRIDGE_HOME, 'bridge-token'), 'utf8').trim()
 
 // ═══════════════════════════════════════════
 // ── Step 1: 创建 session ──

@@ -366,7 +366,7 @@ Code → Actions → 最新一次 Workflow run → Artifacts
 
 主界面左侧栏：
 
-- **项目列表**：自动扫描 `~/.claude/projects/` 下所有会话项目
+- **项目列表**：自动扫描 `~/.claude-desktop-bridge/projects/` 下所有会话项目
 - **新增项目**：点击 → 选择本地文件夹（调用系统原生目录选择器），或手动输入绝对路径
 - **会话管理**：每个项目可创建 / 恢复 / 删除会话，分页加载
 - **实时对话**：Enter 发送，Shift+Enter 换行
@@ -398,7 +398,7 @@ Code → Actions → 最新一次 Workflow run → Artifacts
 - **文件列表**：该轮修改的所有文件及 `+x/-y` 行数
 - **回退**：一键将工作目录恢复到指定记录点之前的状态（写磁盘）
 - **提交**：确认本轮修改，选择性提交文件，清空记录点，重新建立基线
-- 数据持久化到 `~/.claude/projects/<name>/bridge-checkpoints/`，重启不丢失
+- 数据持久化到 `~/.claude-desktop-bridge/projects/<name>/bridge-checkpoints/`，重启不丢失
 
 ### 桌面宠物
 
@@ -423,7 +423,7 @@ Gateway 内置项目结构分析引擎（`gateway/projects/project-cache.mjs`）
 - **技术栈检测**：自动识别框架（Vue/React/Angular/Svelte）、构建工具（Vite/Webpack/Maven/Gradle/Cargo）、包管理器、Electron 等
 - **增量更新**：首次全量扫描（SHA256），后续仅更新变更文件
 - **自动注入**：Claude 首次探索项目时，自动注入 ~8000 字符的结构摘要，避免重复文件扫描
-- 缓存文件：`~/.claude/projects/<name>/bridge-structure-cache.json`
+- 缓存文件：`~/.claude-desktop-bridge/projects/<name>/bridge-structure-cache.json`
 
 ### IM 集成（微信 / 飞书 / 钉钉）
 
@@ -452,7 +452,7 @@ Gateway 每次启动时为每个已连接的平台生成一个 6 位**配对码*
 4. Bot 回复"配对成功" → 激活完成，此后可正常对话
 ```
 
-> **配对码仅需一次**：每个用户配对后即写入 `~/.claude/bridge-paired*.json` 持久化。Gateway 重启后配对码会变，但已配对用户无需重复操作。平台解绑会停止对应连接，并清除该平台凭据、账号缓存、配对白名单、Session 绑定、待处理消息和通知 outbox；重新绑定后需要使用新配对码。
+> **配对码仅需一次**：每个用户配对后即写入 `~/.claude-desktop-bridge/bridge-paired*.json` 持久化。Gateway 重启后配对码会变，但已配对用户无需重复操作。平台解绑会停止对应连接，并清除该平台凭据、账号缓存、配对白名单、Session 绑定、待处理消息和通知 outbox；重新绑定后需要使用新配对码。
 
 设置页 → **IM 连接** Tab：
 
@@ -542,11 +542,15 @@ Gateway 每次启动时为每个已连接的平台生成一个 6 位**配对码*
 | **定时任务** | Cron 定时任务 CRUD，可视化频率选择（每天/工作日/每周/每月/自定义），手动触发 |
 | **开源** | Caveman 压缩配置 / RTK 压缩配置 / 桌面宠物选择 |
 
-Bridge 只使用仓库内的 `gateway/context/BRIDGE_RULES.md` 作为唯一长期规则来源，不读取或合并用户机器上的
-Claude/Codex 全局规则。Claude Agent SDK 以
-`settingSources: []` 运行，不隐式加载用户或项目目录的 `CLAUDE.md`、`AGENTS.md` 和
-`.claude/settings*.json`。供应商、API Key、MCP、Skills 与 Agents 仍由 Gateway 配置层按需读取并显式传入；
-简单问答不加载这些扩展，执行型任务才升级为完整上下文。
+Bridge 只使用仓库内的 `gateway/context/BRIDGE_RULES.md` 作为跨项目长期规则来源，不读取或合并用户机器上的
+Claude/Codex 全局规则。操作 Bridge 仓库根目录或其子目录时，Gateway 额外注入
+`gateway/context/BRIDGE_PROJECT_RULES.md` 中的 Electron、Gateway 和会话生命周期约束；外部项目不会收到这些
+仓库专属内容。完整执行会话只启用 `CLAUDE_CONFIG_DIR` 指向的 Bridge 私有 `user` settings，
+不读取用户机器上的 Claude/Codex 配置，也不加载目标项目目录的 `CLAUDE.md` 或 `AGENTS.md`；轻量和只读会话继续关闭所有 setting sources。
+供应商、API Key、MCP、Skills 与 Agents 由 Gateway 从 Bridge 私有目录按需读取并显式传入；
+简单问答不加载这些扩展，执行型任务才升级为完整上下文。明确的数字孪生集成任务会按需准备并加载 Bridge
+内置的 `digital-twin-cad` Skill；普通 CAD、普通前端和仅 Viewer 预览不触发该 Skill，已有同名用户 Skill
+不会被覆盖。
 
 ### 压缩模式（Caveman / RTK）
 
@@ -580,7 +584,7 @@ Claude/Codex 全局规则。Claude Agent SDK 以
 - **手动触发**：立即执行一次任务
 - **启用/禁用**：暂停/恢复自动调度
 - **完成通知**：任务执行完毕后通知当前会话
-- 任务持久化到 `~/.claude/scheduled-tasks/`，重启自动恢复
+- 任务持久化到 `~/.claude-desktop-bridge/bridge-scheduled-tasks.json`，重启自动恢复
 
 ### IM 通知可靠投递
 
@@ -626,6 +630,7 @@ Claude/Codex 全局规则。Claude Agent SDK 以
 | `BRIDGE_SCHEDULED_MAX_DURATION_MS` | `1800000` | 单个定时任务最长运行时间，最少 60 秒 |
 | `BRIDGE_OCR_MAX_CONCURRENT` | `1` | OCR 并发上限，范围 1-4 |
 | `BRIDGE_UPLOAD_TTL_MS` | `86400000` | 临时上传文件保留时间，范围 5 分钟-30 天；过期文件自动清理 |
+| `BRIDGE_HOME` | `~/.claude-desktop-bridge` | Bridge 私有配置、会话和 IM 数据根目录；必须是绝对路径 |
 | `LOG_LEVEL` | `info` | 日志级别: trace / debug / info / warn / error / fatal |
 | `LOG_MAX_SIZE` | `10m` | 单日志文件最大体积 (k/m/g) |
 | `LOG_RETAIN_DAYS` | `30` | 日志文件保留天数 |
@@ -634,13 +639,12 @@ Claude/Codex 全局规则。Claude Agent SDK 以
 
 ### settings.json
 
-路径：`~/.claude/settings.json`
+路径：`~/.claude-desktop-bridge/settings.json`
 
 ```json
 {
   "theme": "dark",
   "language": "chinese",
-  "model": "deepseek-v4-pro",
   "claudeExe": "/opt/homebrew/bin/claude",
   "maxTurns": 40,
   "maxContextTokens": 200000,
@@ -649,17 +653,15 @@ Claude/Codex 全局规则。Claude Agent SDK 以
   "permissionMode": "default",
   "thinkingLevel": "auto",
   "mcpServers": {},
-  "hooks": {},
-  "env": {
-    "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
-    "ANTHROPIC_AUTH_TOKEN": "sk-xxx"
-  }
+  "hooks": {}
 }
 ```
 
+供应商地址、模型和 API Key 独立保存在同目录的 `bridge-provider.json`，不与 Claude Code、Codex 或 CCSwitch 配置合并。
+
 ### adapters.json
 
-路径：`~/.claude/adapters.json`
+路径：`~/.claude-desktop-bridge/adapters.json`
 
 该文件由设置页维护，当前格式是 AES-256-GCM 加密 envelope，不应手工填写平台凭据：
 
@@ -671,7 +673,7 @@ Claude/Codex 全局规则。Claude Agent SDK 以
 }
 ```
 
-Electron 启动时优先使用系统 `safeStorage` 保护主密钥，并通过 IPC 注入 Gateway。若操作系统安全存储不可用，则退回权限受限的 `~/.claude/bridge-store-key`。独立运行 `node gateway/index.mjs` 时，如需读取 Electron 已创建的加密数据，必须显式提供同一 `BRIDGE_SECURE_PAYLOAD_KEY`；缺少密钥会安全失败，不会创建新密钥覆盖旧数据。旧版明文配置会在密钥可用时自动迁移。
+Electron 启动时优先使用系统 `safeStorage` 保护主密钥，并通过 IPC 注入 Gateway。若操作系统安全存储不可用，则退回权限受限的 `~/.claude-desktop-bridge/bridge-store-key`。独立运行 `node gateway/index.mjs` 时，如需读取 Electron 已创建的加密数据，必须显式提供同一 `BRIDGE_SECURE_PAYLOAD_KEY`；缺少密钥会安全失败，不会创建新密钥覆盖旧数据。旧版明文配置会在密钥可用时自动迁移。
 
 ---
 
@@ -748,7 +750,7 @@ Gateway 启动时会按以下顺序自动查找 Claude Code 可执行文件：
 1. 输入 Claude Code 可执行文件的**完整路径**
 2. 点击"检测此路径"验证
 3. 验证通过后点击"保存并继续"
-4. 路径写入 `~/.claude/settings.json` → `claudeExe` 字段
+4. 路径写入 `~/.claude-desktop-bridge/settings.json` → `claudeExe` 字段
 
 ---
 
@@ -819,8 +821,8 @@ cat gateway/bridge-logs/error.$(date +%Y-%m-%d).*.log
 
 ### 微信 Bot 无响应
 
-1. 检查 `~/.claude/adapters.json` 中 wechat.botToken 是否存在
-2. 检查 `~/.claude/bridge-paired.json` 中是否包含该用户的 `from_user_id`
+1. 检查 `~/.claude-desktop-bridge/adapters.json` 中 wechat.botToken 是否存在
+2. 检查 `~/.claude-desktop-bridge/bridge-paired.json` 中是否包含该用户的 `from_user_id`
 3. 在桌面端 **设置 → IM 连接** 确认微信状态为运行中，并查看当前配对码
 4. 查看 Gateway 日志 `gateway/bridge-logs/` 搜索 `[wechat]` 或 `poll`
 
@@ -832,7 +834,7 @@ cat gateway/bridge-logs/error.$(date +%Y-%m-%d).*.log
 2. **找不到配对码** → 在桌面端 **设置 → IM 连接** 查看；日志和 Bot 回复不会显示配对码
 3. **配对码不对** → 确认使用的是同一平台当前显示的 6 位配对码；适配器重启后旧码会失效
 4. **连续输错被锁定** → 等待设置页提示的冷却时间后再试，避免继续触发暴力破解保护
-5. **已配对用户重启后无需操作** → 配对信息持久化到 `~/.claude/bridge-paired*.json`；平台解绑后白名单会被清除
+5. **已配对用户重启后无需操作** → 配对信息持久化到 `~/.claude-desktop-bridge/bridge-paired*.json`；平台解绑后白名单会被清除
 
 ### 桌面端连接 Gateway 失败
 

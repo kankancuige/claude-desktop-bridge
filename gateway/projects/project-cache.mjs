@@ -18,13 +18,12 @@ import {createHash} from 'node:crypto'
 import {createRequire} from 'node:module'
 import {readdirSync, statSync, readFileSync, writeFileSync, mkdirSync, existsSync} from 'node:fs'
 import {join, dirname, relative, extname, basename} from 'node:path'
-import {homedir} from 'node:os'
 import {safeBasename, safeChildPath} from '../security/path-security.mjs'
+import {BRIDGE_HOME} from '../config/bridge-home.mjs'
 
 const require = createRequire(import.meta.url)
 
 // ── 常量 ──
-const CLAUDE_HOME = join(homedir(), '.claude')
 const MAX_SNAP_FILE_BYTES = 512 * 1024
 const MAX_SNAP_FILES = 5000
 const SNAP_EXCLUDE_DIRS = new Set(['node_modules', '.git', 'dist', 'dist-electron', 'build', '.next', 'out',
@@ -1313,7 +1312,7 @@ function scanSourceFiles(workDir) {
 // ── cacheFilePath ── 缓存文件路径
 // 功能说明: 返回项目对应的缓存文件绝对路径
 export function cacheFilePath(workDir) {
-    const projectsDir = join(CLAUDE_HOME, 'projects')
+    const projectsDir = join(BRIDGE_HOME, 'projects')
     const projectDir = safeBasename(projectsDir, encodeProjectName(workDir))
     return projectDir ? safeChildPath(projectDir, 'bridge-structure-cache.json', {allowNested: false, extensions: ['.json']}) : null
 }

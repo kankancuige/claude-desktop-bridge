@@ -5,6 +5,7 @@ import {
     hasBridgeProviderSettings,
     normalizeBridgeProviderSettings,
     overlayBridgeProviderSettings,
+    stripBridgeProviderSettings,
 } from './bridge-provider-settings.mjs'
 
 test('provider settings normalize API key aliases into one auth token', () => {
@@ -44,4 +45,20 @@ test('redacted provider token is restored from bridge-owned settings', () => {
 test('empty provider settings are distinguishable from a configured provider', () => {
     assert.equal(hasBridgeProviderSettings({}), false)
     assert.equal(hasBridgeProviderSettings({env: {ANTHROPIC_BASE_URL: 'https://relay.example'}}), true)
+})
+
+test('settings persistence removes every provider-owned field', () => {
+    assert.deepEqual(stripBridgeProviderSettings({
+        theme: 'dark',
+        model: 'gpt-5.6-sol',
+        env: {
+            PATH: 'kept',
+            ANTHROPIC_BASE_URL: 'https://relay.example/v1',
+            ANTHROPIC_AUTH_TOKEN: 'secret',
+            ANTHROPIC_DEFAULT_OPUS_MODEL: 'gpt-5.6-sol',
+        },
+    }), {
+        theme: 'dark',
+        env: {PATH: 'kept'},
+    })
 })

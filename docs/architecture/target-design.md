@@ -7,10 +7,33 @@ Incomplete: None
 
 ## 目标边界
 
-- 保持 Electron + Vue + 单 Gateway 的 modular monolith，不引入数据库或新服务。
+- 保持 Electron + Vue + 单 Gateway 的 modular monolith；新增 Bridge 私有 SQLite 运行状态库，不引入数据库服务或云同步。
 - transcript 继续由 Claude SDK 持有；桌面端只新增有界的 session draft store。
 - API 层统一产生脱敏错误事件，页面继续负责业务语义和可执行重试。
 - 会话入口明确区分恢复、分支和空白新建；按需接力只读取 transcript，不新增任务正文数据库。
+- Bridge 使用 `~/.claude-desktop-bridge` 作为唯一默认配置根目录，并允许 `BRIDGE_HOME` 指向另一个绝对目录；不得回退读取 `~/.claude` 或 `~/.codex`。
+- Claude Agent SDK 仍是执行 Provider，但父进程和 Query 子进程都必须使用同一 `CLAUDE_CONFIG_DIR`，使 transcript、settings 和 SDK 衍生文件归 Bridge 所有。
+
+## Bridge 私有配置契约
+
+- `config/bridge-home.mjs` 是根目录唯一解析入口；业务模块不得自行拼接 `homedir()/.claude*`。
+- `settings.json` 保存 Bridge 自有 MCP、Hooks 和 SDK兼容设置；供应商凭据继续由 `bridge-provider.json` 隔离管理。
+- `rules/`、`skills/`、`agents/`、`hooks/` 和 `workflows/` 保持可读文件格式，不放入 SQLite。
+- `projects/` 同时保存 SDK transcript 与 Bridge 的 session map、journal、checkpoint、snapshot 和 preference；所有消费者使用同一根目录。
+- `bridge-state.db` 只保存 IM inbox/outbox、消息去重、会话索引和 Memory 文件索引；不保存 transcript 正文、规则正文或凭据。
+- SQLite 使用 WAL、短事务和 schema version；不可用时显式降级到旧文件状态并广播 `state_store_degraded`，不得静默丢失任务。
+- 完整上下文只启用 Bridge 私有 `user` setting source；focused/light 继续关闭 setting source、MCP、Agent 和 Hook。
+- 首次兼容迁移复制已知资源和 Bridge 数据，目标已存在时不覆盖；写入迁移清单后正常运行只访问新目录。旧目录保留供人工回退，绝不自动删除。
+
+## 配置隔离失败模型
+
+| 失败 | 行为 | 恢复 |
+|---|---|---|
+| `BRIDGE_HOME` 不是绝对路径 | 启动失败并给出稳定错误 | 修正环境变量后重启 |
+| 创建私有目录失败 | Gateway 不启动，避免部分写入两个根目录 | 修复权限或磁盘后重试 |
+| 单项迁移失败 | 记录失败项，不删除源；下次启动重试缺失目标 | 修复文件权限后重启 |
+| SDK 未使用私有目录 | 隔离契约测试失败，禁止发布 | 检查 `CLAUDE_CONFIG_DIR` 注入和 Runtime wrapper |
+| 旧数据不存在 | 建立空的 Bridge 私有目录并正常启动 | 无需恢复 |
 
 ## 契约
 
@@ -75,7 +98,7 @@ interface BridgeNotice {
 | 方案 | 结论 | 原因 |
 |---|---|---|
 | 保存完整 Vue 消息树 | 不采用 | 重复 transcript、结构易漂移、可能保存敏感运行态 |
-| 新增 SQLite 会话库 | 不采用 | 单机规模没有证据支付迁移和双写成本 |
+| 新增 SQLite 运行状态与派生索引 | 部分采用 | 用于原子 IM 重试、去重和有界检索，不复制配置或正文 |
 | JSONL 为正文事实源 + 本地有界草稿 | 采用 | 与 Claude SDK 一致、改动可逆、能覆盖中断原文恢复 |
 | 每个 fetch 手写 toast | 不采用 | 109 个调用点易漏且提示不一致 |
 | 共享传输错误事件 + 业务调用方补充 | 采用 | 可覆盖网络共性，同时避免后台轮询刷屏 |
@@ -177,3 +200,11 @@ Gateway 保持单进程 modular monolith。`gateway/index.mjs` 是唯一组合�
 | `tools/` | 附件、上传和 RTK 等可复用工具支持 | `shared/`、`security/` |
 
 `shared/` 不得反向依赖任何领域目录；IM adapter 不直接修改 Session 内部状态；Workflow 不解释 HTTP、WebSocket 或 IM 协议。跨领域行为由 `index.mjs` 组合，后续再提取显式 coordinator，目录迁移本身不改变公开 API、持久化格式或运行进程数。
+
+## 上下文规则分层与内置 Skill
+
+- 跨项目规则由 `BRIDGE_RULES.md` 持有；Bridge 仓库专属规则由 `BRIDGE_PROJECT_RULES.md` 持有。完整 Query 创建和重建统一传递当前 `workDir`，只有绝对路径位于运行时仓库根目录或子目录时才追加专属层。
+- 完整会话仅启用 Bridge 私有 `user` setting source，不读取用户机器上的 Claude/Codex 配置、目标项目 `CLAUDE.md`、`AGENTS.md` 或 Codex Skill；轻量问答和聚焦只读上下文继续使用 `settingSources: []`。
+- 数字孪生路由要求孪生上下文与 CAD/STEP/GLB、节点映射、遥测状态、URDF/SDF 或 manifest 集成证据同时出现；CAD/GLB 节点绑定和遥测驱动模型状态可作为直接证据。
+- `digital-twin-cad` 是 Bridge 自带但按需准备的 Skill。首次命中且用户目录不存在同名文件时写入；已有文件不覆盖，源缺失或目录不可写时在 Query 创建前明确失败。
+- 回滚只需恢复单层规则选择并移除路由接线；已经写入用户 Skill 目录的文件不自动删除，防止删除用户后续修改。

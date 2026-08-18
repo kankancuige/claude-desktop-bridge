@@ -24,3 +24,34 @@ test('路由结果稳定去重，未知内容不加载全部 Skill', () => {
     assert.deepEqual(updated.skills, ['protocol-parser'])
     assert.deepEqual(original.skills, ['old'])
 })
+
+test('数字孪生集成任务加载专用 Skill', () => {
+    for (const text of [
+        '为工业数字孪生生成 STEP 和 GLB，并建立 twin manifest',
+        '把 GLB 节点绑定到设备遥测状态',
+        '更新机器人孪生 URDF 关节和传感器映射',
+        '将 CAD 零件节点绑定到设备 ID 和告警状态',
+    ]) {
+        assert.deepEqual(routeSkills({text, profile: 'full'}), ['digital-twin-cad'], text)
+    }
+})
+
+test('普通 CAD、GLB Viewer 和前端任务不加载数字孪生 Skill', () => {
+    assert.deepEqual(routeSkills({text: '帮我画一个普通 CAD 零件', profile: 'full'}), [])
+    assert.deepEqual(routeSkills({text: '做一个 GLB Viewer 预览页面', profile: 'full'}), ['vue-frontend'])
+    assert.deepEqual(routeSkills({text: '这个 digital-twin-cad Skill 是干什么的？', profile: 'focused'}), [])
+})
+
+test('数字孪生任务只有明确开发设备连接或驱动时才联合加载设备 Skill', () => {
+    assert.deepEqual(
+        routeSkills({text: '为设备数字孪生添加串口驱动、断线重连和 GLB 节点状态绑定', profile: 'full'}),
+        ['digital-twin-cad', 'device-driver'],
+    )
+})
+
+test('只有明确记忆操作才加载 Bridge Memory Skill', () => {
+    assert.deepEqual(routeSkills({text: '把当前项目的 UTF-8 编码约定记住，写入项目 Memory', profile: 'full'}), ['bridge-memory'])
+    assert.deepEqual(routeSkills({text: '忘记刚才记录的项目约定', profile: 'full'}), ['bridge-memory'])
+    assert.deepEqual(routeSkills({text: '这个 Memory Skill 是干什么的？', profile: 'focused'}), [])
+    assert.deepEqual(routeSkills({text: '修改代码并使用 UTF-8 编码', profile: 'full'}), [])
+})

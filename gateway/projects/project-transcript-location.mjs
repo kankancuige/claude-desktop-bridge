@@ -3,7 +3,7 @@ import {join} from 'node:path'
 
 const SESSION_FILE_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/
 
-/** 将 URL 路径段安全还原为 ~/.claude/projects 下的单个目录名。 */
+/** 将 URL 路径段安全还原为 Bridge 私有 projects 下的单个目录名。 */
 export function decodeProjectDirectorySegment(value) {
     let decoded
     try {
@@ -77,16 +77,55 @@ function readTranscriptExcerpt(filePath, maxBytes) {
  * 并限制候选数和单文件读取量，避免引用性短句阻塞 Gateway。
  */
 export function listProjectTranscriptCandidates({
-    claudeHome,
+    bridgeHome,
     encodedDir,
     workDir,
+    stateStore = null,
     limit = 24,
     maxBytesPerFile = 512 * 1024,
 } = {}) {
     const decodedDir = decodeProjectDirectorySegment(encodedDir)
     if (!decodedDir || !workDir) return []
-    const projectsRoot = join(claudeHome, 'projects')
+    const projectsRoot = join(bridgeHome, 'projects')
     if (!existsSync(projectsRoot)) return []
+    const requestedProjectDir = join(projectsRoot, decodedDir)
+    const indexed = stateStore?.available ? stateStore.listSessionIndex(decodedDir, {limit: 500}) : []
+    if (indexed.length > 0 && existsSync(requestedProjectDir)) {
+        try {
+            const diskFiles = new Map(readdirSync(requestedProjectDir)
+                .filter(filename => filename.endsWith('.jsonl') && !filename.startsWith('.trash-'))
+                .map(filename => [filename.slice(0, -'.jsonl'.length), filename]))
+            const candidates = []
+            let stale = false
+            for (const row of indexed) {
+                const filename = diskFiles.get(row.sessionId)
+                const filePath = filename ? join(requestedProjectDir, filename) : row.transcriptPath
+                if (!filename || !existsSync(filePath)) {
+                    stateStore.removeSessionIndex(row.transcriptPath)
+                    stale = true
+                    continue
+                }
+                const stat = statSync(filePath)
+                if (!stat.isFile() || stat.mtimeMs !== Number(row.mtime) || stat.size !== Number(row.size) || !transcriptMatchesWorkDir(filePath, decodedDir, workDir)) {
+                    stateStore.removeSessionIndex(row.transcriptPath)
+                    stale = true
+                    continue
+                }
+                candidates.push({id: row.sessionId, mtime: stat.mtimeMs, filePath})
+            }
+            if (!stale && candidates.length === diskFiles.size) {
+                return candidates
+                    .sort((a, b) => b.mtime - a.mtime)
+                    .slice(0, Math.max(1, Math.min(100, Number(limit) || 24)))
+                    .map(candidate => {
+                        try { return {...candidate, content: readTranscriptExcerpt(candidate.filePath, maxBytesPerFile)} } catch { return null }
+                    })
+                    .filter(Boolean)
+            }
+        } catch {
+            // 索引损坏或目录正在变化时回退到现有只读扫描。
+        }
+    }
     const files = []
     const projectEntries = readdirSync(projectsRoot, {withFileTypes: true})
     const candidateDirectories = new Set([decodedDir])
@@ -127,7 +166,7 @@ export function listProjectTranscriptCandidates({
             }
         }
     }
-    return files
+    const result = files
         .sort((a, b) => b.mtime - a.mtime)
         .slice(0, Math.max(1, Math.min(100, Number(limit) || 24)))
         .map(candidate => {
@@ -138,17 +177,39 @@ export function listProjectTranscriptCandidates({
             }
         })
         .filter(Boolean)
+    if (stateStore?.available) {
+        const currentPaths = new Set(files.map(candidate => candidate.filePath))
+        for (const indexedItem of stateStore.listSessionIndex(decodedDir, {limit: 500})) {
+            if (!currentPaths.has(indexedItem.transcriptPath)) stateStore.removeSessionIndex(indexedItem.transcriptPath)
+        }
+        for (const candidate of files) {
+            try {
+                const stat = statSync(candidate.filePath)
+                stateStore.upsertSessionIndex({
+                    projectKey: decodedDir,
+                    sessionId: candidate.id,
+                    workDir,
+                    transcriptPath: candidate.filePath,
+                    mtime: stat.mtimeMs,
+                    size: stat.size,
+                })
+            } catch {
+                // 索引是派生优化，单个文件变化不应阻断 transcript 读取。
+            }
+        }
+    }
+    return result
 }
 
 /**
  * 定位 transcript。优先使用请求目录；旧版本曾把 Unicode 目录通过 URL 编码传入，
  * 因此在指定目录缺失时按 session ID 做只读兼容查找。
  */
-export function findSessionTranscript({claudeHome, encodedDir, sessionId, workDir}) {
+export function findSessionTranscript({bridgeHome, encodedDir, sessionId, workDir}) {
     if (!validSessionId(sessionId)) return {status: 'invalid'}
     const decodedDir = decodeProjectDirectorySegment(encodedDir)
     if (!decodedDir) return {status: 'invalid'}
-    const projectsRoot = join(claudeHome, 'projects')
+    const projectsRoot = join(bridgeHome, 'projects')
     const requestedDir = join(projectsRoot, decodedDir)
     const requestedFile = join(requestedDir, `${sessionId}.jsonl`)
     if (existsSync(requestedFile) && statSync(requestedFile).isFile()) {

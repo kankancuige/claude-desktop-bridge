@@ -30,7 +30,6 @@
  */
 import {readFileSync} from 'node:fs'
 import {join} from 'node:path'
-import {homedir} from 'node:os'
 import {randomInt} from 'node:crypto'
 import {DWClient, TOPIC_ROBOT} from 'dingtalk-stream'
 import {createLogger} from '../shared/logger.mjs'
@@ -51,11 +50,12 @@ import {runImTask} from './im-task-runner.mjs'
 import {platformEntryFilePath} from './platform-entry-store.mjs'
 import {PendingConfirmRegistry} from './pending-confirm.mjs'
 import {findLatestAdapterUserForSession} from './adapter-bindings.mjs'
+import {BRIDGE_HOME} from '../config/bridge-home.mjs'
 
 const log = createLogger('dingtalk')
 
 const GW = () => gatewayHttpBase()              // Gateway 本地 HTTP 地址
-const CLAUDE_HOME = join(homedir(), '.claude')   // Claude 配置根目录
+// Bridge 私有配置根目录；不读取 Claude/Codex 的用户配置。
 
 // ── startDingTalkAdapter ──
 // 功能说明: 钉钉适配器入口函数，初始化凭据、access_token 管理、配对状态、确认挂起表
@@ -63,7 +63,7 @@ const CLAUDE_HOME = join(homedir(), '.claude')   // Claude 配置根目录
 //          返回 null 表示凭据加载失败，适配器无法启动。
 // 关键数据流: adapters.json 加载凭据 → 获取 access_token → 创建 DWClient → 注册回调
 //          → connect() → 返回钩子对象
-export function startDingTalkAdapter(token, {taskCommands} = {}) {
+export function startDingTalkAdapter(token, {taskCommands, stateStore = null} = {}) {
     let appKey, appSecret
     let stopped = false
     let connectionError = null
@@ -75,7 +75,7 @@ export function startDingTalkAdapter(token, {taskCommands} = {}) {
     // SIDE_EFFECT: 修改模块级变量 appKey / appSecret
     function reloadCreds() {
         try {
-            const adapters = readAdapterConfig(join(CLAUDE_HOME, 'adapters.json'))
+            const adapters = readAdapterConfig(join(BRIDGE_HOME, 'adapters.json'))
             appKey = adapters.dingtalk?.appKey
             appSecret = adapters.dingtalk?.appSecret
             if (!appKey || !appSecret) {
@@ -184,7 +184,7 @@ export function startDingTalkAdapter(token, {taskCommands} = {}) {
     }
 
     // ── 配对白名单 ──
-    const pairedFile = join(CLAUDE_HOME, 'bridge-paired-dingtalk.json')
+    const pairedFile = join(BRIDGE_HOME, 'bridge-paired-dingtalk.json')
     const pairedUsers = loadPairedUsers(pairedFile)
 
     // ── 配对码生成 ──
@@ -202,17 +202,19 @@ export function startDingTalkAdapter(token, {taskCommands} = {}) {
     const pendingConfirm = new PendingConfirmRegistry()
     const sessionQueue = new SessionTaskQueue({maxDepth: 8})
     const messageDeduper = new ImMessageDeduper()
-    const payloadCodec = new SecurePayloadCodec(join(CLAUDE_HOME, 'bridge-store-key'))
-    const legacyInboxFile = join(CLAUDE_HOME, 'bridge-im-inbox.json')
-    const legacyOutboxFile = join(CLAUDE_HOME, 'bridge-notification-outbox.json')
+    const payloadCodec = new SecurePayloadCodec(join(BRIDGE_HOME, 'bridge-store-key'))
+    const legacyInboxFile = join(BRIDGE_HOME, 'bridge-im-inbox.json')
+    const legacyOutboxFile = join(BRIDGE_HOME, 'bridge-notification-outbox.json')
     const inbox = new ImInbox({
-        filePath: platformEntryFilePath(CLAUDE_HOME, 'bridge-im-inbox', 'dingtalk'), legacyFilePath: legacyInboxFile,
+        filePath: platformEntryFilePath(BRIDGE_HOME, 'bridge-im-inbox', 'dingtalk'), legacyFilePath: legacyInboxFile,
         platform: 'dingtalk', payloadCodec,
+        stateStore,
         onPersistError: error => log.error({err: error}, 'IM inbox 持久化失败'),
     })
     const outbox = new NotificationOutbox({
-        filePath: platformEntryFilePath(CLAUDE_HOME, 'bridge-notification-outbox', 'dingtalk'), legacyFilePath: legacyOutboxFile,
+        filePath: platformEntryFilePath(BRIDGE_HOME, 'bridge-notification-outbox', 'dingtalk'), legacyFilePath: legacyOutboxFile,
         platform: 'dingtalk', payloadCodec,
+        stateStore,
         onPersistError: error => log.error({err: error}, '通知 outbox 持久化失败'),
     })
     // pendingConfirm TTL 清理：5 分钟超时自动清除，防止异常路径下残留
@@ -471,7 +473,7 @@ export function startDingTalkAdapter(token, {taskCommands} = {}) {
     function findUserForSession(sid) {
         let ad = {}
         try {
-            ad = JSON.parse(readFileSync(join(CLAUDE_HOME, 'adapter-sessions.json'), 'utf8'))
+            ad = JSON.parse(readFileSync(join(BRIDGE_HOME, 'adapter-sessions.json'), 'utf8'))
         } catch (error) {
             log.debug({err: error, sessionId: sid?.slice(0, 8)}, '读取钉钉镜像状态失败')
         }

@@ -7,7 +7,7 @@ import {createUserPreferenceService, detectPreferenceCandidates} from './user-pr
 
 function fixture(options = {}) {
     const home = mkdtempSync(join(tmpdir(), 'bridge-preferences-'))
-    return {home, service: createUserPreferenceService({claudeHome: home, ...options})}
+    return {home, service: createUserPreferenceService({bridgeHome: home, ...options})}
 }
 
 test('只识别明确的白名单偏好表达', () => {

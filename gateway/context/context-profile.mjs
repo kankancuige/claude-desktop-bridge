@@ -63,14 +63,14 @@ function buildLightSystemPrompt(model) {
     ].join('\n')
 }
 
-export function applyContextProfile(options, profile, model) {
+export function applyContextProfile(options, profile, model, {workDir = ''} = {}) {
     const normalizedProfile = normalizeContextProfile(profile)
     if (normalizedProfile === 'full') {
         return {
             ...options,
-            // Bridge 完整会话也必须隔离 SDK 对外部 CLAUDE.md/settings 的默认扫描。
-            settingSources: [],
-            systemPrompt: appendBridgeRules(options.systemPrompt),
+            // 仅加载 CLAUDE_CONFIG_DIR 指向的 Bridge 私有 user settings；不扫描目标项目或本机 Claude/Codex 配置。
+            settingSources: ['user'],
+            systemPrompt: appendBridgeRules(options.systemPrompt, {workDir}),
         }
     }
     if (normalizedProfile === 'focused') {

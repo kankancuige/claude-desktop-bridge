@@ -8,7 +8,7 @@ import {buildAgentRuntimeMetadata} from '../agents/agent-runtime-metadata.mjs'
 import {readdirSync, readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, rmSync, statSync, mkdtempSync} from 'node:fs'
 import {execFileSync, fork} from 'node:child_process'
 import {join, extname, dirname} from 'node:path'
-import {homedir, tmpdir} from 'node:os'
+import {tmpdir} from 'node:os'
 import {fileURLToPath} from 'node:url'
 import {createLogger} from '../shared/logger.mjs'
 import {safeBasename} from '../security/path-security.mjs'
@@ -16,19 +16,19 @@ import {sanitizeWorktreeSegment} from '../shared/worktree-path.mjs'
 import {getCurrentSessionWorkflow, sortSessionWorkflows} from '../tasks/task-lifecycle.mjs'
 import {taskWorkflowResultMarker} from '../tasks/task-workflow-gate.mjs'
 import {requirementsForAgentStart} from '../agents/agent-capabilities.mjs'
+import {BRIDGE_HOME} from '../config/bridge-home.mjs'
 
 const log = createLogger('workflow')
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-const CLAUDE_HOME = join(homedir(), '.claude')
-const WF_DIR = join(CLAUDE_HOME, 'workflows')
-const JOURNAL_DIR = join(CLAUDE_HOME, 'workflow-journals')
-const WORKTREE_ROOT = join(CLAUDE_HOME, 'worktrees')
+const WF_DIR = join(BRIDGE_HOME, 'workflows')
+const JOURNAL_DIR = join(BRIDGE_HOME, 'workflow-journals')
+const WORKTREE_ROOT = join(BRIDGE_HOME, 'worktrees')
 const DEFAULT_MAX_TURNS = 15
 const SCRIPT_TIMEOUT_MS = 1_200_000    // 脚本总超时 20 分钟
 const AGENT_TIMEOUT_MS = 600_000       // 单 agent 超时 10 分钟
 const MAX_WORKFLOW_SCRIPT_BYTES = 1024 * 1024
-const HISTORY_FILE = join(CLAUDE_HOME, 'bridge-workflow-history.jsonl')
+const HISTORY_FILE = join(BRIDGE_HOME, 'bridge-workflow-history.jsonl')
 const MAX_HISTORY_ENTRIES = 500
 
 async function cleanupWorkflowAgentSession({
@@ -49,9 +49,9 @@ async function cleanupWorkflowAgentSession({
 }
 
 // ── Agent 类型注册表 ──
-// 扫描 ~/.claude/agents/*.md 的 frontmatter，建立 {type} → [{name, language, exts}] 索引
+// 扫描 Bridge 私有 agents/*.md 的 frontmatter，建立 {type} → [{name, language, exts}] 索引
 // workflow 只需声明 agentType: 'reviewer'，系统根据项目语言自动匹配具体 agent
-const AGENTS_DIR = join(CLAUDE_HOME, 'agents')
+const AGENTS_DIR = join(BRIDGE_HOME, 'agents')
 
 function parseAgentFrontmatter(content) {
     const m = content.match(/^---\r?\n([\s\S]*?)\r?\n---/)
@@ -185,7 +185,7 @@ function resolveAgentType(requestedType, workDir) {
 
 const SCHEMA_MAX_RETRIES = 2           // Schema 验证失败重试次数
 
-// ── 内置 Workflow 模板（启动时自动创建到 ~/.claude/workflows/） ──
+// ── 内置 Workflow 模板（启动时自动创建到 ~/.claude-desktop-bridge/workflows/） ──
 // 7 个实战模式，模型根据任务特征自主选择
 const BUILTIN_WORKFLOWS = {
 
@@ -1296,7 +1296,7 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
         if (_deps?.deleteSession && _deps?.encodeProjectName) {
             // 使用 effectiveWorkDir 而非 workDir: worktree 隔离时 SDK transcript
             // 落在 worktree 路径对应的 project 目录，两个路径 encodeProjectName 不同
-            const projectsDir = join(homedir(), '.claude', 'projects', _deps.encodeProjectName(effectiveWorkDir))
+            const projectsDir = join(BRIDGE_HOME, 'projects', _deps.encodeProjectName(effectiveWorkDir))
             if (sdkSessionId) {
                 try {
                     const cleanup = await cleanupWorkflowAgentSession({

@@ -28,7 +28,6 @@
  */
 import {readFileSync} from 'node:fs'
 import {join} from 'node:path'
-import {homedir} from 'node:os'
 import {randomInt} from 'node:crypto'
 import {WSClient, EventDispatcher, Client, LoggerLevel, defaultHttpInstance} from '@larksuiteoapi/node-sdk'
 import {createLogger} from '../shared/logger.mjs'
@@ -49,18 +48,19 @@ import {runImTask} from './im-task-runner.mjs'
 import {platformEntryFilePath} from './platform-entry-store.mjs'
 import {PendingConfirmRegistry} from './pending-confirm.mjs'
 import {findLatestAdapterUserForSession} from './adapter-bindings.mjs'
+import {BRIDGE_HOME} from '../config/bridge-home.mjs'
 
 const log = createLogger('feishu')
 
 const GW = () => gatewayHttpBase()              // Gateway 本地 HTTP 地址
-const CLAUDE_HOME = join(homedir(), '.claude')   // Claude 配置根目录
+// Bridge 私有配置根目录；不读取 Claude/Codex 的用户配置。
 
 // ── startFeishuAdapter ──
 // 功能说明: 飞书适配器入口函数，初始化凭据、SDK 客户端、配对状态、确认挂起表
 // 实现方式: 使用闭包保存内部状态，返回镜像钩子供 Gateway 调用。
 //          返回 null 表示凭据加载失败，适配器无法启动。
 // 关键数据流: adapters.json 加载凭据 → 创建 Client + WSClient → 注册事件处理器 → 启动 WS → 返回钩子对象
-export function startFeishuAdapter(token, {taskCommands} = {}) {
+export function startFeishuAdapter(token, {taskCommands, stateStore = null} = {}) {
     let appId, appSecret
     let stopped = false
     let connectionError = null
@@ -72,7 +72,7 @@ export function startFeishuAdapter(token, {taskCommands} = {}) {
     // SIDE_EFFECT: 修改模块级变量 appId / appSecret
     function reloadCreds() {
         try {
-            const adapters = readAdapterConfig(join(CLAUDE_HOME, 'adapters.json'))
+            const adapters = readAdapterConfig(join(BRIDGE_HOME, 'adapters.json'))
             appId = adapters.feishu?.appId
             appSecret = adapters.feishu?.appSecret
             if (!appId || !appSecret) {
@@ -94,7 +94,7 @@ export function startFeishuAdapter(token, {taskCommands} = {}) {
     // 功能说明: 从 bridge-paired-feishu.json 加载已配对用户白名单
     // 实现方式: 文件不存在时默认空集合，首次配对成功时写入磁盘持久化。
     // 飞书使用独立的配对文件，与微信/钉钉隔离。
-    const pairedFile = join(CLAUDE_HOME, 'bridge-paired-feishu.json')
+    const pairedFile = join(BRIDGE_HOME, 'bridge-paired-feishu.json')
     const pairedUsers = loadPairedUsers(pairedFile)
 
     // ── 配对码生成 ──
@@ -113,17 +113,19 @@ export function startFeishuAdapter(token, {taskCommands} = {}) {
     const pendingConfirm = new PendingConfirmRegistry()
     const sessionQueue = new SessionTaskQueue({maxDepth: 8})
     const messageDeduper = new ImMessageDeduper()
-    const payloadCodec = new SecurePayloadCodec(join(CLAUDE_HOME, 'bridge-store-key'))
-    const legacyInboxFile = join(CLAUDE_HOME, 'bridge-im-inbox.json')
-    const legacyOutboxFile = join(CLAUDE_HOME, 'bridge-notification-outbox.json')
+    const payloadCodec = new SecurePayloadCodec(join(BRIDGE_HOME, 'bridge-store-key'))
+    const legacyInboxFile = join(BRIDGE_HOME, 'bridge-im-inbox.json')
+    const legacyOutboxFile = join(BRIDGE_HOME, 'bridge-notification-outbox.json')
     const inbox = new ImInbox({
-        filePath: platformEntryFilePath(CLAUDE_HOME, 'bridge-im-inbox', 'feishu'), legacyFilePath: legacyInboxFile,
+        filePath: platformEntryFilePath(BRIDGE_HOME, 'bridge-im-inbox', 'feishu'), legacyFilePath: legacyInboxFile,
         platform: 'feishu', payloadCodec,
+        stateStore,
         onPersistError: error => log.error({err: error}, 'IM inbox 持久化失败'),
     })
     const outbox = new NotificationOutbox({
-        filePath: platformEntryFilePath(CLAUDE_HOME, 'bridge-notification-outbox', 'feishu'), legacyFilePath: legacyOutboxFile,
+        filePath: platformEntryFilePath(BRIDGE_HOME, 'bridge-notification-outbox', 'feishu'), legacyFilePath: legacyOutboxFile,
         platform: 'feishu', payloadCodec,
+        stateStore,
         onPersistError: error => log.error({err: error}, '通知 outbox 持久化失败'),
     })
     // pendingConfirm TTL 清理：5 分钟超时自动清除，防止异常路径下残留
@@ -438,7 +440,7 @@ export function startFeishuAdapter(token, {taskCommands} = {}) {
     function findUserForSession(sid) {
         let ad = {}
         try {
-            ad = JSON.parse(readFileSync(join(CLAUDE_HOME, 'adapter-sessions.json'), 'utf8'))
+            ad = JSON.parse(readFileSync(join(BRIDGE_HOME, 'adapter-sessions.json'), 'utf8'))
         } catch (error) {
             log.debug({err: error, sessionId: sid?.slice(0, 8)}, '读取飞书镜像状态失败')
         }

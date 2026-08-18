@@ -26,7 +26,7 @@ function notificationEnqueueResult(key, platform, duplicate, state, structured) 
 }
 
 export class NotificationOutbox {
-    constructor({filePath, legacyFilePath = null, platform, payloadCodec, maxEntries = 2_000, maxAttempts = 8, sentTtlMs = 24 * 60 * 60 * 1000, onPersistError = null} = {}) {
+    constructor({filePath, legacyFilePath = null, platform, payloadCodec, maxEntries = 2_000, maxAttempts = 8, sentTtlMs = 24 * 60 * 60 * 1000, onPersistError = null, stateStore = null} = {}) {
         if (!filePath || !platform || !payloadCodec) throw new TypeError('filePath, platform and payloadCodec are required')
         this.filePath = filePath
         this.legacyFilePath = legacyFilePath && legacyFilePath !== filePath ? legacyFilePath : null
@@ -36,12 +36,21 @@ export class NotificationOutbox {
         this.maxAttempts = maxAttempts
         this.sentTtlMs = sentTtlMs
         this.onPersistError = typeof onPersistError === 'function' ? onPersistError : null
+        this.stateStore = stateStore?.available ? stateStore : null
         this._entries = new Map()
         const loadedFromLegacy = this._load()
         if (loadedFromLegacy && this._entries.size > 0) this._persist()
     }
 
     _load() {
+        if (this.stateStore) {
+            const persisted = this.stateStore.loadEntries('outbox', this.platform)
+            for (const [key, value] of persisted) {
+                if (value && typeof value === 'object' && Number.isFinite(value.updatedAt)) this._entries.set(key, value)
+            }
+            this._cleanup()
+            if (this._entries.size > 0) return false
+        }
         const sourcePath = !existsSync(this.filePath) && this.legacyFilePath && existsSync(this.legacyFilePath)
             ? this.legacyFilePath
             : this.filePath
@@ -53,7 +62,7 @@ export class NotificationOutbox {
                 if (!key.startsWith(prefix)) continue
                 if (value && typeof value === 'object' && Number.isFinite(value.updatedAt)) this._entries.set(key, value)
             }
-            loadedFromLegacy = sourcePath !== this.filePath
+            loadedFromLegacy = sourcePath !== this.filePath || Boolean(this.stateStore && this._entries.size > 0)
         } catch (error) {
             if (error?.code !== 'ENOENT' && existsSync(sourcePath)) this._quarantineCorruptFile(error, sourcePath)
         }
@@ -94,6 +103,16 @@ export class NotificationOutbox {
     }
 
     _persist() {
+        if (this.stateStore) {
+            this._cleanup()
+            try {
+                this.stateStore.replaceEntries('outbox', this.platform, this._entries)
+                return true
+            } catch (error) {
+                this.onPersistError?.(error)
+                return false
+            }
+        }
         this._cleanup()
         const merged = new Map()
         const prefix = `${this.platform}:`

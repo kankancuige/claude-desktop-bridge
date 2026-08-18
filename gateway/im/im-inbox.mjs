@@ -26,7 +26,7 @@ export function claimDurableInboxMessage({inbox, deduper, messageId, payload}) {
  * 保存事件 ID、状态和加密恢复载荷；不明文保存消息正文、token 或用户凭据。
  */
 export class ImInbox {
-    constructor({filePath, legacyFilePath = null, platform, payloadCodec = null, ttlMs = 24 * 60 * 60 * 1000, maxEntries = 10_000, retryAfterMs = 30_000, onPersistError = null} = {}) {
+    constructor({filePath, legacyFilePath = null, platform, payloadCodec = null, ttlMs = 24 * 60 * 60 * 1000, maxEntries = 10_000, retryAfterMs = 30_000, onPersistError = null, stateStore = null} = {}) {
         if (!filePath || !platform) throw new TypeError('filePath and platform are required')
         this.filePath = filePath
         this.legacyFilePath = legacyFilePath && legacyFilePath !== filePath ? legacyFilePath : null
@@ -36,12 +36,21 @@ export class ImInbox {
         this.retryAfterMs = retryAfterMs
         this.payloadCodec = payloadCodec
         this.onPersistError = typeof onPersistError === 'function' ? onPersistError : null
+        this.stateStore = stateStore?.available ? stateStore : null
         this._entries = new Map()
         const loadedFromLegacy = this._load()
         if (loadedFromLegacy && this._entries.size > 0) this._persist()
     }
 
     _load() {
+        if (this.stateStore) {
+            const persisted = this.stateStore.loadEntries('inbox', this.platform)
+            for (const [key, value] of persisted) {
+                if (value && typeof value === 'object' && Number.isFinite(value.at)) this._entries.set(key, value)
+            }
+            this._cleanup()
+            if (this._entries.size > 0) return false
+        }
         const sourcePath = !existsSync(this.filePath) && this.legacyFilePath && existsSync(this.legacyFilePath)
             ? this.legacyFilePath
             : this.filePath
@@ -55,7 +64,7 @@ export class ImInbox {
                 if (!value || typeof value !== 'object' || !Number.isFinite(value.at)) continue
                 if (now - value.at <= this.ttlMs) this._entries.set(key, value)
             }
-            return sourcePath !== this.filePath
+            return sourcePath !== this.filePath || Boolean(this.stateStore && this._entries.size > 0)
         } catch (error) {
             if (error?.code !== 'ENOENT' && existsSync(sourcePath)) this._quarantineCorruptFile(error, sourcePath)
             return false
@@ -87,6 +96,15 @@ export class ImInbox {
     }
 
     _persist() {
+        if (this.stateStore) {
+            try {
+                this.stateStore.replaceEntries('inbox', this.platform, this._entries)
+                return true
+            } catch (error) {
+                this.onPersistError?.(error)
+                return false
+            }
+        }
         // 每个平台只替换自己拥有的记录，保留磁盘上其他平台的最新状态。
         this._cleanup()
         const merged = new Map()

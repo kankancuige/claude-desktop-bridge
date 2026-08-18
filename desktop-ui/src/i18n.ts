@@ -266,7 +266,7 @@ const messages: Record<Locale, Record<string, string>> = {
     // ────────────────────────────────────────────────────────────────────────
     // Agents 管理页 —— 自定义子代理的 CRUD、工具继承、模型配置
     // ────────────────────────────────────────────────────────────────────────
-    'agents.count': '共 {n} 个 Agent · 文件位于 ~/.claude/agents/',
+    'agents.count': '共 {n} 个 Agent · 文件位于 ~/.claude-desktop-bridge/agents/',
     'agents.editTitle': '编辑 Agent: {name}',
     'agents.namePlaceholder': 'Agent 名称 (kebab-case)',
     'agents.typePlaceholder': 'Type (选择或自定义, 如 reviewer)',
@@ -309,7 +309,7 @@ const messages: Record<Locale, Record<string, string>> = {
     // ────────────────────────────────────────────────────────────────────────
     'mem.scanning': '扫描项目 memory...',
     'mem.emptyTitle': '未发现任何项目记忆',
-    'mem.emptyHint1': 'Memory 文件存放在各项目的 ~/.claude/projects/项目名/memory/ 目录下',
+    'mem.emptyHint1': 'Memory 文件存放在各项目的 ~/.claude-desktop-bridge/projects/项目名/memory/ 目录下',
     'mem.emptyHint2': '当你和 Claude 对话中保存记忆时，这里会自动出现',
     'mem.totalFiles': '共 {n} 个记忆文件',
     'mem.refresh': '↻ 刷新',
@@ -318,6 +318,23 @@ const messages: Record<Locale, Record<string, string>> = {
     'mem.loadingFiles': '加载中...',
     'mem.noFiles': '暂无记忆文件，在上方输入文件名创建',
     'mem.confirmDelete': '确定删除 {name} ?',
+    'mem.searchPlaceholder': '搜索标题、来源或内容...',
+    'mem.search': '搜索',
+    'mem.rebuild': '重建索引',
+    'mem.rebuilding': '重建中...',
+    'mem.indexReady': 'SQLite 索引正常',
+    'mem.fileMode': '文件降级模式',
+    'mem.active': '已启用',
+    'mem.disabled': '已停用',
+    'mem.enable': '启用',
+    'mem.disable': '停用',
+    'mem.scopeProject': '项目作用域',
+    'mem.verifiedAt': '验证于 {time}',
+    'mem.never': '尚未验证',
+    'mem.loadFailed': 'Memory 加载失败',
+    'mem.deleteFailed': 'Memory 删除失败',
+    'mem.statusFailed': 'Memory 状态更新失败',
+    'mem.rebuildFailed': 'Memory 索引重建失败',
 
     // ────────────────────────────────────────────────────────────────────────
     // MCP 配置页 —— 已安装插件列表、启用/禁用状态、自定义 Server 说明
@@ -327,7 +344,7 @@ const messages: Record<Locale, Record<string, string>> = {
     'mcp.enabled': '已启用', 'mcp.disabled': '已禁用',
     'mcp.empty': '暂无已安装的 MCP 插件',
     'mcp.customTitle': '自定义 MCP Server',
-    'mcp.customDesc': '在 ~/.claude/settings.json 的 mcpServers 字段中配置',
+    'mcp.customDesc': '在 ~/.claude-desktop-bridge/settings.json 的 mcpServers 字段中配置',
     'mcp.tip': '修改后重启 Claude Code 生效',
     'mcp.serversTitle': 'MCP 服务器',
     'mcp.serversEmpty': '尚未配置 MCP 服务器，点击 + 新增',
@@ -351,7 +368,7 @@ const messages: Record<Locale, Record<string, string>> = {
     'im.viewConfig': '查看配置',
     'im.noPlatform': '暂无 IM 平台配置',
     'im.noteTitle': '绑定说明',
-    'im.note1': 'IM 连接通过 ~/.claude/adapters.json 管理。微信使用 iLink Bot API，飞书/钉钉需在开放平台创建应用获取凭证。',
+    'im.note1': 'IM 连接通过 ~/.claude-desktop-bridge/adapters.json 管理。微信使用 iLink Bot API，飞书/钉钉需在开放平台创建应用获取凭证。',
     'im.note2': '当前微信适配器已集成在 Gateway 中（im/wechat.mjs），启动 Gateway 后自动开始轮询微信消息。',
 
     // ────────────────────────────────────────────────────────────────────────
@@ -747,7 +764,7 @@ const messages: Record<Locale, Record<string, string>> = {
     'skills.installedToast': 'Installed: {name}',
 
     // ── Agents ──
-    'agents.count': '{n} agents · in ~/.claude/agents/',
+    'agents.count': '{n} agents · in ~/.claude-desktop-bridge/agents/',
     'agents.editTitle': 'Edit Agent: {name}',
     'agents.namePlaceholder': 'Agent name (kebab-case)',
     'agents.typePlaceholder': 'Type (select or custom, e.g. reviewer)',
@@ -782,7 +799,7 @@ const messages: Record<Locale, Record<string, string>> = {
     // ── Memory ──
     'mem.scanning': 'Scanning project memory...',
     'mem.emptyTitle': 'No project memory found',
-    'mem.emptyHint1': 'Memory files live under each project\'s ~/.claude/projects/<name>/memory/',
+    'mem.emptyHint1': 'Memory files live under each project\'s ~/.claude-desktop-bridge/projects/<name>/memory/',
     'mem.emptyHint2': 'They appear here automatically when you save memory with Claude',
     'mem.totalFiles': '{n} memory files',
     'mem.refresh': '↻ Refresh',
@@ -791,6 +808,23 @@ const messages: Record<Locale, Record<string, string>> = {
     'mem.loadingFiles': 'Loading...',
     'mem.noFiles': 'No memory files yet. Type a filename above to create one.',
     'mem.confirmDelete': 'Delete {name}?',
+    'mem.searchPlaceholder': 'Search title, source, or content...',
+    'mem.search': 'Search',
+    'mem.rebuild': 'Rebuild index',
+    'mem.rebuilding': 'Rebuilding...',
+    'mem.indexReady': 'SQLite index ready',
+    'mem.fileMode': 'File fallback mode',
+    'mem.active': 'Enabled',
+    'mem.disabled': 'Disabled',
+    'mem.enable': 'Enable',
+    'mem.disable': 'Disable',
+    'mem.scopeProject': 'Project scope',
+    'mem.verifiedAt': 'Verified {time}',
+    'mem.never': 'Not verified',
+    'mem.loadFailed': 'Failed to load memory',
+    'mem.deleteFailed': 'Failed to delete memory',
+    'mem.statusFailed': 'Failed to update memory status',
+    'mem.rebuildFailed': 'Failed to rebuild memory index',
 
     // ── MCP ──
     'mcp.installed': 'Installed plugins · {n}',
@@ -798,7 +832,7 @@ const messages: Record<Locale, Record<string, string>> = {
     'mcp.enabled': 'enabled', 'mcp.disabled': 'disabled',
     'mcp.empty': 'No installed MCP plugins',
     'mcp.customTitle': 'Custom MCP Server',
-    'mcp.customDesc': 'Configure in the mcpServers field of ~/.claude/settings.json',
+    'mcp.customDesc': 'Configure in the mcpServers field of ~/.claude-desktop-bridge/settings.json',
     'mcp.tip': 'Restart Claude Code to take effect',
     'mcp.serversTitle': 'MCP Servers',
     'mcp.serversEmpty': 'No MCP servers configured. Click + to add one.',
@@ -820,7 +854,7 @@ const messages: Record<Locale, Record<string, string>> = {
     'im.viewConfig': 'View config',
     'im.noPlatform': 'No IM platform configured',
     'im.noteTitle': 'Binding notes',
-    'im.note1': 'IM connections are managed in ~/.claude/adapters.json. WeChat uses the iLink Bot API; Feishu/DingTalk need an app created on their open platform.',
+    'im.note1': 'IM connections are managed in ~/.claude-desktop-bridge/adapters.json. WeChat uses the iLink Bot API; Feishu/DingTalk need an app created on their open platform.',
     'im.note2': 'The WeChat adapter is built into the Gateway (im/wechat.mjs) and starts polling automatically once the Gateway runs.',
 
     // ── Workspace sidebar ──

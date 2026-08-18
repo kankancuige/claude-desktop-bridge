@@ -100,12 +100,12 @@ export function detectPreferenceCandidates(text) {
     }))
 }
 
-export function createUserPreferenceService({claudeHome, threshold = 2, windowMs = DEFAULT_WINDOW_MS, now = () => Date.now(), onWarning = () => {}} = {}) {
-    if (!claudeHome) throw new Error('claudeHome is required')
-    const globalPath = join(claudeHome, 'bridge-preferences.json')
+export function createUserPreferenceService({bridgeHome, threshold = 2, windowMs = DEFAULT_WINDOW_MS, now = () => Date.now(), onWarning = () => {}} = {}) {
+    if (!bridgeHome) throw new Error('bridgeHome is required')
+    const globalPath = join(bridgeHome, 'bridge-preferences.json')
 
     function projectPath(workDir) {
-        return join(claudeHome, 'projects', projectKey(workDir), 'bridge-preferences.json')
+        return join(bridgeHome, 'projects', projectKey(workDir), 'bridge-preferences.json')
     }
 
     function readStore(path) {
@@ -236,7 +236,7 @@ export function createUserPreferenceService({claudeHome, threshold = 2, windowMs
 
     function listAll() {
         const projects = []
-        const projectsRoot = join(claudeHome, 'projects')
+        const projectsRoot = join(bridgeHome, 'projects')
         if (existsSync(projectsRoot)) {
             for (const encodedDir of readdirSync(projectsRoot, {withFileTypes: true})) {
                 if (!encodedDir.isDirectory()) continue
@@ -251,7 +251,7 @@ export function createUserPreferenceService({claudeHome, threshold = 2, windowMs
 
     function update({scope, projectDir, encodedDir, id, enabled}) {
         const path = scope === 'global' ? globalPath : encodedDir
-            ? join(claudeHome, 'projects', encodedDir, 'bridge-preferences.json')
+            ? join(bridgeHome, 'projects', encodedDir, 'bridge-preferences.json')
             : projectPath(projectDir)
         const store = readStore(path)
         if (!store.preferences[id]) throw Object.assign(new Error('preference not found'), {code: 'PREFERENCE_NOT_FOUND'})
@@ -263,7 +263,7 @@ export function createUserPreferenceService({claudeHome, threshold = 2, windowMs
 
     function remove({scope, projectDir, encodedDir, id}) {
         const path = scope === 'global' ? globalPath : encodedDir
-            ? join(claudeHome, 'projects', encodedDir, 'bridge-preferences.json')
+            ? join(bridgeHome, 'projects', encodedDir, 'bridge-preferences.json')
             : projectPath(projectDir)
         const store = readStore(path)
         const existed = Boolean(store.preferences[id])

@@ -17,7 +17,6 @@
  */
 import {readFileSync} from 'node:fs'
 import {join} from 'node:path'
-import {homedir} from 'node:os'
 import {randomInt} from 'node:crypto'
 import {createLogger} from '../shared/logger.mjs'
 import {detectCommand, executeCommand} from './im-commands.mjs'
@@ -38,12 +37,13 @@ import {runImTask} from './im-task-runner.mjs'
 import {platformEntryFilePath} from './platform-entry-store.mjs'
 import {PendingConfirmRegistry} from './pending-confirm.mjs'
 import {findLatestAdapterUserForSession} from './adapter-bindings.mjs'
+import {BRIDGE_HOME} from '../config/bridge-home.mjs'
 
 const log = createLogger('wechat')
 
 // ── 常量定义 ──
 const GW = () => gatewayHttpBase()              // Gateway 本地 HTTP 地址
-const CLAUDE_HOME = join(homedir(), '.claude')   // Claude 配置根目录
+// Bridge 私有配置根目录；不读取 Claude/Codex 的用户配置。
 const POLL_TIMEOUT = 35000                        // 长轮询超时(毫秒)，略小于微信服务端超时避免断开
 
 // ── startWeChatAdapter ──
@@ -51,7 +51,7 @@ const POLL_TIMEOUT = 35000                        // 长轮询超时(毫秒)，�
 // 实现方式: 使用闭包保存内部状态(onConfirmRequest/onConfirmResolved/findUserForSession/sendToUser)，
 //          返回镜像钩子供 Gateway 调用。
 // 关键数据流: adapters.json 加载 token → 生成配对码 → 启动 poll() → 返回钩子对象
-export function startWeChatAdapter(token, {taskCommands} = {}) {
+export function startWeChatAdapter(token, {taskCommands, stateStore = null} = {}) {
     let botToken, baseUrl
     let stopped = false
     let activePollController = null
@@ -77,12 +77,12 @@ export function startWeChatAdapter(token, {taskCommands} = {}) {
     // SIDE_EFFECT: 修改模块级变量 botToken / baseUrl
     function reloadToken() {
         try {
-            const adapters = readAdapterConfig(join(CLAUDE_HOME, 'adapters.json'))
+            const adapters = readAdapterConfig(join(BRIDGE_HOME, 'adapters.json'))
             botToken = adapters.wechat?.botToken
             baseUrl = normalizeWeChatBaseUrl(adapters.wechat?.baseUrl)
             if (!botToken) {
                 // 回退：旧格式凭据路径
-                const acc = JSON.parse(readFileSync(join(CLAUDE_HOME, 'channels', 'wechat', 'default', 'account.json'), 'utf8'))
+                const acc = JSON.parse(readFileSync(join(BRIDGE_HOME, 'channels', 'wechat', 'default', 'account.json'), 'utf8'))
                 botToken = acc.token;
                 baseUrl = normalizeWeChatBaseUrl(acc.baseUrl)
             }
@@ -105,7 +105,7 @@ export function startWeChatAdapter(token, {taskCommands} = {}) {
     // 功能说明: 从 bridge-paired.json 加载已配对用户白名单到内存 Set
     // 实现方式: 文件不存在时默认空集合，首次配对成功时写入磁盘持久化。
     // 关键数据流: 磁盘 JSON → Set 内存 → 消息处理时 O(1) 查白名单
-    const pairedFile = join(CLAUDE_HOME, 'bridge-paired.json')
+    const pairedFile = join(BRIDGE_HOME, 'bridge-paired.json')
     const pairedUsers = loadPairedUsers(pairedFile)
 
     // ── 配对码生成 ──
@@ -132,17 +132,19 @@ export function startWeChatAdapter(token, {taskCommands} = {}) {
     const pendingConfirm = new PendingConfirmRegistry()
     const sessionQueue = new SessionTaskQueue({maxDepth: 8})
     const messageDeduper = new ImMessageDeduper()
-    const payloadCodec = new SecurePayloadCodec(join(CLAUDE_HOME, 'bridge-store-key'))
-    const legacyInboxFile = join(CLAUDE_HOME, 'bridge-im-inbox.json')
-    const legacyOutboxFile = join(CLAUDE_HOME, 'bridge-notification-outbox.json')
+    const payloadCodec = new SecurePayloadCodec(join(BRIDGE_HOME, 'bridge-store-key'))
+    const legacyInboxFile = join(BRIDGE_HOME, 'bridge-im-inbox.json')
+    const legacyOutboxFile = join(BRIDGE_HOME, 'bridge-notification-outbox.json')
     const inbox = new ImInbox({
-        filePath: platformEntryFilePath(CLAUDE_HOME, 'bridge-im-inbox', 'wechat'), legacyFilePath: legacyInboxFile,
+        filePath: platformEntryFilePath(BRIDGE_HOME, 'bridge-im-inbox', 'wechat'), legacyFilePath: legacyInboxFile,
         platform: 'wechat', payloadCodec,
+        stateStore,
         onPersistError: error => log.error({err: error}, 'IM inbox 持久化失败'),
     })
     const outbox = new NotificationOutbox({
-        filePath: platformEntryFilePath(CLAUDE_HOME, 'bridge-notification-outbox', 'wechat'), legacyFilePath: legacyOutboxFile,
+        filePath: platformEntryFilePath(BRIDGE_HOME, 'bridge-notification-outbox', 'wechat'), legacyFilePath: legacyOutboxFile,
         platform: 'wechat', payloadCodec,
+        stateStore,
         onPersistError: error => log.error({err: error}, '通知 outbox 持久化失败'),
     })
     // pendingConfirm TTL 清理：60s 间隔扫描，清理超时条目防止内存泄漏
@@ -590,7 +592,7 @@ export function startWeChatAdapter(token, {taskCommands} = {}) {
     function findUserForSession(sid) {
         let ad = {}
         try {
-            ad = JSON.parse(readFileSync(join(CLAUDE_HOME, 'adapter-sessions.json'), 'utf8'))
+            ad = JSON.parse(readFileSync(join(BRIDGE_HOME, 'adapter-sessions.json'), 'utf8'))
         } catch (error) {
             log.debug({err: error, sessionId: sid?.slice(0, 8)}, '读取微信镜像状态失败')
         }

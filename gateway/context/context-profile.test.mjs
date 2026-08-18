@@ -1,5 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import {dirname, join} from 'node:path'
+import {BRIDGE_REPOSITORY_ROOT} from './bridge-rules.mjs'
 import {applyContextProfile, classifyContextProfile, nextContextProfile} from './context-profile.mjs'
 
 test('简单对话和短概念问题使用轻量上下文', () => {
@@ -63,14 +65,24 @@ test('轻量配置关闭工具、Skills、MCP、设置扫描和扩展思考', ()
     assert.deepEqual(original.tools, {type: 'preset', preset: 'claude_code'})
 })
 
-test('完整配置保持调用方原始选项', () => {
+test('完整配置保留调用方选项并仅启用 Bridge 私有 user settings', () => {
     const original = {model: 'gpt-5.6-sol', tools: ['Read'], skills: ['db-sql']}
     const full = applyContextProfile(original, 'full', 'gpt-5.6-sol')
     assert.notEqual(full, original)
-    assert.deepEqual(full.settingSources, [])
+    assert.deepEqual(full.settingSources, ['user'])
     assert.equal(full.model, original.model)
     assert.deepEqual(full.tools, original.tools)
     assert.match(full.systemPrompt.append, /Bridge 自有长期规则/)
+})
+
+test('完整配置按工作目录选择 Bridge 仓库专属规则', () => {
+    const bridge = applyContextProfile({}, 'full', 'gpt-5.6-sol', {workDir: BRIDGE_REPOSITORY_ROOT})
+    assert.match(bridge.systemPrompt.append, /Bridge 仓库专属规则/)
+
+    const external = applyContextProfile({}, 'full', 'gpt-5.6-sol', {
+        workDir: join(dirname(BRIDGE_REPOSITORY_ROOT), 'external-project'),
+    })
+    assert.doesNotMatch(external.systemPrompt.append, /Bridge 仓库专属规则/)
 })
 
 test('只读审查和解释请求不会获得写入能力', () => {

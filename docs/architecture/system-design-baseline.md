@@ -29,6 +29,10 @@ Incomplete: None
 | 数据保留 | transcript 沿用 Claude SDK 的本地保留策略；本地草稿限制数量、长度和保留期 | SUPPORTING / ASSUMED | 无产品保留期要求；出现磁盘/隐私要求时复核 |
 | 跨会话接力 | 显式分支继承完整 transcript；空白新会话只在首条引用性短句时读取最近有效主会话，注入文本不超过 6 KB | DRIVER / CONFIRMED | 用户要求；引用分类或 SDK fork 契约变化时复核 |
 | 上下文隔离 | 普通新问题不得自动注入旧 transcript；agent/workflow/单轮断裂会话不得成为接力来源 | DRIVER / CONFIRMED | 用户此前要求减少无关注入；项目列表过滤规则变化时复核 |
+| 规则隔离 | 外部项目只注入跨项目规则；Bridge 的 Electron/Gateway 专属规则只在绝对 `workDir` 位于仓库根目录时注入 | DRIVER / CONFIRMED | 用户要求减少无关规则；规则选择或项目路径规范化变化时复核 |
+| Skill 按需可用 | 数字孪生集成任务在 Query 创建前具备 `digital-twin-cad`；普通 CAD、普通前端和 Viewer 不加载 | DRIVER / CONFIRMED | 用户新增数字孪生规则；Skill Router 或内置 Skill 发布方式变化时复核 |
+| Bridge 配置独立 | Rule、Skill、MCP、Agent、Hook、Workflow、IM 和会话数据只读写 Bridge 私有根目录；正常运行不得读取 `~/.claude` 或 `~/.codex` | DRIVER / CONFIRMED | 用户明确要求完全独立；配置根目录或 SDK 启动方式变化时复核 |
+| 兼容迁移 | 首次迁移必须幂等、非破坏且保留旧数据；任一条目失败可在下次启动重试，不允许以空目录覆盖已有目标 | DRIVER / CONFIRMED | 用户数据连续性要求；迁移清单或目录结构变化时复核 |
 | 统一任务入口 | desktop、wechat、feishu、dingtalk 和内部 Workflow 的任务接收必须共享校验、去重、排队、模型路由和停止语义 | DRIVER / CONFIRMED | 用户要求；新增入口或任务协议变化时复核 |
 | Bridge 事件恢复 | 已接受任务在 100ms 内写入不含正文的连续事件日志；强制重启后能投影最后任务状态 | DRIVER / ASSUMED | 本阶段目标；完成 crash smoke 后升级证据 |
 | Agent 能力协商 | 必需能力不满足时在 SDK query 启动前失败，不允许接受后忽略或静默降级 | DRIVER / CONFIRMED | 用户此前遇到 Agent 只分析不修改；新增 Provider 时复核 |
@@ -36,7 +40,7 @@ Incomplete: None
 
 ## 数据语义与恢复
 
-- `~/.claude/projects/<encoded>/*.jsonl` 是会话正文 system of record。
+- `~/.claude-desktop-bridge/projects/<encoded>/*.jsonl` 是迁移后的会话正文 system of record；可通过绝对路径环境变量 `BRIDGE_HOME` 覆盖根目录。
 - `bridge-session-map.json` 只保存 Gateway ID 与 SDK conversation ID 映射，不替代 transcript。
 - 恢复目标通过校验后必须在返回成功前写入 runtime identity，并尝试同步持久化映射；不得等待下一条 `system/init` 才建立身份。
 - 跨会话接力只从现有 transcript 派生有界只读上下文，不建立第二份会话正文存储。
@@ -50,3 +54,4 @@ Incomplete: None
 - 错误提示只能显示稳定错误码、HTTP 状态和脱敏说明，不显示 secret、请求 body 或堆栈。
 - 后台轮询采用去重/限频提示；用户触发的保存、恢复、发送、停止必须逐次给出结果。
 - 当前单机负载没有可信生产指标；设计按最多数十个打开 tab、数百个本地 transcript 工作，超过该量级后以扫描延迟和存储占用重新评估。
+- Rule、Skill、MCP、Agent 和 Hook 属于低频、可人工检查的配置资产，继续使用 Markdown、JSON 和脚本文件；SQLite 仅用于 IM 高频状态、会话索引和 Memory 文件索引，不保存配置或正文。

@@ -51,3 +51,60 @@ Incomplete: None
 - Provider 回滚不涉及数据迁移；任何第二 Provider 上线前必须补齐六项能力声明、释放测试和协议兼容证据。
 - Gateway 目录迁移只改变内部模块位置，不修改 Electron `extraResources` 递归打包规则、`node gateway/index.mjs` 启动契约、HTTP/WebSocket 接口、配置键或持久化文件位置。
 - 历史 implementation plan 保留旧路径作为当时证据；README、当前架构文档、静态 wiring 测试和有效源码引用随迁移同步更新。
+
+## SQLite 运行状态与 Memory 索引迁移（2026-08-18）
+
+### 状态转换
+
+- 当前：IM inbox/outbox、消息去重和 Memory/会话候选依赖内存、JSON 重写或目录扫描；Rules、Skills、MCP、Agents、Hooks 和 transcript 是文件事实源。
+- 目标：`BRIDGE_HOME/bridge-state.db` 保存 IM 原子状态与可重建索引；旧 JSON/JSONL、Markdown 和 SDK transcript 继续可读。
+- 非目标：迁移配置正文、迁移 Claude transcript、引入服务端数据库、自动删除旧状态或做跨设备同步。
+
+### 阶段
+
+| 阶段 | 入口门禁 | 变更 | 成功证据 | 中止条件 | 回滚或前滚 |
+|---|---|---|---|---|---|
+| 1 数据库准备 | 仓储红测存在 | 创建 schema、WAL、busy timeout 和健康状态 | schema/pragma/关闭测试 | native addon 不兼容或目录不可写 | 保持文件模式，修复依赖后重试 |
+| 2 惰性导入 | 旧 JSON 解析测试通过 | 仅在 SQLite 缺少对应平台记录时导入 inbox/outbox | 重启后状态数量和 payload 校验一致 | 导入中断或出现重复主键 | 保留旧 JSON，删除未确认的新行并重试 |
+| 3 IM 切换 | 三平台单元测试通过 | adapters 通过仓储接口读写 SQLite | 重复消息、失败重试、dead 状态和通知顺序一致 | 队列丢失或状态提前完成 | 关闭 SQLite adapter，回读旧文件 |
+| 4 派生索引 | transcript/Memory 扫描基线固定 | 会话和 Markdown Memory 写入索引 | 索引结果与扫描结果一致；正文未复制 | 索引污染跨项目数据 | 停止索引读取，回退目录扫描 |
+| 5 稳定观察 | Gateway/desktop 门禁通过 | 健康接口与 degraded 日志可见 | 重启、损坏 DB、锁等待和恢复 smoke | 无法判断数据是否可靠 | 保留双读和旧文件，不删除兼容代码 |
+
+### 数据与回滚
+
+- SQLite 数据库只新增，不覆盖旧 JSON；所有导入按 `platform + message_id` 或 `platform + notification_id` 幂等。
+- 数据库损坏时重命名为 `.corrupt-<timestamp>`，切换文件模式并保留告警；不自动删除排队载荷。
+- 只有连续一个发布周期确认 SQLite 与文件模式可互相恢复，才允许讨论移除文件兼容路径；本次不删除旧路径。
+# Bridge 私有配置根目录迁移（2026-08-18）
+
+**Verdict:** READY
+
+## 状态转换
+
+- 当前：Gateway、Electron、SDK、IM 和 Workflow 共用 `~/.claude`。
+- 目标：所有 Bridge 数据位于 `~/.claude-desktop-bridge` 或绝对 `BRIDGE_HOME`；SDK 使用相同 `CLAUDE_CONFIG_DIR`；正常运行不读取 Claude/Codex 配置。
+- 不变项：HTTP/WebSocket、Session ID、transcript JSONL、Rule/Skill/Agent/Hook 文件格式和供应商 API 契约。
+- 非目标：替换 Claude Agent SDK、删除旧目录、引入 SQLite、云同步。
+
+## 阶段
+
+| 阶段 | 入口门禁 | 变更 | 成功证据 | 中止条件 | 回滚或前滚 |
+|---|---|---|---|---|---|
+| 准备 | 路径清单和现有数据所有权确认 | 增加统一根目录解析与迁移清单 | 单元测试验证绝对路径和幂等复制 | 目标目录不可创建 | 修复权限后重试，不改源目录 |
+| 共存迁移 | 新目录可写 | 首次复制已知文件/目录，已有目标不覆盖 | 清单无失败，关键文件数量可核对 | 任一关键文件复制失败 | 保留源和已复制目标，下次仅重试缺失项 |
+| 运行切换 | 迁移准备完成 | Gateway/Electron/SDK 全部切换到私有根目录 | 静态扫描无产品级旧路径，定向测试通过 | SDK transcript 仍写入旧目录 | 停止发布，修复 `CLAUDE_CONFIG_DIR` 后前滚 |
+| 稳定观察 | 新旧数据均保留 | 验证设置、会话、IM 和 Workflow 重启恢复 | runtime smoke 与日志证据 | 会话或凭据不可恢复 | 用户可临时将 `BRIDGE_HOME` 指向备份副本；禁止自动删源 |
+| 旧路径移除 | 至少一个发布周期且实测零读取 | 仅移除兼容迁移代码或由用户手工归档旧数据 | 明确授权和零读取证据 | 任一用户仍需旧数据 | 延后移除，不做破坏操作 |
+
+## 数据与兼容
+
+- 复制单位为单文件或单目录，使用“不覆盖已有目标”的幂等语义；迁移清单采用原子替换写入。
+- `settings.json` 迁移时移除 Anthropic/provider 凭据字段，供应商继续以 `bridge-provider.json` 为事实源，避免重新引入 CCSwitch 代理配置。
+- `projects/`、IM 配对、加密密钥和 provider 配置属于关键数据；复制失败必须记录并阻止把迁移标为完成。
+- 旧目录始终只读且不删除；迁移后的所有新写入只进入 Bridge 私有目录，因此回滚是显式选择旧快照，而不是双写。
+
+## 观测与验收
+
+- 启动日志只记录根目录、迁移状态、文件数量和耗时，不记录 token、API Key 或 Hook 内容。
+- smoke 后核对新会话 JSONL、`bridge-session-map.json`、IM pairing/outbox 和设置修改均只出现在私有目录。
+- 发布前运行 Gateway 全量测试、桌面测试、Node 语法检查、Vue 类型检查、Vite build 和 `git diff --check`。

@@ -14,11 +14,13 @@ const { spawn } = require('child_process')
 const crypto = require('crypto')
 const path = require('path')
 const fs = require('fs')
-const os = require('os')
 const { pathToFileURL } = require('url')
 const {normalizeExternalUrl} = require('./external-url.cjs')
 const {openDirectoryInShell} = require('./open-directory.cjs')
 const { checkForUpdates, downloadUpdate, quitAndInstall } = require('./updater.cjs')
+const {resolveBridgeHome} = require('./bridge-home.cjs')
+
+const BRIDGE_HOME = resolveBridgeHome()
 
 // ── 全局状态 ──
 let mainWindow = null           // 主窗口实例，全局唯一
@@ -97,29 +99,29 @@ function drainLogQueue() {
   setImmediate(next)
 }
 
-function readLegacySecurePayloadKey() {
-  const legacyPath = path.join(os.homedir(), '.claude', 'bridge-store-key')
+function readBridgeSecurePayloadKey() {
+  const keyPath = path.join(BRIDGE_HOME, 'bridge-store-key')
   try {
-    const encoded = fs.readFileSync(legacyPath, 'utf8').trim()
+    const encoded = fs.readFileSync(keyPath, 'utf8').trim()
     const key = Buffer.from(encoded, 'hex')
-    if (key.length === 32) return {key, legacyPath}
+    if (key.length === 32) return {key, keyPath}
   } catch (error) {
-    if (error?.code !== 'ENOENT') logToFile(`[WARN] legacy secure key read failed: ${error.message}`)
+    if (error?.code !== 'ENOENT') logToFile(`[WARN] Bridge secure key read failed: ${error.message}`)
   }
-  return {key: null, legacyPath}
+  return {key: null, keyPath}
 }
 
 function getGatewaySecurePayloadKey() {
   if (gatewaySecurePayloadKey) return gatewaySecurePayloadKey
-  const {key: legacyKey, legacyPath} = readLegacySecurePayloadKey()
+  const {key: bridgeKey, keyPath} = readBridgeSecurePayloadKey()
   const backend = process.platform === 'linux' ? safeStorage.getSelectedStorageBackend?.() : null
   const canUseOsStore = safeStorage.isEncryptionAvailable() && backend !== 'basic_text'
 
   if (!canUseOsStore) {
-    const key = legacyKey || crypto.randomBytes(32)
-    if (!legacyKey) {
-      fs.mkdirSync(path.dirname(legacyPath), {recursive: true})
-      fs.writeFileSync(legacyPath, key.toString('hex'), {encoding: 'utf8', mode: 0o600})
+    const key = bridgeKey || crypto.randomBytes(32)
+    if (!bridgeKey) {
+      fs.mkdirSync(path.dirname(keyPath), {recursive: true})
+      fs.writeFileSync(keyPath, key.toString('hex'), {encoding: 'utf8', mode: 0o600})
     }
     logToFile('[WARN] OS secure storage unavailable; using permission-restricted local key')
     gatewaySecurePayloadKey = key.toString('base64')
@@ -134,16 +136,11 @@ function getGatewaySecurePayloadKey() {
     if (decoded.length !== 32) throw new Error('OS-protected secure payload key is invalid')
     key = decoded
   } else {
-    key = legacyKey || crypto.randomBytes(32)
+    key = bridgeKey || crypto.randomBytes(32)
     fs.mkdirSync(path.dirname(protectedPath), {recursive: true})
     const tmp = `${protectedPath}.tmp`
     fs.writeFileSync(tmp, safeStorage.encryptString(key.toString('hex')), {mode: 0o600})
     fs.renameSync(tmp, protectedPath)
-  }
-  if (legacyKey) {
-    try { fs.unlinkSync(legacyPath) } catch (error) {
-      logToFile(`[WARN] legacy plaintext key cleanup failed: ${error.message}`)
-    }
   }
   gatewaySecurePayloadKey = key.toString('base64')
   return gatewaySecurePayloadKey
@@ -185,7 +182,7 @@ function startGateway() {
     cwd: gatewayDir,                              // 工作目录设为 gateway 目录，确保相对路径正确
     stdio: ['pipe', 'pipe', 'pipe', 'ipc'],       // IPC 用于 Windows 下可靠的优雅关闭
     windowsHide: true,                            // Windows 下隐藏控制台窗口
-    env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },  // 继承环境变量并设置 NODE 模式标志
+    env: { ...process.env, BRIDGE_HOME, ELECTRON_RUN_AS_NODE: '1' },  // 子进程与 Electron 共用 Bridge 私有目录
   })
   gatewayProcess = proc
   proc.on('message', (message) => {
@@ -454,7 +451,7 @@ function createWindow() {
   // ── IPC: 获取 Bridge Token（本地 API 认证） ──
   trustedHandle('getBridgeToken', () => {
     try {
-      const tokenPath = path.join(os.homedir(), '.claude', 'bridge-token')
+      const tokenPath = path.join(BRIDGE_HOME, 'bridge-token')
       if (fs.existsSync(tokenPath)) return fs.readFileSync(tokenPath, 'utf8').trim()
     } catch (error) {
       logToFile(`[WARN] bridge token read failed: ${error.message}`)

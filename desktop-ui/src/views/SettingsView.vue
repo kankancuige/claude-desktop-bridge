@@ -743,7 +743,7 @@ async function updateRtk() {
 // ── Skills ──
 // ═══════════════════════════════════════════════════════════════
 // Skills CRUD 数据 - AI 技能模块管理
-// 功能说明: 管理 ~/.claude/skills/ 下的 SKILL.md 文件，支持分类浏览与全屏编辑器
+// 功能说明: 管理 ~/.claude-desktop-bridge/skills/ 下的 SKILL.md 文件，支持分类浏览与全屏编辑器
 // ═══════════════════════════════════════════════════════════════
 // ── Skills 列表，从 /api/config/skills 加载 ──
 const skills = ref<any[]>([])
@@ -945,7 +945,7 @@ async function createSkill() {
 // ── Agents（自定义子代理，CRUD 镜像 Skills）──
 // ═══════════════════════════════════════════════════════════════
 // Agents CRUD 数据 - 自定义子代理管理
-// 功能说明: 管理 ~/.claude/agents/ 下的代理配置文件，支持 name/description/tools/model
+// 功能说明: 管理 ~/.claude-desktop-bridge/agents/ 下的代理配置文件，支持 name/description/tools/model
 //   删除时 Gateway 自动保留 .bak 备份
 // ═══════════════════════════════════════════════════════════════
 // ── Agents 列表，从 /api/config/agents 加载 ──
@@ -1102,7 +1102,7 @@ const filteredCommands = computed(() => {
 // ── Hooks ──
 // ═══════════════════════════════════════════════════════════════
 // Hooks CRUD - 事件钩子管理
-// 功能说明: 管理 ~/.claude/hooks/ 下的钩子脚本，
+// 功能说明: 管理 ~/.claude-desktop-bridge/hooks/ 下的钩子脚本，
 //   按 event 类型（如 PostToolUse/Stop/PreToolUse）分组展示，
 //   每组内含多个 entry（matcher+timeout），每个 entry 含多个 hook 文件
 // ═══════════════════════════════════════════════════════════════
@@ -1207,7 +1207,7 @@ async function createHook() {
 
 // ═══════════════════════════════════════════════════════════════
 // Rules CRUD - 编码规则文件管理
-// 功能说明: 管理 ~/.claude/rules/ 下的规则文件（.md 格式），
+// 功能说明: 管理 ~/.claude-desktop-bridge/rules/ 下的规则文件（.md 格式），
 //   根据 frontmatter 的 paths 字段（如 ".cs" ".java" ".vue"）自动分类到语言组
 // ═══════════════════════════════════════════════════════════════
 // ── Rules 列表，从 /api/config/rules 加载 ──
@@ -1352,7 +1352,7 @@ async function deleteRule(filename: string) {
 // ── Memory (all projects summary view) ──
 // ═══════════════════════════════════════════════════════════════
 // Memory 管理 - 跨项目 memory 文件管理
-// 功能说明: 扫描各项目的 memory 文件（~/.claude/projects/*/memory/），
+// 功能说明: 扫描各项目的 memory 文件（~/.claude-desktop-bridge/projects/*/memory/），
 //   按项目分组，点击展开加载项目下所有 memory 文件，支持编辑/新建/删除
 // ═══════════════════════════════════════════════════════════════
 // ── 项目列表摘要，含 encodedDir/workDir/fileCount ──
@@ -1367,6 +1367,14 @@ const memorySaving = ref(false)
 const memorySaved = ref(false)
 // ── 新建 memory 文件名输入（自动补 .md 后缀）──
 const newMemoryName = ref('')
+const memorySearch = ref('')
+const memoryAction = ref('')
+
+function formatMemoryTime(value: unknown): string {
+  const timestamp = Number(value || 0)
+  if (!timestamp) return t('mem.never')
+  return new Date(timestamp).toLocaleString()
+}
 
 // ── 用户偏好：结构化候选确认后的全局/项目规则 ──
 const preferenceData = ref<{global: any[]; projects: any[]}>({global: [], projects: []})
@@ -1438,12 +1446,19 @@ async function loadMemoryForProject(encodedDir: string) {
   if (!proj) return
   proj._loading = true
   try {
-    const res = await fetch(`${GW}/api/projects/${encodedDir}/memory`)
+    const query = memorySearch.value.trim()
+    const res = await fetch(`${GW}/api/projects/${encodedDir}/memory${query ? `?q=${encodeURIComponent(query)}` : ''}`)
     if (res.ok) {
       const data = await res.json()
       proj.files = data.files || []
+      proj._memoryMode = data.mode || 'file'
+    } else {
+      const data = await res.json().catch(() => ({}))
+      throw new Error(data.error || `HTTP ${res.status}`)
     }
-  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
+  } catch (error: any) {
+    showAlert(`${t('mem.loadFailed')}: ${error?.message || ''}`)
+  }
   proj._loading = false
 }
 
@@ -1470,19 +1485,22 @@ async function saveMemory() {
   memorySaving.value = true
   memorySaved.value = false
   try {
-    const res = await fetch(`${GW}/api/projects/${encodedDir}/memory/${filename}`, {
+    const res = await fetch(`${GW}/api/projects/${encodedDir}/memory/${encodeURIComponent(filename)}`, {
       method: 'PUT',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({content: editMemoryContent.value}),
     })
-    if (!res.ok) throw new Error(t('common.saveFailed'))
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      throw new Error(data.error || t('common.saveFailed'))
+    }
     editingMemory.value.content = editMemoryContent.value
     memorySaved.value = true
     setTimeout(() => {
       memorySaved.value = false
     }, 3000)
     await loadMemoryForProject(encodedDir)
-  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
+  } catch (error: any) { showAlert(`${t('common.saveFailed')}: ${error?.message || ''}`) }
   memorySaving.value = false
 }
 
@@ -1492,14 +1510,18 @@ async function createMemory(encodedDir: string) {
   const filename = name.endsWith('.md') ? name : name + '.md'
   memorySaving.value = true
   try {
-    await fetch(`${GW}/api/projects/${encodedDir}/memory/${filename}`, {
+    const response = await fetch(`${GW}/api/projects/${encodedDir}/memory/${encodeURIComponent(filename)}`, {
       method: 'PUT',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({content: '# ' + name + '\n'}),
     })
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}))
+      throw new Error(data.error || t('common.saveFailed'))
+    }
     newMemoryName.value = ''
     await loadMemoryForProject(encodedDir)
-  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
+  } catch (error: any) { showAlert(`${t('common.saveFailed')}: ${error?.message || ''}`) }
   memorySaving.value = false
 }
 
@@ -1507,10 +1529,53 @@ async function deleteMemory(filename: string, encodedDir: string) {
   showConfirm(`确定删除 ${filename} ?`, async () => {
     appConfirm.value = null
     try {
-      await fetch(`${GW}/api/projects/${encodedDir}/memory/${filename}`, {method: 'DELETE'})
+      const response = await fetch(`${GW}/api/projects/${encodedDir}/memory/${encodeURIComponent(filename)}`, {method: 'DELETE'})
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}))
+        throw new Error(data.error || t('mem.deleteFailed'))
+      }
       await loadMemoryForProject(encodedDir)
-    } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
+    } catch (error: any) { showAlert(`${t('mem.deleteFailed')}: ${error?.message || ''}`) }
   })
+}
+
+async function toggleMemoryEnabled(file: any, encodedDir: string) {
+  const actionKey = `${encodedDir}:${file.filename}:status`
+  if (memoryAction.value) return
+  memoryAction.value = actionKey
+  try {
+    const response = await fetch(`${GW}/api/projects/${encodedDir}/memory/${encodeURIComponent(file.filename)}/status`, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({enabled: file.status === 'disabled'}),
+    })
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}))
+      throw new Error(data.error || t('mem.statusFailed'))
+    }
+    await loadMemoryForProject(encodedDir)
+  } catch (error: any) {
+    showAlert(`${t('mem.statusFailed')}: ${error?.message || ''}`)
+  } finally {
+    memoryAction.value = ''
+  }
+}
+
+async function rebuildMemoryIndex(proj: any) {
+  if (memoryAction.value) return
+  memoryAction.value = `${proj.encodedDir}:rebuild`
+  try {
+    const response = await fetch(`${GW}/api/projects/${proj.encodedDir}/memory/rebuild`, {method: 'POST'})
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}))
+      throw new Error(data.error || t('mem.rebuildFailed'))
+    }
+    await loadMemoryForProject(proj.encodedDir)
+  } catch (error: any) {
+    showAlert(`${t('mem.rebuildFailed')}: ${error?.message || ''}`)
+  } finally {
+    memoryAction.value = ''
+  }
 }
 
 function cancelEditMemory() {
@@ -1987,10 +2052,10 @@ function startEditPlatform(p: any) {
 }
 
 // ── 保存平台配置 ──
-// 功能说明: 当前版本仅做备忘展示，需手动编辑 ~/.claude/adapters.json
+// 功能说明: 当前版本仅做备忘展示，需手动编辑 ~/.claude-desktop-bridge/adapters.json
 async function savePlatformConfig() {
   editingPlatform.value = null
-  showAlert('配置已备忘。当前版本需手动编辑 ~/.claude/adapters.json 应用更改。')
+  showAlert('配置已备忘。当前版本需手动编辑 ~/.claude-desktop-bridge/adapters.json 应用更改。')
 }
 
 // ── 退出平台配置查看 ──
@@ -3163,6 +3228,18 @@ onUnmounted(() => {
                   <span class="proj-count">{{ t('mem.fileCount', {n: proj.fileCount}) }}</span>
                 </div>
                 <div v-if="expandedMemoryProj === proj.encodedDir" class="memory-files">
+                  <div class="memory-toolbar">
+                    <input v-model="memorySearch" :placeholder="t('mem.searchPlaceholder')" class="field-input"
+                           @keydown.enter="loadMemoryForProject(proj.encodedDir)"/>
+                    <button class="btn-text" @click="loadMemoryForProject(proj.encodedDir)">{{ t('mem.search') }}</button>
+                    <button class="btn-text" :disabled="!!memoryAction"
+                            @click="rebuildMemoryIndex(proj)">
+                      {{ memoryAction === `${proj.encodedDir}:rebuild` ? t('mem.rebuilding') : t('mem.rebuild') }}
+                    </button>
+                    <span class="memory-mode" :class="{degraded: proj._memoryMode !== 'sqlite'}">
+                      {{ proj._memoryMode === 'sqlite' ? t('mem.indexReady') : t('mem.fileMode') }}
+                    </span>
+                  </div>
                   <div class="memory-create">
                     <input v-model="newMemoryName" :placeholder="t('mem.newPlaceholder')" class="field-input"
                            @keydown.enter="createMemory(proj.encodedDir)"/>
@@ -3170,13 +3247,26 @@ onUnmounted(() => {
                             @click="createMemory(proj.encodedDir)">{{ t('common.create') }}
                     </button>
                   </div>
-                  <div v-for="file in proj.files" :key="file.filename" class="list-item">
+                  <div v-for="file in proj.files" :key="file.filename" class="list-item memory-file-row"
+                       :class="{disabled: file.status === 'disabled'}">
                     <div class="item-icon"
                          v-html="ri('<path d=&quot;M12 20h9&quot;/><path d=&quot;M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z&quot;/>')"></div>
                     <div class="item-info" @click="startEditMemory(file, proj.encodedDir)" style="cursor:pointer">
-                      <div class="item-name">{{ file.filename }}</div>
-                      <div class="item-desc">{{ (file.size / 1024).toFixed(1) }}KB</div>
+                      <div class="item-name memory-file-title">
+                        {{ file.title || file.filename }}
+                        <span class="memory-status" :class="file.status">{{ file.status === 'disabled' ? t('mem.disabled') : t('mem.active') }}</span>
+                      </div>
+                      <div class="item-desc memory-file-meta">
+                        <span>{{ file.sourcePath || `memory/${file.filename}` }}</span>
+                        <span>{{ (file.size / 1024).toFixed(1) }}KB</span>
+                        <span>{{ t('mem.scopeProject') }}</span>
+                        <span>{{ t('mem.verifiedAt', {time: formatMemoryTime(file.lastVerifiedAt)}) }}</span>
+                      </div>
                     </div>
+                    <button class="btn-text" :disabled="!!memoryAction"
+                            @click="toggleMemoryEnabled(file, proj.encodedDir)">
+                      {{ file.status === 'disabled' ? t('mem.enable') : t('mem.disable') }}
+                    </button>
                     <button class="btn-danger-sm" @click="deleteMemory(file.filename, proj.encodedDir)"
                             :title="t('common.delete')">
                       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
@@ -5045,6 +5135,56 @@ input[type="time"].field-input::-webkit-calendar-picker-indicator {
   border-left: 2px solid var(--border);
   padding-left: 12px;
   margin-bottom: 16px;
+}
+
+.memory-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 0 4px;
+  flex-wrap: wrap;
+}
+
+.memory-toolbar .field-input {
+  flex: 1 1 220px;
+  min-width: 160px;
+}
+
+.memory-mode {
+  font-size: 11px;
+  color: var(--success);
+  white-space: nowrap;
+}
+
+.memory-mode.degraded { color: var(--warning); }
+
+.memory-file-row.disabled { background: var(--bg-deep); }
+.memory-file-row.disabled .item-name { color: var(--text-muted); }
+
+.memory-file-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.memory-status {
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 10px;
+  line-height: 15px;
+  flex-shrink: 0;
+}
+
+.memory-status.active { color: var(--success); }
+.memory-status.disabled { color: var(--text-muted); }
+
+.memory-file-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .memory-create {

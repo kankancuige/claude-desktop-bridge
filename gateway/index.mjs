@@ -15,7 +15,8 @@ import {fileURLToPath} from 'node:url'
 import {WebSocketServer} from 'ws'
 import {config as loadEnv} from 'dotenv'
 import {safeBasename, safeChildPath} from './security/path-security.mjs'
-import {query, deleteSession, forkSession} from '@anthropic-ai/claude-agent-sdk'
+import {query, deleteSession, forkSession} from './providers/claude-agent-sdk-runtime.mjs'
+import {BRIDGE_HOME, prepareBridgeHome} from './config/bridge-home.mjs'
 import {createLogger, logHttpRequest} from './shared/logger.mjs'
 import {buildSessionStopResponse, getSessionStopScope, hasStoppableSessionWork} from './sessions/session-stop.mjs'
 import {resolveSessionResume} from './sessions/session-resume.mjs'
@@ -85,7 +86,7 @@ import {extractWebSocketToken} from './security/websocket-auth.mjs'
 import {redactSecretMap, restoreSecretMap, restoreSecretValue} from './security/config-redaction.mjs'
 import {buildWindowsRtkExtractArgs, buildWindowsRtkExtractEnv, selectRtkReleaseAsset, verifyRtkAssetDigest} from './tools/rtk-archive.mjs'
 import {getCodexRelayProxyUrl, startCodexRelayProxy, stopCodexRelayProxy} from './providers/codex-relay-proxy.mjs'
-import {BRIDGE_PROVIDER_ENV_KEYS, extractBridgeProviderSettings, normalizeBridgeProviderSettings, overlayBridgeProviderSettings} from './providers/bridge-provider-settings.mjs'
+import {extractBridgeProviderSettings, normalizeBridgeProviderSettings, overlayBridgeProviderSettings, stripBridgeProviderSettings} from './providers/bridge-provider-settings.mjs'
 import {applyContextProfile, classifyContextProfile, normalizeContextProfile} from './context/context-profile.mjs'
 import {decideTask} from './tasks/task-decision.mjs'
 import {shouldCaptureTurnCheckpoint} from './tasks/turn-checkpoint-policy.mjs'
@@ -111,6 +112,7 @@ import {
     isInternalWorkflowResultText,
 } from './tasks/task-workflow-gate.mjs'
 import {applySkillRoute, routeSkills} from './agents/skill-router.mjs'
+import {ensureBuiltinSkillsAvailable} from './agents/builtin-skill-installer.mjs'
 import {buildSystemInitEvent} from './sessions/session-init-event.mjs'
 import {resolveRtkCommandArgs} from './tools/rtk-command.mjs'
 import {describeAttachment, isImageAttachment} from './tools/attachment-type.mjs'
@@ -118,6 +120,15 @@ import {cleanupUploadDir, prepareUploadDir} from './tools/upload-storage.mjs'
 import {mapStreamEvent} from './sessions/stream-event-mapper.mjs'
 import {parseDeepSeekBalance, resolveBalanceProvider} from './providers/balance-provider.mjs'
 import {createUserPreferenceService} from './context/user-preferences.mjs'
+import {createBridgeStateDb} from './storage/bridge-state-db.mjs'
+import {createMemoryService} from './context/memory-service.mjs'
+import {
+    deleteProjectMemory,
+    listProjectMemory,
+    rebuildProjectMemory,
+    saveProjectMemory,
+    setProjectMemoryEnabled,
+} from './context/memory-admin.mjs'
 import {createImProgressReporter} from './im/im-progress-reporter.mjs'
 import {
     calculateAutoCompactWindow,
@@ -149,6 +160,8 @@ import cron from 'node-cron'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 loadEnv({path: join(__dirname, '.env'), override: true})
 const log = createLogger('gateway')
+let bridgeStateDb = null
+let memoryService = null
 
 const providerRegistry = createProviderRegistry({
     onDisposeError: (error, context) => log.warn({err: error, ...context}, 'Agent Provider 释放失败'),
@@ -325,21 +338,20 @@ function mapModel(name) {
     return normalizeExplicitModel(name)
 }
 
-const CLAUDE_HOME = join(homedir(), '.claude')
 const userPreferences = createUserPreferenceService({
-    claudeHome: CLAUDE_HOME,
+    bridgeHome: BRIDGE_HOME,
     onWarning: (error, context) => log.warn({err: error, ...context}, '用户偏好存储降级'),
 })
-const BRIDGE_TOKEN_PATH = join(CLAUDE_HOME, 'bridge-token')
-const BRIDGE_PROVIDER_SETTINGS_PATH = join(CLAUDE_HOME, 'bridge-provider.json')
-const ADAPTER_SESSIONS_PATH = join(CLAUDE_HOME, 'adapter-sessions.json')
-const ADAPTER_CONFIG_PATH = join(CLAUDE_HOME, 'adapters.json')
-const SECURE_PAYLOAD_KEY_PATH = join(CLAUDE_HOME, 'bridge-store-key')
+const BRIDGE_TOKEN_PATH = join(BRIDGE_HOME, 'bridge-token')
+const BRIDGE_PROVIDER_SETTINGS_PATH = join(BRIDGE_HOME, 'bridge-provider.json')
+const ADAPTER_SESSIONS_PATH = join(BRIDGE_HOME, 'adapter-sessions.json')
+const ADAPTER_CONFIG_PATH = join(BRIDGE_HOME, 'adapters.json')
+const SECURE_PAYLOAD_KEY_PATH = join(BRIDGE_HOME, 'bridge-store-key')
 // 本地 API 认证 token: 启动时生成随机 token，写入文件供桌面端读取
 // 所有 POST/PUT/DELETE 请求须携带 x-bridge-token header 与此匹配
 const BRIDGE_TOKEN = crypto.randomUUID()
 function persistBridgeToken() {
-    mkdirSync(CLAUDE_HOME, {recursive: true})
+    mkdirSync(BRIDGE_HOME, {recursive: true})
     writeFileSync(BRIDGE_TOKEN_PATH, BRIDGE_TOKEN, {encoding: 'utf8', mode: 0o600})
 }
 const ALLOW_TOKEN_ENDPOINT = process.env.BRIDGE_ALLOW_TOKEN_ENDPOINT === '1'
@@ -393,7 +405,7 @@ function migrateAdapterCredentials() {
         if (result.migrated) log.info('IM 凭据已从明文配置迁移为加密存储')
     }
 
-    const legacyWechatPath = join(CLAUDE_HOME, 'channels', 'wechat', 'default', 'account.json')
+    const legacyWechatPath = join(BRIDGE_HOME, 'channels', 'wechat', 'default', 'account.json')
     if (existsSync(legacyWechatPath)) {
         const legacy = readJSON(legacyWechatPath)
         if (!config.wechat?.botToken && legacy?.token) {
@@ -426,7 +438,7 @@ function safeDecodeURIComponent(value) {
 // ---- 动态模型/命令缓存 ----
 // supportedModels()/supportedCommands() 是控制请求，需活跃 query；冷启动设置页读这里的缓存
 // SIDE_EFFECT: mutates dynamicCache（内存）+ 落盘 bridge-dynamic-cache.json
-const DYNAMIC_CACHE_FILE = join(CLAUDE_HOME, 'bridge-dynamic-cache.json')
+const DYNAMIC_CACHE_FILE = join(BRIDGE_HOME, 'bridge-dynamic-cache.json')
 const dynamicCache = {models: null, commands: null, agentNames: null, updatedAt: 0}
 // 启动时从磁盘恢复缓存（失败忽略，保持空缓存）
 try {
@@ -566,11 +578,11 @@ const VALID_MODEL_MODES = new Set(['auto', 'fixed'])
 
 function taskStateStorePath(workDir, sessionId) {
     const safeId = taskStateFileId(sessionId, null)
-    return safeId ? join(CLAUDE_HOME, 'projects', encodeProjectName(workDir), 'bridge-task-state', `${safeId}.json`) : null
+    return safeId ? join(BRIDGE_HOME, 'projects', encodeProjectName(workDir), 'bridge-task-state', `${safeId}.json`) : null
 }
 
 function sessionMirrorStorePath(workDir) {
-    return mirrorStorePath(join(CLAUDE_HOME, 'projects', encodeProjectName(workDir)))
+    return mirrorStorePath(join(BRIDGE_HOME, 'projects', encodeProjectName(workDir)))
 }
 
 function sessionMirrorIds(session, sessionId = null) {
@@ -622,7 +634,7 @@ function removePersistedSessionMirrors(workDir, ids) {
 }
 
 function openSessionEventJournal(workDir, sessionId) {
-    const projectDir = join(CLAUDE_HOME, 'projects', encodeProjectName(workDir))
+    const projectDir = join(BRIDGE_HOME, 'projects', encodeProjectName(workDir))
     return new SessionEventJournal({
         path: sessionEventStorePath(projectDir, sessionId),
         onCorrupt: result => {
@@ -1140,7 +1152,7 @@ function startAdapter(platform) {
     const starter = ADAPTER_STARTERS.get(platform)
     if (!starter) return null
     try {
-        const hooks = starter(ADAPTER_TOKENS.get(platform), {taskCommands})
+        const hooks = starter(ADAPTER_TOKENS.get(platform), {taskCommands, stateStore: bridgeStateDb})
         if (!hooks) return null
         const registered = {...hooks, platform}
         confirmHooks.push(registered)
@@ -1159,17 +1171,19 @@ function restartAdapter(platform) {
 function clearAdapterPlatformState(platform) {
     stopAdapter(platform)
     const bindings = clearAdapterBindings(binding => binding.platform === platform)
-    const inbox = clearPlatformEntries(platformEntryFilePath(CLAUDE_HOME, 'bridge-im-inbox', platform), platform)
-        + clearPlatformEntries(join(CLAUDE_HOME, 'bridge-im-inbox.json'), platform)
-    const notifications = clearPlatformEntries(platformEntryFilePath(CLAUDE_HOME, 'bridge-notification-outbox', platform), platform)
-        + clearPlatformEntries(join(CLAUDE_HOME, 'bridge-notification-outbox.json'), platform)
+    const sqliteInbox = bridgeStateDb?.clearEntries?.('inbox', platform) || 0
+    const sqliteNotifications = bridgeStateDb?.clearEntries?.('outbox', platform) || 0
+    const inbox = sqliteInbox + clearPlatformEntries(platformEntryFilePath(BRIDGE_HOME, 'bridge-im-inbox', platform), platform)
+        + clearPlatformEntries(join(BRIDGE_HOME, 'bridge-im-inbox.json'), platform)
+    const notifications = sqliteNotifications + clearPlatformEntries(platformEntryFilePath(BRIDGE_HOME, 'bridge-notification-outbox', platform), platform)
+        + clearPlatformEntries(join(BRIDGE_HOME, 'bridge-notification-outbox.json'), platform)
     const pairedFiles = {
         wechat: 'bridge-paired.json',
         feishu: 'bridge-paired-feishu.json',
         dingtalk: 'bridge-paired-dingtalk.json',
     }
     let paired = false
-    const pairedFile = pairedFiles[platform] ? join(CLAUDE_HOME, pairedFiles[platform]) : null
+    const pairedFile = pairedFiles[platform] ? join(BRIDGE_HOME, pairedFiles[platform]) : null
     if (pairedFile && existsSync(pairedFile)) {
         try {
             unlinkSync(pairedFile)
@@ -1178,7 +1192,7 @@ function clearAdapterPlatformState(platform) {
             log.warn({err: error, platform}, '清理 IM 配对白名单失败')
         }
     }
-    return {bindings, inbox, notifications, paired}
+    return {bindings, inbox, notifications, paired, sqlite: {inbox: sqliteInbox, notifications: sqliteNotifications}}
 }
 
 // ── WebSocket 广播 ──
@@ -1659,9 +1673,9 @@ function backupFile(p) {
     } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
 }
 
-// 功能说明: 加载 ~/.claude/settings.json 配置文件，不存在则返回 {}
+// 功能说明: 加载 ~/.claude-desktop-bridge/settings.json 配置文件，不存在则返回 {}
 // 实现方式: readJSON 封装 JSON.parse + readFileSync + try/catch，失败返回 null → || {} 兜底
-// 关键数据流: ~/.claude/settings.json → readFileSync → JSON.parse → 配置对象 或 {}
+// 关键数据流: ~/.claude-desktop-bridge/settings.json → readFileSync → JSON.parse → 配置对象 或 {}
 function loadBridgeProviderSettings() {
     const stored = readJSON(BRIDGE_PROVIDER_SETTINGS_PATH)
     if (stored && typeof stored === 'object' && !Array.isArray(stored)) {
@@ -1680,18 +1694,18 @@ function loadBridgeProviderSettings() {
 
 function saveBridgeProviderSettings(settings) {
     const normalized = normalizeBridgeProviderSettings(settings)
-    mkdirSync(CLAUDE_HOME, {recursive: true})
+    mkdirSync(BRIDGE_HOME, {recursive: true})
     writeJSON(BRIDGE_PROVIDER_SETTINGS_PATH, normalized)
     return normalized
 }
 
 function loadCliSettings() {
-    const raw = readJSON(join(CLAUDE_HOME, 'settings.json')) || {}
+    const raw = readJSON(join(BRIDGE_HOME, 'settings.json')) || {}
     return overlayBridgeProviderSettings(raw, loadBridgeProviderSettings())
 }
 
 function loadCliSettingsForUpdate() {
-    const settingsPath = join(CLAUDE_HOME, 'settings.json')
+    const settingsPath = join(BRIDGE_HOME, 'settings.json')
     if (!existsSync(settingsPath)) return {}
     const value = JSON.parse(readFileSync(settingsPath, 'utf8'))
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -1703,11 +1717,11 @@ function loadCliSettingsForUpdate() {
 // ── Hook 脚本存在性审计 ──
 // 启动时只记录明显缺失的脚本。Gateway 不应在用户未确认时改写全局 settings.json。
 function validateHooks() {
-    const sp = join(CLAUDE_HOME, 'settings.json')
+    const sp = join(BRIDGE_HOME, 'settings.json')
     const s = readJSON(sp)
     if (!s || !s.hooks || typeof s.hooks !== 'object') return
 
-    const hooksDir = join(CLAUDE_HOME, 'hooks')
+    const hooksDir = join(BRIDGE_HOME, 'hooks')
 
     for (const [eventType, entries] of Object.entries(s.hooks)) {
         if (!Array.isArray(entries)) continue
@@ -1728,7 +1742,7 @@ function validateHooks() {
 }
 
 // workflow 全局开关
-const WF_CONFIG_FILE = join(CLAUDE_HOME, 'bridge-workflow.json')
+const WF_CONFIG_FILE = join(BRIDGE_HOME, 'bridge-workflow.json')
 
 function loadWfConfig() {
     return {enabled: false, journalCacheTTL: 30,
@@ -1741,10 +1755,10 @@ function saveWfConfig(c) {
 }
 
 // ── Caveman skill 内置安装 + 配置 ──
-// 功能说明: 确保 ~/.claude/skills/caveman/SKILL.md 存在，不存在则从内置模板写入
+// 功能说明: 确保 ~/.claude-desktop-bridge/skills/caveman/SKILL.md 存在，不存在则从内置模板写入
 //   配置存 settings.json → caveman: {enabled, level}，默认开启 full 级别
-// SIDE_EFFECT: 写入 ~/.claude/skills/caveman/SKILL.md（首次）
-const CAVEMAN_SKILL_DIR = join(CLAUDE_HOME, 'skills', 'caveman')
+// SIDE_EFFECT: 写入 ~/.claude-desktop-bridge/skills/caveman/SKILL.md（首次）
+const CAVEMAN_SKILL_DIR = join(BRIDGE_HOME, 'skills', 'caveman')
 const CAVEMAN_SKILL_FILE = join(CAVEMAN_SKILL_DIR, 'SKILL.md')
 const CAVEMAN_VERSION_FILE = join(CAVEMAN_SKILL_DIR, 'VERSION')
 const CAVEMAN_DEFAULT_CONFIG = {enabled: true, level: 'full'}
@@ -1824,7 +1838,7 @@ async function downloadAndReplaceCaveman(targetVersion) {
 }
 
 function loadCavemanConfig() {
-    const s = readJSON(join(CLAUDE_HOME, 'settings.json')) || {}
+    const s = readJSON(join(BRIDGE_HOME, 'settings.json')) || {}
     const c = s.caveman
     if (c && typeof c === 'object' && typeof c.enabled === 'boolean' && CAVEMAN_VALID_LEVELS.includes(c.level)) {
         return c
@@ -1835,7 +1849,7 @@ function loadCavemanConfig() {
 function saveCavemanConfig(cfg) {
     const s = loadCliSettingsForUpdate()
     s.caveman = cfg
-    writeJSON(join(CLAUDE_HOME, 'settings.json'), s)
+    writeJSON(join(BRIDGE_HOME, 'settings.json'), s)
 }
 
 // ── Caveman 系统提示词生成（会话级 systemPrompt.append 注入，不污染任何 CLAUDE.md）──
@@ -1919,7 +1933,7 @@ function getRtkDir() {
 }
 
 function loadRtkConfig() {
-    const s = readJSON(join(CLAUDE_HOME, 'settings.json')) || {}
+    const s = readJSON(join(BRIDGE_HOME, 'settings.json')) || {}
     const c = s.bashCompress
     if (c && typeof c === 'object' && typeof c.enabled === 'boolean') return c
     return {enabled: true}
@@ -1928,7 +1942,7 @@ function loadRtkConfig() {
 function saveRtkConfig(cfg) {
     const s = loadCliSettingsForUpdate()
     s.bashCompress = cfg
-    writeJSON(join(CLAUDE_HOME, 'settings.json'), s)
+    writeJSON(join(BRIDGE_HOME, 'settings.json'), s)
 }
 
 async function checkRtkUpdate() {
@@ -2324,11 +2338,11 @@ function spawnRtk(rtkPath, cmd, _text) {
     })
 }
 
-// 功能说明: 扫描 ~/.claude/agents/*.md，解析 frontmatter 组装为 SDK AgentDefinition 字典
+// 功能说明: 扫描 ~/.claude-desktop-bridge/agents/*.md，解析 frontmatter 组装为 SDK AgentDefinition 字典
 // key 为 agent name（frontmatter.name 或文件名去扩展名），value 含 description/tools/model/prompt
 // 关键数据流: agents/ 目录 → 遍历 .md → parseFrontmatter → {name: AgentDefinition}
 function loadAgentDefinitions() {
-    const ad = join(CLAUDE_HOME, 'agents');
+    const ad = join(BRIDGE_HOME, 'agents');
     const defs = {}
     try {
         for (const fn of readdirSync(ad)) {
@@ -2695,7 +2709,7 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
     const permissionMode = VALID_PERMISSION_MODES.has(body.permissionMode) ? body.permissionMode : 'default'
     const requestedMaxTurns = Number(body.maxTurns || cliS.maxTurns || 40)
     const contextProfile = normalizeContextProfile(body.contextProfile)
-    const skillRoute = Array.isArray(body.skillRoute)
+    const requestedSkillRoute = Array.isArray(body.skillRoute)
         ? [...new Set(body.skillRoute.filter(name => typeof name === 'string' && name.length <= 128))]
         : routeSkills({
             text: body.text || '',
@@ -2703,6 +2717,11 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
             profile: contextProfile,
             targetFiles: body.targetFiles || [],
         })
+    const skillRoute = contextProfile === 'light' ? [] : requestedSkillRoute
+    const builtinSkills = ensureBuiltinSkillsAvailable(skillRoute, {bridgeHome: BRIDGE_HOME})
+    if (builtinSkills.installed.length) {
+        log.info({skills: builtinSkills.installed}, 'Bridge 内置 Skill 已准备')
+    }
     const agents = contextProfile === 'full' ? (body._agents || loadAgentDefinitions()) : {}
 
     // DeepSeek 兼容代理: 自动路由请求通过本地代理修复参数冲突
@@ -2801,6 +2820,7 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
             const e = {
                 ...buildChildProcessEnv(),
                 CLAUDE_CODE_ENTRYPOINT: 'claude',
+                CLAUDE_CONFIG_DIR: BRIDGE_HOME,
                 ANTHROPIC_API_KEY: sdkApiKey,
                 ANTHROPIC_AUTH_TOKEN: sdkApiKey,
                 ANTHROPIC_BASE_URL: effectiveBaseUrl,
@@ -2885,7 +2905,7 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
                     })
                     // 清理子 agent transcript 文件，防止积累
                     if (input.agent_transcript_path) {
-                        const projectsRoot = join(CLAUDE_HOME, 'projects')
+                        const projectsRoot = join(BRIDGE_HOME, 'projects')
                         const transcriptRelativePath = relative(projectsRoot, resolve(String(input.agent_transcript_path)))
                         const tp = safeChildPath(projectsRoot, transcriptRelativePath, {extensions: ['.jsonl']})
                         if (!tp) {
@@ -2933,6 +2953,7 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
     }
     // 暴露本次生效的 env 给同进程兼容路径，替代写 process.env 全局
     opts.runtimeEnv = {
+        CLAUDE_CONFIG_DIR: BRIDGE_HOME,
         ANTHROPIC_BASE_URL: effectiveBaseUrl,
         ANTHROPIC_API_KEY: sdkApiKey,
         ANTHROPIC_AUTH_TOKEN: sdkApiKey,
@@ -2948,7 +2969,7 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
         opts.runtimeEnv.API_TIMEOUT_MS = '600000'
         opts.runtimeEnv.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'
     }
-    opts = applyContextProfile(opts, contextProfile, resolvedModel)
+    opts = applyContextProfile(opts, contextProfile, resolvedModel, {workDir})
     opts = applySkillRoute(opts, skillRoute)
     // 仅供 Bridge 保存 Session 状态；Claude Agent SDK 会忽略未知选项。
     opts.bridgeContextProfile = contextProfile
@@ -3790,7 +3811,7 @@ const BUILTIN_MCP = {
 const builtinCache = {skills: [...BUILTIN_SKILLS], agents: [...BUILTIN_AGENTS], commands: [], updatedAt: 0}
 
 // ── 定时任务调度（模块级状态）──
-const SCHEDULED_TASKS_FILE = join(CLAUDE_HOME, 'bridge-scheduled-tasks.json')
+const SCHEDULED_TASKS_FILE = join(BRIDGE_HOME, 'bridge-scheduled-tasks.json')
 const scheduledTasks = readJSON(SCHEDULED_TASKS_FILE) || {}
 const cronJobs = new Map()
 const scheduledRuns = new Map()
@@ -3925,9 +3946,10 @@ function resolveSdkInputContent(sessionId, session, prompt) {
         session._continuationResolved = true
         try {
             const transcripts = listProjectTranscriptCandidates({
-                claudeHome: CLAUDE_HOME,
+                bridgeHome: BRIDGE_HOME,
                 encodedDir: encodeProjectName(session.workDir),
                 workDir: session.workDir,
+                stateStore: bridgeStateDb,
             })
             const context = buildProjectContinuationContext({
                 prompt,
@@ -3946,12 +3968,27 @@ function resolveSdkInputContent(sessionId, session, prompt) {
             log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '项目会话接力上下文读取失败，已按原消息继续')
         }
     }
+    let enriched
     try {
-        return userPreferences.inject(session.workDir, content, prompt)
+        enriched = userPreferences.inject(session.workDir, content, prompt)
     } catch (error) {
+        enriched = content
         log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '用户偏好读取失败，已按原消息继续')
-        return content
     }
+    try {
+        const memory = memoryService?.retrieve({
+            workDir: session.workDir,
+            encodedDir: encodeProjectName(session.workDir),
+            text: prompt,
+        })
+        if (memory?.text) {
+            log.info({sessionId: sessionId?.slice(0, 8), itemCount: memory.items.length, memoryReason: memory.reason}, '已按需注入项目 Memory')
+            enriched = `${memory.text}\n\n${enriched}`
+        }
+    } catch (error) {
+        log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '项目 Memory 读取失败，已按原消息继续')
+    }
+    return enriched
 }
 
 function destroyScheduledJob(id) {
@@ -4649,7 +4686,7 @@ async function handleHttpRequest(req, res) {
         if (createMode.mode === 'fork') {
             const encDir = encodeProjectName(workDir)
             const sourceTranscript = findSessionTranscript({
-                claudeHome: CLAUDE_HOME,
+                bridgeHome: BRIDGE_HOME,
                 encodedDir: encDir,
                 sessionId: createMode.sourceSessionId,
                 workDir,
@@ -4666,7 +4703,7 @@ async function handleHttpRequest(req, res) {
         } else if (createMode.mode === 'resume') {
             const encDir = encodeProjectName(workDir)
             const requestedTranscript = findSessionTranscript({
-                claudeHome: CLAUDE_HOME,
+                bridgeHome: BRIDGE_HOME,
                 encodedDir: encDir,
                 sessionId: body.resume,
                 workDir,
@@ -4682,7 +4719,7 @@ async function handleHttpRequest(req, res) {
             }
             const mappedSdkCandidate = lookupSdkSessionId(workDir, body.resume)
             const mappedSdkTranscript = mappedSdkCandidate
-                ? findSessionTranscript({claudeHome: CLAUDE_HOME, encodedDir: encDir, sessionId: mappedSdkCandidate, workDir})
+                ? findSessionTranscript({bridgeHome: BRIDGE_HOME, encodedDir: encDir, sessionId: mappedSdkCandidate, workDir})
                 : null
             const mappedGatewayCandidate = transcriptExists ? lookupGatewaySessionId(workDir, body.resume) : null
             const mappedRuntime = mappedGatewayCandidate ? sessions.get(mappedGatewayCandidate) : null
@@ -5863,11 +5900,10 @@ async function handleHttpRequest(req, res) {
 
     // ── Config endpoints ──
 
-    // ── /api/config/settings —— 通用 Claude 配置 + Bridge 私有 provider 配置 ──
-    // provider 字段通过 bridge-provider.json 隔离保存；settings.json 中的同名字段
-    // 继续留给 Claude/CCSwitch，避免外部工具覆盖 Bridge 的会话供应商。
+    // ── /api/config/settings —— Bridge 通用配置 + 私有 provider 配置 ──
+    // provider 字段只写 bridge-provider.json；settings.json 不保留第二份模型、地址或密钥。
     if (url.pathname === '/api/config/settings') {
-        const sp = join(CLAUDE_HOME, 'settings.json');
+        const sp = join(BRIDGE_HOME, 'settings.json');
         if (req.method === 'GET') {
             const d = readJSON(sp) || {};
             const effective = overlayBridgeProviderSettings(d, loadBridgeProviderSettings())
@@ -5901,12 +5937,7 @@ async function handleHttpRequest(req, res) {
                     delete b.env.ANTHROPIC_DEFAULT_SONNET_MODEL
                     delete b.env.ANTHROPIC_DEFAULT_HAIKU_MODEL
                 }
-                // 全局 settings 保留 CCSwitch/Claude 自己的 provider 字段；Bridge provider 已单独落盘。
-                // 这样本项目写入主题、宠物、MCP 等通用设置时不会反向接管外部工具的连接配置。
-                const persisted = {...b, env: {...(current.env || {})}}
-                for (const [key, value] of Object.entries(b.env || {})) {
-                    if (!BRIDGE_PROVIDER_ENV_KEYS.includes(key)) persisted.env[key] = value
-                }
+                const persisted = stripBridgeProviderSettings(b)
                 backupFile(sp);
                 writeJSON(sp, persisted);
                 res.writeHead(200);
@@ -5924,6 +5955,21 @@ async function handleHttpRequest(req, res) {
     if (req.method === 'GET' && url.pathname === '/api/version') {
         res.writeHead(200, {'Content-Type': 'application/json'});
         res.end(JSON.stringify({version: PKG_VERSION}));
+        return
+    }
+    // ── GET /api/health —— Gateway 与持久化状态健康信息 ──
+    if (req.method === 'GET' && url.pathname === '/api/health') {
+        const healthy = !bridgeStateDb?.degraded
+        res.writeHead(healthy ? 200 : 503, {'Content-Type': 'application/json'})
+        res.end(JSON.stringify({
+            ok: healthy,
+            version: PKG_VERSION,
+            stateStoreMode: bridgeStateDb?.mode || 'unavailable',
+            stateStoreSchemaVersion: bridgeStateDb?.schemaVersion || 0,
+            stateStoreDegraded: Boolean(bridgeStateDb?.degraded),
+            stateStoreDegradedReason: bridgeStateDb?.degradedReason || null,
+            stateStoreQuarantined: bridgeStateDb?.quarantinePaths?.length || 0,
+        }))
         return
     }
     // ── GET /api/config/claude-status —— Claude Code 安装状态查询 ──
@@ -5962,8 +6008,8 @@ async function handleHttpRequest(req, res) {
             }
             const cliS = loadCliSettingsForUpdate()
             cliS.claudeExe = p
-            backupFile(join(CLAUDE_HOME, 'settings.json'))
-            writeJSON(join(CLAUDE_HOME, 'settings.json'), cliS)
+            backupFile(join(BRIDGE_HOME, 'settings.json'))
+            writeJSON(join(BRIDGE_HOME, 'settings.json'), cliS)
             _exe = p // 更新缓存
             log.info({path: p}, '用户手动设置 claudeExe')
             res.writeHead(200);
@@ -5976,11 +6022,11 @@ async function handleHttpRequest(req, res) {
         }
     }
     // ── GET /api/config/skills —— 列出所有 Skills ──
-    // 功能说明: 扫描 ~/.claude/skills/ 目录下所有 SKILL.md，解析 frontmatter 返回名称/描述/内容
+    // 功能说明: 扫描 ~/.claude-desktop-bridge/skills/ 目录下所有 SKILL.md，解析 frontmatter 返回名称/描述/内容
     // 实现方式: readdirSync → forEach 读 SKILL.md → parseFrontmatter 提取元数据
     // 关键数据流: skills/ 目录 → 遍历读 SKILL.md → 200 {skills: [{name, description, content, size}]}
     if (req.method === 'GET' && url.pathname === '/api/config/skills') {
-        const sd = join(CLAUDE_HOME, 'skills');
+        const sd = join(BRIDGE_HOME, 'skills');
         const r = [];
         const builtinNames = new Set(builtinCache.skills);
         const seen = new Set();
@@ -6020,7 +6066,7 @@ async function handleHttpRequest(req, res) {
     const skillM = url.pathname.match(/^\/api\/config\/skills\/(.+)$/);
     if (skillM) {
         const sn = safeDecodeURIComponent(skillM[1]);
-        const skillsDir = join(CLAUDE_HOME, 'skills')
+        const skillsDir = join(BRIDGE_HOME, 'skills')
         if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(sn)) {
             res.writeHead(400)
             res.end(JSON.stringify({error: 'invalid skill name'}))
@@ -6066,7 +6112,7 @@ async function handleHttpRequest(req, res) {
         // 仅已禁用的 skill 可删除（防止误删正在使用的 skill）
         if (req.method === 'DELETE') {
             try {
-                const s = readJSON(join(CLAUDE_HOME, 'settings.json')) || {}
+                const s = readJSON(join(BRIDGE_HOME, 'settings.json')) || {}
                 if (!(s.disabledSkills || []).includes(sn)) {
                     res.writeHead(409)
                     res.end(JSON.stringify({error: '请先禁用再删除'}))
@@ -6083,7 +6129,7 @@ async function handleHttpRequest(req, res) {
         }
     }
     // ── POST /api/config/skills —— 创建新 Skill ──
-    // 功能说明: 在 ~/.claude/skills/ 下创建新的 SKILL.md，名称自动 sanitize 为小写+连字符
+    // 功能说明: 在 ~/.claude-desktop-bridge/skills/ 下创建新的 SKILL.md，名称自动 sanitize 为小写+连字符
     //   已存在则返回 409
     // 关键数据流: POST {name, content?} → mkdir + writeFile → 201 {ok:true, name}
     if (req.method === 'POST' && url.pathname === '/api/config/skills') {
@@ -6095,7 +6141,7 @@ async function handleHttpRequest(req, res) {
                 res.end(JSON.stringify({error: 'name required'}));
                 return
             }
-            ;const d = join(CLAUDE_HOME, 'skills', n);
+            ;const d = join(BRIDGE_HOME, 'skills', n);
             if (existsSync(d)) {
                 res.writeHead(409);
                 res.end(JSON.stringify({error: 'exists'}));
@@ -6114,7 +6160,7 @@ async function handleHttpRequest(req, res) {
     }
     // ── GET /api/config/disabled-skills —— 获取已禁用的 skill 名称列表 ──
     if (req.method === 'GET' && url.pathname === '/api/config/disabled-skills') {
-        const s = readJSON(join(CLAUDE_HOME, 'settings.json')) || {}
+        const s = readJSON(join(BRIDGE_HOME, 'settings.json')) || {}
         res.writeHead(200)
         res.end(JSON.stringify({disabled: s.disabledSkills || []}))
         return
@@ -6132,7 +6178,7 @@ async function handleHttpRequest(req, res) {
             } else {
                 s.disabledSkills = s.disabledSkills.filter((n) => n !== name)
             }
-            writeJSON(join(CLAUDE_HOME, 'settings.json'), s)
+            writeJSON(join(BRIDGE_HOME, 'settings.json'), s)
             res.writeHead(200)
             res.end(JSON.stringify({ok: true, name, disabled: b.disabled}))
         } catch (e) { res.writeHead(500); res.end(JSON.stringify({error: e.message})) }
@@ -6140,7 +6186,7 @@ async function handleHttpRequest(req, res) {
     }
     // ── GET /api/config/disabled-mcp-plugins —— 获取已禁用的 MCP 插件名称列表 ──
     if (req.method === 'GET' && url.pathname === '/api/config/disabled-mcp-plugins') {
-        const s = readJSON(join(CLAUDE_HOME, 'settings.json')) || {}
+        const s = readJSON(join(BRIDGE_HOME, 'settings.json')) || {}
         res.writeHead(200)
         res.end(JSON.stringify({disabled: s.disabledMcpPlugins || []}))
         return
@@ -6158,7 +6204,7 @@ async function handleHttpRequest(req, res) {
             } else {
                 s.disabledMcpPlugins = s.disabledMcpPlugins.filter((n) => n !== name)
             }
-            writeJSON(join(CLAUDE_HOME, 'settings.json'), s)
+            writeJSON(join(BRIDGE_HOME, 'settings.json'), s)
             res.writeHead(200)
             res.end(JSON.stringify({ok: true, name, disabled: b.disabled}))
         } catch (e) { res.writeHead(500); res.end(JSON.stringify({error: e.message})) }
@@ -6343,7 +6389,7 @@ async function handleHttpRequest(req, res) {
                 return
             }
 
-            const d = join(CLAUDE_HOME, 'skills', name)
+            const d = join(BRIDGE_HOME, 'skills', name)
             mkdirSync(d, {recursive: true})
             writeFileSync(join(d, 'SKILL.md'), content, 'utf8')
             log.info({name}, 'skill 已从市场安装')
@@ -6457,13 +6503,13 @@ async function handleHttpRequest(req, res) {
         return
     }
     // ── GET /api/config/hooks —— 列出所有 Hooks ──
-    // 功能说明: 从 settings.json 中读取 hooks 配置，同时读取 ~/.claude/hooks/ 下对应的脚本文件内容
+    // 功能说明: 从 settings.json 中读取 hooks 配置，同时读取 ~/.claude-desktop-bridge/hooks/ 下对应的脚本文件内容
     //   返回按事件类型分组的 hooks 列表，每个 hook 包含对应的脚本文件内容
     // 实现方式: readJSON settings.json → 提取 hooks 字段 → 遍历匹配 hooks 目录下实际脚本 → 嵌入 content
     // 关键数据流: settings.json hooks → 匹配 hooks/ 目录文件 → 200 {hooks: {eventType: [{matcher, hooks:[{command, filename, content}]}]}}
     if (req.method === 'GET' && url.pathname === '/api/config/hooks') {
-        const hp = join(CLAUDE_HOME, 'settings.json');
-        const hd = join(CLAUDE_HOME, 'hooks');
+        const hp = join(BRIDGE_HOME, 'settings.json');
+        const hd = join(BRIDGE_HOME, 'hooks');
         const hooks = {};
         try {
             const s = readJSON(hp);
@@ -6494,7 +6540,7 @@ async function handleHttpRequest(req, res) {
     const hookFileM = url.pathname.match(/^\/api\/config\/hooks\/([^/]+)$/);
     if (hookFileM) {
         const fn = safeDecodeURIComponent(hookFileM[1]);
-        const hd = join(CLAUDE_HOME, 'hooks')
+        const hd = join(BRIDGE_HOME, 'hooks')
         if (!/^[a-zA-Z0-9_.-]+\.(sh|js)$/.test(fn)) {
             res.writeHead(400)
             res.end(JSON.stringify({error: 'invalid hook filename'}))
@@ -6534,7 +6580,7 @@ async function handleHttpRequest(req, res) {
         }
     }
     // ── POST /api/config/hooks —— 创建新 Hook 脚本 ──
-    // 功能说明: 在 ~/.claude/hooks/ 下创建新的 .sh 或 .js 脚本文件，文件名自动 sanitize
+    // 功能说明: 在 ~/.claude-desktop-bridge/hooks/ 下创建新的 .sh 或 .js 脚本文件，文件名自动 sanitize
     //   默认填充 #!/usr/bin/env bash + set -euo pipefail 模板
     // 关键数据流: POST {filename, content?} → writeFileSync → 201 {ok:true, filename}
     if (req.method === 'POST' && url.pathname === '/api/config/hooks') {
@@ -6542,7 +6588,7 @@ async function handleHttpRequest(req, res) {
             const b = await readBody(req);
             let fn = (b.filename || 'new-hook').trim().replace(/[^a-zA-Z0-9_.-]/g, '-');
             if (!fn.endsWith('.sh') && !fn.endsWith('.js')) fn += '.sh';
-            const hd = join(CLAUDE_HOME, 'hooks')
+            const hd = join(BRIDGE_HOME, 'hooks')
             const fp = safeBasename(hd, fn, {extensions: ['.sh', '.js']})
             if (!fp) {
                 res.writeHead(400)
@@ -6590,11 +6636,11 @@ async function handleHttpRequest(req, res) {
         }
     }
     // ── GET /api/config/rules —— 列出所有 Rules ──
-    // 功能说明: 递归扫描 ~/.claude/rules/ 目录下所有 .md 文件，解析 frontmatter 返回源数据
+    // 功能说明: 递归扫描 ~/.claude-desktop-bridge/rules/ 目录下所有 .md 文件，解析 frontmatter 返回源数据
     //   Rules 为按文件扩展名匹配注入的编码规范
     // 关键数据流: rules/ 目录 → 遍历 .md → parseFrontmatter → 200 {rules: [{filename, content, frontmatter}]}
     if (req.method === 'GET' && url.pathname === '/api/config/rules') {
-        const rd = join(CLAUDE_HOME, 'rules');
+        const rd = join(BRIDGE_HOME, 'rules');
         const r = [];
         try {
             scanRulesDir(rd, rd, r)
@@ -6608,7 +6654,7 @@ async function handleHttpRequest(req, res) {
     const ruleM = url.pathname.match(/^\/api\/config\/rules\/(.+)$/);
     if (ruleM) {
         let fn = safeDecodeURIComponent(ruleM[1]);
-        const rulesDir = join(CLAUDE_HOME, 'rules')
+        const rulesDir = join(BRIDGE_HOME, 'rules')
         const fp = safeChildPath(rulesDir, fn, {extensions: ['.md']})
         if (!fp) {
             res.writeHead(400); res.end(JSON.stringify({error: 'invalid filename'})); return
@@ -6656,7 +6702,7 @@ async function handleHttpRequest(req, res) {
         }
     }
     // ── POST /api/config/rules —— 创建新 Rule ──
-    // 功能说明: 在 ~/.claude/rules/ 下创建新的 .md 规则文件，文件名自动 sanitize
+    // 功能说明: 在 ~/.claude-desktop-bridge/rules/ 下创建新的 .md 规则文件，文件名自动 sanitize
     //   默认模板包含 paths frontmatter 配置
     // 关键数据流: POST {filename, content?, paths?} → writeFileSync → 201 {ok:true, filename}
     if (req.method === 'POST' && url.pathname === '/api/config/rules') {
@@ -6664,7 +6710,7 @@ async function handleHttpRequest(req, res) {
             const b = await readBody(req);
             let fn = (b.filename || 'new-rule').trim().replace(/[^a-zA-Z0-9_.-]/g, '-');
             if (!fn.endsWith('.md')) fn += '.md';
-            const fp = join(CLAUDE_HOME, 'rules', fn);
+            const fp = join(BRIDGE_HOME, 'rules', fn);
             if (existsSync(fp)) {
                 res.writeHead(409);
                 res.end(JSON.stringify({error: 'exists'}));
@@ -6680,9 +6726,9 @@ async function handleHttpRequest(req, res) {
         ;
         return
     }
-    // ── Agents CRUD（~/.claude/agents/<name>.md，frontmatter: name/description/tools/model）──
+    // ── Agents CRUD（~/.claude-desktop-bridge/agents/<name>.md，frontmatter: name/description/tools/model）──
     if (req.method === 'GET' && url.pathname === '/api/config/agents') {
-        const ad = join(CLAUDE_HOME, 'agents');
+        const ad = join(BRIDGE_HOME, 'agents');
         const r = [];
         const seen = new Set()
         try {
@@ -6733,7 +6779,7 @@ async function handleHttpRequest(req, res) {
     const agentM = url.pathname.match(/^\/api\/config\/agents\/(.+)$/)
     if (agentM) {
         const an = safeDecodeURIComponent(agentM[1]).replace(/\.md$/, '').replace(/[^a-zA-Z0-9_-]/g, '-')
-        const fp = join(CLAUDE_HOME, 'agents', an + '.md')
+        const fp = join(BRIDGE_HOME, 'agents', an + '.md')
         if (req.method === 'GET') {
             try {
                 const c = readFileSync(fp, 'utf8');
@@ -6783,7 +6829,7 @@ async function handleHttpRequest(req, res) {
         }
     }
     // ── POST /api/config/agents —— 创建新 Agent ──
-    // 功能说明: 在 ~/.claude/agents/ 下创建新的 .md 文件，名称自动 sanitize
+    // 功能说明: 在 ~/.claude-desktop-bridge/agents/ 下创建新的 .md 文件，名称自动 sanitize
     //   默认 frontmatter 模板: tools 留空 = 继承全部工具，model 默认 inherit
     // 关键数据流: POST {name, description?, tools?, model?} → writeFileSync → 201 {ok:true, name}
     if (req.method === 'POST' && url.pathname === '/api/config/agents') {
@@ -6795,7 +6841,7 @@ async function handleHttpRequest(req, res) {
                 res.end(JSON.stringify({error: 'name required'}));
                 return
             }
-            const ad = join(CLAUDE_HOME, 'agents');
+            const ad = join(BRIDGE_HOME, 'agents');
             if (!existsSync(ad)) mkdirSync(ad, {recursive: true})
             const fp = join(ad, n + '.md')
             if (existsSync(fp)) {
@@ -7327,10 +7373,11 @@ async function handleHttpRequest(req, res) {
         const notificationStatus = p => {
             const live = confirmHooks.find(h => h.platform === p)?.notificationStatus?.()
             if (live) return live
-            const platformFile = platformEntryFilePath(CLAUDE_HOME, 'bridge-notification-outbox', p)
+            if (bridgeStateDb?.available) return bridgeStateDb.summarizeEntries('outbox', p)
+            const platformFile = platformEntryFilePath(BRIDGE_HOME, 'bridge-notification-outbox', p)
             return existsSync(platformFile)
                 ? readNotificationSummary(platformFile, p)
-                : readNotificationSummary(join(CLAUDE_HOME, 'bridge-notification-outbox.json'), p)
+                : readNotificationSummary(join(BRIDGE_HOME, 'bridge-notification-outbox.json'), p)
         }
         const allBindings = listAdapterBindings(readAdapterBindings(), {
             allowedPlatforms: ADAPTER_PLATFORMS,
@@ -7541,7 +7588,7 @@ async function handleHttpRequest(req, res) {
         return
     }
     // ── DELETE /api/config/adapters/:id —— 删除适配器配置 ──
-    // 功能说明: 从 adapters.json 移除指定平台的凭据配置，同时清理 ~/.claude/channels/ 下的账号缓存目录
+    // 功能说明: 从 adapters.json 移除指定平台的凭据配置，同时清理 ~/.claude-desktop-bridge/channels/ 下的账号缓存目录
     // 关键数据流: DELETE → 移除 adapters.json[platform] + 清理 channels/ 目录 → 200 {ok:true}
     if (req.method === 'DELETE' && apm) {
         const pid = apm[1];
@@ -7555,7 +7602,7 @@ async function handleHttpRequest(req, res) {
             const cleaned = clearAdapterPlatformState(pid)
             // 同时清理 channels 目录下的账号缓存
             try {
-                const cd = join(CLAUDE_HOME, 'channels', pid);
+                const cd = join(BRIDGE_HOME, 'channels', pid);
                 if (existsSync(cd)) rmSync(cd, {recursive: true, force: true})
             } catch (error) {
                 log.warn({err: error, platform: pid}, '清理 IM 账号缓存失败')
@@ -7571,15 +7618,15 @@ async function handleHttpRequest(req, res) {
         return
     }
     // ── GET /api/config/mcp —— MCP 插件列表 ──
-    // 功能说明: 从 ~/.claude/plugins/installed_plugins.json 读取已安装的 MCP 插件信息
+    // 功能说明: 从 ~/.claude-desktop-bridge/plugins/installed_plugins.json 读取已安装的 MCP 插件信息
     // 关键数据流: GET → readJSON installed_plugins.json → 200 {plugins: [{name, version, scope, enabled}]}
     // ── GET /api/config/mcp —— MCP 插件列表 ──
     // 功能说明: 合并硬编码内置 MCP + installed_plugins.json 用户安装的插件
     // 关键数据流: BUILTIN_MCP 打底 → 叠加 installed_plugins.json → 200 {plugins}
     if (req.method === 'GET' && url.pathname === '/api/config/mcp') {
-        const s = readJSON(join(CLAUDE_HOME, 'settings.json')) || {}
+        const s = readJSON(join(BRIDGE_HOME, 'settings.json')) || {}
         const disabledList = s.disabledMcpPlugins || []
-        const pj = join(CLAUDE_HOME, 'plugins', 'installed_plugins.json')
+        const pj = join(BRIDGE_HOME, 'plugins', 'installed_plugins.json')
         const pm = new Map()
         for (const [k, v] of Object.entries(BUILTIN_MCP)) {
             pm.set(k, {name: k, version: v.version, scope: v.scope, enabled: !disabledList.includes(k), source: 'builtin'})
@@ -7701,7 +7748,7 @@ async function handleHttpRequest(req, res) {
                 if (Object.keys(headers).length) cfg.headers = headers
             }
             s.mcpServers[name] = cfg
-            writeJSON(join(CLAUDE_HOME, 'settings.json'), s)
+            writeJSON(join(BRIDGE_HOME, 'settings.json'), s)
             log.info({name, transport}, 'MCP 服务器已保存')
             res.writeHead(200)
             res.end(JSON.stringify({ok: true, name}))
@@ -7725,7 +7772,7 @@ async function handleHttpRequest(req, res) {
             const s = loadCliSettingsForUpdate()
             if (s.mcpServers) {
                 delete s.mcpServers[name]
-                writeJSON(join(CLAUDE_HOME, 'settings.json'), s)
+                writeJSON(join(BRIDGE_HOME, 'settings.json'), s)
             }
             log.info({name}, 'MCP 服务器已删除')
             res.writeHead(200)
@@ -7758,7 +7805,7 @@ async function handleHttpRequest(req, res) {
             ;
             if (!t) {
                 try {
-                    const a = readJSON(join(CLAUDE_HOME, 'channels', 'wechat', 'default', 'account.json'));
+                    const a = readJSON(join(BRIDGE_HOME, 'channels', 'wechat', 'default', 'account.json'));
                     t = a.token;
                     u = normalizeWeChatBaseUrl(a.baseUrl)
                 } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
@@ -7818,10 +7865,10 @@ async function handleHttpRequest(req, res) {
     // ── GET /api/config/memory-summary —— 项目记忆摘要 ──
     // 功能说明: 扫描所有项目的 memory/ 目录，返回每个项目的工作目录路径和记忆文件列表
     //   前端设置页 Memory 面板依赖此接口展示各项目的记忆文件
-    // 实现方式: 遍历 ~/.claude/projects/ → 读 memory/ 目录 → 从 .jsonl 解析真实 cwd
+    // 实现方式: 遍历 ~/.claude-desktop-bridge/projects/ → 读 memory/ 目录 → 从 .jsonl 解析真实 cwd
     // 关键数据流: GET → 遍历 projects/ → 200 {projects: [{workDir, fileCount, files}]}
     if (req.method === 'GET' && url.pathname === '/api/config/memory-summary') {
-        const bp = join(CLAUDE_HOME, 'projects');
+        const bp = join(BRIDGE_HOME, 'projects');
         const rs = [];
         try {
             for (const ed of readdirSync(bp)) {
@@ -7930,7 +7977,7 @@ async function handleHttpRequest(req, res) {
     }
 
     // ── GET /api/projects —— 扫描所有项目 ──
-    // 功能说明: 扫描 ~/.claude/projects/ 目录，返回所有项目的列表（含 session 摘要和最后活跃时间）
+    // 功能说明: 扫描 ~/.claude-desktop-bridge/projects/ 目录，返回所有项目的列表（含 session 摘要和最后活跃时间）
     //   去重按 workDir 合并多 session 的同一项目
     // 关键数据流: GET → scanProjects() → 200 {projects: [{workDir, sessionCount, sessions, lastActive}]}
     if (req.method === 'GET' && url.pathname === '/api/projects') {
@@ -7969,7 +8016,7 @@ async function handleHttpRequest(req, res) {
         if (identity && !adapterOwnsProject(identity, msm[1])) {
             res.writeHead(403); res.end(JSON.stringify({error: 'project ownership mismatch'})); return
         }
-        const location = findSessionTranscript({claudeHome: CLAUDE_HOME, encodedDir: msm[1], sessionId: msm[2]})
+        const location = findSessionTranscript({bridgeHome: BRIDGE_HOME, encodedDir: msm[1], sessionId: msm[2]})
         if (location.status === 'invalid') {
             res.writeHead(400); res.end(JSON.stringify({error: 'invalid project or session'})); return
         }
@@ -7999,65 +8046,93 @@ async function handleHttpRequest(req, res) {
     const projMemM = url.pathname.match(/^\/api\/projects\/([^/]+)\/memory$/);
     if (req.method === 'GET' && projMemM) {
         const ed = safeDecodeURIComponent(projMemM[1]);
-        const projectDir = safeBasename(join(CLAUDE_HOME, 'projects'), ed)
-        const md = projectDir ? safeChildPath(projectDir, 'memory', {allowNested: false}) : null
-        if (!md) {
-            res.writeHead(400)
-            res.end(JSON.stringify({error: 'invalid project path'}))
-            return
-        }
-        const files = [];
         try {
-            if (existsSync(md)) {
-                for (const f of readdirSync(md)) {
-                    if (!f.endsWith('.md')) continue;
-                    const content = readFileSync(join(md, f), 'utf8');
-                    files.push({filename: f, content, size: Buffer.byteLength(content)});
-                }
-            }
-        } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
-        res.writeHead(200);
-        res.end(JSON.stringify({files}));
+            const result = listProjectMemory({
+                bridgeHome: BRIDGE_HOME,
+                encodedDir: ed,
+                workDir: decodeProjectName(ed) || ed,
+                memoryService,
+                query: url.searchParams.get('q') || '',
+            })
+            res.writeHead(200)
+            res.end(JSON.stringify(result))
+        } catch (error) {
+            log.warn({err: error, encodedDir: ed}, '读取项目 Memory 失败')
+            res.writeHead(error.statusCode || 500)
+            res.end(JSON.stringify({error: error.message, code: error.code || 'MEMORY_LIST_FAILED'}))
+        }
         return
     }
-    // ── PUT/DELETE /api/projects/:encodedDir/memory/:filename —— 创建/编辑/删除 memory 文件 ──
+    const projMemRebuildM = url.pathname.match(/^\/api\/projects\/([^/]+)\/memory\/rebuild$/)
+    if (req.method === 'POST' && projMemRebuildM) {
+        const ed = safeDecodeURIComponent(projMemRebuildM[1])
+        try {
+            const result = rebuildProjectMemory({
+                workDir: decodeProjectName(ed) || ed,
+                encodedDir: ed,
+                memoryService,
+            })
+            res.writeHead(200)
+            res.end(JSON.stringify({ok: true, ...result}))
+        } catch (error) {
+            res.writeHead(error.statusCode || 500)
+            res.end(JSON.stringify({error: error.message, code: error.code || 'MEMORY_REBUILD_FAILED'}))
+        }
+        return
+    }
+    const projMemStatusM = url.pathname.match(/^\/api\/projects\/([^/]+)\/memory\/([^/]+)\/status$/)
+    if (req.method === 'PUT' && projMemStatusM) {
+        const ed = safeDecodeURIComponent(projMemStatusM[1])
+        const fn = safeDecodeURIComponent(projMemStatusM[2])
+        const body = await readBody(req)
+        try {
+            const result = setProjectMemoryEnabled({encodedDir: ed, filename: fn, enabled: body.enabled, memoryService})
+            res.writeHead(200)
+            res.end(JSON.stringify({ok: true, ...result}))
+        } catch (error) {
+            res.writeHead(error.statusCode || 500)
+            res.end(JSON.stringify({error: error.message, code: error.code || 'MEMORY_STATUS_FAILED'}))
+        }
+        return
+    }
+    // ── PUT/DELETE /api/projects/:encodedDir/memory/:filename —— 创建、编辑或删除 Memory 文件 ──
     const projMemFileM = url.pathname.match(/^\/api\/projects\/([^/]+)\/memory\/([^/]+)$/);
     if (req.method === 'PUT' && projMemFileM) {
         const ed = safeDecodeURIComponent(projMemFileM[1]);
         const fn = safeDecodeURIComponent(projMemFileM[2]);
         const body = await readBody(req);
-        const projectDir = safeBasename(join(CLAUDE_HOME, 'projects'), ed)
-        const md = projectDir ? safeChildPath(projectDir, 'memory', {allowNested: false}) : null
-        const fp = md ? safeBasename(md, fn, {extensions: ['.md']}) : null
-        if (!md || !fp) {
-            res.writeHead(400)
-            res.end(JSON.stringify({error: 'invalid memory path'}))
-            return
+        try {
+            const result = saveProjectMemory({
+                bridgeHome: BRIDGE_HOME,
+                encodedDir: ed,
+                workDir: decodeProjectName(ed) || ed,
+                filename: fn,
+                content: body.content,
+                memoryService,
+            })
+            res.writeHead(200)
+            res.end(JSON.stringify({ok: true, ...result}))
+        } catch (error) {
+            res.writeHead(error.statusCode || 500)
+            res.end(JSON.stringify({error: error.message, code: error.code || 'MEMORY_SAVE_FAILED'}))
         }
-        try { mkdirSync(md, {recursive: true}); } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
-        writeFileSync(fp, body.content || '', 'utf8');
-        res.writeHead(200);
-        res.end(JSON.stringify({ok: true}));
         return
     }
     if (req.method === 'DELETE' && projMemFileM) {
         const ed = safeDecodeURIComponent(projMemFileM[1]);
         const fn = safeDecodeURIComponent(projMemFileM[2]);
-        const projectDir = safeBasename(join(CLAUDE_HOME, 'projects'), ed)
-        const md = projectDir ? safeChildPath(projectDir, 'memory', {allowNested: false}) : null
-        const fp = md ? safeBasename(md, fn, {extensions: ['.md']}) : null
-        if (!fp) {
-            res.writeHead(400)
-            res.end(JSON.stringify({error: 'invalid memory path'}))
-            return
+        try {
+            const result = deleteProjectMemory({bridgeHome: BRIDGE_HOME, encodedDir: ed, filename: fn, memoryService})
+            res.writeHead(200)
+            res.end(JSON.stringify({ok: true, ...result}))
+        } catch (error) {
+            res.writeHead(error.statusCode || 500)
+            res.end(JSON.stringify({error: error.message, code: error.code || 'MEMORY_DELETE_FAILED'}))
         }
-        try { unlinkSync(fp); } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
-        res.writeHead(200);
-        res.end(JSON.stringify({ok: true}));
         return
     }
 
-    // ── Workflow 脚本 CRUD ( ~/.claude/workflows/*.mjs ) ──
+    // ── Workflow 脚本 CRUD ( ~/.claude-desktop-bridge/workflows/*.mjs ) ──
     // GET  /api/workflows          → 列出所有脚本
     // GET  /api/workflows/:name    → 读取脚本内容
     // PUT  /api/workflows/:name    → 保存脚本
@@ -8978,6 +9053,7 @@ async function shutdownGateway(reason, exitCode = 0) {
         const closing = stopCodexRelayProxy()
         if (closing && typeof closing.then === 'function') closers.push(closing)
     } catch (error) { log.debug({err: error}, '关闭 Codex Relay proxy 失败') }
+    try { bridgeStateDb?.close() } catch (error) { log.warn({err: error}, '关闭 SQLite 状态库失败') }
     const serverClosed = new Promise(resolve => {
         if (!httpServer.listening) { resolve(); return }
         httpServer.close(() => resolve())
@@ -9052,6 +9128,25 @@ async function initializeSecurePayloadKey() {
 }
 
 async function bootGateway() {
+    const migration = prepareBridgeHome({bridgeHome: BRIDGE_HOME})
+    log.info({
+        bridgeHome: BRIDGE_HOME,
+        migrated: migration.copied?.length || 0,
+        skipped: migration.skipped?.length || 0,
+        alreadyComplete: migration.alreadyComplete,
+    }, 'Bridge 私有配置目录已准备')
+    bridgeStateDb = createBridgeStateDb({bridgeHome: BRIDGE_HOME, logger: log})
+    if (bridgeStateDb.degraded) {
+        log.warn({
+            path: bridgeStateDb.path,
+            code: bridgeStateDb.error?.code || 'STATE_STORE_UNAVAILABLE',
+            degradedReason: bridgeStateDb.degradedReason,
+            quarantinePaths: bridgeStateDb.quarantinePaths,
+        }, 'SQLite 状态库不可用，将使用旧文件持久化')
+    } else {
+        log.info({path: bridgeStateDb.path, driver: bridgeStateDb.driver, schemaVersion: bridgeStateDb.schemaVersion}, 'SQLite 状态库已启用')
+    }
+    memoryService = createMemoryService({bridgeHome: BRIDGE_HOME, stateStore: bridgeStateDb, logger: log})
     const injected = await initializeSecurePayloadKey()
     if (typeof process.send === 'function' && !injected) {
         log.warn('未收到 Electron 安全存储密钥，将使用受限权限本地密钥')
@@ -9062,7 +9157,7 @@ async function bootGateway() {
         adapterConfigReadError = String(error?.message || error)
         log.error({err: error}, 'IM 凭据加密迁移失败，适配器将保持停止')
     }
-    // Hook 启动检查只读，不修改用户全局配置。
+    // Hook 启动检查只读，不修改 Bridge 私有配置。
     validateHooks()
     httpServer.on('error', error => {
         log.fatal({err: error, port: PORT}, 'Gateway 监听失败')
@@ -9110,7 +9205,7 @@ function readFileHeadLines(path, maxBytes = 4096) {
 // 启动时清理幽灵目录: {sessionId}/subagents/ 无对应主 .jsonl 的孤儿残留
 // 来源: SDK Task tool 子 agent transcript 在主 session 被删除后残留 / Gateway 崩溃未完成清理
 function cleanupOrphanSessionDirs() {
-    const projectsDir = join(CLAUDE_HOME, 'projects')
+    const projectsDir = join(BRIDGE_HOME, 'projects')
     let cleaned = 0
     try {
         for (const projectEntry of readdirSync(projectsDir)) {
@@ -9164,7 +9259,7 @@ let _scanningProjects = null
 // 2) 扫描与 DELETE 并发：扫描完成写回缓存时 DELETE 还未执行到 invalidate
 // 3) 缓存命中：返回缓存结果时其中包含已删除的会话（缓存 10s 内的旧快照）
 // 持久化到 bridge-deleted-sessions.json，Gateway 重启不丢失删除标记
-const DELETED_SESSIONS_FILE = join(CLAUDE_HOME, 'bridge-deleted-sessions.json')
+const DELETED_SESSIONS_FILE = join(BRIDGE_HOME, 'bridge-deleted-sessions.json')
 const _deletedSessionIds = new Map()
 
 // 启动时从磁盘恢复删除标记
@@ -9238,7 +9333,7 @@ async function scanProjects() {
     if (_scanningProjects) return _scanningProjects.then(filterDeletedSessions)
     _scanningProjects = (async () => {
 
-    const base = join(CLAUDE_HOME, 'projects');
+    const base = join(BRIDGE_HOME, 'projects');
     const results = []
     try {
         for (const name of readdirSync(base)) {
@@ -9337,7 +9432,7 @@ async function removeSessionArtifact(path, {recursive = false} = {}) {
 }
 
 async function deleteSessionFiles(sessionId, relatedSessionIds = []) {
-    const projectsDir = join(CLAUDE_HOME, 'projects')
+    const projectsDir = join(BRIDGE_HOME, 'projects')
     let entries
     try {
         entries = readdirSync(projectsDir)
@@ -9387,6 +9482,7 @@ async function deleteSessionFiles(sessionId, relatedSessionIds = []) {
                     log.warn({err: error, sessionId: targetId?.slice(0, 8), path}, '清理 Session 残留失败')
                 }
             }
+            bridgeStateDb?.removeSessionIndex?.(transcriptPath)
         }
     }
 
@@ -9501,7 +9597,7 @@ function loadProjectVisibilityWithMigration(projectDir, workDir) {
 }
 
 async function listProjectSessions(ed) {
-    const base = join(CLAUDE_HOME, 'projects', ed);
+    const base = join(BRIDGE_HOME, 'projects', ed);
     const workDir = resolveTranscriptProjectWorkDir(base, ed)
     const visibility = loadProjectVisibilityWithMigration(base, workDir)
     const r = []
@@ -9895,7 +9991,7 @@ function diffSnapshotVsCurrent(snapshot, currentFiles, workDir) {
 //   会创建新 .jsonl → scanProjects 看到两个文件 → "一个会话变两个"
 // SIDE_EFFECT: 读写 bridge-session-map.json
 function sessionMapPath(workDir) {
-    return join(CLAUDE_HOME, 'projects', encodeProjectName(workDir), 'bridge-session-map.json')
+    return join(BRIDGE_HOME, 'projects', encodeProjectName(workDir), 'bridge-session-map.json')
 }
 
 function loadSessionMap(workDir) {
@@ -9914,7 +10010,7 @@ function saveSessionMap(workDir, map) {
 }
 
 function sessionVisibilityStorePath(workDir) {
-    return join(CLAUDE_HOME, 'projects', encodeProjectName(workDir), 'bridge-session-visibility.json')
+    return join(BRIDGE_HOME, 'projects', encodeProjectName(workDir), 'bridge-session-visibility.json')
 }
 
 function saveSessionVisibility(workDir, state) {
@@ -9944,7 +10040,7 @@ function removeVisibleSession(workDir, gatewaySessionId, sdkSessionId) {
 }
 
 function removeVisibleSessionEverywhere(gatewaySessionId, sdkSessionId = null) {
-    const projectsDir = join(CLAUDE_HOME, 'projects')
+    const projectsDir = join(BRIDGE_HOME, 'projects')
     try {
         for (const encodedDir of readdirSync(projectsDir)) {
             const projectDir = join(projectsDir, encodedDir)
@@ -9998,7 +10094,7 @@ function lookupGatewaySessionId(workDir, sdkSessionId) {
 // 兜底搜索：path 编码不一致时，跨所有项目目录查找指定 .jsonl
 //   验证其 cwd 与给定 workDir 匹配（规范化后忽略大小写），返回 true 表示找到
 function findSessionJsonl(sessionId, workDir) {
-    const projectsDir = join(CLAUDE_HOME, 'projects')
+    const projectsDir = join(BRIDGE_HOME, 'projects')
     const targetFile = sessionId + '.jsonl'
     const normWd = normalizeWorkDir(workDir).toLowerCase()
     try {
@@ -10028,7 +10124,7 @@ function findSessionJsonl(sessionId, workDir) {
 // ── 基线快照持久化（让文件面板「仅改动」在重启/resume 后仍以会话起始为基线）──
 // SIDE_EFFECT: 读写 bridge-snapshot/<sessionId>.json
 function snapshotStorePath(workDir, sessionId) {
-    return join(CLAUDE_HOME, 'projects', encodeProjectName(workDir), 'bridge-snapshot', sessionId + '.json')
+    return join(BRIDGE_HOME, 'projects', encodeProjectName(workDir), 'bridge-snapshot', sessionId + '.json')
 }
 
 function saveSnapshot(s, sessionId) {
@@ -10056,9 +10152,9 @@ function loadSnapshot(workDir, sessionId) {
     return {takenAt: d.takenAt, truncated: !!d.truncated, gitHead: d.gitHead || undefined, files: new Map(d.files)}
 }
 
-// 记录点落盘路径：~/.claude/projects/<encoded>/bridge-checkpoints/<sessionId>.json
+// 记录点落盘路径：~/.claude-desktop-bridge/projects/<encoded>/bridge-checkpoints/<sessionId>.json
 function checkpointStorePath(workDir, sessionId) {
-    return join(CLAUDE_HOME, 'projects', encodeProjectName(workDir), 'bridge-checkpoints', sessionId + '.json')
+    return join(BRIDGE_HOME, 'projects', encodeProjectName(workDir), 'bridge-checkpoints', sessionId + '.json')
 }
 
 // 从磁盘载入历史记录点（resume 续接用）；失败返回空数组

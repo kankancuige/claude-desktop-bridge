@@ -3,6 +3,13 @@ export const BRIDGE_PROVIDER_ENV_KEYS = Object.freeze([
     'ANTHROPIC_AUTH_TOKEN',
     'ANTHROPIC_API_KEY',
     'ANTHROPIC_MODEL',
+    'ANTHROPIC_DEFAULT_OPUS_MODEL',
+    'ANTHROPIC_DEFAULT_OPUS_MODEL_NAME',
+    'ANTHROPIC_DEFAULT_SONNET_MODEL',
+    'ANTHROPIC_DEFAULT_SONNET_MODEL_NAME',
+    'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+    'ANTHROPIC_SMALL_FAST_MODEL',
+    'CLAUDE_CODE_OAUTH_TOKEN',
 ])
 
 function stringValue(value) {
@@ -50,4 +57,17 @@ export function extractBridgeProviderSettings(settings, existing = null) {
         source.env.ANTHROPIC_AUTH_TOKEN = previous.env.ANTHROPIC_AUTH_TOKEN
     }
     return source
+}
+
+export function stripBridgeProviderSettings(settings) {
+    const result = {...(settings && typeof settings === 'object' && !Array.isArray(settings) ? settings : {})}
+    delete result.model
+    if (result.env && typeof result.env === 'object' && !Array.isArray(result.env)) {
+        result.env = {...result.env}
+        for (const key of BRIDGE_PROVIDER_ENV_KEYS) delete result.env[key]
+        if (Object.keys(result.env).length === 0) delete result.env
+    } else {
+        delete result.env
+    }
+    return result
 }
