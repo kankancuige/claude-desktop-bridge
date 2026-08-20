@@ -40,6 +40,7 @@ const deliveryStarted = new Promise(resolve => { markDeliveryStarted = resolve }
 let markDeliveryFinished
 const deliveryFinished = new Promise(resolve => { markDeliveryFinished = resolve })
 const workerTransitions = []
+const workerStateChanges = []
 const workerOutbox = {
     due: () => [{id: 'n2', payload: {text: 'in-flight'}}],
     complete: id => workerTransitions.push(`complete:${id}`),
@@ -54,6 +55,7 @@ const worker = startNotificationWorker({
         markDeliveryFinished()
         return true
     },
+    onStateChange: event => workerStateChanges.push(event),
     intervalMs: 60_000,
 })
 await deliveryStarted
@@ -62,4 +64,20 @@ releaseDelivery()
 await deliveryFinished
 await new Promise(resolve => setTimeout(resolve, 0))
 assert.deepEqual(workerTransitions, [])
+
+const completedWorker = startNotificationWorker({
+    outbox: {
+        due: () => [{id: 'task-1:task_completed:part:1', payload: {text: 'done'}}],
+        complete: () => true,
+        fail: () => true,
+        summary: () => ({}),
+    },
+    deliver: async () => true,
+    onStateChange: event => workerStateChanges.push(event),
+    intervalMs: 60_000,
+})
+await completedWorker.flush()
+completedWorker.stop()
+assert.equal(workerStateChanges.at(-1).state, 'sent')
+assert.equal(workerStateChanges.at(-1).notificationId, 'task-1:task_completed')
 console.log('notification-worker tests passed')

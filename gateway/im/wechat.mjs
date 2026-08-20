@@ -51,7 +51,7 @@ const POLL_TIMEOUT = 35000                        // 长轮询超时(毫秒)，�
 // 实现方式: 使用闭包保存内部状态(onConfirmRequest/onConfirmResolved/findUserForSession/sendToUser)，
 //          返回镜像钩子供 Gateway 调用。
 // 关键数据流: adapters.json 加载 token → 生成配对码 → 启动 poll() → 返回钩子对象
-export function startWeChatAdapter(token, {taskCommands, stateStore = null} = {}) {
+export function startWeChatAdapter(token, {taskCommands, stateStore = null, onNotificationStateChange = null} = {}) {
     let botToken, baseUrl
     let stopped = false
     let activePollController = null
@@ -548,7 +548,12 @@ export function startWeChatAdapter(token, {taskCommands, stateStore = null} = {}
         return sendMsg(payload.userId, payload.contextToken || '', payload.text)
     }
 
-    const notificationWorker = startNotificationWorker({outbox, deliver: deliverNotification, log})
+    const notificationWorker = startNotificationWorker({
+        outbox,
+        deliver: deliverNotification,
+        log,
+        onStateChange: event => onNotificationStateChange?.({...event, platform: 'wechat'}),
+    })
 
     async function sendReliableText(userId, contextToken, text, notificationId = null) {
         if (stopped) return {sent: false, queued: false, error: 'adapter_stopped'}

@@ -63,7 +63,7 @@ const GW = () => gatewayHttpBase()              // Gateway 本地 HTTP 地址
 //          返回 null 表示凭据加载失败，适配器无法启动。
 // 关键数据流: adapters.json 加载凭据 → 获取 access_token → 创建 DWClient → 注册回调
 //          → connect() → 返回钩子对象
-export function startDingTalkAdapter(token, {taskCommands, stateStore = null} = {}) {
+export function startDingTalkAdapter(token, {taskCommands, stateStore = null, onNotificationStateChange = null} = {}) {
     let appKey, appSecret
     let stopped = false
     let connectionError = null
@@ -390,6 +390,7 @@ export function startDingTalkAdapter(token, {taskCommands, stateStore = null} = 
         outbox,
         deliver: payload => sendMsg(payload.userId, payload.text),
         log,
+        onStateChange: event => onNotificationStateChange?.({...event, platform: 'dingtalk'}),
     })
 
     async function sendReliableText(userId, text, notificationId = null) {

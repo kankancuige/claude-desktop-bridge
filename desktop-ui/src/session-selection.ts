@@ -32,6 +32,38 @@ export function classifySessionExistsResponse(ok: boolean, status: number): 'exi
   return 'unavailable'
 }
 
+export type SessionRuntimeRecoveryDecision =
+  | {kind: 'reuse'; sessionId: string}
+  | {kind: 'recreate'}
+  | {kind: 'reset'}
+  | {kind: 'unavailable'; reason: string}
+
+/** 将 HTTP、Gateway runtime 和 SDK history 三种身份统一为一个恢复决策。 */
+export function decideSessionRuntimeRecovery({
+  ok,
+  status,
+  response,
+  historySessionId,
+  fallbackSessionId,
+}: {
+  ok: boolean
+  status: number
+  response: any
+  historySessionId?: string | null
+  fallbackSessionId?: string | null
+}): SessionRuntimeRecoveryDecision {
+  const hasHistory = !!String(historySessionId || '').trim()
+  const existsStatus = classifySessionExistsResponse(ok, status)
+  if (existsStatus === 'missing') return {kind: hasHistory ? 'recreate' : 'reset'}
+  if (existsStatus === 'unavailable') return {kind: 'unavailable', reason: `HTTP ${status}`}
+  if (response?.exists !== true) return {kind: 'unavailable', reason: 'Gateway 返回了无效的会话状态'}
+  if (!runtimeSessionMatchesHistory(historySessionId, response?.historySessionId)) {
+    return {kind: hasHistory ? 'recreate' : 'reset'}
+  }
+  const sessionId = resolveExistingSessionTarget(response, fallbackSessionId)
+  return sessionId ? {kind: 'reuse', sessionId} : {kind: 'unavailable', reason: 'Gateway 未返回运行会话 ID'}
+}
+
 function normalizeProjectPath(value: string | null | undefined): string {
   return String(value || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
 }

@@ -29,6 +29,7 @@ import {isUserSessionSource, loadSessionVisibility, markSessionVisible, migrateL
 import {initialSessionIdentity, resolveSessionCreateMode} from './sessions/session-create-mode.mjs'
 import {createSessionRuntime} from './sessions/session-runtime.mjs'
 import {getPersistedMirrors, mirrorSessionIds, mirrorStorePath, removePersistedMirrors, setPersistedMirror, setPersistedMirrors} from './sessions/session-mirror-state.mjs'
+import {reconcileSessionCatalog} from './sessions/session-catalog.mjs'
 import {buildProjectContinuationContext, composeContinuationPrompt} from './projects/project-continuation-context.mjs'
 import {buildAgentDescriptor, buildAgentToolLifecycleEvent} from './agents/agent-tool-lifecycle.mjs'
 import {startWeChatAdapter} from './im/wechat.mjs'
@@ -140,12 +141,19 @@ import {
 let _proxyStarting = null
 // 同一项目只允许一个后台索引任务，避免连续新建会话重复扫描同一目录。
 const projectCacheBuilds = new Map()
+const PROJECT_CACHE_IDLE_DELAY_MS = 1500
 
 function scheduleProjectCacheBuild(workDir) {
     const projectCachePath = cacheFilePath(workDir)
     if (!projectCachePath || existsSync(projectCachePath) || projectCacheBuilds.has(workDir)) return
 
-    const job = new Promise(resolve => setImmediate(resolve))
+    // 新会话响应后优先让出事件循环给 WebSocket 握手、首条消息和 IM 聚焦。
+    // project-cache 会扫描并解析整个项目，虽然内部会分批让出事件循环，首次同步扫描仍可能阻塞数秒；
+    // 延迟到连接稳定后再启动，避免点击“新增会话”时 UI 长时间停留在 loading。
+    const job = new Promise(resolve => {
+        const timer = setTimeout(resolve, PROJECT_CACHE_IDLE_DELAY_MS)
+        timer.unref?.()
+    })
         .then(() => buildProjectCache(workDir))
         .then(cache => {
             if (cache) saveProjectCache(workDir, cache)
@@ -590,11 +598,77 @@ function sessionMirrorIds(session, sessionId = null) {
         session?.taskState?.historySessionId, session?.queryOpts?.resume)
 }
 
+function sessionCatalogProjectKey(workDir) {
+    return encodeProjectName(normalizeWorkDir(workDir))
+}
+
+function sessionCatalogIds(session, sessionId = null) {
+    return sessionMirrorIds(session, sessionId)
+}
+
+function ensureSessionCatalogIdentity(workDir, gatewaySessionId, sdkSessionId, source = 'desktop') {
+    if (!bridgeStateDb?.available || !workDir || !sdkSessionId) return false
+    try {
+        const projectKey = sessionCatalogProjectKey(workDir)
+        const projectDir = join(BRIDGE_HOME, 'projects', projectKey)
+        const transcriptPath = join(projectDir, `${sdkSessionId}.jsonl`)
+        const stat = existsSync(transcriptPath) ? statSync(transcriptPath) : null
+        if (!stat?.isFile()) return false
+        bridgeStateDb.upsertSessionCatalog({
+            projectKey,
+            sessionId: sdkSessionId,
+            sdkSessionId,
+            workDir,
+            source: isUserSessionSource(source) ? source : 'desktop',
+            visibility: 'visible',
+            transcriptPath,
+            mtime: stat?.mtimeMs || 0,
+            size: stat?.size || 0,
+            title: sdkSessionId.slice(0, 8),
+        })
+        return true
+    } catch (error) {
+        log.warn({err: error, workDir, sessionId: sdkSessionId?.slice?.(0, 8)}, 'Session SQLite 身份索引保存失败')
+        return false
+    }
+}
+
+function readSessionCatalogSettings(session, sessionId = null) {
+    if (!bridgeStateDb?.available || !session?.workDir) return null
+    const projectKey = sessionCatalogProjectKey(session.workDir)
+    for (const id of sessionCatalogIds(session, sessionId)) {
+        const row = bridgeStateDb.getSessionCatalog(projectKey, id)
+        if (row) return row
+    }
+    return null
+}
+
+function persistSessionCatalogSettings(session, sessionId = null, patch = {}) {
+    if (!bridgeStateDb?.available || !session?.workDir) return false
+    try {
+        const ids = sessionCatalogIds(session, sessionId)
+        const projectKey = sessionCatalogProjectKey(session.workDir)
+        const existing = ids.some(id => bridgeStateDb.getSessionCatalog(projectKey, id))
+        if (!existing && ids.length > 0) {
+            ensureSessionCatalogIdentity(session.workDir, sessionId || ids[0], session.lastSessionId || session.taskState?.sdkSessionId || session.queryOpts?.resume || sessionId || ids[0], session.visibleSource || 'desktop')
+        }
+        return bridgeStateDb.updateSessionSettingsByIds(
+            projectKey,
+            ids,
+            patch,
+        )
+    } catch (error) {
+        log.warn({err: error, sessionId: sessionId?.slice?.(0, 8)}, 'Session SQLite 设置索引保存失败')
+        return false
+    }
+}
+
 function restoreSessionMirrors(session, sessionId = null) {
     if (!session?.workDir) return false
     try {
         const path = sessionMirrorStorePath(session.workDir)
-        session.mirrors = getPersistedMirrors(readJSON(path), sessionMirrorIds(session, sessionId))
+        const catalog = readSessionCatalogSettings(session, sessionId)
+        session.mirrors = catalog?.mirrors || getPersistedMirrors(readJSON(path), sessionMirrorIds(session, sessionId))
         return true
     } catch (error) {
         log.warn({err: error, sessionId: sessionId?.slice?.(0, 8)}, 'Session 镜像状态恢复失败')
@@ -611,6 +685,7 @@ function persistSessionMirrors(session, sessionId = null, platform = null, enabl
         let next = readJSON(path)
         next = platform ? setPersistedMirror(next, ids, platform, enabled === true) : setPersistedMirrors(next, ids, session.mirrors)
         writeJSON(path, next)
+        persistSessionCatalogSettings(session, sessionId, {mirrors: session.mirrors})
         return true
     } catch (error) {
         log.warn({err: error, workDir: session.workDir, sessionId: sessionId?.slice?.(0, 8)}, 'Session 镜像状态保存失败')
@@ -674,8 +749,64 @@ function saveTaskState(session, sessionId) {
 
 function loadTaskState(workDir, sessionId) {
     const path = taskStateStorePath(workDir, sessionId)
-    const raw = path ? readJSON(path) : null
-    return raw ? recoverTaskState(raw) : null
+    const fileState = path ? readJSON(path) : null
+    if (bridgeStateDb?.available && workDir && sessionId) {
+        try {
+            const projected = bridgeStateDb.getTaskState(sessionCatalogProjectKey(workDir), sessionId)
+            if (projected?.state && typeof projected.state === 'object' && projected.state.status) {
+                return recoverTaskState({
+                    ...(fileState && typeof fileState === 'object' ? fileState : {}),
+                    ...projected.state,
+                    // SQLite 不复制正文；兼容快照只补充用户可见内容和审查详情，不能覆盖权威状态。
+                    detail: fileState?.detail || '',
+                    finalReplyText: fileState?.finalReplyText || '',
+                    finalReplyAvailable: fileState?.finalReplyAvailable === true || Boolean(fileState?.finalReplyText),
+                    review: {
+                        ...(fileState?.review && typeof fileState.review === 'object' ? fileState.review : {}),
+                        ...(projected.state.review && typeof projected.state.review === 'object' ? projected.state.review : {}),
+                    },
+                })
+            }
+        } catch (error) {
+            log.warn({err: error, workDir, sessionId: sessionId?.slice?.(0, 8)}, 'SQLite task-state 投影读取失败，回退文件')
+        }
+    }
+    return fileState ? recoverTaskState(fileState) : null
+}
+
+function persistTaskStateProjection(session, sessionId, state, eventType = 'task/state-changed') {
+    if (!bridgeStateDb?.available || !session?.workDir || !state) return false
+    try {
+        const projectKey = sessionCatalogProjectKey(session.workDir)
+        const taskKey = state.taskId || state.sdkSessionId || state.historySessionId || sessionId
+        const revision = Math.max(1, Number(session._taskStateRevision || 0), Number(state.updatedAt || 0))
+        session._taskStateRevision = revision
+        return bridgeStateDb.recordTaskTransition({
+            projectKey,
+            taskKey,
+            sessionId,
+            taskId: state.taskId,
+            sdkSessionId: state.sdkSessionId || state.historySessionId,
+            status: state.status,
+            outcome: state.outcome,
+            continuationReason: state.continuationReason,
+            phase: state.status,
+            reviewState: state.review?.tier || null,
+            modelTier: session.modelTier || session.modelMode || null,
+            errorCode: state.continuationReason === 'execution_error' ? 'EXECUTION_ERROR' : null,
+            sequence: state.sequence,
+            revision,
+            startedAt: state.startedAt,
+            completedAt: state.completedAt,
+            updatedAt: state.updatedAt,
+            notifications: state.notifications,
+            state,
+            eventType,
+        })
+    } catch (error) {
+        log.warn({err: error, sessionId: sessionId?.slice?.(0, 8)}, 'SQLite task-state 投影保存失败，保留文件事实源')
+        return false
+    }
 }
 
 function updateTaskState(session, sessionId, next) {
@@ -687,6 +818,9 @@ function updateTaskState(session, sessionId, next) {
     })
     saveTaskState(session, sessionId)
     appendSessionEvent(session, 'task/state-changed', {taskState: journalTaskState(session.taskState)})
+    // SQLite 只保存结构化投影；旧 JSON 与 Event Journal 仍作为兼容事实源继续双写。
+    session._taskStateRevision = Math.max(Number(session._taskStateRevision || 0) + 1, Number(session.taskState.updatedAt || 0))
+    persistTaskStateProjection(session, sessionId, session.taskState)
     return session.taskState
 }
 
@@ -730,7 +864,10 @@ function updateTaskNotificationState(session, sessionId, platform, state, notifi
     if (!session || !platform) return
     const notifications = {...(session.taskState?.notifications || {})}
     notifications[platform] = {state, notificationId: String(notificationId || ''), lastError: String(lastError || ''), updatedAt: Date.now()}
-    updateTaskState(session, sessionId, taskStateFromCompletion({...session, taskState: {...session.taskState, notifications}}))
+    const nextState = session.taskState
+        ? createTaskStatePatch({...session.taskState, notifications, updatedAt: Date.now()})
+        : taskStateFromCompletion({...session, taskState: {notifications}})
+    updateTaskState(session, sessionId, nextState)
     broadcastTaskLifecycle(sessionId)
 }
 
@@ -738,7 +875,25 @@ function updateTaskCompletion(session, sessionId, event) {
     const transition = transitionTaskCompletion(session?.taskCompletion, event)
     if (!session) return transition
     session.taskCompletion = transition.state
-    updateTaskState(session, sessionId, taskStateFromCompletion(session))
+    const nextState = taskStateFromCompletion(session)
+    const terminalEffect = transition.effects.find(effect => ['complete', 'fail', 'pause'].includes(effect?.type))
+    if (terminalEffect) {
+        const eventType = terminalEffect.type === 'complete'
+            ? 'task_completed'
+            : terminalEffect.type === 'pause' ? 'task_review_paused' : 'task_failed'
+        const taskId = session.taskCompletionTaskId || sessionId
+        const notificationId = `${taskId}:${eventType}`
+        const turnIdentity = session.taskCompletionIdentity || session.activeTurnIdentity || null
+        const notifications = {...(nextState.notifications || {})}
+        for (const [platform, enabled] of Object.entries(session.mirrors || {})) {
+            if (!enabled || !['wechat', 'feishu', 'dingtalk'].includes(platform) || !shouldRouteMirror(platform, turnIdentity)) continue
+            notifications[platform] = {
+                state: 'pending', notificationId, lastError: '', updatedAt: Date.now(),
+            }
+        }
+        nextState.notifications = notifications
+    }
+    updateTaskState(session, sessionId, nextState)
     return transition
 }
 
@@ -1070,6 +1225,70 @@ function getAdapterHook(platform) {
     return confirmHooks.find(hook => hook.platform === platform) || null
 }
 
+function notificationTaskId(notificationId) {
+    const match = String(notificationId || '').match(/^(.*):(task_completed|task_failed|task_review_paused)$/)
+    return match?.[1] || ''
+}
+
+function handleNotificationStateChange({platform, notificationId, state, lastError = ''} = {}) {
+    const taskId = notificationTaskId(notificationId)
+    if (!platform || !taskId) return false
+    const updatedAt = Date.now()
+    for (const [sessionId, session] of sessions) {
+        if (session?.taskCompletionTaskId !== taskId && session?.taskState?.taskId !== taskId) continue
+        updateTaskNotificationState(session, sessionId, platform, state, notificationId, lastError)
+        return true
+    }
+    try {
+        return bridgeStateDb?.updateTaskNotification?.({
+            taskId, platform, notificationId, state, lastError, updatedAt,
+        }) === true
+    } catch (error) {
+        log.warn({err: error, platform, notificationId}, '通知状态回写 SQLite 任务投影失败')
+        return false
+    }
+}
+
+async function reconcilePersistedNotificationIntents(platform) {
+    const hook = getAdapterHook(platform)
+    if (!hook || !bridgeStateDb?.available) return 0
+    let restored = 0
+    for (const task of bridgeStateDb.listTaskNotificationIntents(platform, {limit: 200})) {
+        const intent = task.notifications?.[platform]
+        if (!intent?.notificationId || hook.notificationState?.(intent.notificationId)) continue
+        const catalog = [task.sdkSessionId, task.sessionId]
+            .filter(Boolean)
+            .map(id => bridgeStateDb.getSessionCatalog(task.projectKey, id))
+            .find(Boolean)
+        if (!catalog?.workDir || !task.sessionId) continue
+        const persisted = loadTaskState(catalog.workDir, task.sdkSessionId || task.sessionId)
+            || loadTaskState(catalog.workDir, task.sessionId)
+        const text = buildIncompleteMirrorText(persisted?.finalReplyText || persisted?.detail, {
+            outcome: task.status === 'succeeded' ? 'succeeded'
+                : ['incomplete', 'review_paused'].includes(task.status) ? 'incomplete' : 'failed',
+            continuationReason: task.continuationReason || null,
+        })
+        if (!text) continue
+        try {
+            const result = await hook.sendToUser(task.sessionId, text, null, intent.notificationId)
+            const next = result === true || result?.sent === true
+                ? {state: 'sent', lastError: ''}
+                : result?.queued === true
+                    ? {state: 'pending', lastError: result.error || 'queued_for_retry'}
+                    : {state: 'failed', lastError: result?.error || 'send_failed'}
+            handleNotificationStateChange({platform, notificationId: intent.notificationId, ...next})
+            restored++
+        } catch (error) {
+            handleNotificationStateChange({
+                platform, notificationId: intent.notificationId,
+                state: 'failed', lastError: error?.message || error,
+            })
+            log.warn({err: error, platform, taskId: task.taskId}, '持久化任务通知意图恢复失败')
+        }
+    }
+    return restored
+}
+
 function imProgressReporterKey(sessionId, turnId, platform, userId) {
     return [sessionId, turnId || 'turn', platform, userId || 'bound-user'].join(':')
 }
@@ -1152,10 +1371,22 @@ function startAdapter(platform) {
     const starter = ADAPTER_STARTERS.get(platform)
     if (!starter) return null
     try {
-        const hooks = starter(ADAPTER_TOKENS.get(platform), {taskCommands, stateStore: bridgeStateDb})
+        const hooks = starter(ADAPTER_TOKENS.get(platform), {
+            taskCommands,
+            stateStore: bridgeStateDb,
+            onNotificationStateChange: handleNotificationStateChange,
+        })
         if (!hooks) return null
         const registered = {...hooks, platform}
         confirmHooks.push(registered)
+        for (const [sessionId, session] of sessions) {
+            if (session?.taskState?.notifications?.[platform]?.state === 'pending') {
+                queueMicrotask(() => reconcileTaskNotificationIntents(sessionId, session, platform))
+            }
+        }
+        queueMicrotask(() => reconcilePersistedNotificationIntents(platform).catch(error => {
+            log.warn({err: error, platform}, '适配器启动后恢复待通知任务失败')
+        }))
         return registered
     } catch (error) {
         log.error({err: error, platform}, '启动 IM 适配器失败')
@@ -1289,7 +1520,7 @@ function broadcastWorkflowEvent(sid, msg) {
 }
 
 // 注入依赖到 workflow-runner，供 Workflow 子进程通过受控 IPC 请求 agent() 调用
-setDeps({agentProvider: claudeAgentProvider, deleteSession, makeQueryOptions, loadCliSettings, loadWfConfig, PushStream, broadcast: broadcastWorkflowEvent, sessions, persistSdkSessionId, removeSdkSessionId, encodeProjectName})
+setDeps({agentProvider: claudeAgentProvider, deleteSession, makeQueryOptions, loadCliSettings, loadWfConfig, PushStream, broadcast: broadcastWorkflowEvent, sessions, persistSdkSessionId, removeSdkSessionId, encodeProjectName, stateStore: () => bridgeStateDb})
 
 // 收口：任一通道响应或超时都走这里，幂等（已 settled 则忽略）
 // ── 确认请求收口（settlePending）──
@@ -3602,7 +3833,7 @@ async function sendWeChatChunks(bn, token, userId, contextToken, fullText) {
 async function maybeMirror(sid, taskResult = {outcome: 'succeeded'}, notificationId = null) {
     const s = sessions.get(sid)
     if (!s) return {attempted: 0, sent: 0, pending: 0, failed: 0}
-    const text = buildIncompleteMirrorText(s.turnText || s.taskFinalReplyText, taskResult)
+    const text = buildIncompleteMirrorText(s.turnText || s.taskFinalReplyText || s.taskState?.detail, taskResult)
     if (!text) return {attempted: 0, sent: 0, pending: 0, failed: 0}
     const turnIdentity = s.activeTurnIdentity ? {...s.activeTurnIdentity} : null
     const summary = {attempted: 0, sent: 0, pending: 0, failed: 0}
@@ -3610,7 +3841,6 @@ async function maybeMirror(sid, taskResult = {outcome: 'succeeded'}, notificatio
         if (!s.mirrors[hook.platform]) continue
         if (!shouldRouteMirror(hook.platform, turnIdentity)) continue
         summary.attempted++
-        updateTaskNotificationState(s, sid, hook.platform, 'pending', notificationId)
         try {
             const result = await hook.sendToUser(sid, text, turnIdentity?.userId || null, notificationId)
             if (result === true || result?.sent === true) {
@@ -3630,6 +3860,30 @@ async function maybeMirror(sid, taskResult = {outcome: 'succeeded'}, notificatio
         }
     }
     return summary
+}
+
+async function reconcileTaskNotificationIntents(sessionId, session = sessions.get(sessionId), platform = null) {
+    if (!session?.taskState || !['succeeded', 'failed', 'incomplete', 'review_paused', 'interrupted'].includes(session.taskState.status)) return false
+    const pending = Object.entries(session.taskState.notifications || {}).filter(([name, item]) =>
+        (!platform || name === platform) && ['pending', 'failed'].includes(item?.state))
+    if (!pending.length) return false
+    const missing = pending.some(([name, item]) => {
+        const hook = getAdapterHook(name)
+        return hook && !hook.notificationState?.(item.notificationId)
+    })
+    if (!missing) return false
+    const outcome = session.taskState.status === 'succeeded'
+        ? 'succeeded'
+        : session.taskState.status === 'incomplete' || session.taskState.status === 'review_paused' ? 'incomplete' : 'failed'
+    const notificationId = pending[0][1]?.notificationId
+        || `${session.taskState.taskId || sessionId}:${outcome === 'succeeded' ? 'task_completed' : outcome === 'incomplete' ? 'task_review_paused' : 'task_failed'}`
+    try {
+        await maybeMirror(sessionId, {outcome, continuationReason: outcome === 'succeeded' ? null : 'execution_error'}, notificationId)
+        return true
+    } catch (error) {
+        log.warn({err: error, sessionId: String(sessionId).slice(0, 8)}, '恢复缺失的任务通知意图失败')
+        return false
+    }
 }
 
 // ── 项目结构缓存注入（maybeInjectProjectCache）──
@@ -4750,6 +5004,13 @@ async function handleHttpRequest(req, res) {
         }
         // 重启后前端旧快照通常仍会带 default；已有会话的非 default 权限以服务端持久化值为准。
         // 用户在会话中主动切回 default 后，持久化值也会变为 default，不会阻止后续切换。
+        const persistedCatalogKey = sessionCatalogProjectKey(workDir)
+        const persistedCatalogIds = createMode.mode === 'resume'
+            ? [body.resume, lookupSdkSessionId(workDir, body.resume)]
+            : createMode.mode === 'fork' ? [forkSourceId] : []
+        const persistedCatalogState = bridgeStateDb?.available
+            ? persistedCatalogIds.map(id => id ? bridgeStateDb.getSessionCatalog(persistedCatalogKey, id) : null).find(Boolean) || null
+            : null
         const persistedPermissionState = createMode.mode === 'resume'
             ? (loadTaskState(workDir, resumeSid || body.resume) || null)
             : createMode.mode === 'fork'
@@ -4757,6 +5018,8 @@ async function handleHttpRequest(req, res) {
                 : null
         const persistedPermissionMode = VALID_PERMISSION_MODES.has(persistedPermissionState?.permissionMode)
             ? persistedPermissionState.permissionMode
+            : VALID_PERMISSION_MODES.has(persistedCatalogState?.permissionMode)
+                ? persistedCatalogState.permissionMode
             : null
         if (persistedPermissionMode && persistedPermissionMode !== 'default' && body.permissionMode === 'default') {
             body.permissionMode = persistedPermissionMode
@@ -4790,6 +5053,11 @@ async function handleHttpRequest(req, res) {
             const oldSess = sessions.get(sessionId)
             if (oldSess?.query && oldSess?.pushStream) {
                 restoreSessionMirrors(oldSess, sessionId)
+                persistSessionCatalogSettings(oldSess, sessionId, {
+                    permissionMode: oldSess.permissionMode,
+                    mirrors: oldSess.mirrors,
+                    lastOpenedAt: Date.now(),
+                })
                 focusedSessionId = sessionId
                 res.writeHead(200);
                 res.end(JSON.stringify({sessionId, workDir, resumed: true, historySessionId: oldSess.lastSessionId || resumeSid,
@@ -4837,7 +5105,7 @@ async function handleHttpRequest(req, res) {
                 ? createdSession.eventJournal.projectTaskState({recoverRunning: true})
                 : null
             const persistedTaskState = repairPersistedTaskState(resumeSid
-                ? (journalTaskProjection || loadTaskState(workDir, sessionId) || loadTaskState(workDir, resumeSid))
+                ? (loadTaskState(workDir, resumeSid) || journalTaskProjection || loadTaskState(workDir, sessionId))
                 : null)
             createdSession.taskState = persistedTaskState || createTaskStatePatch({
                 status: 'idle',
@@ -4887,6 +5155,12 @@ async function handleHttpRequest(req, res) {
             createdSession.taskCompletionTurnId = persistedTaskState?.turnId || null
             createdSession._taskCompletionSequence = persistedTaskState?.sequence || 0
             restoreSessionMirrors(createdSession, sessionId)
+            createdSession.taskFinalReplyText = persistedTaskState?.finalReplyText || ''
+            persistSessionCatalogSettings(createdSession, sessionId, {
+                permissionMode: createdSession.permissionMode,
+                mirrors: createdSession.mirrors,
+                lastOpenedAt: Date.now(),
+            })
             createdSession.visibleSource = sessionVisibilitySource(getProjectVisibility(workDir), sessionId, resumeSid)
             if (resumeSid && createdSession.taskState.status === 'running') {
                 createdSession.taskState = recoverTaskState(createdSession.taskState)
@@ -4904,6 +5178,7 @@ async function handleHttpRequest(req, res) {
                 historySessionId: resumeSid,
                 taskState: taskStateForClient(sessions.get(sessionId)?.taskState),
                 gitInfo: sessions.get(sessionId)?.snapshot?.gitHead || null}))
+            queueMicrotask(() => reconcileTaskNotificationIntents(sessionId, createdSession))
             // 响应并建立会话后再构建项目索引，不能让首次扫描阻塞 WebSocket/focus。
             scheduleProjectCacheBuild(workDir)
             const backgroundSession = sessions.get(sessionId)
@@ -5239,6 +5514,7 @@ async function handleHttpRequest(req, res) {
     // GET /api/sessions/:id/files —— 文件树 + 改动状态
     const filesM = url.pathname.match(/^\/api\/sessions\/([^/]+)\/files$/)
     if (req.method === 'GET' && filesM) {
+        res.setHeader('Cache-Control', 'no-store')
         const s = sessions.get(filesM[1])
         if (!s) {
             res.writeHead(404);
@@ -5395,6 +5671,7 @@ async function handleHttpRequest(req, res) {
     // GET /api/sessions/:id/file?path=xxx —— 当前文件内容
     const fileM = url.pathname.match(/^\/api\/sessions\/([^/]+)\/file$/)
     if (req.method === 'GET' && fileM) {
+        res.setHeader('Cache-Control', 'no-store')
         const s = sessions.get(fileM[1])
         if (!s) {
             res.writeHead(404);
@@ -8943,6 +9220,7 @@ wss.on('connection', (ws, req) => {
             if (newPerm && newPerm !== s.permissionMode) {
                 s.permissionMode = newPerm
                 updateTaskState(s, sessionId, {...(s.taskState || {}), permissionMode: newPerm})
+                persistSessionCatalogSettings(s, sessionId, {permissionMode: newPerm})
                 log.info({sessionId: sessionId?.slice(0,8), permissionMode: newPerm}, 'permissionMode 变更 (即时)')
                 if (newPerm === 'bypassPermissions' && s.pending) {
                     for (const [rid, entry] of s.pending) {
@@ -9145,6 +9423,13 @@ async function bootGateway() {
         }, 'SQLite 状态库不可用，将使用旧文件持久化')
     } else {
         log.info({path: bridgeStateDb.path, driver: bridgeStateDb.driver, schemaVersion: bridgeStateDb.schemaVersion}, 'SQLite 状态库已启用')
+        try {
+            const tasks = bridgeStateDb.pruneTaskState({olderThanMs: 30 * 24 * 60 * 60 * 1000, maxRows: 500})
+            const workflows = bridgeStateDb.pruneWorkflowState({olderThanMs: 30 * 24 * 60 * 60 * 1000, maxRows: 500})
+            if (tasks || workflows) log.info({tasks, workflows}, '已清理过期 SQLite 运行状态投影')
+        } catch (error) {
+            log.warn({err: error}, 'SQLite 运行状态投影清理失败，本次启动继续保留旧记录')
+        }
     }
     memoryService = createMemoryService({bridgeHome: BRIDGE_HOME, stateStore: bridgeStateDb, logger: log})
     const injected = await initializeSecurePayloadKey()
@@ -9336,64 +9621,33 @@ async function scanProjects() {
     const base = join(BRIDGE_HOME, 'projects');
     const results = []
     try {
-        for (const name of readdirSync(base)) {
-            const full = join(base, name);
-            if (!statSync(full).isDirectory()) continue
-
-            const wd = resolveTranscriptProjectWorkDir(full, name)
-            const visibility = loadProjectVisibilityWithMigration(full, wd)
-
-            const files = readdirSync(full).filter(f => {
-                if (!f.endsWith('.jsonl')) return false
-                if (f.startsWith('.trash-')) return false
-                const sid = f.replace('.jsonl', '')
-                // 已标记删除的会话：尝试再次清理残留文件，跳过展示
-                if (_deletedSessionIds.has(sid)) {
-                    return false
-                }
-                return shouldShowSession(visibility, sid)
-            })
-                .map(f => ({name: f, mtime: statSync(join(full, f)).mtimeMs}))
-                .sort((a, b) => b.mtime - a.mtime)
-                .map(f => f.name);
-
-            if (!files.length) continue
-            const sds = files.map(f => {
-                const id = f.replace('.jsonl', '');
-                let t = id.slice(0, 8);
-                try {
-                    const l = readFileHeadLines(join(full, f), 4096);
-                    for (let i = 0; i < l.length; i++) {
-                        if (!l[i].trim()) continue;
-                        const e = JSON.parse(l[i]);
-                        let x = e.content || '';
-                        if (!x && e.message?.content) x = typeof e.message.content === 'string' ? e.message.content : (Array.isArray(e.message.content) ? (e.message.content.find(b => b.type === 'text')?.text || '') : '');
-                        if (x && !String(x).startsWith('<task-notification')) {
-                            t = String(x).slice(0, 50);
-                            break
-                        }
-                    }
-                } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
-                ;
-                return {id, title: t, size: statSync(join(full, f)).size, encodedDir: name}
-            })
-            const ex = results.find(r => r.workDir === wd)
-            if (ex) {
-                for (const s of sds) {
-                    if (!ex.sessions.find(es => es.id === s.id)) ex.sessions.push(s)
-                }
-                ;ex.sessionCount = ex.sessions.length;
-                const lm = await getLastModified(full, files);
-                if (lm > (ex.lastActive || 0)) ex.lastActive = lm;
-                continue
+        for (const group of collectTranscriptProjectGroups(base)) {
+            try {
+                const {workDir: wd, projectKey, projectDirs} = group
+                const visibility = loadProjectVisibilityWithMigration(projectDirs, wd)
+                const catalogRows = reconcileSessionCatalog({
+                    projectKey,
+                    projectDirs,
+                    workDir: wd,
+                    visibility,
+                    stateStore: bridgeStateDb,
+                    readHeadLines: readFileHeadLines,
+                    settingsForSession: sessionId => ({
+                        permissionMode: loadTaskState(wd, sessionId)?.permissionMode || null,
+                        mirrors: getPersistedMirrors(readJSON(sessionMirrorStorePath(wd)), [sessionId]),
+                    }),
+                }).filter(row => !_deletedSessionIds.has(row.id))
+                if (!catalogRows.length) continue
+                results.push({
+                    workDir: wd,
+                    encodedDir: projectKey,
+                    sessionCount: catalogRows.length,
+                    sessions: catalogRows.map(row => ({id: row.id, title: row.title, size: row.size, encodedDir: projectKey})),
+                    lastActive: Math.max(...catalogRows.map(row => Number(row.mtime || 0)), 0),
+                })
+            } catch (error) {
+                log.warn({err: error, workDir: group.workDir, projectKey: group.projectKey}, '项目会话目录协调失败，已跳过当前项目')
             }
-            results.push({
-                workDir: wd,
-                encodedDir: name,
-                sessionCount: files.length,
-                sessions: sds,
-                lastActive: await getLastModified(full, files)
-            })
         }
     } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
         ;results.sort((a, b) => (b.lastActive || 0) - (a.lastActive || 0));
@@ -9565,67 +9819,111 @@ function resolveTranscriptProjectWorkDir(projectDir, encodedDir) {
     return decodeProjectName(encodedDir) || encodedDir
 }
 
-function loadProjectVisibilityWithMigration(projectDir, workDir) {
+function collectTranscriptProjectGroups(projectsRoot = join(BRIDGE_HOME, 'projects')) {
+    const groups = new Map()
+    try {
+        for (const entry of readdirSync(projectsRoot, {withFileTypes: true})) {
+            if (!entry.isDirectory()) continue
+            const projectDir = join(projectsRoot, entry.name)
+            let hasTranscript = false
+            try {
+                hasTranscript = readdirSync(projectDir).some(name => name.endsWith('.jsonl') && !name.startsWith('.trash-'))
+            } catch {
+                continue
+            }
+            if (!hasTranscript) continue
+            const workDir = resolveTranscriptProjectWorkDir(projectDir, entry.name)
+            const normalized = normalizeWorkDir(workDir)
+            if (!normalized) continue
+            const identity = normalized.toLowerCase()
+            const group = groups.get(identity) || {workDir: normalized, projectKey: encodeProjectName(normalized), projectDirs: []}
+            group.projectDirs.push(projectDir)
+            groups.set(identity, group)
+        }
+        for (const group of groups.values()) {
+            const canonicalDir = join(projectsRoot, group.projectKey)
+            if (existsSync(canonicalDir) && !group.projectDirs.includes(canonicalDir)) group.projectDirs.unshift(canonicalDir)
+        }
+    } catch (error) {
+        log.debug({err: error, projectsRoot}, '扫描 transcript 项目分组失败')
+    }
+    return [...groups.values()]
+}
+
+function loadProjectVisibilityWithMigration(projectDirs, workDir) {
+    const directories = [...new Set((Array.isArray(projectDirs) ? projectDirs : [projectDirs]).filter(Boolean))]
     const canonicalDir = dirname(sessionVisibilityStorePath(workDir))
     let state = loadSessionVisibility(canonicalDir)
-    if (projectDir !== canonicalDir) {
+    for (const projectDir of directories) {
+        if (projectDir === canonicalDir) continue
         const legacy = loadSessionVisibility(projectDir)
         for (const [gatewaySessionId, entry] of Object.entries(legacy.sessions || {})) {
             state = markSessionVisible(state, {gatewaySessionId, ...entry})
         }
     }
-    if (state.legacyMigrationVersion >= 1) return state
+    if (state.legacyMigrationVersion >= 2) return state
 
-    const sessionMap = {
-        ...(readJSON(join(projectDir, 'bridge-session-map.json')) || {}),
-        ...(readJSON(join(canonicalDir, 'bridge-session-map.json')) || {}),
-    }
+    const sessionMap = {}
+    for (const projectDir of [...directories, canonicalDir]) Object.assign(sessionMap, readJSON(join(projectDir, 'bridge-session-map.json')) || {})
     const transcriptKinds = {}
     const taskStates = {}
     for (const [gatewaySessionId, sdkSessionId] of Object.entries(sessionMap)) {
         if (gatewaySessionId.startsWith('@rev:') || typeof sdkSessionId !== 'string') continue
-        const transcriptPath = [join(projectDir, `${sdkSessionId}.jsonl`), join(canonicalDir, `${sdkSessionId}.jsonl`)]
+        const transcriptPath = [...directories, canonicalDir].map(projectDir => join(projectDir, `${sdkSessionId}.jsonl`))
             .find(path => existsSync(path))
         if (transcriptPath) transcriptKinds[sdkSessionId] = classifyTranscriptFile(transcriptPath)
         taskStates[gatewaySessionId] = readJSON(join(canonicalDir, 'bridge-task-state', `${gatewaySessionId}.json`))
         taskStates[sdkSessionId] = readJSON(join(canonicalDir, 'bridge-task-state', `${sdkSessionId}.json`))
     }
-    const migrated = migrateLegacySessionVisibility(state, {sessionMap, transcriptKinds, taskStates})
-    // 即使没有可迁移会话也保存版本，避免每次打开空项目都重复扫描 transcript。
+    let migrated = migrateLegacySessionVisibility(state, {sessionMap, transcriptKinds, taskStates})
+    const scheduledIds = new Set(Object.values(scheduledTasks || {}).map(task => String(task?.sessionId || '').trim()).filter(Boolean))
+    const internalSdkIds = new Set(Object.entries(sessionMap)
+        .filter(([gatewaySessionId]) => gatewaySessionId.startsWith('@rev:') || /^(?:agent-|wf-agent-)/.test(gatewaySessionId) || scheduledIds.has(gatewaySessionId))
+        .map(([, sdkSessionId]) => sdkSessionId))
+    for (const projectDir of directories) {
+        let filenames = []
+        try {
+            filenames = readdirSync(projectDir).filter(name => name.endsWith('.jsonl') && !name.startsWith('.trash-'))
+        } catch {
+            continue
+        }
+        for (const filename of filenames) {
+            const sdkSessionId = filename.slice(0, -'.jsonl'.length)
+            if (shouldShowSession(migrated, sdkSessionId) || scheduledIds.has(sdkSessionId) || internalSdkIds.has(sdkSessionId)) continue
+            if (classifyTranscriptFile(join(projectDir, filename)) !== 'main') continue
+            // 旧版本未保存来源时信息不可逆；仅明确的主 transcript 可按桌面输入会话修复。
+            migrated = markSessionVisible(migrated, {gatewaySessionId: sdkSessionId, sdkSessionId, source: 'desktop', firstInputAt: 0})
+        }
+    }
+    migrated = {...migrated, legacyMigrationVersion: 2}
     saveSessionVisibility(workDir, migrated)
     return migrated
 }
 
 async function listProjectSessions(ed) {
-    const base = join(BRIDGE_HOME, 'projects', ed);
-    const workDir = resolveTranscriptProjectWorkDir(base, ed)
-    const visibility = loadProjectVisibilityWithMigration(base, workDir)
-    const r = []
-    try {
-        for (const f of readdirSync(base).filter(x => x.endsWith('.jsonl') && !x.startsWith('.trash-') && !x.startsWith('agent-') && !x.startsWith('wf-agent-'))) {
-            const id = f.replace('.jsonl', '');
-            const filePath = join(base, f)
-            if (!shouldShowSession(visibility, id)) continue
-            const st = statSync(filePath);
-            let t = id.slice(0, 8);
-            try {
-                const l = readFileHeadLines(filePath, 4096);
-                for (let i = 0; i < l.length; i++) {
-                    if (!l[i].trim()) continue;
-                    const e = JSON.parse(l[i]);
-                    let x = e.content || '';
-                    if (!x && e.message?.content) x = typeof e.message.content === 'string' ? e.message.content : (Array.isArray(e.message.content) ? (e.message.content.find(b => b.type === 'text')?.text || '') : '');
-                    if (x && !String(x).startsWith('<task-notification')) {
-                        t = String(x).slice(0, 50);
-                        break
-                    }
-                }
-            } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
-            ;r.push({id, title: t, size: st.size, mtime: st.mtimeMs, encodedDir: ed})
-        }
-    } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
-    r.sort((a, b) => b.mtime - a.mtime);
-    return r
+    const projectsRoot = join(BRIDGE_HOME, 'projects')
+    const group = collectTranscriptProjectGroups(projectsRoot)
+        .find(item => item.projectKey === ed || item.projectDirs.some(path => basename(path) === ed))
+    if (!group) return []
+    const visibility = loadProjectVisibilityWithMigration(group.projectDirs, group.workDir)
+    return reconcileSessionCatalog({
+        projectKey: group.projectKey,
+        projectDirs: group.projectDirs,
+        workDir: group.workDir,
+        visibility,
+        stateStore: bridgeStateDb,
+        readHeadLines: readFileHeadLines,
+        settingsForSession: sessionId => ({
+            permissionMode: loadTaskState(group.workDir, sessionId)?.permissionMode || null,
+            mirrors: getPersistedMirrors(readJSON(sessionMirrorStorePath(group.workDir)), [sessionId]),
+        }),
+    }).filter(row => !_deletedSessionIds.has(row.id)).map(row => ({
+        id: row.id,
+        title: row.title,
+        size: row.size,
+        mtime: row.mtime,
+        encodedDir: group.projectKey,
+    }))
 }
 
 async function getLastModified(dir, files) {
@@ -10027,6 +10325,7 @@ function markVisibleSession(workDir, gatewaySessionId, sdkSessionId, source) {
     const current = loadSessionVisibility(dirname(sessionVisibilityStorePath(workDir)))
     const next = markSessionVisible(current, {gatewaySessionId, sdkSessionId, source})
     const saved = saveSessionVisibility(workDir, next)
+    ensureSessionCatalogIdentity(workDir, gatewaySessionId, sdkSessionId, source)
     if (saved) invalidateProjectsCache()
     return saved
 }

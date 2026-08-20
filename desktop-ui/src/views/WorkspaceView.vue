@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { collectClipboardFiles } from '../clipboard-files'
 /**
  * WorkspaceView - Claude Desktop Bridge 主工作区视图
  *
@@ -44,7 +45,7 @@ import {
   upsertSessionDraft,
   writeSessionDraftStore,
 } from '../session-drafts'
-import {classifySessionExistsResponse, isSameSessionSelection, resolveExistingSessionTarget, runtimeSessionMatchesHistory, shouldCloseSocketBeforeConnect, shouldReuseConnectedSession, shouldValidateSessionRuntime} from '../session-selection'
+import {decideSessionRuntimeRecovery, isSameSessionSelection, shouldCloseSocketBeforeConnect, shouldReuseConnectedSession, shouldValidateSessionRuntime} from '../session-selection'
 import {applySessionVisibilityEvent} from '../project-sessions'
 import {buildSessionCreateRequest} from '../session-create-mode'
 import {attachmentKindLabel} from '../attachment-description'
@@ -1134,21 +1135,44 @@ async function switchToTab(tabId: string, validateCurrentRuntime = false) {
     ws = null  // 切断旧 tab 的 ws 引用，防止 connectWS 误关
     // 校验 session 是否仍存在，避免用已删除的 gatewayUUID resume 导致"一变二"
     let sessionMissing = false
+    const checkedRuntimeSessionId = tab.state.sessionId
     try {
-      const check = await apiFetch(`${GW}/api/sessions/${tab.state.sessionId}/exists`)
-      if (activeTabId.value !== tab.id) return
-      const existsStatus = classifySessionExistsResponse(check.ok, check.status)
-      if (existsStatus === 'unavailable') throw new Error(`Gateway 会话状态不可用（HTTP ${check.status}）`)
-      sessionMissing = existsStatus === 'missing'
+      const check = await apiFetch(`${GW}/api/sessions/${checkedRuntimeSessionId}/exists`)
+      if (activeTabId.value !== tab.id || tab.state.sessionId !== checkedRuntimeSessionId) return
       const checkData = check.ok ? await check.json() : null
-      if (activeTabId.value !== tab.id) return
-      if (!runtimeSessionMatchesHistory(tab.historySessionId, checkData?.historySessionId)) {
-        // 当前 tab 保存的 Gateway UUID 已绑定到另一个 SDK conversation，不能覆盖用户选中的历史会话。
+      if (activeTabId.value !== tab.id || tab.state.sessionId !== checkedRuntimeSessionId) return
+      const recovery = decideSessionRuntimeRecovery({
+        ok: check.ok,
+        status: check.status,
+        response: checkData,
+        historySessionId: tab.historySessionId,
+        fallbackSessionId: checkedRuntimeSessionId,
+      })
+      if (recovery.kind === 'recreate') {
         sessionMissing = true
-        throw new Error('Gateway 会话与历史会话不匹配')
+        throw new Error('Gateway 运行会话已失效')
       }
-      const existingSessionId = resolveExistingSessionTarget(checkData, tab.state.sessionId)
-      if (!existingSessionId) throw new Error('gone')
+      if (recovery.kind === 'reset') {
+        cancelSessionReconnect(tab.id)
+        tab.state.sessionId = null
+        tab.state.connected = false
+        tab.state.status = 'idle'
+        sessionId.value = null
+        activeSessionId.value = null
+        connected.value = false
+        status.value = 'idle'
+        ws = null
+        const notice = '原运行会话已不存在，且尚未生成可恢复的历史会话 ID；已保留当前内容，请重新发送任务。'
+        if (!messages.value.some(item => item.role === 'error' && item.text === notice)) {
+          messages.value.push({role: 'error', text: notice, time: Date.now()})
+        }
+        syncCurrentTabState()
+        persistWorkspaceShell()
+        showToast('原运行会话无法恢复，请重新发送任务', 6000)
+        return
+      }
+      if (recovery.kind === 'unavailable') throw new Error(`Gateway 会话状态不可用（${recovery.reason}）`)
+      const existingSessionId = recovery.sessionId
       const wasInterrupted = tab.state.status === 'thinking'
       tab.state.sessionId = existingSessionId
       if (checkData.historySessionId) {
@@ -1566,17 +1590,12 @@ function onFileSelect(e: Event) {
   input.value = ''
 }
 
-/** 粘贴事件处理: 从剪贴板提取图片并加入待发送列表 */
+/** 粘贴事件处理：图片和资源管理器复制的普通文件都加入待发送列表。 */
 function onPaste(e: ClipboardEvent) {
-  const items = e.clipboardData?.items
-  if (!items) return
-  for (const item of items) {
-    if (item.type.startsWith('image/')) {
-      e.preventDefault()
-      const file = item.getAsFile()
-      if (file) addAttachment(file)
-    }
-  }
+  const files = collectClipboardFiles(e.clipboardData)
+  if (!files.length) return
+  e.preventDefault()
+  for (const file of files) addAttachment(file)
 }
 
 /** 移除待发送附件 */
@@ -2089,6 +2108,43 @@ async function loadProviderModels() {
   }
 }
 
+/**
+ * 恢复工作区首屏所需的本地设置。
+ * 这里只读取 Bridge 本地配置，不等待供应商网络请求；模型和余额由启动后的后台任务加载。
+ */
+async function loadSavedWorkspaceSettings() {
+  try {
+    const sr = await fetch(`${GW}/api/config/settings`)
+    if (!sr.ok) return
+    const s = await sr.json()
+    if (s.model && !model.value) model.value = s.model
+    if (typeof s.costLimitPercent === 'number') costLimitPercent.value = s.costLimitPercent
+    if (typeof s.fileInjectLimitKB === 'number') fileInjectLimitKB.value = s.fileInjectLimitKB
+    if (typeof s.maxContextTokens === 'number' && s.maxContextTokens > 0) contextSafetyCap.value = s.maxContextTokens
+    if (s.language) setLocale(s.language)
+    if (s.petEnabled !== undefined) {
+      petEnabledGlob.value = s.petEnabled
+      localStorage.setItem('claude-bridge-pet-enabled', String(s.petEnabled))
+    }
+    if (s.pet) {
+      petId.value = s.pet
+      localStorage.setItem('claude-bridge-pet', s.pet)
+    }
+  } catch (error: any) {
+    console.warn('工作区设置加载失败，继续恢复项目列表:', error)
+  }
+}
+
+/** 读取版本号不应阻塞项目列表或历史会话恢复。 */
+async function loadGatewayVersion() {
+  try {
+    const vr = await fetch(`${GW}/api/version`)
+    if (vr.ok) gatewayVersion.value = (await vr.json()).version
+  } catch (error) {
+    console.debug('Gateway 版本读取失败，已按降级路径继续', error)
+  }
+}
+
 // 组件挂载：加载项目列表、余额、模型列表、斜杠命令、IM 绑定状态
 // 同时注册全局键盘快捷键（Esc 关闭弹窗）
 onMounted(async () => {
@@ -2096,34 +2152,20 @@ onMounted(async () => {
   // 组件重建时复位控制通道停止标志，确保 connectControlWS 能正常建立连接
   _ctrlRetryCount = 0
   _controlWSStopped = false
-  // 先拿到当前模型再加载供应商，确保模型选择器默认选中 settings 中保存的模型
-  try {
-    const sr = await fetch(`${GW}/api/config/settings`)
-    if (sr.ok) {
-      const s = await sr.json()
-      if (s.model && !model.value) model.value = s.model
-      if (typeof s.costLimitPercent === 'number') costLimitPercent.value = s.costLimitPercent
-      if (typeof s.fileInjectLimitKB === 'number') fileInjectLimitKB.value = s.fileInjectLimitKB
-      if (typeof s.maxContextTokens === 'number' && s.maxContextTokens > 0) contextSafetyCap.value = s.maxContextTokens
-      if (s.language) setLocale(s.language)  // 应用已保存的语言
-      // 从 Gateway 恢复 pet 设置
-      if (s.petEnabled !== undefined) {
-        petEnabledGlob.value = s.petEnabled
-        localStorage.setItem('claude-bridge-pet-enabled', String(s.petEnabled))
-      }
-      if (s.pet) {
-        petId.value = s.pet
-        localStorage.setItem('claude-bridge-pet', s.pet)
-      }
-    }
-  } catch (error: any) {
-    console.warn('项目列表加载失败', error)
-    showToast(`项目列表加载失败：${error?.message || '未知错误'}`, 6000)
-  }
-  // 获取 Gateway 版本号
-  try { const vr = await fetch(`${GW}/api/version`); if (vr.ok) gatewayVersion.value = (await vr.json()).version } catch (e) { console.error(e) }
-  await Promise.all([loadProjects(), loadBalance(), loadProviderModels(), loadSlashCommands(), loadIMStatus()])
+  // 首屏只等待本地 settings、项目目录和工作区壳；供应商网络请求不能阻塞历史会话显示。
+  const projectsTask = loadProjects()
+  const settingsTask = loadSavedWorkspaceSettings()
+  await Promise.allSettled([projectsTask, settingsTask])
   await restoreWorkspaceShell()
+
+  // 余额、实时模型、命令和 IM 状态属于非关键数据，后台加载且互不阻塞。
+  void Promise.allSettled([
+    loadGatewayVersion(),
+    loadBalance(),
+    loadProviderModels(),
+    loadSlashCommands(),
+    loadIMStatus(),
+  ])
   // Esc 关闭 diff/文件 modal
   window.addEventListener('keydown', onGlobalKeydown)
   // 建立控制通道 WS：独立于 session，启动即连，接收 IM nudge 事件
@@ -4482,7 +4524,7 @@ async function buildWireText(text: string, attachments?: PendingAttachment[]): P
         continue
       }  // 已超总量，剩余文件跳过
       try {
-        const res = await fetch(`${GW}/api/sessions/${sessionId.value}/file?path=${encodeURIComponent(p)}`)
+        const res = await fetch(`${GW}/api/sessions/${sessionId.value}/file?path=${encodeURIComponent(p)}&fresh=${Date.now()}`, {cache: 'no-store'})
         if (!res.ok) continue
         const d = await res.json()
         if (d.binary || typeof d.content !== 'string') continue
@@ -4942,6 +4984,9 @@ function applyCommand(c: SlashCmd) {
 // ═══════════════════════════════════════════
 /** 当前项目的文件列表（从 Gateway 懒加载） */
 const mentionFiles = ref<{ path: string }[]>([])
+let mentionFilesLoadedAt = 0
+let mentionFilesSessionId = ''
+let mentionFilesLoadingSessionId = ''
 /** 文件补全菜单是否可见 */
 const showFileMenu = ref(false)
 /** 当前高亮的文件索引 */
@@ -4969,16 +5014,29 @@ async function loadMentionFiles() {
   const targetSessionId = sessionId.value
   const ownerTabId = activeTabId.value
   if (!targetSessionId || !ownerTabId) return
+  if (mentionFilesLoadingSessionId === targetSessionId) return
+  mentionFilesLoadingSessionId = targetSessionId
   try {
-    const res = await fetch(`${GW}/api/sessions/${targetSessionId}/files`)
+    const res = await fetch(`${GW}/api/sessions/${targetSessionId}/files?fresh=${Date.now()}`, {cache: 'no-store'})
     if (activeTabId.value !== ownerTabId || sessionId.value !== targetSessionId) return
     if (res.ok) {
       const d = await res.json();
       if (activeTabId.value !== ownerTabId || sessionId.value !== targetSessionId) return
       mentionFiles.value = (d.files || []).map((f: any) => ({path: f.path}))
+      mentionFilesLoadedAt = Date.now()
+      mentionFilesSessionId = targetSessionId
       notifyProjectCacheWarnings(d.projectCacheWarnings)
+      const hasFileToken = /#[^\s#]*$/.test(inputText.value)
+      if (!showCmdMenu.value && hasFileToken && fileMatches.value.length > 0) {
+        showFileMenu.value = true
+        fileIndex.value = 0
+      }
     }
-  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
+  } catch (error) {
+    console.debug('非关键 UI 操作失败，已按降级路径继续', error)
+  } finally {
+    if (mentionFilesLoadingSessionId === targetSessionId) mentionFilesLoadingSessionId = ''
+  }
 }
 
 /** 模糊匹配的文件列表：匹配输入行末尾的 #路径片段，最多 50 条 */
@@ -5044,7 +5102,7 @@ watch(inputText, () => {
   showCmdMenu.value = isCmd
   if (isCmd) cmdIndex.value = 0
   const fileTok = /#[^\s#]*$/.test(inputText.value)
-  if (fileTok && mentionFiles.value.length === 0) loadMentionFiles()  // 懒加载文件列表
+  if (fileTok && (mentionFilesSessionId !== sessionId.value || mentionFiles.value.length === 0 || Date.now() - mentionFilesLoadedAt > 3000)) loadMentionFiles()  // 会话切换时强制刷新，输入过程中仅短时缓存
   showFileMenu.value = !isCmd && fileTok && fileMatches.value.length > 0
   if (showFileMenu.value) fileIndex.value = 0
   const agentTok = /@[a-zA-Z0-9_-]*$/.test(inputText.value)
@@ -5188,10 +5246,10 @@ function scrollDown(force?: boolean) {
 // 文件树由扁平 FlatFile 数组构建为嵌套树结构，目录默认折叠。
 // ═══════════════════════════════════════════
 
-/** 切换文件面板可见性，首次打开时加载文件树 */
+/** 切换文件面板可见性：每次打开都重新扫描当前工作目录。 */
 function toggleFilePanel() {
   showFilePanel.value = !showFilePanel.value
-  if (showFilePanel.value && fileList.value.length === 0) loadFileTree()
+  if (showFilePanel.value) loadFileTree()
 }
 
 /** 从 Gateway 加载当前会话的文件列表和快照状态，增量同步到文件树 */
@@ -5203,7 +5261,7 @@ async function loadFileTree() {
   const seq = ++_loadFileTreeSeq
   fileTreeLoading.value = true
   try {
-    const res = await fetch(`${GW}/api/sessions/${targetSessionId}/files`)
+    const res = await fetch(`${GW}/api/sessions/${targetSessionId}/files?fresh=${Date.now()}`, {cache: 'no-store'})
     if (seq !== _loadFileTreeSeq || activeTabId.value !== ownerTabId || sessionId.value !== targetSessionId) return
     if (res.ok) {
       const d = await res.json()
@@ -5377,7 +5435,7 @@ async function openFileByPath(filePath: string) {
   modalFileContent.value = '';
   modalFileBinary.value = false
   try {
-    const res = await fetch(`${GW}/api/sessions/${sessionId.value}/file?path=${encodeURIComponent(filePath)}`)
+    const res = await fetch(`${GW}/api/sessions/${sessionId.value}/file?path=${encodeURIComponent(filePath)}&fresh=${Date.now()}`, {cache: 'no-store'})
     const d = await res.json()
     if (d.binary) {
       modalFileBinary.value = true;
@@ -5400,7 +5458,7 @@ async function openFileModal(f: FlatFile) {
   modalFileContent.value = '';
   modalFileBinary.value = false
   try {
-    const res = await fetch(`${GW}/api/sessions/${sessionId.value}/file?path=${encodeURIComponent(f.path)}`)
+    const res = await fetch(`${GW}/api/sessions/${sessionId.value}/file?path=${encodeURIComponent(f.path)}&fresh=${Date.now()}`, {cache: 'no-store'})
     const d = await res.json()
     if (d.binary) modalFileBinary.value = true
     else if (res.ok) modalFileContent.value = d.content || ''

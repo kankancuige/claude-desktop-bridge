@@ -60,7 +60,7 @@ const GW = () => gatewayHttpBase()              // Gateway 本地 HTTP 地址
 // 实现方式: 使用闭包保存内部状态，返回镜像钩子供 Gateway 调用。
 //          返回 null 表示凭据加载失败，适配器无法启动。
 // 关键数据流: adapters.json 加载凭据 → 创建 Client + WSClient → 注册事件处理器 → 启动 WS → 返回钩子对象
-export function startFeishuAdapter(token, {taskCommands, stateStore = null} = {}) {
+export function startFeishuAdapter(token, {taskCommands, stateStore = null, onNotificationStateChange = null} = {}) {
     let appId, appSecret
     let stopped = false
     let connectionError = null
@@ -355,6 +355,7 @@ export function startFeishuAdapter(token, {taskCommands, stateStore = null} = {}
         outbox,
         deliver: payload => sendMsg(payload.userId, payload.text),
         log,
+        onStateChange: event => onNotificationStateChange?.({...event, platform: 'feishu'}),
     })
 
     async function sendReliableText(userId, text, notificationId = null) {

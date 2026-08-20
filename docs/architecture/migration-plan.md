@@ -69,12 +69,16 @@ Incomplete: None
 | 3 IM 切换 | 三平台单元测试通过 | adapters 通过仓储接口读写 SQLite | 重复消息、失败重试、dead 状态和通知顺序一致 | 队列丢失或状态提前完成 | 关闭 SQLite adapter，回读旧文件 |
 | 4 派生索引 | transcript/Memory 扫描基线固定 | 会话和 Markdown Memory 写入索引 | 索引结果与扫描结果一致；正文未复制 | 索引污染跨项目数据 | 停止索引读取，回退目录扫描 |
 | 5 稳定观察 | Gateway/desktop 门禁通过 | 健康接口与 degraded 日志可见 | 重启、损坏 DB、锁等待和恢复 smoke | 无法判断数据是否可靠 | 保留双读和旧文件，不删除兼容代码 |
+| 6 旧会话目录修复 | transcript 分类测试通过 | 按真实 `cwd` 合并物理目录；空的 migration-v1 sidecar 升级为 v2 并补建主会话索引 | 主会话恢复、Agent 过滤、canonical 去重、权限/镜像继承 | 任何内部会话进入侧栏或正文被移动 | 删除派生索引并从原 JSONL/sidecar 重建 |
 
 ### 数据与回滚
 
 - SQLite 数据库只新增，不覆盖旧 JSON；所有导入按 `platform + message_id` 或 `platform + notification_id` 幂等。
 - 数据库损坏时重命名为 `.corrupt-<timestamp>`，切换文件模式并保留告警；不自动删除排队载荷。
 - 只有连续一个发布周期确认 SQLite 与文件模式可互相恢复，才允许讨论移除文件兼容路径；本次不删除旧路径。
+- schema v3 增量增加会话权限、IM 镜像、最近打开时间和 runtime revision 字段。首次协调从 `bridge-session-visibility.json`、`bridge-task-state/*.json`、`bridge-session-mirrors.json` 与 transcript 元数据导入；删除或重建数据库不会删除这些文件。
+- schema v4 增加任务/Workflow 结构化投影。任务状态、revision 和幂等事件在短事务内写入 SQLite，迟到 revision 同时拒绝状态和事件；终态通知意图通过确定性 ID 与 outbox 对账，worker 回写 sent/failed/dead。Workflow 重启恢复将旧存活态降为 paused 并结合 journal 恢复。系统继续双写 task-state JSON 与 Session Event Journal；SQLite 缺失或不可用时回退 journal/JSON。投影不保存最终回复、transcript 或审查正文。
+- session visibility migration v2 修复曾被 v1 空迁移永久跳过的旧主 transcript；只新增 canonical SQLite 索引和 sidecar 可见记录，不移动或复制 JSONL。`agent` 分类、已知 Workflow/Agent 映射和已知定时会话保持隐藏。
 # Bridge 私有配置根目录迁移（2026-08-18）
 
 **Verdict:** READY

@@ -6,7 +6,7 @@ import {transform} from 'esbuild'
 const source = readFileSync(new URL('./session-selection.ts', import.meta.url), 'utf8')
 const compiled = await transform(source, {loader: 'ts', format: 'esm', target: 'es2022'})
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(compiled.code).toString('base64')}`
-const {classifySessionExistsResponse, isSameSessionSelection, resolveExistingSessionTarget, runtimeSessionMatchesHistory, shouldCloseSocketBeforeConnect, shouldReuseConnectedSession, shouldValidateSessionRuntime} = await import(moduleUrl)
+const {classifySessionExistsResponse, decideSessionRuntimeRecovery, isSameSessionSelection, resolveExistingSessionTarget, runtimeSessionMatchesHistory, shouldCloseSocketBeforeConnect, shouldReuseConnectedSession, shouldValidateSessionRuntime} = await import(moduleUrl)
 
 const connectedSession = {
   requestedWorkDir: 'D:/work',
@@ -87,4 +87,32 @@ test('Gateway Session 只能复用到它实际绑定的 SDK 历史会话', () =>
 test('restart requires runtime validation even when the persisted tab identity matches', () => {
   assert.equal(shouldValidateSessionRuntime({...connectedSession, connected: false, socketReadyState: 3}), true)
   assert.equal(shouldValidateSessionRuntime(connectedSession), false)
+})
+
+test('运行会话存在时复用 Gateway 返回的实际 ID', () => {
+  assert.deepEqual(decideSessionRuntimeRecovery({
+    ok: true, status: 200, response: {exists: true, sessionId: 'gw-live', historySessionId: 'sdk-1'},
+    historySessionId: 'sdk-1', fallbackSessionId: 'gw-old',
+  }), {kind: 'reuse', sessionId: 'gw-live'})
+})
+
+test('运行会话 404 时只在存在 SDK 历史 ID 时重建', () => {
+  assert.deepEqual(decideSessionRuntimeRecovery({
+    ok: false, status: 404, response: null, historySessionId: 'sdk-1', fallbackSessionId: 'gw-old',
+  }), {kind: 'recreate'})
+  assert.deepEqual(decideSessionRuntimeRecovery({
+    ok: false, status: 404, response: null, historySessionId: null, fallbackSessionId: 'gw-old',
+  }), {kind: 'reset'})
+})
+
+test('Gateway 5xx 和畸形 200 响应只重试，不创建重复会话', () => {
+  assert.equal(decideSessionRuntimeRecovery({ok: false, status: 503, response: null, historySessionId: 'sdk-1', fallbackSessionId: 'gw-old'}).kind, 'unavailable')
+  assert.equal(decideSessionRuntimeRecovery({ok: true, status: 200, response: {exists: false}, historySessionId: 'sdk-1', fallbackSessionId: 'gw-old'}).kind, 'unavailable')
+})
+
+test('Gateway runtime 绑定错误历史时重建用户选中的 SDK 会话', () => {
+  assert.deepEqual(decideSessionRuntimeRecovery({
+    ok: true, status: 200, response: {exists: true, sessionId: 'gw-live', historySessionId: 'sdk-other'},
+    historySessionId: 'sdk-1', fallbackSessionId: 'gw-old',
+  }), {kind: 'recreate'})
 })

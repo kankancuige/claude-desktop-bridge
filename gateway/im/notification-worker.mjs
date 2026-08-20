@@ -1,7 +1,19 @@
-export function startNotificationWorker({outbox, deliver, log, intervalMs = 30_000} = {}) {
+function baseNotificationId(id) {
+    return String(id || '').replace(/:part:\d+$/, '')
+}
+
+export function startNotificationWorker({outbox, deliver, log, onStateChange = null, intervalMs = 30_000} = {}) {
     if (!outbox || typeof deliver !== 'function') throw new TypeError('outbox and deliver are required')
     let running = false
     let stopped = false
+    const emitState = async event => {
+        if (typeof onStateChange !== 'function') return
+        try {
+            await onStateChange(event)
+        } catch (error) {
+            log?.warn?.({err: error, notificationId: event?.notificationId}, '通知任务投影回写失败')
+        }
+    }
 
     const flush = async () => {
         if (running || stopped) return
@@ -17,12 +29,28 @@ export function startNotificationWorker({outbox, deliver, log, intervalMs = 30_0
                         : outbox.fail(entry.id, 'send_failed')
                     if (persisted === false) {
                         log?.error?.({notificationId: entry.id}, '通知状态持久化失败')
+                    } else {
+                        const current = outbox.status?.(baseNotificationId(entry.id))
+                        await emitState({
+                            notificationId: baseNotificationId(entry.id),
+                            partId: entry.id,
+                            state: current?.state || (delivered ? 'sent' : 'failed'),
+                            lastError: current?.lastError || (delivered ? '' : 'send_failed'),
+                        })
                     }
                 } catch (error) {
                     if (stopped) break
                     const persisted = outbox.fail(entry.id, error)
                     if (persisted === false) {
                         log?.error?.({notificationId: entry.id}, '通知失败状态持久化失败')
+                    } else {
+                        const current = outbox.status?.(baseNotificationId(entry.id))
+                        await emitState({
+                            notificationId: baseNotificationId(entry.id),
+                            partId: entry.id,
+                            state: current?.state || 'failed',
+                            lastError: current?.lastError || String(error?.message || error || 'send_failed'),
+                        })
                     }
                     log?.warn?.({err: error, notificationId: entry.id}, '通知重试失败')
                 }

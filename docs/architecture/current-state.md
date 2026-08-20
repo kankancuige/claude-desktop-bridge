@@ -18,6 +18,7 @@ Incomplete: None
 | `ProviderRegistry` | 校验 Agent 能力并统一启动/释放 Provider | `agent/claude-sdk`、`AGENT_CAPABILITY_UNSUPPORTED` |
 | Claude SDK | 在 Gateway 强制设置的 `CLAUDE_CONFIG_DIR` 下写入 `~/.claude-desktop-bridge/projects/.../*.jsonl` | `providers/claude-agent-sdk-runtime.mjs`、`system/init.session_id` |
 | `bridge-session-map.json` | Gateway UUID 与 SDK conversation ID 双向映射 | `persistSdkSessionId` |
+| `bridge-state.db/bridge_session_index` | 保存可重建的会话目录、权限和 IM 镜像投影；不保存对话正文 | `sessions/session-catalog.mjs`、`storage/bridge-state-db.mjs` |
 
 ## 当前关键流程
 
@@ -32,6 +33,8 @@ Incomplete: None
 9. 任务接收：`task/accepted` 先同步写入并 `fsync`；写入失败返回 `session_event_persist_failed` 且回滚输入。后续状态、Workflow/Agent、停止和 runtime 失败写入安全事件投影。
 10. Agent 启动：主 Session、定时 Session、query 重建和 Workflow Agent 都通过 `agent/claude-sdk` Provider；只有 Provider 注册适配器可以直接调用 SDK `query()`。
 11. 重启恢复：优先从连续 journal 投影任务状态；尾部半行自动修复，中间损坏或序号中断会隔离为 `.corrupt-*` 并回退 `bridge-task-state`。
+12. 项目扫描：按 transcript 内真实 `cwd` 聚合 canonical 与旧编码物理目录；SQLite 使用 canonical project key，JSONL 保留原路径。旧空 visibility sidecar 仅修复明确分类为 `main` 的 transcript，Agent/Workflow transcript 继续过滤。
+13. Tab 恢复：Gateway runtime 404 且有 SDK history ID 时重建 runtime；没有 history ID 时清除失效 UUID并要求重新发送；网络、5xx 或无效响应才进入重连。
 
 ## 静态检查仍未关闭的风险
 
@@ -58,7 +61,7 @@ Incomplete: None
 - Bridge journal 不保存用户/assistant 正文、Prompt、API Key、请求 body 或完整工具结果；正文仍只由 Claude SDK transcript 持有。
 - journal 容量有界，Session 替换、删除和 Gateway shutdown 会释放对象；同一 Session 的模型/权限重建不会关闭 journal。
 - Claude SDK Provider 声明六项稳定能力，调用要求在 SDK 启动前验证；Registry shutdown 会隔离单个 disposer 错误并继续释放其余 Provider。
-- 本地门禁证据为 Gateway 296/296、桌面端 82/82、156 个 Gateway MJS 语法检查、Vue 类型检查和 Vite 生产构建通过；这些改动仍位于 dirty worktree。真实微信/飞书/钉钉凭据端到端与强制崩溃恢复仍需 runtime 验收。
+- 本地门禁证据更新为 Gateway 370/370、桌面端 97/97、Vue 类型检查和 Vite 生产构建通过；这些改动仍位于 dirty worktree。真实微信/飞书/钉钉凭据端到端、强制杀进程恢复和桌面交互 smoke 仍需 runtime 验收。
 
 ## Gateway 源码布局补充（2026-08-14）
 
@@ -82,7 +85,7 @@ Incomplete: None
 - Electron 主进程也从 `~/.claude/bridge-token` 和 `~/.claude/bridge-store-key` 读取 Gateway token 与旧安全载荷密钥。
 - Claude Agent SDK 是唯一执行 Provider；SDK 默认使用 `~/.claude`，除非 Query 子进程显式收到 `CLAUDE_CONFIG_DIR`。
 - 设置页可管理 `rules/` 和 `hooks/`，但完整 Query 关闭了所有 `settingSources`，因此自定义 Rule/Hook 没有进入实际会话执行链路。
-- 仓库没有 SQLite 依赖；当前配置和会话状态均为 Markdown、JSON、JSONL 或脚本文件。
+- Bridge 使用位于 `BRIDGE_HOME` 的 SQLite 运行状态库保存可重建的 IM、会话、任务和 Workflow 结构化投影；Claude transcript、事件正文、规则、Skill、Agent、Workflow 定义和附件正文仍保持 Markdown、JSON、JSONL 或脚本文件事实源。
 
 ## Bridge 私有配置实现补充（2026-08-18）
 
@@ -97,8 +100,10 @@ Incomplete: None
 ## SQLite 与 Memory 实现补充（2026-08-18）
 
 - `BRIDGE_HOME/bridge-state.db` 已保存 IM inbox/outbox、会话索引和 Memory Markdown 派生索引；Rules、Skills、MCP、Agents、Hooks、Provider 配置、Memory 正文和 Claude transcript 继续使用文件事实源。
-- Electron 使用内置 `node:sqlite`，Node 20 可选加载 `better-sqlite3`。数据库使用 WAL、5 秒 busy timeout 和 schema v2；驱动不可用时显式进入文件模式，确认损坏时隔离数据库并在健康接口暴露原因和隔离计数。
+- Electron 使用内置 `node:sqlite`，Node 20 可选加载 `better-sqlite3`。数据库使用 WAL、5 秒 busy timeout 和 schema v3；驱动不可用时显式进入文件模式，确认损坏时隔离数据库并在健康接口暴露原因和隔离计数。
+- 项目与会话列表通过 `bridge_session_index` 增量协调 transcript 的路径、mtime、size、标题、用户可见性、来源、权限、IM 镜像和最近打开时间。扫描先按 mtime 稳定选择最新记录，既有目录一次批量读取并在一个短事务内批量 upsert；mtime/size 未变化时不重新读取 transcript。visibility sidecar 缺失或损坏时可用 SQLite 中已确认的 `visible` 记录恢复，SQLite 不可用时继续使用原 JSON/JSONL 扫描和 sidecar 设置。
 - 微信、飞书、钉钉按平台惰性导入旧 JSON。重配或解绑会同时清理 SQLite 和兼容文件；适配器停止时通知统计仍读取 SQLite。
+- 任务状态通过 `bridge_task_state`/`bridge_task_events` 双写 SQLite 与旧 task-state/Event Journal；状态和事件在同一短事务内按 revision 接受或拒绝，迟到 revision 不再进入事件流。终态任务先保存平台通知意图，通知使用确定性 ID 进入 outbox；worker 的 sent/failed/dead 结果回写任务投影，重启时对账缺失 outbox 记录并重新入队。Workflow 通过 `bridge_workflow_state` 保存阶段、token、父 Session 和运行键；重启后存活态降为可恢复的 paused，并结合 journal 恢复阶段和 token。SQLite 不复制最终回复或事件正文。
 - transcript 索引只保存路径和元数据，命中时走快速路径；文件删除或元数据失效后清理陈旧行并回退目录扫描，不复制会话正文。
 - `context/memory-service.mjs` 对动作任务做确定性关键词召回，最多注入 6 KB；简单问题、无匹配内容、停用/过期记录和明确“不要记住”均不注入。
 - 设置页可搜索、启停、删除和重建项目 Memory，展示来源、状态、作用域和最近验证时间。SQLite 只保存索引，`memory/*.md` 仍可直接编辑和恢复。

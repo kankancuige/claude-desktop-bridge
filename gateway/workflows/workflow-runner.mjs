@@ -676,6 +676,106 @@ const _cleanupTimers = new Map()   // wfId → setTimeout id，workflow 终止�
 // 运行状态 TTL（毫秒），终端状态保留此时间后自动清理，给 UI 留查询窗口
 const RUN_STATE_TTL_MS = 5 * 60 * 1000
 
+function persistWorkflowProjection(wfId, state) {
+    const store = typeof _deps?.stateStore === 'function' ? _deps.stateStore() : _deps?.stateStore
+    if (!store?.available || !state?._workDir) return
+    try {
+        const projectKey = _deps?.encodeProjectName?.(state._workDir)
+        if (!projectKey) return
+        const revision = Math.max(1, Number(state._revision || 0) + 1)
+        state._revision = revision
+        const phases = Array.isArray(state.phases) ? state.phases.slice(-50) : []
+        store.upsertWorkflowState({
+            projectKey,
+            workflowId: wfId,
+            parentSessionId: state._parentSid || null,
+            name: state.name,
+            status: state.status,
+            currentPhase: state._currentPhase || phases.find(item => item.status === 'running')?.title || null,
+            tokenSpent: state._tokenSpent || state.tokenSpent || 0,
+            startedAt: state.startedAt,
+            endedAt: state.endedAt || null,
+            revision,
+            state: {
+                wfId, name: state.name, status: state.status, phases,
+                currentPhase: state._currentPhase || null,
+                tokenSpent: state._tokenSpent || state.tokenSpent || 0,
+                startedAt: state.startedAt, endedAt: state.endedAt || null,
+                runKey: state.runKey || state.name,
+                taskOwned: state._args?._taskOwned === true,
+                returnsToParent: state._args?._returnToParent !== false,
+            },
+        })
+    } catch (error) {
+        log.warn({err: error, workflowId: wfId}, 'Workflow SQLite 状态投影保存失败，保留 JSON journal')
+    }
+}
+
+function restoreSessionWorkflowStates(sessionId) {
+    const session = _deps?.sessions?.get?.(sessionId)
+    const store = typeof _deps?.stateStore === 'function' ? _deps.stateStore() : _deps?.stateStore
+    if (!session?.workDir || !store?.available) return
+    let rows = []
+    try {
+        const projectKey = _deps?.encodeProjectName?.(session.workDir)
+        if (!projectKey) return
+        rows = store.listWorkflowStates(projectKey, {parentSessionId: sessionId, limit: 100})
+    } catch (error) {
+        log.warn({err: error, sessionId: String(sessionId).slice(0, 8)}, '恢复 Workflow SQLite 状态失败')
+        return
+    }
+    for (const row of rows) {
+        if (!row?.workflowId || _runStates.has(row.workflowId)) continue
+        if (!['starting', 'running', 'paused'].includes(row.status)
+            && Date.now() - Number(row.updatedAt || 0) > RUN_STATE_TTL_MS) continue
+        const projected = row.state && typeof row.state === 'object' ? row.state : {}
+        const wasAlive = ['starting', 'running'].includes(row.status)
+        const status = wasAlive ? 'paused' : row.status
+        const runKey = projected.runKey || `${row.name}:${sessionId}`
+        const journal = loadJournal(row.workflowId) || {}
+        const phases = Array.isArray(journal.phases) && journal.phases.length
+            ? journal.phases
+            : Array.isArray(projected.phases) ? projected.phases : []
+        const state = {
+            name: row.name,
+            runKey,
+            status,
+            phases,
+            logs: Array.isArray(journal.logs) ? journal.logs.slice(-100) : [],
+            startedAt: row.startedAt || projected.startedAt || Date.now(),
+            endedAt: status === 'paused' ? null : row.endedAt || projected.endedAt || null,
+            wfId: row.workflowId,
+            tokenSpent: Number(journal.tokenSpent ?? row.tokenSpent ?? projected.tokenSpent) || 0,
+            _parentSid: sessionId,
+            _workDir: session.workDir,
+            _currentPhase: journal.currentPhase || row.currentPhase || projected.currentPhase || '',
+            _tokenSpent: Number(journal.tokenSpent ?? row.tokenSpent ?? projected.tokenSpent) || 0,
+            _revision: Number(row.revision || 0),
+            _args: journal.args && typeof journal.args === 'object'
+                ? journal.args
+                : {_taskOwned: projected.taskOwned === true, _returnToParent: projected.returnsToParent !== false, _runKey: runKey},
+            _journalCache: journal.journalCache && typeof journal.journalCache === 'object' ? journal.journalCache : {},
+            _countedKeys: new Set(journal._countedKeys || []),
+            _agentAborts: new Map(),
+            _agentHandles: new Map(),
+            _pausedAgents: new Map(),
+            _aborted: status === 'paused',
+        }
+        _runStates.set(row.workflowId, state)
+        _activeByName.set(runKey, row.workflowId)
+        if (status === 'paused') {
+            _pausedStates.set(runKey, {
+                name: row.name, runKey, status, phases, logs: state.logs,
+                wfId: row.workflowId, pausedAt: Date.now(), parentSid: sessionId,
+                args: state._args, workDir: session.workDir, journalCache: state._journalCache,
+                tokenSpent: state._tokenSpent, currentPhase: state._currentPhase,
+                _countedKeys: [...state._countedKeys],
+            })
+        }
+        if (wasAlive) persistWorkflowProjection(row.workflowId, state)
+    }
+}
+
 function getRunState(nameOrWfId) {
     // 先按 wfId 查找，再按 name 查找最新活跃 wfId
     let state = _runStates.has(nameOrWfId) ? _runStates.get(nameOrWfId) : null
@@ -1427,6 +1527,23 @@ function stopWorkflow(nameOrRunKey) {
         _pausedAgents: new Map(state._pausedAgents || []),
     })
     state.status = 'paused'
+    state.endedAt = null
+    persistWorkflowProjection(wfId, state)
+    saveJournal(wfId, {
+        name: state.name,
+        runKey,
+        parentSid: state._parentSid,
+        workDir: state._workDir,
+        args: state._args,
+        phases: state.phases || [],
+        logs: (state.logs || []).slice(-200),
+        tokenSpent: state._tokenSpent || 0,
+        journalCache: state._journalCache || {},
+        currentPhase: state._currentPhase || '',
+        _countedKeys: [...(state._countedKeys || [])],
+        savedAt: Date.now(),
+        paused: true,
+    })
     // 调用 _abort() 桥接闭包变量 aborted 和 state._aborted，确保 VM 沙箱内 agent()/parallel()/pipeline() 感知到暂停
     if (typeof state._abort === 'function') state._abort()
     else state._aborted = true  // 兜底：旧版本 runState 没有 _abort 方法
@@ -1491,6 +1608,9 @@ function resumeWorkflowAgent(wfId, agentLabel) {
 
 // ── 恢复工作流 ──
 async function resumeWorkflow(name, parentSidOrNull, overrideArgs = {}, runKey = name) {
+    if (!_pausedStates.has(runKey) && !_pausedStates.has(name) && parentSidOrNull) {
+        restoreSessionWorkflowStates(parentSidOrNull)
+    }
     const snapshot = _pausedStates.get(runKey) || _pausedStates.get(name)
     if (!snapshot) throw new Error('没有可恢复的暂停状态: ' + name)
 
@@ -1597,6 +1717,10 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
         // 每个 phase 切换时持久化 journal
         saveJournal(wfId, {
             name,
+            runKey,
+            parentSid,
+            workDir,
+            args: extraArgs,
             phases: [...phases],
             logs: logs.slice(-200),
             tokenSpent,
@@ -1630,6 +1754,7 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
         runState.phases = phases.length > 0 ? [...phases]
             : (meta?.phases || []).map(p => ({...p, status: p.title === currentPhase ? 'running' : 'pending'}))
         runState._currentPhase = currentPhase
+        persistWorkflowProjection(wfId, runState)
     }
     const origLogFn = logFn
     const enhancedLog = (msg, ph) => {
@@ -1638,6 +1763,7 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
     }
 
     const isResume = !!resumeState
+    persistWorkflowProjection(wfId, runState)
     _broadcast({
         type: isResume ? 'workflow_resumed' : 'workflow_started',
         workflowId: wfId, name,
@@ -2000,9 +2126,11 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
         }
 
         runState.status = 'done'
+        runState.endedAt = Date.now()
         runState.result = result
         runState.phases = phases.length > 0 ? [...phases] : (meta?.phases || []).map(p => ({...p, status: 'done'}))
         runState.tokenSpent = tokenSpent
+        persistWorkflowProjection(wfId, runState)
 
         _broadcast({
             type: 'workflow_done', workflowId: wfId, name,
@@ -2045,13 +2173,19 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
         // 区分暂停 vs 真实错误
         if (aborted || e.message?.includes('WorkflowAborted')) {
             runState.status = 'paused'
+            runState.endedAt = Date.now()
             runState.phases = phases.length > 0 ? [...phases] : (meta?.phases || []).map(p => ({
                 ...p,
                 status: p.title === currentPhase ? 'running' : 'pending'
             }))
             runState.tokenSpent = tokenSpent
+            persistWorkflowProjection(wfId, runState)
             saveJournal(wfId, {
                 name,
+                runKey,
+                parentSid,
+                workDir,
+                args: extraArgs,
                 phases: [...phases],
                 logs: logs.slice(-200),
                 tokenSpent,
@@ -2077,7 +2211,9 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
         }
 
         runState.status = 'error'
+        runState.endedAt = Date.now()
         runState.error = e.message
+        persistWorkflowProjection(wfId, runState)
         _broadcast({type: 'workflow_error', workflowId: wfId, name, error: e.message, logs: logs.slice(-50)})
         enhancedLog('[Workflow] 错误: ' + e.message)
 
@@ -2185,6 +2321,7 @@ function serializeSessionWorkflowState(wfId, state) {
 
 // 返回该会话全部 Workflow，父任务聚合器负责判断是否仍有必需子执行。
 function getSessionWorkflowStates(sessionId) {
+    restoreSessionWorkflowStates(sessionId)
     const workflows = []
     for (const [wfId, state] of _runStates) {
         if (state._parentSid !== sessionId) continue

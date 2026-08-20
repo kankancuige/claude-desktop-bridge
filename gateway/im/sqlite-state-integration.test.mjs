@@ -44,3 +44,31 @@ test('通知 outbox 的状态转换通过 SQLite 持久化并可按平台隔离'
     assert.equal(restored.summary().failed, 1)
     assert.equal(new NotificationOutbox({filePath: join(root, 'outbox.json'), platform: 'wechat', payloadCodec: codec, stateStore: store}).summary().failed, 0)
 })
+
+test('父任务完成与通知待投递可跨重启独立恢复，通知失败不覆盖任务结果', () => {
+    const {root, store, codec} = fixture()
+    const outboxPath = join(root, 'outbox.json')
+    const outbox = new NotificationOutbox({filePath: outboxPath, platform: 'dingtalk', payloadCodec: codec, stateStore: store})
+    const notificationId = 'task-1:task_completed:part:1'
+    outbox.enqueue({userId: 'u1', text: '任务完成'}, {id: notificationId})
+    store.recordTaskTransition({
+        projectKey: 'D--demo', taskKey: 'task-1', taskId: 'task-1', sessionId: 'gw-1',
+        revision: 1, eventType: 'task/completed',
+        state: {
+            status: 'succeeded', outcome: 'succeeded', taskId: 'task-1', sequence: 1,
+            updatedAt: 100, notifications: {dingtalk: {state: 'pending', notificationId, updatedAt: 100}},
+        },
+    })
+    store.close()
+
+    const reopened = new BridgeStateDb({bridgeHome: root})
+    const restoredTask = reopened.getTaskState('D--demo', 'task-1')
+    const restoredOutbox = new NotificationOutbox({filePath: outboxPath, platform: 'dingtalk', payloadCodec: codec, stateStore: reopened})
+    assert.equal(restoredTask.status, 'succeeded')
+    assert.equal(restoredTask.notifications.dingtalk.state, 'pending')
+    assert.equal(restoredOutbox.summary().pending, 1)
+    restoredOutbox.fail(notificationId, 'timeout')
+    assert.equal(reopened.getTaskState('D--demo', 'task-1').status, 'succeeded')
+    assert.equal(restoredOutbox.summary().failed, 1)
+    reopened.close()
+})

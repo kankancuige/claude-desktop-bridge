@@ -21,7 +21,12 @@ Incomplete: None
 - `rules/`、`skills/`、`agents/`、`hooks/` 和 `workflows/` 保持可读文件格式，不放入 SQLite。
 - `projects/` 同时保存 SDK transcript 与 Bridge 的 session map、journal、checkpoint、snapshot 和 preference；所有消费者使用同一根目录。
 - `bridge-state.db` 只保存 IM inbox/outbox、消息去重、会话索引和 Memory 文件索引；不保存 transcript 正文、规则正文或凭据。
+- 会话目录以 `(project_key, session_id)` 为唯一身份，统一保存可重建 transcript 元数据以及权限、IM 镜像和最近打开状态；项目列表优先读取目录并按 mtime/size 增量协调，JSON/JSONL 与 sidecar 文件保持兼容事实源和降级路径。
+- `project_key` 必须由 transcript 的真实 `cwd` 生成；同一 `cwd` 的 canonical 与旧编码目录合并协调。`transcript_path` 保留物理位置并全局唯一，项目键转移时原子继承权限和 IM 镜像投影。
 - SQLite 使用 WAL、短事务和 schema version；不可用时显式降级到旧文件状态并广播 `state_store_degraded`，不得静默丢失任务。
+- SQLite 的 `bridge_task_state`、`bridge_task_events` 和 `bridge_workflow_state` 只保存状态字段、revision、时间、计数和投影元数据；最终回复、transcript、事件正文和审查详细文本继续留在文件事实源。
+- 任务终态与通知采用 at-least-once 契约：终态投影包含待投递意图，outbox 在网络调用前持久化并使用确定性 notification ID 去重；worker 结果回写任务投影，重启对账补建缺失记录。不得把跨平台网络调用包在 SQLite 事务内。
+- Gateway 重启时，数据库中的 `starting/running` Workflow 不得继续显示为存活进程；恢复层将其转换为 `paused`，由 journal 补充阶段、token 和受控参数后再 resume。
 - 完整上下文只启用 Bridge 私有 `user` setting source；focused/light 继续关闭 setting source、MCP、Agent 和 Hook。
 - 首次兼容迁移复制已知资源和 Bridge 数据，目标已存在时不覆盖；写入迁移清单后正常运行只访问新目录。旧目录保留供人工回退，绝不自动删除。
 
@@ -42,6 +47,7 @@ Incomplete: None
 - `POST /api/sessions` 未传 `resume`：创建新会话。
 - 传 `resume` 且 transcript/映射存在：返回 `resumed: true` 和稳定的 Gateway/SDK ID。
 - 传 `resume` 但不存在：返回 `404`、`code: SESSION_RESUME_NOT_FOUND`；禁止静默创建新会话。
+- 桌面端检查旧 Gateway UUID 返回 404 时，只有持有 SDK history ID 才重建 runtime；没有 history ID 的空壳会话停止自动重试并提示重新发送。网络与 5xx 不得被误判为会话丢失。
 - `POST /api/sessions/:id/stop`：幂等停止当前生成，返回 `stopped`、`resumable`、`historySessionId`；不删除 transcript。
 - `POST /api/sessions {forkFrom}`：校验源 transcript 后调用 SDK `forkSession`，返回新的 SDK conversation ID；源会话保持不变，fork 不复制 undo/file-history。
 - 恢复或 fork 生成的 SDK ID 在 runtime 创建时立即写入 `lastSessionId` 并尝试持久化双向映射；重复 `system/init` 只校正同一身份。
