@@ -19,6 +19,7 @@ const {normalizeExternalUrl} = require('./external-url.cjs')
 const {openDirectoryInShell} = require('./open-directory.cjs')
 const { checkForUpdates, downloadUpdate, quitAndInstall } = require('./updater.cjs')
 const {resolveBridgeHome} = require('./bridge-home.cjs')
+const {decideGatewayRestart} = require('./gateway-restart-policy.cjs')
 
 const BRIDGE_HOME = resolveBridgeHome()
 
@@ -232,15 +233,19 @@ function startGateway() {
     if (gatewayProcess === proc) gatewayProcess = null
     if (stoppingGatewayProcesses.has(proc)) return
     if (isQuitting) return  // 退出中，不重启
-    if (code !== 0 && gatewayRestarts < MAX_RESTARTS) {
-      gatewayRestarts++
+    const restart = decideGatewayRestart({
+      exitCode: code,
+      restartCount: gatewayRestarts,
+      maxRestarts: MAX_RESTARTS,
+    })
+    gatewayRestarts = restart.restartCount
+    if (restart.shouldRestart) {
       logToFile(`[RESTART] ${gatewayRestarts}/${MAX_RESTARTS}`)
-      const restartDelay = Math.min(30_000, 2_000 * (2 ** (gatewayRestarts - 1)))
-      logToFile(`[RESTART] retrying in ${restartDelay}ms`)
+      logToFile(`[RESTART] retrying in ${restart.delayMs}ms`)
       gatewayRestartTimer = setTimeout(() => {
         gatewayRestartTimer = null
         startGateway()
-      }, restartDelay)
+      }, restart.delayMs)
       gatewayRestartTimer.unref?.()
     }
   })

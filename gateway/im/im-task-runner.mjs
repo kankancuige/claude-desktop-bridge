@@ -1,7 +1,9 @@
 import {createImTurnTimeout} from './im-turn-timeout.mjs'
 import {turnFallbackText} from './im-turn-finish.mjs'
 
-const TERMINAL_TYPES = new Set(['task_completed', 'task_failed', 'task_review_paused'])
+const TERMINAL_TYPES = new Set([
+    'task_completed', 'task_failed', 'task_review_paused', 'task_verification_inconclusive',
+])
 
 function assistantText(message) {
     const parts = []

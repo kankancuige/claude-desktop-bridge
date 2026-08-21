@@ -1,0 +1,7 @@
+# 内置 CAD Skill 的 scripts 是随资源包分发的第三方镜像与构建产物。
+# 保持其原始字节，避免格式化改变资源校验；Bridge 自有源码继续使用默认 whitespace 门禁。
+gateway/builtin-resources/skills/cad-viewer/scripts/** -whitespace
+gateway/builtin-resources/skills/cad/scripts/** -whitespace
+gateway/builtin-resources/skills/sdf/scripts/** -whitespace
+gateway/builtin-resources/skills/srdf/scripts/** -whitespace
+gateway/builtin-resources/skills/urdf/scripts/** -whitespace

@@ -17,20 +17,24 @@ import {config as loadEnv} from 'dotenv'
 import {safeBasename, safeChildPath} from './security/path-security.mjs'
 import {query, deleteSession, forkSession} from './providers/claude-agent-sdk-runtime.mjs'
 import {BRIDGE_HOME, prepareBridgeHome} from './config/bridge-home.mjs'
+import {getBuiltinResourceState, setBuiltinResourceEnabled} from './config/builtin-resources.mjs'
 import {createLogger, logHttpRequest} from './shared/logger.mjs'
 import {buildSessionStopResponse, getSessionStopScope, hasStoppableSessionWork} from './sessions/session-stop.mjs'
 import {resolveSessionResume} from './sessions/session-resume.mjs'
-import {getSessionRuntimeState} from './sessions/session-runtime-state.mjs'
+import {consumePendingSessionInputOnResult, getSessionRuntimeState} from './sessions/session-runtime-state.mjs'
 import {classifyTranscriptFile} from './projects/transcript-classifier.mjs'
 import {parseSessionHistory} from './sessions/session-history.mjs'
 import {findSessionTranscript, listProjectTranscriptCandidates} from './projects/project-transcript-location.mjs'
 import {removeSessionMapEntry, resolveMappedGatewaySessionId, updateSessionMap} from './sessions/session-map-consistency.mjs'
 import {isUserSessionSource, loadSessionVisibility, markSessionVisible, migrateLegacySessionVisibility, removeSessionVisibility, sessionVisibilitySource, shouldShowSession} from './sessions/session-visibility.mjs'
 import {initialSessionIdentity, resolveSessionCreateMode} from './sessions/session-create-mode.mjs'
-import {createSessionRuntime} from './sessions/session-runtime.mjs'
+import {createSessionContextEnvelope, createSessionRuntime} from './sessions/session-runtime.mjs'
+import {createTaskInputQueue} from './sessions/task-input-queue.mjs'
+import {createSdkStreamAdapter} from './sessions/sdk-stream-adapter.mjs'
+import {createSessionCoordinator} from './sessions/session-coordinator.mjs'
 import {getPersistedMirrors, mirrorSessionIds, mirrorStorePath, removePersistedMirrors, setPersistedMirror, setPersistedMirrors} from './sessions/session-mirror-state.mjs'
 import {reconcileSessionCatalog} from './sessions/session-catalog.mjs'
-import {buildProjectContinuationContext, composeContinuationPrompt} from './projects/project-continuation-context.mjs'
+import {buildModelHandoffPrompt, buildProjectContinuationContext, composeContinuationPrompt} from './projects/project-continuation-context.mjs'
 import {buildAgentDescriptor, buildAgentToolLifecycleEvent} from './agents/agent-tool-lifecycle.mjs'
 import {startWeChatAdapter} from './im/wechat.mjs'
 import {startFeishuAdapter} from './im/feishu.mjs'
@@ -64,6 +68,7 @@ import {
     buildCacheInjectionText,
     cacheFilePath
 } from './projects/project-cache.mjs'
+import {buildProjectContext} from './projects/project-context.mjs'
 import {startDeepSeekProxy, getProxyUrl, stopDeepSeekProxy, isProxyConfiguredFor} from './providers/deepseek-proxy.mjs'
 import {startOpenCodeProxy, getOpenCodeProxyUrl, stopOpenCodeProxy, isOpenCodeProxyRunning} from './providers/opencode-proxy.mjs'
 import {validateProviderUrl, resolveProviderUrl, resolveProviderRedirect, buildProviderModelsUrl, buildProviderFallbackUrls, createPinnedLookup} from './security/provider-url-security.mjs'
@@ -77,7 +82,7 @@ import {
     looksLikeIncompleteTransportFailure,
 } from './tasks/task-result-outcome.mjs'
 import {isAutoContinuationPrompt, resolveAutoContinuation} from './tasks/task-auto-continuation.mjs'
-import {createTaskStatePatch, recoverTaskState, taskStateForClient, taskStateForError, taskStateForStop, taskStateFileId} from './tasks/task-state.mjs'
+import {createTaskStatePatch, recoverTaskState, taskStateForClient, taskStateForError, taskStateForInconclusive, taskStateForStop, taskStateFileId} from './tasks/task-state.mjs'
 import {clearPlatformEntries, platformEntryFilePath} from './im/platform-entry-store.mjs'
 import {createTurnIdentity, shouldDeliverTurnEvent, shouldRouteMirror} from './tasks/turn-routing.mjs'
 import {normalizeWeChatBaseUrl} from './im/wechat-url.mjs'
@@ -93,9 +98,19 @@ import {decideTask} from './tasks/task-decision.mjs'
 import {shouldCaptureTurnCheckpoint} from './tasks/turn-checkpoint-policy.mjs'
 import {normalizeExplicitModel, resolveTaskModelRoute, resolveTurnModelRoute, shouldDeferAutomaticQuery, shouldValidateProviderModel, validateProviderModel} from './tasks/model-routing.mjs'
 import {resolveWorkflowFinalReviewTier, shouldAutoTriggerWorkflow} from './workflows/workflow-model-routing.mjs'
-import {createTaskCompletionState, normalizeReviewOutcome, resolveFinalReviewPlan, transitionTaskCompletion} from './tasks/task-completion.mjs'
+import {createTaskCompletionState, hasPersistedNotificationIntents, normalizeReviewOutcome, resolveFinalReviewPlan, resolveRequiredNotificationPlatforms, transitionTaskCompletion} from './tasks/task-completion.mjs'
 import {createTaskLifecycleSnapshot} from './tasks/task-lifecycle.mjs'
 import {createTaskCommandService} from './tasks/task-command.mjs'
+import {createTaskPlan} from './tasks/task-plan.mjs'
+import {resolveTaskPhases} from './tasks/task-phase.mjs'
+import {createTaskCoordinator} from './tasks/task-coordinator.mjs'
+import {restoreCoordinatorSnapshot} from './tasks/coordinator-compatibility.mjs'
+import {createCoordinatorPersistence} from './tasks/coordinator-persistence.mjs'
+import {createTaskWorkbenchRuntime} from './tasks/task-workbench-runtime.mjs'
+import {BUILTIN_AGENT_DEFINITIONS, createAgentRegistry, resolveAgents as resolveTaskAgents} from './agents/agent-registry.mjs'
+import {createVerificationAdapterRegistry} from './validation/verification-adapter.mjs'
+import {createCommandVerificationAdapter} from './validation/command-adapter.mjs'
+import {createVerificationCampaignService} from './validation/verification-campaign.mjs'
 import {SessionEventJournal, journalTaskState, sessionEventStorePath} from './sessions/session-event-journal.mjs'
 import {requirementsForAgentStart} from './agents/agent-capabilities.mjs'
 import {createProviderRegistry} from './providers/provider-registry.mjs'
@@ -118,9 +133,11 @@ import {buildSystemInitEvent} from './sessions/session-init-event.mjs'
 import {resolveRtkCommandArgs} from './tools/rtk-command.mjs'
 import {describeAttachment, isImageAttachment} from './tools/attachment-type.mjs'
 import {cleanupUploadDir, prepareUploadDir} from './tools/upload-storage.mjs'
-import {mapStreamEvent} from './sessions/stream-event-mapper.mjs'
 import {parseDeepSeekBalance, resolveBalanceProvider} from './providers/balance-provider.mjs'
 import {createUserPreferenceService} from './context/user-preferences.mjs'
+import {createPitfallService} from './context/pitfall-service.mjs'
+import {createPitfallAdmin} from './context/pitfall-admin.mjs'
+import {checkAiLayerHealth, detectRuleDrift} from './context/ai-layer-health.mjs'
 import {createBridgeStateDb} from './storage/bridge-state-db.mjs'
 import {createMemoryService} from './context/memory-service.mjs'
 import {
@@ -131,6 +148,7 @@ import {
     setProjectMemoryEnabled,
 } from './context/memory-admin.mjs'
 import {createImProgressReporter} from './im/im-progress-reporter.mjs'
+import {createImProgressPolicy} from './im/im-progress-policy.mjs'
 import {
     calculateAutoCompactWindow,
     compactBoundaryToEvent,
@@ -138,6 +156,8 @@ import {
     isSyntheticCompactSummary,
     parseTokenCount,
 } from './context/context-lifecycle.mjs'
+import {resolveContextReusePolicy} from './context/context-cache-policy.mjs'
+import {createModelUsageEvent} from './context/model-usage.mjs'
 let _proxyStarting = null
 // 同一项目只允许一个后台索引任务，避免连续新建会话重复扫描同一目录。
 const projectCacheBuilds = new Map()
@@ -169,6 +189,10 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 loadEnv({path: join(__dirname, '.env'), override: true})
 const log = createLogger('gateway')
 let bridgeStateDb = null
+let taskCoordinator = null
+let taskWorkbench = null
+let pitfallService = null
+let pitfallAdmin = null
 let memoryService = null
 
 const providerRegistry = createProviderRegistry({
@@ -580,6 +604,8 @@ const sessions = new Map()
 let focusedSessionId = null
 const IM_SOURCES = new Set(['wechat', 'feishu', 'dingtalk'])
 const MAX_SESSION_INPUT_QUEUE = 32
+const taskInputQueue = createTaskInputQueue({maxPending: MAX_SESSION_INPUT_QUEUE, imSources: IM_SOURCES})
+const sessionCoordinator = createSessionCoordinator()
 const VALID_PERMISSION_MODES = new Set(['default', 'acceptEdits', 'plan', 'bypassPermissions'])
 const VALID_THINKING_LEVELS = new Set(['auto', 'off', 'low', 'medium', 'high', 'xhigh', 'max'])
 const VALID_MODEL_MODES = new Set(['auto', 'fixed'])
@@ -871,11 +897,163 @@ function updateTaskNotificationState(session, sessionId, platform, state, notifi
     broadcastTaskLifecycle(sessionId)
 }
 
+async function initializeTaskWorkbenchSession({session, sessionId, taskId, turnId, source, userId = null, goal, decision}) {
+    if (!taskWorkbench) throw Object.assign(new Error('Task Workbench Runtime 尚未初始化'), {code: 'TASK_WORKBENCH_UNAVAILABLE'})
+    const phasePlan = resolveTaskPhases(decision)
+    const projectContext = phasePlan.requiresProjectContext
+        ? await buildProjectContext(session.workDir, {persist: true})
+        : null
+    const agentRoute = resolveTaskAgents(projectContext || {}, decision).map(item => item.id)
+    const plan = createTaskPlan({
+        taskId, turnId, sessionId, source, userId, goal, workDir: session.workDir,
+        decision, projectContext, phases: phasePlan.phases,
+        reviewRequired: decision.finalReview !== 'none',
+        acceptanceCriteria: ['完成用户明确要求', '执行与风险相称的验证', '记录未验证风险'],
+    })
+    session.projectContext = projectContext
+    session.taskPhasePlan = phasePlan
+    session.agentRoute = agentRoute
+    session.coordinatorTaskId = plan.taskId
+    const accepted = taskWorkbench.acceptTask({plan, projectContext, agentRoute})
+    session.taskPitfallReminders = accepted.pitfalls
+    return accepted
+}
+
+function buildTaskPitfallReminder(reminders = []) {
+    const items = reminders.slice(0, 5).map(item => {
+        const prevention = String(item.prevention || item.summary || '').trim().slice(0, 500)
+        return prevention ? `- ${String(item.title || '历史踩坑').slice(0, 160)}：${prevention}` : ''
+    }).filter(Boolean)
+    return items.length ? `\n\n[Bridge 相关 Pitfall 提醒]\n${items.join('\n')}\n请只在与当前任务相关时应用，并以当前代码和验证证据为准。` : ''
+}
+
+function trustedValidationCommands(projectContext) {
+    const commands = Array.isArray(projectContext?.commands) ? projectContext.commands : []
+    const tests = commands.filter(item => item?.kind === 'test' || /^test(?::|$)/i.test(String(item?.name || '')))
+    const builds = commands.filter(item => item?.kind === 'build' || /^build(?::|$)/i.test(String(item?.name || '')))
+    const unique = new Map()
+    for (const item of [...tests, ...builds]) {
+        const normalized = {...item, kind: tests.includes(item) ? 'test' : 'build'}
+        const key = `${normalized.executable}\0${(normalized.args || []).join('\0')}`
+        if (!unique.has(key)) unique.set(key, normalized)
+    }
+    return [...unique.values()].slice(0, 20)
+}
+
+async function runCoordinatorValidation(sessionId, session, {reason = 'primary_result'} = {}) {
+    const snapshot = session?.coordinatorTaskId ? taskCoordinator?.getTaskSnapshot(session.coordinatorTaskId) : null
+    if (!snapshot || !snapshot.plan.steps.some(step => step.phase === 'validate' && step.required !== false)) return snapshot
+    if (snapshot.verification?.status === 'passed') return snapshot
+    if (['blocked_environment', 'regression_detected', 'inconclusive'].includes(snapshot.verification?.status)) return snapshot
+    if (session._coordinatorValidationPromise) return session._coordinatorValidationPromise
+    const commands = trustedValidationCommands(session.projectContext)
+    if (!commands.length) {
+        return taskWorkbench.recordVerification(snapshot.taskId, {
+            status: 'inconclusive', evidenceLevel: 'L0', testsExecuted: false,
+            summary: '目标项目未识别到受信测试或构建命令，无法自动验证',
+        })
+    }
+    session._coordinatorValidationPromise = (async () => {
+        const registry = createVerificationAdapterRegistry([
+            createCommandVerificationAdapter({commands}),
+        ])
+        const projectKey = session.projectContext?.projectKey || sessionCatalogProjectKey(session.workDir)
+        const campaignService = createVerificationCampaignService({
+            registry,
+            persist: campaign => {
+                if (!bridgeStateDb?.available) return false
+                try {
+                    return bridgeStateDb.upsertVerificationCampaign({projectKey, campaign, updatedAt: campaign.updatedAt || Date.now()})
+                } catch (error) {
+                    log.warn({err: error, taskId: snapshot.taskId}, 'Verification Campaign 持久化失败')
+                    return false
+                }
+            },
+            publish: event => appendSessionEvent(session, event.type, {
+                taskId: snapshot.taskId,
+                campaignId: event.campaignId,
+                mode: event.mode || null,
+                status: event.status || null,
+                evidenceLevel: event.evidenceLevel || null,
+            }, {critical: event.type === 'verification/completed'}),
+        })
+        const campaign = campaignService.create({
+            taskId: snapshot.taskId,
+            adapterId: 'project-command',
+            scenarios: commands.map((command, index) => ({
+                id: `${command.kind || 'command'}:${command.name || index + 1}`,
+                kind: command.kind || 'command', command, workDir: session.workDir,
+            })),
+            rounds: 1,
+            evidenceLevel: commands.some(command => command.kind === 'test') ? 'L2' : 'L1',
+        })
+        const result = await campaignService.runVerificationCampaign(campaign.campaignId)
+        const current = taskCoordinator.getTaskSnapshot(snapshot.taskId)
+        if (!current) return null
+        const tests = result.candidate.filter(item => item.kind === 'test').map(item => ({
+            name: item.scenarioId,
+            status: item.passed ? 'passed' : 'failed',
+            executed: true,
+            evidence: `exitCode=${item.exitCode ?? 'unknown'}; round=${item.round}`,
+        }))
+        const hasTests = tests.length > 0
+        const status = result.status === 'passed' && !hasTests ? 'inconclusive' : result.status
+        const summary = status === 'passed'
+            ? `${commands.length} 个受信验证命令全部通过，其中测试 ${tests.length} 个`
+            : result.status === 'passed'
+                ? `${commands.length} 个受信构建命令通过，但项目未识别到测试命令`
+                : `${commands.length} 个受信验证命令执行状态：${result.status}`
+        return taskWorkbench.recordVerification(current.taskId, {
+            status,
+            evidenceLevel: result.evidenceLevel,
+            testsExecuted: hasTests,
+            campaignId: result.campaignId,
+            results: result.candidate,
+            tests,
+            summary,
+        })
+    })().catch(error => {
+        const current = taskCoordinator.getTaskSnapshot(snapshot.taskId)
+        if (!current) return null
+        log.warn({err: error, sessionId: sessionId?.slice(0, 8), reason}, 'Coordinator 自动验证异常，降级为验证不足')
+        return taskWorkbench.recordVerification(current.taskId, {
+            status: 'inconclusive', evidenceLevel: 'L0', testsExecuted: false,
+            summary: `自动验证异常：${String(error?.message || error).slice(0, 500)}`,
+        })
+    }).finally(() => {
+        session._coordinatorValidationPromise = null
+    })
+    return session._coordinatorValidationPromise
+}
+
+function requestCoordinatorCompletion(session, {notificationIntentPersisted = false} = {}) {
+    const snapshot = session?.coordinatorTaskId ? taskCoordinator?.getTaskSnapshot(session.coordinatorTaskId) : null
+    if (!snapshot) return null
+    return taskWorkbench?.requestCompletion(snapshot.taskId, {notificationIntentPersisted}) || null
+}
+
+function requiredTaskNotificationPlatforms(session) {
+    const turnIdentity = session?.taskCompletionIdentity || session?.activeTurnIdentity || null
+    return resolveRequiredNotificationPlatforms({identity: turnIdentity, mirrors: session?.mirrors || {}})
+}
+
+function taskStateWithNotificationIntents(session, state, notificationId) {
+    const notifications = {...(state?.notifications || {})}
+    for (const platform of requiredTaskNotificationPlatforms(session)) {
+        const existing = notifications[platform]
+        if (existing?.notificationId === notificationId) continue
+        notifications[platform] = {
+            state: 'pending', notificationId, lastError: '', updatedAt: Date.now(),
+        }
+    }
+    return createTaskStatePatch({...state, notifications})
+}
+
 function updateTaskCompletion(session, sessionId, event) {
     const transition = transitionTaskCompletion(session?.taskCompletion, event)
     if (!session) return transition
     session.taskCompletion = transition.state
-    const nextState = taskStateFromCompletion(session)
+    let nextState = taskStateFromCompletion(session)
     const terminalEffect = transition.effects.find(effect => ['complete', 'fail', 'pause'].includes(effect?.type))
     if (terminalEffect) {
         const eventType = terminalEffect.type === 'complete'
@@ -883,15 +1061,7 @@ function updateTaskCompletion(session, sessionId, event) {
             : terminalEffect.type === 'pause' ? 'task_review_paused' : 'task_failed'
         const taskId = session.taskCompletionTaskId || sessionId
         const notificationId = `${taskId}:${eventType}`
-        const turnIdentity = session.taskCompletionIdentity || session.activeTurnIdentity || null
-        const notifications = {...(nextState.notifications || {})}
-        for (const [platform, enabled] of Object.entries(session.mirrors || {})) {
-            if (!enabled || !['wechat', 'feishu', 'dingtalk'].includes(platform) || !shouldRouteMirror(platform, turnIdentity)) continue
-            notifications[platform] = {
-                state: 'pending', notificationId, lastError: '', updatedAt: Date.now(),
-            }
-        }
-        nextState.notifications = notifications
+        nextState = taskStateWithNotificationIntents(session, nextState, notificationId)
     }
     updateTaskState(session, sessionId, nextState)
     return transition
@@ -972,44 +1142,17 @@ function cleanupSessionUploads(workDir, sessionId = 'legacy', removeAll = false)
 }
 
 function acceptSessionInput(s, source, messageId, userId = null, taskDecision = null) {
-    const now = Date.now()
-    if (!s._inputIds) s._inputIds = new Map()
-    for (const [id, at] of s._inputIds) {
-        if (now - at > 10 * 60 * 1000) s._inputIds.delete(id)
-    }
-    const id = String(messageId || crypto.randomUUID()).slice(0, 200)
-    const dedupeKey = `${String(source || 'desktop')}\0${String(userId || '')}\0${id}`
-    if (s._inputIds.has(dedupeKey)) return {ok: false, duplicate: true, messageId: id}
-    const queued = (s._pendingInputs?.length || 0) + (s.activeTurnId ? 1 : 0)
-    if (queued >= MAX_SESSION_INPUT_QUEUE) return {ok: false, error: 'input_queue_full', queuePosition: queued}
-    const turnId = crypto.randomUUID()
-    s._inputIds.set(dedupeKey, now)
-    if (!Array.isArray(s._pendingInputs)) s._pendingInputs = []
-    s._pendingInputs.push({
-        messageId: id,
-        turnId,
-        source,
-        userId: IM_SOURCES.has(source) ? String(userId || '') : null,
-        taskDecision,
-        dedupeKey,
-    })
-    return {ok: true, messageId: id, turnId, queuePosition: queued, dedupeKey}
+    return taskInputQueue.accept(s, {source, messageId, userId, taskDecision})
 }
 
 function rollbackSessionInput(s, accepted) {
-    if (!s || !accepted?.turnId) return false
-    const index = s._pendingInputs?.findIndex(item => item.turnId === accepted.turnId) ?? -1
-    if (index < 0) return false
-    s._pendingInputs.splice(index, 1)
-    if (accepted.dedupeKey) s._inputIds?.delete(accepted.dedupeKey)
-    return true
+    return taskInputQueue.rollback(s, accepted)
 }
 
 function failPendingSessionInputs(sessionId, s, error) {
-    const pending = Array.isArray(s?._pendingInputs) ? s._pendingInputs.splice(0) : []
+    const pending = taskInputQueue.drain(s)
     s._pendingSources = []
     for (const input of pending) {
-        if (input.dedupeKey) s._inputIds?.delete(input.dedupeKey)
         const identity = createTurnIdentity(input.source, input.userId, IM_SOURCES)
         broadcastTurn(sessionId, {
             type: 'error',
@@ -1022,10 +1165,9 @@ function failPendingSessionInputs(sessionId, s, error) {
 }
 
 function cancelPendingSessionInputs(sessionId, s) {
-    const pending = Array.isArray(s?._pendingInputs) ? s._pendingInputs.splice(0) : []
+    const pending = taskInputQueue.drain(s)
     s._pendingSources = []
     for (const input of pending) {
-        if (input.dedupeKey) s._inputIds?.delete(input.dedupeKey)
         const identity = createTurnIdentity(input.source, input.userId, IM_SOURCES)
         broadcastTurn(sessionId, {
             type: 'generation_stopped',
@@ -1121,14 +1263,16 @@ async function stopSessionGeneration(sessionId, s) {
         const stoppedTurnId = s.activeTurnId || null
         const stoppedTurnIdentity = s.activeTurnIdentity ? {...s.activeTurnIdentity} : null
         updateTaskCompletion(s, sessionId, {type: 'user_stopped', detail: '用户已暂停任务'})
+        if (s.coordinatorTaskId && taskWorkbench) {
+            taskWorkbench.recordTaskEvent(s.coordinatorTaskId, {type: 'task/paused', detail: '用户已暂停任务'})
+        }
         clearTaskWorkflowGate(s._taskWorkflowGate)
         s._internalWorkflowResultTurnId = null
         s._autoContinuationRequest = null
         s.autoContinuationCount = 0
         s.autoContinuationTurns = 0
         // 先失效异步 rebuild token，再等待 SDK 关闭；否则 makeQueryOptions 完成后可能复活已停止任务。
-        s._rebuildId = null
-        s._pendingMessages = null
+        sessionCoordinator.invalidate(s)
         for (const id of [...(s.pending?.keys() || [])]) settlePending(sessionId, id, {
             behavior: 'deny',
             message: '已取消',
@@ -1143,7 +1287,6 @@ async function stopSessionGeneration(sessionId, s) {
             log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '停止生成时保存 checkpoint 失败')
         }
         s.pendingTurn = null
-        s._rebuildPromise = null
         const cancelledInputs = cancelPendingSessionInputs(sessionId, s)
         s._pendingTurns = []
         s._generating = false
@@ -1183,8 +1326,7 @@ async function stopSessionGeneration(sessionId, s) {
 }
 
 function markInternalInput(s, taskDecision = null) {
-    if (!Array.isArray(s._pendingInputs)) s._pendingInputs = []
-    s._pendingInputs.unshift({messageId: null, turnId: null, source: s.lastTurnSource || 'desktop', userId: null, taskDecision})
+    taskInputQueue.prependInternal(s, {source: s.lastTurnSource || 'desktop', taskDecision})
 }
 
 const taskCommands = createTaskCommandService({
@@ -1196,6 +1338,39 @@ const taskCommands = createTaskCommandService({
     },
     onListenerError: (error, context) => {
         log.warn({err: error, sessionId: context.sessionId?.slice(0, 8), eventType: context.eventType}, 'Task observer 处理失败')
+    },
+})
+
+const coordinatorPersistence = createCoordinatorPersistence({
+    stateStore: {
+        get available() { return Boolean(bridgeStateDb?.available) },
+        recordTaskTransition(record) { return bridgeStateDb?.recordTaskTransition(record) || false },
+    },
+    projectKeyForWorkDir: sessionCatalogProjectKey,
+    resolveJournal: sessionId => sessions.get(sessionId)?.eventJournal || null,
+})
+
+taskCoordinator = createTaskCoordinator({
+    persist: coordinatorPersistence,
+    publish: (snapshot, event) => {
+        if (!snapshot?.sessionId) return
+        const payload = {
+            type: 'task_coordinator_event',
+            taskId: snapshot.taskId,
+            turnId: snapshot.turnId,
+            status: snapshot.status,
+            phase: snapshot.phase,
+            revision: snapshot.revision,
+            sequence: snapshot.sequence,
+            event: event?.type || 'task/state-changed',
+            stepId: event?.stepId || null,
+            role: event?.role || null,
+            detail: event?.detail || null,
+            verification: snapshot.verification,
+            timestamp: snapshot.updatedAt,
+        }
+        const identity = {source: snapshot.source, userId: snapshot.userId || null}
+        broadcastTurn(snapshot.sessionId, payload, identity)
     },
 })
 
@@ -1215,6 +1390,7 @@ setInterval(() => {
 let reqCounter = 0
 const confirmHooks = []   // [{platform, onConfirmRequest, onConfirmResolved, findUserForSession, sendToUser}] —— 各 IM 适配器注册的钩子
 const imProgressReporters = new Map()
+const imProgressPolicy = createImProgressPolicy()
 const ADAPTER_STARTERS = new Map([
     ['wechat', startWeChatAdapter],
     ['feishu', startFeishuAdapter],
@@ -1226,7 +1402,7 @@ function getAdapterHook(platform) {
 }
 
 function notificationTaskId(notificationId) {
-    const match = String(notificationId || '').match(/^(.*):(task_completed|task_failed|task_review_paused)$/)
+    const match = String(notificationId || '').match(/^(.*):(task_completed|task_failed|task_review_paused|task_verification_inconclusive)$/)
     return match?.[1] || ''
 }
 
@@ -1319,10 +1495,12 @@ function reportImProgressEvent(sessionId, event, identity = null) {
     const session = sessions.get(sessionId)
     if (!session || !event || typeof event !== 'object') return
     const turnId = event.turnId || session.taskCompletionTurnId || session.activeTurnId || 'turn'
-    if (['task_completed', 'task_failed', 'task_review_paused', 'generation_stopped', 'stream_error', 'error'].includes(event.type)) {
+    if (['task_completed', 'task_failed', 'task_review_paused', 'task_verification_inconclusive', 'generation_stopped', 'stream_error', 'error'].includes(event.type)) {
         finishImProgressReporters(sessionId, turnId)
         return
     }
+    const policy = imProgressPolicy.evaluate(event, Date.now())
+    if (!policy.send) return
     for (const {hook, userId, mirrored} of imProgressRecipients(sessionId, identity)) {
         const key = imProgressReporterKey(sessionId, turnId, hook.platform, userId)
         let reporter = imProgressReporters.get(key)
@@ -1335,6 +1513,8 @@ function reportImProgressEvent(sessionId, event, identity = null) {
                     if (mirrored && !currentSession.mirrors?.[hook.platform]) return
                     await currentHook.sendToUser(sessionId, text, userId)
                 },
+                firstDelayMs: 0,
+                intervalMs: 0,
                 onError: error => log.warn({err: error, platform: hook.platform, sessionId: sessionId.slice(0, 8)}, 'IM 阶段进度发送失败'),
             })
             imProgressReporters.set(key, reporter)
@@ -1485,6 +1665,37 @@ function broadcastWorkflowEvent(sid, msg) {
     const session = sessions.get(sid)
     const workflowState = msg?.workflowId ? getRunState(msg.workflowId) : null
     let settlingDeferredPrimary = false
+    const coordinatorTaskId = session?.coordinatorTaskId
+    const coordinatorSnapshot = coordinatorTaskId ? taskCoordinator?.getTaskSnapshot(coordinatorTaskId) : null
+    const coordinatorStep = coordinatorSnapshot?.plan?.steps?.find(step => step.status === 'running')
+        || coordinatorSnapshot?.plan?.steps?.find(step => step.phase === coordinatorSnapshot.phase)
+        || null
+    if (coordinatorTaskId && msg?.workflowId) {
+        if (msg.type === 'workflow_started') {
+            taskWorkbench?.recordTaskEvent(coordinatorTaskId, {type: 'workflow/started', workflowId: msg.workflowId})
+        } else if (msg.type === 'workflow_done') {
+            taskWorkbench?.recordTaskEvent(coordinatorTaskId, {type: 'workflow/completed', workflowId: msg.workflowId})
+        } else if (['workflow_paused', 'workflow_error'].includes(msg.type)) {
+            taskWorkbench?.recordTaskEvent(coordinatorTaskId, {type: 'workflow/failed', workflowId: msg.workflowId})
+        } else if (msg.type === 'workflow_agent_started') {
+            taskWorkbench?.recordAgentEvent(coordinatorTaskId, {
+                type: 'agent/started', agentRunId: `${msg.workflowId}:${msg.id || 'agent'}`,
+                stepId: coordinatorStep?.stepId || null, role: msg.role || msg.agentType || 'developer',
+            })
+        } else if (msg.type === 'workflow_agent_done') {
+            taskWorkbench?.recordAgentEvent(coordinatorTaskId, {
+                type: 'agent/completed', agentRunId: `${msg.workflowId}:${msg.id || 'agent'}`,
+                stepId: coordinatorStep?.stepId || null, role: msg.role || msg.agentType || 'developer',
+                result: msg.agentResult || null,
+            })
+        } else if (msg.type === 'workflow_agent_error') {
+            taskWorkbench?.recordAgentEvent(coordinatorTaskId, {
+                type: 'agent/failed', agentRunId: `${msg.workflowId}:${msg.id || 'agent'}`,
+                stepId: coordinatorStep?.stepId || null, role: msg.role || msg.agentType || 'developer',
+                result: msg.agentResult || null,
+            })
+        }
+    }
     if (msg?.type === 'workflow_started' && workflowState?._args?._taskOwned === true) {
         if (!session._taskWorkflowGate) session._taskWorkflowGate = createTaskWorkflowGate()
         attachTaskWorkflow(session._taskWorkflowGate, msg.workflowId)
@@ -1520,7 +1731,11 @@ function broadcastWorkflowEvent(sid, msg) {
 }
 
 // 注入依赖到 workflow-runner，供 Workflow 子进程通过受控 IPC 请求 agent() 调用
-setDeps({agentProvider: claudeAgentProvider, deleteSession, makeQueryOptions, loadCliSettings, loadWfConfig, PushStream, broadcast: broadcastWorkflowEvent, sessions, persistSdkSessionId, removeSdkSessionId, encodeProjectName, stateStore: () => bridgeStateDb})
+setDeps({agentProvider: claudeAgentProvider, deleteSession, makeQueryOptions, loadCliSettings, loadWfConfig,
+    PushStream, broadcast: broadcastWorkflowEvent, sessions, persistSdkSessionId, removeSdkSessionId,
+    encodeProjectName, stateStore: () => bridgeStateDb,
+    getAgentRegistry: (decision, projectContext) => createRuntimeAgentRegistry(decision, projectContext),
+})
 
 // 收口：任一通道响应或超时都走这里，幂等（已 settled 则忽略）
 // ── 确认请求收口（settlePending）──
@@ -2572,12 +2787,18 @@ function spawnRtk(rtkPath, cmd, _text) {
 // 功能说明: 扫描 ~/.claude-desktop-bridge/agents/*.md，解析 frontmatter 组装为 SDK AgentDefinition 字典
 // key 为 agent name（frontmatter.name 或文件名去扩展名），value 含 description/tools/model/prompt
 // 关键数据流: agents/ 目录 → 遍历 .md → parseFrontmatter → {name: AgentDefinition}
-function loadAgentDefinitions() {
+function loadAgentDefinitions(decision = null, projectContext = null) {
     const ad = join(BRIDGE_HOME, 'agents');
     const defs = {}
+    const builtinAgents = getBuiltinResourceState({bridgeHome: BRIDGE_HOME}).filter(item => item.type === 'agent')
+    const enabledAgents = new Set(builtinAgents.filter(item => item.enabled).map(item => item.id))
+    const selectedBuiltinAgents = new Set(decision ? resolveTaskAgents(projectContext || {}, decision).map(item => item.id) : [])
     try {
         for (const fn of readdirSync(ad)) {
             if (!fn.endsWith('.md')) continue
+            const resourceId = fn.replace(/\.md$/, '')
+            if (builtinAgents.some(item => item.id === resourceId) && !enabledAgents.has(resourceId)) continue
+            if (builtinAgents.some(item => item.id === resourceId) && !selectedBuiltinAgents.has(resourceId)) continue
             try {
                 const c = readFileSync(join(ad, fn), 'utf8')
                 const {frontmatter: fm, body} = parseFrontmatter(c)
@@ -2593,6 +2814,21 @@ function loadAgentDefinitions() {
         }
     } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
     return defs
+}
+
+function createRuntimeAgentRegistry(decision = null, projectContext = null) {
+    const enabledBuiltin = new Set(getBuiltinResourceState({bridgeHome: BRIDGE_HOME})
+        .filter(item => item.type === 'agent' && item.enabled).map(item => item.id))
+    const builtin = BUILTIN_AGENT_DEFINITIONS.filter(item => item.id === 'general-purpose' || enabledBuiltin.has(item.id))
+    const custom = Object.entries(loadAgentDefinitions(decision, projectContext)).map(([id, definition]) => ({
+        id,
+        role: id,
+        description: definition.description,
+        actions: ['all'],
+        writable: !/(?:reviewer|explorer|planner|validator|root-cause)/i.test(id),
+        enabled: true,
+    }))
+    return createAgentRegistry({builtin, custom})
 }
 
 // 功能说明: 将存储用的编码目录名还原为真实路径（C--Users-xxx → C:/Users/xxx）
@@ -2787,93 +3023,25 @@ function mapThinkingLevel(lv) {
 // ── SDK 消息转 WebSocket 格式（convertSdkToWs）──
 // 功能说明: 将 Claude Agent SDK 的各种消息类型映射为前端统一的 WebSocket JSON 消息
 //   负责消息类型的甄别、筛选（null 表示不转发）、参数重映射
-// 实现方式: switch (sdkMsg.type) 匹配 6 种 SDK 消息类型，stream_event 委托给 mapStreamEvent 处理子类型
+// 实现方式: 由 sdkStreamAdapter 按稳定契约映射 SDK 消息，组合根只负责注入会话与业务依赖。
 //   丢弃不需要的类型（返回 null → startStreamPump 不广播）
 // 关键数据流: SDK message → switch type → 对应 WS 格式 → broadcast 或 null（跳过）
 //   覆盖类型: system_init / stream_event(含 tool_use_start/thinking/text_delta 等) / assistant_message / user_message_echo / result / tool_progress
+const sdkStreamAdapter = createSdkStreamAdapter({
+    getSession: sessionId => sessions.get(sessionId) || null,
+    lookupModelInfo,
+    buildSystemInitEvent,
+    buildAgentDescriptor,
+    compactBoundaryToEvent,
+    isSyntheticCompactSummary,
+    isInternalWorkflowResultText,
+    isAutoContinuationPrompt,
+    classifyTaskResult,
+    canResumeTask,
+})
+
 function convertSdkToWs(sdkMsg, sessionId) {
-    switch (sdkMsg.type) {
-        case 'system':
-            if (sdkMsg.subtype === 'init') {
-                const info = lookupModelInfo(sdkMsg.model);
-                // PROVIDERS 查不到时，用 session 存储的前端传入 modelMeta 作为回退
-                const s = sessions.get(sessionId);
-                const mm = s?.modelMeta;
-                return buildSystemInitEvent({sdkMsg, gatewaySessionId: sessionId, modelInfo: info, modelMeta: mm});
-            }
-            if (sdkMsg.subtype === 'compact_boundary') return compactBoundaryToEvent(sdkMsg)
-            if (sdkMsg.subtype === 'task_started') {
-                const s = sessions.get(sessionId)
-                const agentType = String(sdkMsg.subagent_type || sdkMsg.task_type || 'unknown')
-                const descriptor = buildAgentDescriptor(agentType, {
-                    description: sdkMsg.description,
-                    prompt: sdkMsg.prompt,
-                }, s?.queryOpts?.agents || {})
-                return {
-                    type: 'subagent_start',
-                    agentId: sdkMsg.task_id,
-                    toolUseId: sdkMsg.tool_use_id || null,
-                    agentType,
-                    description: descriptor.task || descriptor.purpose,
-                    ...descriptor,
-                    ts: Date.now(),
-                }
-            }
-            if (sdkMsg.subtype === 'task_progress') return {
-                type: 'subagent_progress',
-                agentId: sdkMsg.task_id,
-                toolUseId: sdkMsg.tool_use_id || null,
-                agentType: sdkMsg.subagent_type || 'unknown',
-                currentAction: sdkMsg.last_tool_name || sdkMsg.description || '',
-                progress: sdkMsg.summary || sdkMsg.description || '',
-                usage: sdkMsg.usage || null,
-                ts: Date.now(),
-            }
-            if (sdkMsg.subtype === 'task_notification') return {
-                type: 'subagent_done',
-                agentId: sdkMsg.task_id,
-                toolUseId: sdkMsg.tool_use_id || null,
-                status: sdkMsg.status,
-                summary: sdkMsg.summary || '',
-                usage: sdkMsg.usage || null,
-                ts: Date.now(),
-            }
-            return null
-        case 'stream_event':
-            return mapStreamEvent(sdkMsg.event)
-        case 'assistant':
-            return {type: 'assistant_message', message: sdkMsg.message, error: sdkMsg.error}
-        case 'user':
-            if (isSyntheticCompactSummary(sdkMsg)) return null
-            const userText = sdkMsg.message?.content?.find?.(block => block?.type === 'text')?.text
-            if (isInternalWorkflowResultText(userText) || isAutoContinuationPrompt(userText)) return null
-            return {type: 'user_message_echo', message: sdkMsg.message, timestamp: sdkMsg.timestamp}
-        case 'result':
-            const taskResult = classifyTaskResult(sdkMsg)
-            const resultSession = sessions.get(sessionId)
-            return {
-                type: 'result',
-                subtype: sdkMsg.subtype,
-                duration_ms: sdkMsg.duration_ms,
-                is_error: sdkMsg.is_error,
-                num_turns: sdkMsg.num_turns,
-                // 0.3.x: SDKResultError 无 result 字段，改用 errors 数组
-                result: sdkMsg.result || sdkMsg.errors?.join('\n'),
-                usage: sdkMsg.usage,
-                modelUsage: sdkMsg.modelUsage,
-                ...taskResult,
-                resumable: canResumeTask(taskResult, Boolean(resultSession?.lastSessionId || sdkMsg.session_id)),
-            }
-        case 'tool_progress':
-            return {
-                type: 'tool_progress',
-                tool_use_id: sdkMsg.tool_use_id,
-                tool_name: sdkMsg.tool_name,
-                elapsed_time_seconds: sdkMsg.elapsed_time_seconds
-            }
-        default:
-            return null
-    }
+    return sdkStreamAdapter.toClientEvent(sdkMsg, sessionId)
 }
 
 // ── SDK query 选项组装（makeQueryOptions）──
@@ -2948,12 +3116,17 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
             profile: contextProfile,
             targetFiles: body.targetFiles || [],
         })
-    const skillRoute = contextProfile === 'light' ? [] : requestedSkillRoute
+    const builtinSkillsState = getBuiltinResourceState({bridgeHome: BRIDGE_HOME}).filter(item => item.type === 'skill')
+    const enabledSkills = new Set(builtinSkillsState.filter(item => item.enabled).map(item => item.id))
+    const skillRoute = contextProfile === 'light'
+        ? []
+        : requestedSkillRoute.filter(name => !builtinSkillsState.some(item => item.id === name) || enabledSkills.has(name))
     const builtinSkills = ensureBuiltinSkillsAvailable(skillRoute, {bridgeHome: BRIDGE_HOME})
     if (builtinSkills.installed.length) {
         log.info({skills: builtinSkills.installed}, 'Bridge 内置 Skill 已准备')
     }
-    const agents = contextProfile === 'full' ? (body._agents || loadAgentDefinitions()) : {}
+    const taskDecisionForResources = body.taskDecision || (body.text ? decideTask({text: body.text}) : null)
+    const agents = contextProfile === 'full' ? (body._agents || loadAgentDefinitions(taskDecisionForResources, body.projectContext || null)) : {}
 
     // DeepSeek 兼容代理: 自动路由请求通过本地代理修复参数冲突
     const usesDeepSeek = typeof baseUrl === 'string' && /deepseek/i.test(baseUrl)
@@ -2985,7 +3158,7 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
     const requestedModelMode = VALID_MODEL_MODES.has(body.modelMode)
         ? body.modelMode
         : (body.model ? 'fixed' : 'auto')
-    const initialDecision = body.taskDecision || (body.text ? decideTask({text: body.text}) : null)
+    const initialDecision = taskDecisionForResources
     const deferAutomaticQuery = shouldDeferAutomaticQuery({
         modelMode: requestedModelMode,
         hasTaskDecision: Boolean(initialDecision),
@@ -3035,6 +3208,11 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
     const configuredContextCap = parseTokenCount(body.maxContextTokens || cliS.maxContextTokens)
     const knownContextWindow = parseTokenCount(body.modelMeta?.contextWindow) || lookupModelInfo(resolvedModel).contextWindow
     const autoCompactWindow = calculateAutoCompactWindow(knownContextWindow, configuredContextCap)
+    const builtinMcpState = getBuiltinResourceState({bridgeHome: BRIDGE_HOME}).filter(item => item.type === 'mcp')
+    const builtinMcpIds = new Set(builtinMcpState.map(item => item.id))
+    const enabledBuiltinMcp = new Set(builtinMcpState.filter(item => item.enabled).map(item => item.id))
+    const configuredMcpServers = Object.fromEntries(Object.entries(cliS.mcpServers || {})
+        .filter(([name]) => !builtinMcpIds.has(name) || enabledBuiltinMcp.has(name)))
     let opts = {
         model: resolvedModel,
         executable: 'node',
@@ -3043,7 +3221,7 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
         allowDangerouslySkipPermissions: permissionMode === 'bypassPermissions',
         thinking: mapThinkingLevel(VALID_THINKING_LEVELS.has(body.thinkingLevel) ? body.thinkingLevel : 'auto'),
         maxTurns: Number.isFinite(requestedMaxTurns) ? Math.min(100, Math.max(1, requestedMaxTurns)) : 40,
-        mcpServers: sanitizeMcpServers(cliS.mcpServers),
+        mcpServers: sanitizeMcpServers(configuredMcpServers),
         skills: skillRoute,
         stderr: (msg) => process.stderr.write(`[claude.exe stderr] ${msg}`),
         env: (() => {
@@ -3211,6 +3389,12 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
     opts.bridgeModelTier = initialRoute.tier || null
     opts.bridgeProviderBaseUrl = baseUrl || ''
     opts.bridgeProviderApiKey = apiKey || ''
+    // 仅保存哈希后的稳定配置版本，供重建原因与缓存资格判断；不得把规则/工具正文放入运行事件。
+    opts.bridgeToolsetRevision = crypto.createHash('sha256').update(JSON.stringify({
+        tools: opts.tools || [], allowedTools: opts.allowedTools || [], mcpServers: Object.keys(opts.mcpServers || {}).sort(),
+    })).digest('hex').slice(0, 16)
+    opts.bridgeRuleRevision = crypto.createHash('sha256').update(JSON.stringify(opts.systemPrompt || null)).digest('hex').slice(0, 16)
+    opts.bridgeProjectContextRevision = crypto.createHash('sha256').update(JSON.stringify(body.projectContext || null)).digest('hex').slice(0, 16)
     // SDK 的 Anthropic client 读 process.env(不读 opts.env)，直接设 process.env
     // 不再 restore: 多个 session 共享 process.env，restore 会导致 A 恢复 B 的值
     return opts
@@ -3250,6 +3434,38 @@ async function refreshContextUsage(sessionId, session, reason) {
     return session._contextUsageInFlight
 }
 
+function recordProviderUsage(sessionId, session, sdkMsg) {
+    const event = createModelUsageEvent({
+        eventId: crypto.randomUUID(),
+        sessionId,
+        projectKey: sessionCatalogProjectKey(session?.workDir),
+        envelope: session?.contextEnvelope || createSessionContextEnvelope(session),
+        policy: session?._lastContextReusePolicy || {
+            mode: 'reuse_same_session', cacheEligibility: 'unknown', reasonCodes: ['usage_policy_unavailable'],
+        },
+        usage: sdkMsg?.usage,
+        durationMs: sdkMsg?.duration_ms,
+        retryCount: sdkMsg?.retry_count,
+    })
+    try {
+        const persisted = bridgeStateDb?.appendModelUsageEvent(event) || false
+        broadcast(sessionId, {
+            type: 'model_usage_observed',
+            model: event.model,
+            source: event.source,
+            inputTokens: event.inputTokens,
+            outputTokens: event.outputTokens,
+            cacheReadInputTokens: event.cacheReadInputTokens,
+            cacheCreationInputTokens: event.cacheCreationInputTokens,
+            cacheEligibility: event.cacheEligibility,
+            policy: event.policy,
+            persisted,
+        })
+    } catch (error) {
+        log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, 'Provider usage 脱敏账本写入失败')
+    }
+}
+
 function maybeRefreshContextUsage(sessionId, session, reason) {
     if (!session?.query || typeof session.query.getContextUsage !== 'function') return
     const now = Date.now()
@@ -3262,11 +3478,11 @@ async function startAutoContinuation(sessionId, session, request) {
     if (!session || sessions.get(sessionId) !== session || session._autoContinuationRequest !== request
         || !request?.prompt || !session.lastSessionId
         || !['running', 'fixing'].includes(session.taskCompletion?.phase)) return false
-    const rebuildId = Symbol('auto-continuation')
+    const rebuild = sessionCoordinator.beginRebuild(session, request.prompt)
+    if (!rebuild.started) return false
+    const rebuildId = rebuild.token
     const pushStream = new PushStream()
-    session._rebuildId = rebuildId
-    session._pendingMessages = [request.prompt]
-    session._rebuildPromise = (async () => {
+    const rebuildPromise = (async () => {
         const cliS = loadCliSettings()
         session.pushStream = pushStream
         const bodyOverride = {
@@ -3285,7 +3501,7 @@ async function startAutoContinuation(sessionId, session, request) {
         if (session.providerBaseUrl) bodyOverride.baseUrl = session.providerBaseUrl
         if (session.providerApiKey) bodyOverride.apiKey = session.providerApiKey
         const opts = await makeQueryOptions(bodyOverride, session.workDir, cliS, {}, sessionId)
-        if (session._rebuildId !== rebuildId || session.pushStream !== pushStream
+        if (!sessionCoordinator.isCurrent(session, rebuildId) || session.pushStream !== pushStream
             || session._autoContinuationRequest !== request) return false
         opts.resume = session.lastSessionId
         session.query = startClaudeAgent(pushStream, opts)
@@ -3296,8 +3512,7 @@ async function startAutoContinuation(sessionId, session, request) {
         startStreamPump(sessionId)
         // query 已经接管续跑请求；后续追加消息只通过 _rebuildPromise 排队。
         session._autoContinuationRequest = null
-        const pending = session._pendingMessages || []
-        session._pendingMessages = null
+        const pending = sessionCoordinator.consumePendingMessages(session, rebuildId)
         for (const content of pending) {
             pushStream.push({
                 type: 'user', session_id: sessionId,
@@ -3306,15 +3521,12 @@ async function startAutoContinuation(sessionId, session, request) {
             })
             session.hasUserTurns = true
         }
-        session._rebuildPromise = null
-        session._rebuildId = null
+        sessionCoordinator.complete(session, rebuildId)
         return true
     })().catch(error => {
-        if (session._rebuildId !== rebuildId) return false
+        if (!sessionCoordinator.isCurrent(session, rebuildId)) return false
         session._autoContinuationRequest = null
-        session._rebuildPromise = null
-        session._rebuildId = null
-        session._pendingMessages = null
+        sessionCoordinator.fail(session, rebuildId)
         session.pushStream = null
         session.query = null
         const detail = `自动续跑启动失败：${String(error?.message || error || '未知错误')}`
@@ -3343,7 +3555,8 @@ async function startAutoContinuation(sessionId, session, request) {
         }))
         return false
     })
-    await session._rebuildPromise
+    sessionCoordinator.attachPromise(session, rebuildId, rebuildPromise)
+    await rebuildPromise
     return Boolean(session.query)
 }
 
@@ -3417,7 +3630,7 @@ async function startStreamPump(sessionId) {
             if (sdkMsg.type === 'user') {
                 const workflowResultId = taskWorkflowResultIdFromMessage(sdkMsg.message)
                 const consumedWorkflowResult = consumeTaskWorkflowResultTurn(s._taskWorkflowGate, workflowResultId)
-                const inputMeta = consumedWorkflowResult ? null : s._pendingInputs?.shift()
+                const inputMeta = consumedWorkflowResult ? null : taskInputQueue.consume(s)
                 const legacySource = consumedWorkflowResult ? null : s._pendingSources?.shift()
                 s._internalWorkflowResultTurnId = consumedWorkflowResult ? workflowResultId : null
                 s._generating = true
@@ -3457,7 +3670,14 @@ async function startStreamPump(sessionId) {
                             } else {
                                 s._wfRan = true;
                                 log.info({sessionId: sessionId?.slice(0, 8), wfName, wfArgs}, '[WF:run] 已触发');
-                                runWfScript(wfName, sessionId, {...wfArgs, _runKey: `${wfName}:${sessionId}`}).catch(function (e) {
+                                runWfScript(wfName, sessionId, {
+                                    ...wfArgs,
+                                    _runKey: `${wfName}:${sessionId}`,
+                                    _taskOwned: true,
+                                    _taskId: s.coordinatorTaskId || s.taskCompletionTaskId,
+                                    _taskDecision: s.taskDecision || null,
+                                    _projectContext: s.projectContext || null,
+                                }).catch(function (e) {
                                     log.error({err: e, sessionId: sessionId?.slice(0, 8), wfName}, 'Workflow 引擎错误');
                                 });
                             }
@@ -3466,6 +3686,7 @@ async function startStreamPump(sessionId) {
                 }
             }
             // result 只标志主 SDK 回合结束；父任务是否完成由 task-completion 协调器决定。
+            if (sdkMsg.type === 'result') recordProviderUsage(sessionId, s, sdkMsg)
             if (sdkMsg.type === 'result' && s._internalWorkflowResultTurnId) {
                 const workflowTurn = finishTaskWorkflowResultTurn(
                     s._taskWorkflowGate,
@@ -3482,6 +3703,30 @@ async function startStreamPump(sessionId) {
                 s.turnText = ''
                 void refreshContextUsage(sessionId, s, 'workflow-result')
             } else if (sdkMsg.type === 'result') {
+                const consumedInput = consumePendingSessionInputOnResult(s)
+                if (consumedInput) {
+                    log.debug({sessionId: sessionId?.slice(0, 8), turnId: consumedInput.turnId || null}, 'SDK 未回传 user 事件，已由 result 确认输入')
+                }
+                // 补充指令属于同一父任务。前一条输入结束后仍有排队输入时，
+                // 必须等待最后一条 result，不能提前广播最终总结或启动最终审查。
+                if (s._pendingInputs?.length) {
+                    s.turnText = ''
+                    s.autoContinuationTurns = 0
+                    s._generating = false
+                    void refreshContextUsage(sessionId, s, 'queued-input-result')
+                    const wsMsg = convertSdkToWs(sdkMsg, sessionId)
+                    if (wsMsg) broadcastTurn(sessionId, {
+                        ...wsMsg,
+                        turnId: s.activeTurnId || null,
+                        parentTaskTerminal: false,
+                        taskState: taskStateForClient(s.taskState),
+                    }, s.activeTurnIdentity)
+                    s.activeTurnId = null
+                    s.activeTurnIdentity = null
+                    s.activeTaskDecision = null
+                    broadcastTaskLifecycle(sessionId)
+                    continue
+                }
                 const taskResult = classifyTaskResult({...sdkMsg, finalText: s.turnText})
                 const completionDecision = s.activeTaskDecision || s.taskCompletionDecision || s.taskDecision || null
                 const segmentTurns = Math.max(0, Math.trunc(Number(sdkMsg.num_turns) || 0))
@@ -3524,9 +3769,7 @@ async function startStreamPump(sessionId) {
                         userId: continuationIdentity?.userId || null,
                         identity: continuationIdentity,
                     }
-                    if (!Array.isArray(s._pendingInputs)) s._pendingInputs = []
-                    s._pendingInputs.unshift({
-                        messageId: null,
+                    taskInputQueue.prependInternal(s, {
                         turnId: s._autoContinuationRequest.turnId,
                         source: s._autoContinuationRequest.source,
                         userId: s._autoContinuationRequest.userId,
@@ -3606,6 +3849,26 @@ async function startStreamPump(sessionId) {
                 s.taskCompletionDecision = completionDecision
                 s.taskCompletionIdentity = s.activeTurnIdentity ? {...s.activeTurnIdentity} : s.taskCompletionIdentity || null
                 s.taskFinalReplyText = String(s.turnText || s.lastTaskResult.result || '').trim().slice(-100000)
+                if (s.coordinatorTaskId && taskWorkbench) {
+                    const primaryStatus = taskResult.outcome === 'succeeded'
+                        ? 'completed'
+                        : taskResult.outcome === 'incomplete' ? 'inconclusive' : 'failed'
+                    taskWorkbench.recordPrimaryResult(s.coordinatorTaskId, {
+                        status: primaryStatus,
+                        summary: s.lastTaskResult.result || taskResult.outcome,
+                        changedFiles: (checkpoint?.files || []).map(file => file.path).filter(Boolean),
+                        blockers: primaryStatus === 'completed' ? [] : [taskResult.continuationReason || sdkMsg.subtype || 'primary_execution_failed'],
+                        nextAction: taskResult.continuationReason || '',
+                    })
+                    if (primaryStatus !== 'completed') taskWorkbench.recordFailure(s.coordinatorTaskId, {
+                        module: 'primary-session', phase: taskCoordinator.getTaskSnapshot(s.coordinatorTaskId)?.phase || 'implement',
+                        errorCode: taskResult.continuationReason || sdkMsg.subtype || 'PRIMARY_EXECUTION_FAILED',
+                        message: s.lastTaskResult.result || taskResult.outcome,
+                        strategy: `primary-${s.taskCompletion?.fixAttempts || 0}`,
+                        reproducible: taskResult.continuationReason !== 'environment_unavailable',
+                        externalBlocker: taskResult.continuationReason === 'environment_unavailable',
+                    })
+                }
                 const primaryResultEvent = {
                     type: 'primary_result',
                     result: {
@@ -4087,10 +4350,19 @@ function taskCompletionEventForClient(s, sessionId, type, extra = {}) {
     const sequence = (s._taskCompletionSequence = (s._taskCompletionSequence || 0) + 1)
     const taskId = s?.taskCompletionTaskId || `${sessionId}:${s?.taskCompletionTurnId || 'task'}`
     const turnId = s?.taskCompletionTurnId || s?.activeTurnId || null
-    if (s && ['task_completed', 'task_failed', 'task_review_paused'].includes(type) && !s.taskCompletedAt) {
+    if (s && ['task_completed', 'task_failed', 'task_review_paused', 'task_verification_inconclusive'].includes(type) && !s.taskCompletedAt) {
         s.taskCompletedAt = Date.now()
     }
-    updateTaskState(s, sessionId, taskStateFromCompletion(s))
+    let nextState = type === 'task_verification_inconclusive'
+        ? taskStateForInconclusive(s?.taskState, {
+            detail: extra.detail || '验证不足，任务尚未完成',
+            completedAt: s.taskCompletedAt || Date.now(),
+        })
+        : taskStateFromCompletion(s)
+    if (['task_completed', 'task_failed', 'task_review_paused', 'task_verification_inconclusive'].includes(type)) {
+        nextState = taskStateWithNotificationIntents(s, nextState, `${taskId}:${type}`)
+    }
+    updateTaskState(s, sessionId, nextState)
     const taskState = taskStateForSessionClient(s)
     broadcastTurn(sessionId, {
         type,
@@ -4110,11 +4382,84 @@ function taskCompletionEventForClient(s, sessionId, type, extra = {}) {
     broadcastTaskLifecycle(sessionId)
 }
 
+async function publishVerificationInconclusive(sessionId, session, detail, coordinator = null) {
+    taskCompletionEventForClient(session, sessionId, 'task_verification_inconclusive', {
+        detail,
+        coordinator,
+    })
+    try {
+        await maybeMirror(
+            sessionId,
+            {outcome: 'incomplete', continuationReason: 'execution_error'},
+            `${session.taskCompletionTaskId || sessionId}:task_verification_inconclusive`,
+        )
+    } catch (error) {
+        log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '验证不足镜像失败')
+    }
+}
+
+async function runCoordinatorRootCauseAnalysis(sessionId, session, repairDecision, outcome) {
+    const taskId = session?.coordinatorTaskId
+    if (!taskId || !taskWorkbench) return {action: 'stop', status: 'diagnosis_required', result: null}
+    const workflow = 'root-cause-analysis'
+    if (!listWorkflows().some(item => item.enabled !== false && item.name.replace(/\.mjs$/, '') === workflow)) {
+        return taskWorkbench.recordRcaResult(taskId, {summary: 'Root Cause Workflow 不可用'})
+    }
+    const snapshot = taskCoordinator.getTaskSnapshot(taskId)
+    const step = snapshot?.plan?.steps?.find(item => item.status === 'running')
+        || snapshot?.plan?.steps?.find(item => item.phase === 'review')
+    const runKey = `${workflow}:${sessionId}:${snapshot?.revision || 0}`
+    let workflowId
+    try {
+        workflowId = presetRunState(workflow, runKey, sessionId)
+        const result = await runWfScript(workflow, sessionId, {
+            target: session.workDir,
+            evidence: {
+                fingerprint: repairDecision?.fingerprint || '',
+                reason: repairDecision?.repair?.reason || '',
+                previousStrategy: session._lastRepairStrategy || 'apply-review-findings',
+                findings: (outcome?.blockingFindings || []).slice(0, 12),
+                changedFiles: (session.taskReviewFiles || []).map(item => item.path).filter(Boolean).slice(0, 80),
+            },
+            _workflowTier: 'power',
+            _forceModelTier: 'power',
+            _modelTiers: loadWfConfig().modelTiers || {},
+            _fixedModel: session.modelMode === 'fixed' ? session.queryOpts?.model || null : null,
+            _permissionMode: 'plan',
+            _taskId: taskId,
+            _stepId: step?.stepId || `${taskId}:rca`,
+            _taskDecision: session.taskDecision || null,
+            _projectContext: session.projectContext || null,
+            _returnToParent: false,
+            _taskOwned: false,
+            _runKey: runKey,
+        })
+        return taskWorkbench.recordRcaResult(taskId, result || {})
+    } catch (error) {
+        log.error({err: error, sessionId: sessionId?.slice(0, 8), workflowId}, 'Root Cause Agent 执行失败')
+        return taskWorkbench.recordRcaResult(taskId, {summary: `RCA 执行失败：${String(error?.message || error).slice(0, 500)}`})
+    }
+}
+
 async function applyTaskCompletionEffects(sessionId, effects = []) {
     const s = sessions.get(sessionId)
     if (!s) return
     for (const effect of effects) {
         if (effect.type === 'start_review') {
+            // 验证是完成门禁的一部分。先等待受信项目命令的真实结果，再启动最终审查，
+            // 避免 SDK 主回答成功时把未验证修改送入“已完成”出口。
+            const validation = await runCoordinatorValidation(sessionId, s, {reason: 'before_review'})
+            if (['blocked', 'inconclusive', 'regression_detected'].includes(validation?.status)) {
+                const detail = validation.blockers?.at(-1)?.detail || validation.verification?.summary || '验证不足，任务尚未完成'
+                taskWorkbench?.finalizeReport(s.coordinatorTaskId, {
+                    unresolvedRisks: [detail],
+                })
+                await publishVerificationInconclusive(sessionId, s, detail, {
+                    status: validation.status,
+                    verification: validation.verification,
+                })
+                continue
+            }
             const plan = effect.plan || s.taskCompletion?.reviewPlan
             taskCompletionEventForClient(s, sessionId, 'task_reviewing', {
                 reviewTier: plan?.tier || 'balanced',
@@ -4133,7 +4478,17 @@ async function applyTaskCompletionEffects(sessionId, effects = []) {
                 review: s.taskCompletion?.reviewOutcome || null,
                 detail: effect.outcome?.summary || '审查发现需要修复的问题',
             })
-            if (!s.pushStream || s.taskCompletion?.fixAttempts !== 1) continue
+            if (!s.pushStream || ![1, 2].includes(s.taskCompletion?.fixAttempts)) continue
+            if (s._repairDecision?.repair?.action === 'rca') {
+                s._repairDecision = await runCoordinatorRootCauseAnalysis(sessionId, s, s._repairDecision, effect.outcome)
+            }
+            const repairAction = s._repairDecision?.repair?.action || s._repairDecision?.action
+            if (repairAction && repairAction !== 'retry') {
+                const detail = `自动修复已停止：${s._repairDecision?.repair?.status || s._repairDecision?.status || s._repairDecision?.repair?.reason || 'diagnosis_required'}`
+                taskWorkbench?.finalizeReport(s.coordinatorTaskId, {unresolvedRisks: [detail]})
+                await publishVerificationInconclusive(sessionId, s, detail)
+                continue
+            }
             updateTaskCompletion(s, sessionId, {type: 'fix_started'})
             taskCompletionEventForClient(s, sessionId, 'task_fixing', {
                 review: s.taskCompletion?.reviewOutcome || null,
@@ -4146,8 +4501,9 @@ async function applyTaskCompletionEffects(sessionId, effects = []) {
             const prompt = [
                 '[Bridge 内部审查反馈] 主任务已执行完成，但最终审查发现以下必须修复的问题。',
                 '请只修复这些问题，保留已完成的其他改动；完成后运行必要的测试。',
+                s._repairDecision?.result?.nextStrategy ? `RCA 新策略：${s._repairDecision.result.nextStrategy}` : '',
                 findings || '- 审查返回了未结构化的阻断问题，请检查本轮变更并修复真实问题。',
-            ].join('\n')
+            ].filter(Boolean).join('\n')
             beginTurn(sessionId, prompt)
             markInternalInput(s, s.taskCompletionDecision)
             s.pushStream.push({
@@ -4160,13 +4516,29 @@ async function applyTaskCompletionEffects(sessionId, effects = []) {
             await new Promise(resolve => setImmediate(resolve))
         } else if (effect.type === 'complete') {
             if (s.taskCompletion?.notificationEmitted) continue
+            const validation = await runCoordinatorValidation(sessionId, s, {reason: 'before_complete'})
+            const notificationId = `${s.taskCompletionTaskId || sessionId}:task_completed`
+            const notificationIntentPersisted = hasPersistedNotificationIntents({
+                notifications: s.taskState?.notifications,
+                platforms: requiredTaskNotificationPlatforms(s),
+                notificationId,
+            })
+            const completed = requestCoordinatorCompletion(s, {notificationIntentPersisted})
+            if (completed?.status !== 'completed') {
+                const detail = completed?.blockers?.at(-1)?.detail
+                    || validation?.verification?.summary
+                    || '完成门禁未满足，任务状态已保留为待处理'
+                await publishVerificationInconclusive(sessionId, s, detail,
+                    completed ? {status: completed.status, verification: completed.verification} : null)
+                continue
+            }
             updateTaskState(s, sessionId, taskStateFromCompletion(s, effect.detail))
             taskCompletionEventForClient(s, sessionId, 'task_completed', {
                 reply: s.taskFinalReplyText || s.taskState?.finalReplyText || '',
                 review: s.taskCompletion?.reviewOutcome || null,
             })
             try {
-                const notification = await maybeMirror(sessionId, {outcome: 'succeeded'}, `${s.taskCompletionTaskId || sessionId}:task_completed`)
+                const notification = await maybeMirror(sessionId, {outcome: 'succeeded'}, notificationId)
                 if (notification.failed === 0 && notification.pending === 0) {
                     updateTaskCompletion(s, sessionId, {type: 'notification_sent'})
                 }
@@ -4174,6 +4546,16 @@ async function applyTaskCompletionEffects(sessionId, effects = []) {
                 log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '最终完成镜像失败')
             }
         } else if (effect.type === 'fail' || effect.type === 'pause') {
+            if (s.coordinatorTaskId && taskWorkbench) {
+                const snapshot = taskCoordinator.getTaskSnapshot(s.coordinatorTaskId)
+                const step = snapshot?.plan?.steps?.find(item => item.status === 'running')
+                taskWorkbench.recordTaskEvent(s.coordinatorTaskId, effect.type === 'pause'
+                    ? {type: 'task/paused', detail: effect.detail || '任务已暂停'}
+                    : step
+                        ? {type: 'phase/failed', phase: step.phase, stepId: step.stepId, code: 'task_execution_failed', detail: effect.detail || '任务未完成'}
+                        : {type: 'task/status', status: 'failed'})
+                taskWorkbench.finalizeReport(s.coordinatorTaskId, {unresolvedRisks: [effect.detail || '任务未完成']})
+            }
             updateTaskState(s, sessionId, taskStateFromCompletion(s, effect.detail))
             taskCompletionEventForClient(s, sessionId, effect.type === 'pause' ? 'task_review_paused' : 'task_failed', {
                 detail: effect.detail || '任务未完成',
@@ -4293,8 +4675,11 @@ async function executeScheduledTask(id) {
         throw new Error('scheduled task has invalid prompt or workDir')
     }
     log.info({taskId: id, promptLength: task.prompt?.length || 0}, '定时任务触发')
+    const scheduledDecision = decideTask({text: task.prompt})
     const body = {
         workDir: task.workDir,
+        text: task.prompt,
+        taskDecision: scheduledDecision,
         model: task.model || MODEL,
         permissionMode: task.permissionMode || 'default',
         maxTurns: Math.min(100, Math.max(1, Number(task.maxTurns) || 20)),
@@ -4355,18 +4740,28 @@ async function executeScheduledTask(id) {
     sessions.set(sessionId, scheduledSession)
     scheduledSession.taskStartedAt = Date.now()
     scheduledSession.taskCompletion = createTaskCompletionState({phase: 'running'})
-    scheduledSession.taskCompletionDecision = scheduledSession.taskDecision
+    scheduledSession.taskDecision = scheduledDecision
+    scheduledSession.taskCompletionDecision = scheduledDecision
     scheduledSession.taskCompletionTurnId = crypto.randomUUID()
     scheduledSession.taskCompletionTaskId = `${sessionId}:${scheduledSession.taskCompletionTurnId}`
     appendSessionEvent(scheduledSession, 'task/accepted', {
         source: 'scheduled', turnId: scheduledSession.taskCompletionTurnId, taskId: scheduledSession.taskCompletionTaskId,
     }, {critical: true})
+    await initializeTaskWorkbenchSession({
+        session: scheduledSession,
+        sessionId,
+        taskId: scheduledSession.taskCompletionTaskId,
+        turnId: scheduledSession.taskCompletionTurnId,
+        source: 'scheduled',
+        goal: task.prompt,
+        decision: scheduledDecision,
+    })
     scheduledSession._taskCompletionSequence = 0
     updateTaskState(scheduledSession, sessionId, taskStateFromCompletion(scheduledSession))
     markInternalInput(scheduledSession, scheduledSession.taskDecision)
     pushStream.push({
         type: 'user', session_id: sessionId,
-        message: {role: 'user', content: [{type: 'text', text: task.prompt}]},
+        message: {role: 'user', content: [{type: 'text', text: task.prompt + buildTaskPitfallReminder(scheduledSession.taskPitfallReminders)}]},
         parent_tool_use_id: null,
     })
     startStreamPump(sessionId)
@@ -4472,7 +4867,7 @@ async function autoTriggerWorkflow(sessionId, msgContent, taskDecision = null) {
     if (!matchedWf || matchedWf === '__skip__') return
 
     const wfList = listWorkflows()
-    const exists = wfList.some(w => w.name.replace('.mjs', '') === matchedWf)
+    const exists = wfList.some(w => w.enabled !== false && w.name.replace('.mjs', '') === matchedWf)
     if (!exists) return
 
     let wfId
@@ -4512,6 +4907,8 @@ async function autoTriggerWorkflow(sessionId, msgContent, taskDecision = null) {
             ? sessions.get(sessionId)?.queryOpts?.model || null
             : null,
         _taskDecision: taskDecision || null,
+        _taskId: sessions.get(sessionId)?.coordinatorTaskId || sessions.get(sessionId)?.taskCompletionTaskId || null,
+        _projectContext: sessions.get(sessionId)?.projectContext || null,
         _taskOwned: true,
         _runKey: `${matchedWf}:${sessionId}`,
     }).catch(e => {
@@ -5154,6 +5551,16 @@ async function handleHttpRequest(req, res) {
             createdSession.taskCompletionTaskId = persistedTaskState?.taskId || null
             createdSession.taskCompletionTurnId = persistedTaskState?.turnId || null
             createdSession._taskCompletionSequence = persistedTaskState?.sequence || 0
+            if (persistedTaskState?.taskId && bridgeStateDb?.available) {
+                const coordinatorRecord = bridgeStateDb.getCoordinatorTaskState(
+                    sessionCatalogProjectKey(workDir), persistedTaskState.taskId,
+                )
+                const coordinatorSnapshot = restoreCoordinatorSnapshot(coordinatorRecord, {workDir})
+                if (coordinatorSnapshot) {
+                    taskWorkbench.restoreTask(coordinatorSnapshot)
+                    createdSession.coordinatorTaskId = coordinatorSnapshot.taskId
+                }
+            }
             restoreSessionMirrors(createdSession, sessionId)
             createdSession.taskFinalReplyText = persistedTaskState?.finalReplyText || ''
             persistSessionCatalogSettings(createdSession, sessionId, {
@@ -6249,6 +6656,71 @@ async function handleHttpRequest(req, res) {
         }))
         return
     }
+    // ── Workbench 架构运行状态：执行报告、Pitfall 与 AI 层健康 ──
+    if (req.method === 'GET' && url.pathname === '/api/workbench/reports') {
+        const projectKey = String(url.searchParams.get('projectKey') || '').trim()
+        const reports = bridgeStateDb?.available ? bridgeStateDb.listExecutionReports(projectKey || null, {limit: 200}) : []
+        res.writeHead(200, {'Content-Type': 'application/json'})
+        res.end(JSON.stringify({reports}))
+        return
+    }
+    const executionReportMatch = url.pathname.match(/^\/api\/workbench\/reports\/([^/]+)$/)
+    if (req.method === 'GET' && executionReportMatch) {
+        const report = bridgeStateDb?.available
+            ? bridgeStateDb.getExecutionReport(safeDecodeURIComponent(executionReportMatch[1])) : null
+        res.writeHead(report ? 200 : 404, {'Content-Type': 'application/json'})
+        res.end(JSON.stringify(report ? {report} : {error: 'execution_report_not_found'}))
+        return
+    }
+    if (req.method === 'GET' && url.pathname === '/api/workbench/pitfalls') {
+        const projectKey = String(url.searchParams.get('projectKey') || '').trim()
+        const pitfalls = !bridgeStateDb?.available ? [] : projectKey
+            ? pitfallAdmin?.list({projectKey, limit: 200}) || []
+            : bridgeStateDb.listRecentPitfalls({limit: 200})
+        res.writeHead(200, {'Content-Type': 'application/json'})
+        res.end(JSON.stringify({pitfalls}))
+        return
+    }
+    const pitfallActionMatch = url.pathname.match(/^\/api\/workbench\/pitfalls\/([^/]+)$/)
+    if (req.method === 'PUT' && pitfallActionMatch) {
+        if (!pitfallAdmin) {
+            res.writeHead(503, {'Content-Type': 'application/json'})
+            res.end(JSON.stringify({error: 'pitfall_store_unavailable'}))
+            return
+        }
+        try {
+            const id = safeDecodeURIComponent(pitfallActionMatch[1])
+            const body = await readBody(req)
+            const action = String(body.action || '')
+            const changed = action === 'confirm' ? pitfallAdmin.confirm(id, {rootCause: body.rootCause, prevention: body.prevention})
+                : action === 'ignore' ? pitfallAdmin.ignore(id)
+                    : action === 'archive' ? pitfallAdmin.archive(id)
+                        : action === 'verify' ? pitfallAdmin.verify(id, body.evidence) : false
+            if (!['confirm', 'ignore', 'archive', 'verify'].includes(action)) {
+                res.writeHead(400, {'Content-Type': 'application/json'})
+                res.end(JSON.stringify({error: 'invalid_pitfall_action'}))
+                return
+            }
+            res.writeHead(changed ? 200 : 404, {'Content-Type': 'application/json'})
+            res.end(JSON.stringify(changed ? {ok: true} : {error: 'pitfall_not_found'}))
+        } catch (error) {
+            res.writeHead(400, {'Content-Type': 'application/json'})
+            res.end(JSON.stringify({error: String(error?.message || error)}))
+        }
+        return
+    }
+    if (req.method === 'GET' && url.pathname === '/api/workbench/ai-health') {
+        const projectKey = String(url.searchParams.get('projectKey') || '').trim()
+        const reports = bridgeStateDb?.available ? bridgeStateDb.listExecutionReports(projectKey || null, {limit: 200}) : []
+        const pitfalls = !bridgeStateDb?.available ? [] : projectKey
+            ? bridgeStateDb.listPitfalls(projectKey, {limit: 200})
+            : bridgeStateDb.listRecentPitfalls({limit: 200})
+        const health = checkAiLayerHealth({bridgeHome: BRIDGE_HOME})
+        const driftCandidates = detectRuleDrift({executionReports: reports, pitfalls})
+        res.writeHead(health.healthy ? 200 : 503, {'Content-Type': 'application/json'})
+        res.end(JSON.stringify({health, driftCandidates}))
+        return
+    }
     // ── GET /api/config/claude-status —— Claude Code 安装状态查询 ──
     // 功能说明: 前端弹窗用，检测本地是否安装了 Claude Code 可执行文件
     // 实现方式: 支持 ?path= 查询参数手动指定路径；无参数时调用 getClaudeExe() 多级回退查找
@@ -6305,7 +6777,9 @@ async function handleHttpRequest(req, res) {
     if (req.method === 'GET' && url.pathname === '/api/config/skills') {
         const sd = join(BRIDGE_HOME, 'skills');
         const r = [];
-        const builtinNames = new Set(builtinCache.skills);
+        const builtinState = getBuiltinResourceState({bridgeHome: BRIDGE_HOME}).filter(item => item.type === 'skill')
+        const builtinNames = new Set(builtinState.map(item => item.id));
+        const builtinByName = new Map(builtinState.map(item => [item.id, item]))
         const seen = new Set();
         try {
             for (const n of readdirSync(sd)) {
@@ -6320,7 +6794,10 @@ async function handleHttpRequest(req, res) {
                         allowedTools: fm['allowed-tools'] || '',
                         content: c,
                         size: c.length,
-                        source: 'custom'
+                        source: builtinNames.has(name) ? 'builtin' : 'custom',
+                        enabled: builtinByName.get(name)?.enabled ?? true,
+                        customized: builtinByName.get(name)?.customized ?? false,
+                        required: builtinByName.get(name)?.required ?? false,
                     })
                 } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
             }
@@ -6333,7 +6810,8 @@ async function handleHttpRequest(req, res) {
                 allowedTools: '',
                 content: null,
                 size: 0,
-                source: 'builtin'
+                source: 'sdk-builtin',
+                enabled: true,
             })
         }
         ;res.writeHead(200);
@@ -6389,6 +6867,11 @@ async function handleHttpRequest(req, res) {
         // 仅已禁用的 skill 可删除（防止误删正在使用的 skill）
         if (req.method === 'DELETE') {
             try {
+                if (getBuiltinResourceState({bridgeHome: BRIDGE_HOME}).some(item => item.type === 'skill' && item.id === sn)) {
+                    res.writeHead(409)
+                    res.end(JSON.stringify({error: '内置 Skill 不能删除，请使用启用/关闭开关'}))
+                    return
+                }
                 const s = readJSON(join(BRIDGE_HOME, 'settings.json')) || {}
                 if (!(s.disabledSkills || []).includes(sn)) {
                     res.writeHead(409)
@@ -6448,6 +6931,12 @@ async function handleHttpRequest(req, res) {
             const b = await readBody(req)
             const name = (b.name || '').trim()
             if (!name) { res.writeHead(400); res.end(JSON.stringify({error: 'name required'})); return }
+            if (getBuiltinResourceState({bridgeHome: BRIDGE_HOME}).some(item => item.type === 'skill' && item.id === name)) {
+                const resource = setBuiltinResourceEnabled({bridgeHome: BRIDGE_HOME, type: 'skill', id: name, enabled: !b.disabled})
+                res.writeHead(200)
+                res.end(JSON.stringify({ok: true, name, disabled: b.disabled, resource}))
+                return
+            }
             const s = loadCliSettingsForUpdate()
             if (!s.disabledSkills) s.disabledSkills = []
             if (b.disabled) {
@@ -6474,6 +6963,12 @@ async function handleHttpRequest(req, res) {
             const b = await readBody(req)
             const name = (b.name || '').trim()
             if (!name) { res.writeHead(400); res.end(JSON.stringify({error: 'name required'})); return }
+            if (getBuiltinResourceState({bridgeHome: BRIDGE_HOME}).some(item => item.type === 'mcp' && item.id === name)) {
+                const resource = setBuiltinResourceEnabled({bridgeHome: BRIDGE_HOME, type: 'mcp', id: name, enabled: !b.disabled})
+                res.writeHead(200)
+                res.end(JSON.stringify({ok: true, name, disabled: b.disabled, resource}))
+                return
+            }
             const s = loadCliSettingsForUpdate()
             if (!s.disabledMcpPlugins) s.disabledMcpPlugins = []
             if (b.disabled) {
@@ -6889,11 +7384,8 @@ async function handleHttpRequest(req, res) {
         return
     }
     // ── 内置 Rules 名称集合（与项目 CLAUDE.md 模板一起发布的规则）──
-    const BUILTIN_RULES = new Set([
-        'avalonia', 'c', 'csharp', 'java', 'vue',
-        'reactivity', 'security', 'testing',
-        'coding-style',
-    ])
+    const builtinRuleState = new Map(getBuiltinResourceState({bridgeHome: BRIDGE_HOME})
+        .filter(item => item.type === 'rule').map(item => [item.target.replace(/^rules\//, '').replace(/\.md$/, ''), item]))
     // ── 递归扫描 rules/ 目录下所有 .md 文件 ──
     function scanRulesDir(dir, baseDir, result) {
         for (const entry of readdirSync(dir, {withFileTypes: true})) {
@@ -6906,8 +7398,8 @@ async function handleHttpRequest(req, res) {
                     const {frontmatter: fm} = parseFrontmatter(c);
                     const relPath = relative(baseDir, full).replace(/\\/g, '/');
                     const stem = entry.name.replace(/\.md$/, '');
-                    const isBuiltin = BUILTIN_RULES.has(stem);
-                    result.push({filename: relPath, content: c, frontmatter: fm, size: c.length, source: isBuiltin ? 'builtin' : 'custom'})
+                    const builtin = builtinRuleState.get(stem)
+                    result.push({filename: relPath, content: c, frontmatter: fm, size: c.length, source: builtin ? 'builtin' : 'custom', enabled: builtin?.enabled ?? true, customized: builtin?.customized ?? false, required: builtin?.required ?? false})
                 } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
             }
         }
@@ -6966,6 +7458,11 @@ async function handleHttpRequest(req, res) {
         }
         if (req.method === 'DELETE') {
             try {
+                if (getBuiltinResourceState({bridgeHome: BRIDGE_HOME}).some(item => item.type === 'rule' && item.target === `rules/${fn}`)) {
+                    res.writeHead(409)
+                    res.end(JSON.stringify({error: '内置 Rule 不能删除，请使用启用/关闭开关'}))
+                    return
+                }
                 backupFile(fp);
                 if (existsSync(fp)) unlinkSync(fp);
                 res.writeHead(200);
@@ -7008,6 +7505,8 @@ async function handleHttpRequest(req, res) {
         const ad = join(BRIDGE_HOME, 'agents');
         const r = [];
         const seen = new Set()
+        const builtinAgentState = getBuiltinResourceState({bridgeHome: BRIDGE_HOME}).filter(item => item.type === 'agent')
+        const builtinAgentByName = new Map(builtinAgentState.map(item => [item.id, item]))
         try {
             for (const fn of readdirSync(ad)) {
                 if (!fn.endsWith('.md')) continue
@@ -7028,8 +7527,11 @@ async function handleHttpRequest(req, res) {
                         content: c,
                         size: c.length,
                         loaded: isBuiltin,
-                        source: 'custom'
-                    }) // 有磁盘文件的始终是自定义
+                        source: builtinAgentByName.has(name) ? 'builtin' : 'custom',
+                        enabled: builtinAgentByName.get(name)?.enabled ?? true,
+                        customized: builtinAgentByName.get(name)?.customized ?? false,
+                        required: builtinAgentByName.get(name)?.required ?? false,
+                    })
                 } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
             }
         } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
@@ -7045,7 +7547,8 @@ async function handleHttpRequest(req, res) {
                     content: null,
                     size: 0,
                     loaded: true,
-                    source: 'builtin'
+                    source: 'sdk-builtin',
+                    enabled: true,
                 })
             }
         }
@@ -7093,6 +7596,11 @@ async function handleHttpRequest(req, res) {
         }
         if (req.method === 'DELETE') {
             try {
+                if (getBuiltinResourceState({bridgeHome: BRIDGE_HOME}).some(item => item.type === 'agent' && item.target === `agents/${an}.md`)) {
+                    res.writeHead(409)
+                    res.end(JSON.stringify({error: '内置 Agent 不能删除，请使用启用/关闭开关'}))
+                    return
+                }
                 backupFile(fp);
                 if (existsSync(fp)) unlinkSync(fp);
                 res.writeHead(200);
@@ -7374,12 +7882,49 @@ async function handleHttpRequest(req, res) {
                 log.warn({err: e}, 'supportedCommands 失败')
             }
         }
-        ;const commandsList = (dynamicCache.commands?.length ? dynamicCache.commands : null) || BUILTIN_COMMANDS;
-        const builtin = commandsList.map(c => ({...c, source: 'builtin'}));
+        ;const commandsEnabled = getBuiltinResourceState({bridgeHome: BRIDGE_HOME}).find(item => item.type === 'command' && item.id === 'commands')?.enabled !== false
+        const commandsList = (dynamicCache.commands?.length ? dynamicCache.commands : null) || BUILTIN_COMMANDS;
+        const builtin = commandsList.map(c => ({...c, source: 'builtin', enabled: commandsEnabled}));
         const custom = IM_CUSTOM_COMMANDS.map(c => ({...c, source: 'custom'}));
         const tagged = [...builtin, ...custom];
         res.writeHead(200);
-        res.end(JSON.stringify({commands: tagged, live: !!q, cachedAt: dynamicCache.updatedAt}));
+        res.end(JSON.stringify({commands: tagged, builtinEnabled: commandsEnabled, live: !!q, cachedAt: dynamicCache.updatedAt}));
+        return
+    }
+
+    // ── GET /api/config/builtin-resources —— 统一内置资源清单与启用状态 ──
+    if (req.method === 'GET' && url.pathname === '/api/config/builtin-resources') {
+        try {
+            res.writeHead(200)
+            res.end(JSON.stringify({resources: getBuiltinResourceState({bridgeHome: BRIDGE_HOME})}))
+        } catch (error) {
+            log.error({err: error}, '读取内置资源状态失败')
+            res.writeHead(500)
+            res.end(JSON.stringify({error: String(error?.message || error)}))
+        }
+        return
+    }
+
+    // ── PUT /api/config/builtin-resources/:type/:id —— 持久化单项开关 ──
+    const builtinResourceMatch = url.pathname.match(/^\/api\/config\/builtin-resources\/([^/]+)\/([^/]+)$/)
+    if (req.method === 'PUT' && builtinResourceMatch) {
+        try {
+            const type = safeDecodeURIComponent(builtinResourceMatch[1])
+            const id = safeDecodeURIComponent(builtinResourceMatch[2])
+            const body = await readBody(req)
+            if (typeof body.enabled !== 'boolean') {
+                res.writeHead(400)
+                res.end(JSON.stringify({error: 'enabled 必须是布尔值'}))
+                return
+            }
+            const resource = setBuiltinResourceEnabled({bridgeHome: BRIDGE_HOME, type, id, enabled: body.enabled})
+            res.writeHead(200)
+            res.end(JSON.stringify({ok: true, resource}))
+        } catch (error) {
+            const status = ['BUILTIN_RESOURCE_NOT_FOUND', 'BUILTIN_RESOURCE_REQUIRED'].includes(error?.code) ? 400 : 500
+            res.writeHead(status)
+            res.end(JSON.stringify({ok: false, error: String(error?.message || error), code: error?.code || 'BUILTIN_RESOURCE_UPDATE_FAILED'}))
+        }
         return
     }
 
@@ -7903,10 +8448,12 @@ async function handleHttpRequest(req, res) {
     if (req.method === 'GET' && url.pathname === '/api/config/mcp') {
         const s = readJSON(join(BRIDGE_HOME, 'settings.json')) || {}
         const disabledList = s.disabledMcpPlugins || []
+        const builtinMcpState = new Map(getBuiltinResourceState({bridgeHome: BRIDGE_HOME})
+            .filter(item => item.type === 'mcp').map(item => [item.id, item]))
         const pj = join(BRIDGE_HOME, 'plugins', 'installed_plugins.json')
         const pm = new Map()
         for (const [k, v] of Object.entries(BUILTIN_MCP)) {
-            pm.set(k, {name: k, version: v.version, scope: v.scope, enabled: !disabledList.includes(k), source: 'builtin'})
+            pm.set(k, {name: k, version: v.version, scope: v.scope, enabled: builtinMcpState.get(k)?.enabled !== false, required: builtinMcpState.get(k)?.required === true, source: 'builtin'})
         }
         try {
             const d = readJSON(pj)
@@ -7914,7 +8461,9 @@ async function handleHttpRequest(req, res) {
                 for (const [k, vs] of Object.entries(d.plugins)) {
                     for (const v of vs) {
                         const src = v.scope === 'user' || v.scope === 'project' ? 'custom' : 'builtin'
-                        pm.set(k, {name: k, version: v.version, scope: v.scope, enabled: !disabledList.includes(k), source: src})
+                    pm.set(k, {name: k, version: v.version, scope: v.scope, enabled: src === 'builtin'
+                        ? builtinMcpState.get(k)?.enabled !== false
+                        : !disabledList.includes(k), required: src === 'builtin' && builtinMcpState.get(k)?.required === true, source: src})
                     }
                 }
             }
@@ -8647,7 +9196,7 @@ async function autoTriggerFinalReview(sessionId, taskDecision, checkpoint, revie
     const reviewKey = `${checkpoint.id || 'checkpoint'}:${s.taskCompletion?.reviewRound || 1}`
     if (s._finalReviewKey === reviewKey) return
     const workflow = 'final-review'
-    if (!listWorkflows().some(w => w.name.replace('.mjs', '') === workflow)) {
+    if (!listWorkflows().some(w => w.enabled !== false && w.name.replace('.mjs', '') === workflow)) {
         const transition = updateTaskCompletion(s, sessionId, {type: 'review_error', detail: '最终审查 Workflow 不存在'})
         await applyTaskCompletionEffects(sessionId, transition.effects)
         return
@@ -8682,6 +9231,10 @@ async function autoTriggerFinalReview(sessionId, taskDecision, checkpoint, revie
             _modelTiers: wfCfg.modelTiers || {},
             _fixedModel: s.modelMode === 'fixed' ? s.queryOpts?.model || null : null,
             _permissionMode: 'plan',
+            _taskId: s.coordinatorTaskId || s.taskCompletionTaskId,
+            _stepId: taskCoordinator.getTaskSnapshot(s.coordinatorTaskId)?.plan?.steps?.find(step => step.phase === 'review')?.stepId || null,
+            _taskDecision: s.taskDecision || null,
+            _projectContext: s.projectContext || null,
             _returnToParent: false,
             _runKey: runKey,
         })
@@ -8691,6 +9244,19 @@ async function autoTriggerFinalReview(sessionId, taskDecision, checkpoint, revie
             return
         }
         const outcome = normalizeReviewOutcome(result, plan, {files: checkpoint.files})
+        if (s.coordinatorTaskId && taskWorkbench) {
+            taskWorkbench.recordReviewResult(s.coordinatorTaskId, {
+                passed: outcome.passed,
+                summary: outcome.summary,
+                findings: [...outcome.blockingFindings, ...outcome.advisoryFindings],
+            })
+            s._repairDecision = outcome.passed ? null : taskWorkbench.recordFailure(s.coordinatorTaskId, {
+                module: 'final-review', phase: 'review', errorCode: 'REVIEW_BLOCKING_FINDINGS',
+                message: outcome.blockingFindings.map(item => `${item.file}:${item.line || ''}:${item.title}`).join('|') || outcome.summary,
+                strategy: 'apply-review-findings',
+                targetFiles: checkpoint.files.map(file => file.path),
+            })
+        }
         const transition = updateTaskCompletion(s, sessionId, {type: 'review_result', outcome})
         await applyTaskCompletionEffects(sessionId, transition.effects)
     } catch (error) {
@@ -8731,6 +9297,8 @@ async function submitTaskCommand(command) {
     const userId = command.userId || null
     const desktopInput = !IM_SOURCES.has(source)
     const activeTurnInput = Boolean(s._generating || s.activeTurnId || s._pendingInputs?.length)
+    // 必须在热刷新 Provider/模型前捕获旧投影，否则重建原因会被新的运行配置覆盖。
+    const contextEnvelopeBeforeSettings = s.contextEnvelope || createSessionContextEnvelope(s)
     let acceptedInput = null
     let acceptedEventPersisted = false
     try {
@@ -8852,6 +9420,17 @@ async function submitTaskCommand(command) {
             s.autoContinuationCount = 0
             s.autoContinuationTurns = 0
             s._lastContextUsageAt = 0
+
+            await initializeTaskWorkbenchSession({
+                session: s,
+                taskId: s.taskCompletionTaskId,
+                turnId: acceptedInput.turnId,
+                sessionId,
+                source,
+                userId,
+                goal: desktopInput && command.taskText?.trim() ? command.taskText : command.content,
+                decision: taskDecision,
+            })
         }
 
         // 只在新任务入口观察候选；同一执行中的补充消息不能把一次要求误计为多次偏好。
@@ -8912,14 +9491,51 @@ async function submitTaskCommand(command) {
         const modelChanged = newModel && newModel !== s.queryOpts?.model
         const modeChanged = taskRoute.mode !== previousModelMode
         const contextChanged = nextProfile !== (s.contextProfile || 'full')
-        const sdkInputContent = resolveSdkInputContent(sessionId, s, command.content)
+        let sdkInputContent = resolveSdkInputContent(sessionId, s, command.content)
+            + (!activeTurnInput ? buildTaskPitfallReminder(s.taskPitfallReminders) : '')
         const nextSkillRoute = routeSkills({text: sdkInputContent, workDir: s.workDir, profile: nextProfile})
         const skillRouteChanged = JSON.stringify(nextSkillRoute) !== JSON.stringify(s.skillRoute || [])
+        const nextAgentRoute = Array.isArray(s.agentRoute) ? s.agentRoute : []
+        const agentRouteChanged = JSON.stringify(nextAgentRoute) !== JSON.stringify(s.loadedAgentRoute || [])
+        const previousContextEnvelope = contextEnvelopeBeforeSettings
+        const nextContextEnvelope = createSessionContextEnvelope({
+            ...s,
+            providerBaseUrl,
+            permissionMode: newPerm || s.permissionMode,
+            thinkingLevel: newThink || s.thinkingLevel,
+            contextProfile: nextProfile,
+            skillRoute: nextSkillRoute,
+            loadedAgentRoute: nextAgentRoute,
+            queryOpts: {
+                ...s.queryOpts,
+                model: newModel,
+                bridgeProviderBaseUrl: providerBaseUrl,
+                bridgeContextProfile: nextProfile,
+                bridgeSkillRoute: nextSkillRoute,
+            },
+        })
+        const contextReusePolicy = resolveContextReusePolicy({
+            previous: previousContextEnvelope,
+            next: nextContextEnvelope,
+            switchIntent: command.contextSwitchMode,
+        })
+        if (contextReusePolicy.mode === 'handoff_summary') {
+            sdkInputContent = buildModelHandoffPrompt({prompt: sdkInputContent, session: s})
+        }
         beginTurn(sessionId, srcLabel + command.content, {
             captureFiles: shouldCaptureTurnCheckpoint(taskDecision),
         })
 
-        if (permChanged || thinkChanged || modelChanged || modeChanged || contextChanged || skillRouteChanged) {
+        if (permChanged || thinkChanged || modelChanged || modeChanged || contextChanged || skillRouteChanged || agentRouteChanged) {
+            // SDK 的 resume 仅保证会话连续性，不能证明上游缓存命中或费用；事件不含 Provider 地址、Prompt 或凭据。
+            broadcast(sessionId, {
+                type: 'context_rebuild_policy',
+                policy: contextReusePolicy.mode,
+                cacheEligibility: contextReusePolicy.cacheEligibility,
+                reasonCodes: contextReusePolicy.reasonCodes,
+                requiresUserChoice: contextReusePolicy.requiresUserChoice,
+            })
+            s._lastContextReusePolicy = contextReusePolicy
             if (permChanged) s.permissionMode = newPerm
             if (thinkChanged) s.thinkingLevel = newThink
             if (modelChanged) {
@@ -8928,47 +9544,49 @@ async function submitTaskCommand(command) {
             }
             if (contextChanged) s.contextProfile = nextProfile
             if (skillRouteChanged) s.skillRoute = nextSkillRoute
+            if (agentRouteChanged) s.loadedAgentRoute = nextAgentRoute
             await closeSessionRuntime(s, {sessionId, reason: 'runtime_settings_changed'})
             s.query = null
             s.pushStream = null
-            s._rebuildPromise = null
-            s._rebuildId = null
+            sessionCoordinator.invalidate(s)
             if (s._hasConversation) s.lastSessionId = s.lastSessionId || sessionId
         }
         s.modelMode = taskRoute.mode
 
         if (!s.query) {
             if (s._rebuildPromise) {
-                if (!s._pendingMessages) s._pendingMessages = []
-                s._pendingMessages.push(sdkInputContent)
+                sessionCoordinator.enqueue(s, sdkInputContent)
             } else {
-                s._pendingMessages = [sdkInputContent]
-                const myRebuildId = Symbol('rebuild')
-                s._rebuildId = myRebuildId
-                s._rebuildPromise = (async () => {
+                const rebuild = sessionCoordinator.beginRebuild(s, sdkInputContent)
+                const myRebuildId = rebuild.token
+                const rebuildPromise = (async () => {
                     const cliS = loadCliSettings()
                     const rebuildPushStream = new PushStream()
                     s.pushStream = rebuildPushStream
                     const bodyOverride = {
-                        resume: s.hasUserTurns ? (s.lastSessionId || undefined) : undefined,
+                        resume: contextReusePolicy.mode === 'handoff_summary'
+                            ? undefined
+                            : (s.hasUserTurns ? (s.lastSessionId || undefined) : undefined),
                         model: s.queryOpts?.model, modelMode: s.modelMode || 'fixed',
                         taskDecision: s.taskDecision || null, permissionMode: s.permissionMode,
                         thinkingLevel: s.thinkingLevel, contextProfile: s.contextProfile || 'full',
                         skillRoute: s.skillRoute || [], modelMeta: command.modelMeta,
+                        projectContext: s.projectContext || null,
+                        _agents: loadAgentDefinitions(s.taskDecision || null, s.projectContext || null),
                     }
                     if (s.providerBaseUrl) bodyOverride.baseUrl = s.providerBaseUrl
                     if (s.providerApiKey) bodyOverride.apiKey = s.providerApiKey
                     const opts = await makeQueryOptions(bodyOverride, s.workDir, cliS, {}, sessionId)
-                    if (s._rebuildId !== myRebuildId || s.pushStream !== rebuildPushStream) return
+                    if (!sessionCoordinator.isCurrent(s, myRebuildId) || s.pushStream !== rebuildPushStream) return
                     if (bodyOverride.resume) opts.resume = bodyOverride.resume
                     s.query = startClaudeAgent(rebuildPushStream, opts)
                     s.runtimeEnv = opts.runtimeEnv
                     s.providerBaseUrl = opts.bridgeProviderBaseUrl || s.providerBaseUrl
                     s.providerApiKey = opts.bridgeProviderApiKey || s.providerApiKey
                     s.queryOpts = opts
+                    s.contextEnvelope = createSessionContextEnvelope(s, opts)
                     startStreamPump(sessionId)
-                    const pending = s._pendingMessages || []
-                    s._pendingMessages = null
+                    const pending = sessionCoordinator.consumePendingMessages(s, myRebuildId)
                     for (const content of pending) {
                         rebuildPushStream.push({
                             type: 'user', session_id: sessionId,
@@ -8977,19 +9595,17 @@ async function submitTaskCommand(command) {
                         })
                         s.hasUserTurns = true
                     }
-                    s._rebuildPromise = null
-                    s._rebuildId = null
+                    sessionCoordinator.complete(s, myRebuildId)
                 })().catch(error => {
-                    if (s._rebuildId !== myRebuildId) {
+                    if (!sessionCoordinator.isCurrent(s, myRebuildId)) {
                         log.debug({err: error, sessionId: sessionId.slice(0, 8)}, '已过期 rebuild 失败，忽略其状态清理')
                         return
                     }
                     log.error({err: error, sessionId: sessionId.slice(0, 8)}, 'rebuild 失败')
-                    s._rebuildPromise = null
-                    s._rebuildId = null
-                    s._pendingMessages = null
+                    sessionCoordinator.fail(s, myRebuildId)
                     failPendingSessionInputs(sessionId, s, error)
                 })
+                sessionCoordinator.attachPromise(s, myRebuildId, rebuildPromise)
             }
         } else {
             s.pushStream.push({
@@ -9256,6 +9872,7 @@ wss.on('connection', (ws, req) => {
                 modelMode: msg.modelMode,
                 model: msg.model,
                 modelMeta: msg.modelMeta,
+                contextSwitchMode: msg.contextSwitchMode,
                 hasAttachments: msg.hasAttachments,
                 noWorkflow: msg._noWorkflow,
             })
@@ -9431,6 +10048,23 @@ async function bootGateway() {
             log.warn({err: error}, 'SQLite 运行状态投影清理失败，本次启动继续保留旧记录')
         }
     }
+    if (bridgeStateDb.available) {
+        pitfallService = createPitfallService({stateStore: bridgeStateDb})
+        pitfallAdmin = createPitfallAdmin({pitfallService})
+    }
+    taskWorkbench = createTaskWorkbenchRuntime({
+        coordinator: taskCoordinator,
+        pitfallService,
+        persistReport: (report, snapshot) => {
+            if (!bridgeStateDb?.available || !snapshot?.plan?.workDir) return false
+            return bridgeStateDb.upsertExecutionReport({
+                projectKey: sessionCatalogProjectKey(snapshot.plan.workDir),
+                sessionId: snapshot.sessionId,
+                report,
+                updatedAt: Date.now(),
+            })
+        },
+    })
     memoryService = createMemoryService({bridgeHome: BRIDGE_HOME, stateStore: bridgeStateDb, logger: log})
     const injected = await initializeSecurePayloadKey()
     if (typeof process.send === 'function' && !injected) {

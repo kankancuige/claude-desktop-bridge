@@ -1052,7 +1052,7 @@ async function extractFile(absPath, relPath, ext) {
 // ── 技术栈检测 ──
 // 功能说明: 根据项目根目录的配置文件推断语言/运行时/框架
 // 实现方式: 检查 package.json / tsconfig.json / pom.xml / Cargo.toml 等
-function detectStack(workDir) {
+export function detectProjectStack(workDir) {
     const result = {language: 'Unknown', runtime: 'Unknown'}
 
     // Node.js 生态
@@ -1348,7 +1348,7 @@ export async function buildProjectCache(workDir) {
     const scan = scanSourceFiles(workDir)
     if (scan.missing) return null
 
-    const stack = detectStack(workDir)
+    const stack = detectProjectStack(workDir)
     const fileTree = buildFileTree(scan.files)
 
     // 提取所有文件的符号表（并发但有上限）

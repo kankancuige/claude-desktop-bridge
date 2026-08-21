@@ -55,3 +55,13 @@ test('只有明确记忆操作才加载 Bridge Memory Skill', () => {
     assert.deepEqual(routeSkills({text: '这个 Memory Skill 是干什么的？', profile: 'focused'}), [])
     assert.deepEqual(routeSkills({text: '修改代码并使用 UTF-8 编码', profile: 'full'}), [])
 })
+
+test('数字孪生参考图和程序化代理任务加载专用 Skill', () => {
+    for (const text of [
+        '根据参考图片生成数字孪生运行时的程序化 Three.js 模型',
+        '将单张 image-proxy 转成工业孪生的 GLB 运行时代理并写入 manifest',
+        '将 image-to-3D runtime proxy 用于 robot twin，并保留为非工程权威资产',
+    ]) {
+        assert.deepEqual(routeSkills({text, profile: 'full'}), ['digital-twin-cad'], text)
+    }
+})

@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import {getSessionRuntimeState} from './session-runtime-state.mjs'
+import {consumePendingSessionInputOnResult, getSessionRuntimeState} from './session-runtime-state.mjs'
+import {createTaskLifecycleSnapshot} from '../tasks/task-lifecycle.mjs'
 
 test('空闲的长连接 runtime 不应被标记为正在生成', () => {
     assert.deepEqual(getSessionRuntimeState({query: {}, pushStream: {}, _generating: false, _pendingInputs: []}), {
@@ -18,6 +19,44 @@ test('生成中、排队中和重建中都应标记为正在执行', () => {
     assert.equal(getSessionRuntimeState({_pendingInputs: [{}]}).generating, true)
     assert.equal(getSessionRuntimeState({_pendingMessages: ['task']}).generating, true)
     assert.equal(getSessionRuntimeState({_rebuildPromise: Promise.resolve()}).generating, true)
+})
+
+test('SDK 未回传 user 事件时，result 只确认一条已投递输入', () => {
+    const session = {
+        _pendingInputs: [{turnId: 'turn-1'}, {turnId: 'turn-2'}],
+        activeTurnId: null,
+    }
+    assert.deepEqual(consumePendingSessionInputOnResult(session), {turnId: 'turn-1'})
+    assert.deepEqual(session._pendingInputs, [{turnId: 'turn-2'}])
+})
+
+test('最后一条未回显输入由 result 确认后，运行时不再保持执行中', () => {
+    const session = {
+        query: {},
+        pushStream: {},
+        _generating: false,
+        activeTurnId: null,
+        _pendingInputs: [{turnId: 'turn-1'}],
+    }
+    assert.deepEqual(consumePendingSessionInputOnResult(session), {turnId: 'turn-1'})
+    assert.equal(getSessionRuntimeState(session).generating, false)
+    assert.equal(getSessionRuntimeState(session).pendingInputs, 0)
+    const lifecycle = createTaskLifecycleSnapshot({
+        sessionId: 'session-1',
+        runtime: getSessionRuntimeState(session),
+        task: {status: 'succeeded'},
+    })
+    assert.equal(lifecycle.active, false)
+    assert.deepEqual(lifecycle.capabilities, {canSend: true, canStop: false, canContinue: false})
+})
+
+test('SDK 已回传 user 事件时，result 不能误确认下一条补充指令', () => {
+    const session = {
+        _pendingInputs: [{turnId: 'turn-2'}],
+        activeTurnId: 'turn-1',
+    }
+    assert.equal(consumePendingSessionInputOnResult(session), null)
+    assert.deepEqual(session._pendingInputs, [{turnId: 'turn-2'}])
 })
 
 test('runtime state does not expose persisted task internals', () => {

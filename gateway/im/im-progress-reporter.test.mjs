@@ -100,3 +100,14 @@ test('自动续跑是长任务进度而不是终态', () => {
         detail: '第 2/3 次',
     })
 })
+
+test('验证不足会结束进度 reporter 并清理 timer', () => {
+    const clock = fakeClock()
+    const reporter = createImProgressReporter({send: () => {}, ...clock})
+    reporter.observe({type: 'task_started'})
+    reporter.observe({type: 'thinking_start'})
+    assert.equal(clock.pending(), 1)
+    reporter.observe({type: 'task_verification_inconclusive'})
+    assert.equal(reporter.snapshot().finished, true)
+    assert.equal(clock.pending(), 0)
+})

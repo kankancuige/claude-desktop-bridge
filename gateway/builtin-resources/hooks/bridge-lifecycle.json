@@ -1,0 +1,5 @@
+{
+  "events": ["SubagentStart", "SubagentStop", "PostToolUse", "PreCompact"],
+  "required": true,
+  "description": "由 Gateway 注册的核心生命周期 Hook；关闭会破坏任务状态、Agent 面板或上下文压缩链路。"
+}

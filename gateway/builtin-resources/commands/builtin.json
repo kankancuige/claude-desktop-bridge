@@ -1,0 +1,4 @@
+{
+  "source": "gateway",
+  "description": "命令实现保留在 Gateway，清单文件用于安装、展示和逐项开关。"
+}

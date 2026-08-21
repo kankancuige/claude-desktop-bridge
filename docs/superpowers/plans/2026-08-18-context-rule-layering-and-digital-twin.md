@@ -12,7 +12,7 @@
 
 - 不新增依赖，不修改 SDK、HTTP/WebSocket、Session 持久化和 IM 契约。
 - 不硬编码本机仓库绝对路径，运行时从模块位置解析 Bridge 仓库根目录。
-- 不覆盖用户已有的同名 `~/.claude/skills/digital-twin-cad/SKILL.md`。
+- 不覆盖用户已有的同名 `BRIDGE_HOME/skills/digital-twin-cad/SKILL.md`；不会写入 Claude/Codex 外部 Skill 目录。
 - 普通 CAD、普通前端和仅 Viewer 预览不得触发数字孪生 Skill。
 - 注释和用户可见错误使用 UTF-8 简体中文。
 
@@ -99,7 +99,7 @@ Expected: PASS。
 
 **Interfaces:**
 - Consumes: `routeSkills({text, profile, targetFiles})`
-- Produces: `ensureBuiltinSkillsAvailable(skillNames, {claudeHome})`。
+- Produces: `ensureBuiltinSkillsAvailable(skillNames, {bridgeHome})`。
 
 - [ ] **Step 1: 写路由正反例**
 
@@ -111,8 +111,8 @@ assert.deepEqual(routeSkills({text: '做一个 GLB Viewer 预览页面', profile
 - [ ] **Step 2: 写安装失败测试**
 
 ```js
-assert.equal(ensureBuiltinSkillsAvailable(['digital-twin-cad'], {claudeHome: temp}).installed.length, 1)
-assert.equal(ensureBuiltinSkillsAvailable(['digital-twin-cad'], {claudeHome: temp}).installed.length, 0)
+assert.equal(ensureBuiltinSkillsAvailable(['digital-twin-cad'], {bridgeHome: temp}).installed.length, 1)
+assert.equal(ensureBuiltinSkillsAvailable(['digital-twin-cad'], {bridgeHome: temp}).installed.length, 0)
 ```
 
 - [ ] **Step 3: 实现严格路由和不覆盖安装**
@@ -127,7 +127,7 @@ if (skillNames.includes('digital-twin-cad') && !existsSync(target)) {
 - [ ] **Step 4: 接入 Query 创建**
 
 ```js
-ensureBuiltinSkillsAvailable(skillRoute, {claudeHome: CLAUDE_HOME})
+ensureBuiltinSkillsAvailable(skillRoute, {bridgeHome: BRIDGE_HOME})
 ```
 
 - [ ] **Step 5: 运行 Agent 定向测试**

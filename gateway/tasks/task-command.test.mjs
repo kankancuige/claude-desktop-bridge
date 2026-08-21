@@ -5,11 +5,11 @@ import {createTaskCommandService, normalizeTaskCommand} from './task-command.mjs
 test('normalizeTaskCommand 保留受控字段并拒绝非法输入', () => {
     assert.deepEqual(normalizeTaskCommand({
         sessionId: 'session-1', source: 'desktop', messageId: 'message-1', content: ' 修复按钮 ',
-        permissionMode: 'acceptEdits', thinkingLevel: 'high', modelMode: 'auto', modelMeta: {contextWindow: 256000}, hasAttachments: true,
+        permissionMode: 'acceptEdits', thinkingLevel: 'high', modelMode: 'auto', modelMeta: {contextWindow: 256000}, contextSwitchMode: 'handoff_summary', hasAttachments: true,
     }), {
         sessionId: 'session-1', source: 'desktop', userId: null, messageId: 'message-1', content: ' 修复按钮 ',
         taskText: null, permissionMode: 'acceptEdits', thinkingLevel: 'high', modelMode: 'auto', model: null,
-        modelMeta: {contextWindow: 256000},
+        modelMeta: {contextWindow: 256000}, contextSwitchMode: 'handoff_summary',
         hasAttachments: true, noWorkflow: false,
     })
 
@@ -18,6 +18,7 @@ test('normalizeTaskCommand 保留受控字段并拒绝非法输入', () => {
         {sessionId: 's', source: 'unknown', content: 'x'},
         {sessionId: 's', source: 'desktop', content: '   '},
         {sessionId: 's', source: 'desktop', content: 'x', permissionMode: 'root'},
+        {sessionId: 's', source: 'desktop', content: 'x', contextSwitchMode: 'cancel'},
     ]) {
         assert.throws(() => normalizeTaskCommand(input), error => error?.code === 'INVALID_TASK_COMMAND')
     }

@@ -4,6 +4,16 @@
  */
 const { execFileSync } = require('child_process')
 
+try {
+  execFileSync(process.execPath, [require('path').resolve(__dirname, '../../scripts/check-builtin-resources.mjs')], {
+    stdio: 'inherit',
+    windowsHide: true,
+  })
+} catch (error) {
+  console.error('[prebuild] 内置资源校验失败。')
+  process.exit(error?.status || 1)
+}
+
 if (process.platform === 'win32') {
   try {
     const output = execFileSync('tasklist.exe', [

@@ -83,6 +83,21 @@ test('已有目标目录会补齐缺失文件但不覆盖已有文件', () => wi
     assert.equal(readFileSync(join(bridgeHome, 'skills', 'demo', 'missing.md'), 'utf8'), 'copied\n')
 }))
 
+test('迁移后内置旧开关进入统一状态，自定义旧开关保持兼容', () => withTempDirs(({legacyHome, bridgeHome}) => {
+    writeFileSync(join(legacyHome, 'settings.json'), JSON.stringify({
+        disabledSkills: ['caveman', 'custom-skill'],
+        disabledMcpPlugins: ['ccd_directory', 'custom-mcp'],
+    }), 'utf8')
+
+    const result = prepareBridgeHome({bridgeHome, legacyHome})
+    assert.deepEqual(result.resourceStateMigration.migrated, ['skill:caveman', 'mcp:ccd_directory'])
+    const settings = JSON.parse(readFileSync(join(bridgeHome, 'settings.json'), 'utf8'))
+    assert.deepEqual(settings.disabledSkills, ['custom-skill'])
+    assert.deepEqual(settings.disabledMcpPlugins, ['custom-mcp'])
+    assert.deepEqual(settings.disabledBuiltinResources.skill, ['caveman'])
+    assert.deepEqual(settings.disabledBuiltinResources.mcp, ['ccd_directory'])
+}))
+
 test('失败迁移保留清单并可在修复源文件后重试', () => withTempDirs(({legacyHome, bridgeHome}) => {
     writeFileSync(join(legacyHome, 'settings.json'), '{ invalid json', 'utf8')
     assert.throws(

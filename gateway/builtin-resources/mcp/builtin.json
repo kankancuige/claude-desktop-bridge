@@ -1,0 +1,4 @@
+{
+  "servers": ["ccd_directory", "ccd_session", "ccd_session_mgmt", "Claude_Preview", "scheduled-tasks"],
+  "note": "只包含元数据，不包含 API Key、token、本地命令或用户路径。"
+}

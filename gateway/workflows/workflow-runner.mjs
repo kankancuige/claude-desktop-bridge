@@ -5,6 +5,8 @@
 import {createHash} from 'node:crypto'
 import {assertWorkflowAgentModel, inferWorkflowAgentTier, resolveWorkflowAgentModel, resolveWorkflowPermissionMode} from './workflow-model-routing.mjs'
 import {buildAgentRuntimeMetadata} from '../agents/agent-runtime-metadata.mjs'
+import {createAgentDispatcher} from '../agents/agent-dispatcher.mjs'
+import {createAgentRegistry} from '../agents/agent-registry.mjs'
 import {readdirSync, readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, rmSync, statSync, mkdtempSync} from 'node:fs'
 import {execFileSync, fork} from 'node:child_process'
 import {join, extname, dirname} from 'node:path'
@@ -17,6 +19,7 @@ import {getCurrentSessionWorkflow, sortSessionWorkflows} from '../tasks/task-lif
 import {taskWorkflowResultMarker} from '../tasks/task-workflow-gate.mjs'
 import {requirementsForAgentStart} from '../agents/agent-capabilities.mjs'
 import {BRIDGE_HOME} from '../config/bridge-home.mjs'
+import {BUILTIN_RESOURCE_ROOT, getBuiltinResourceState} from '../config/builtin-resources.mjs'
 
 const log = createLogger('workflow')
 
@@ -460,7 +463,7 @@ export const meta = {
 
 var task = args.task || '实现一个健壮的 HTTP 请求重试工具函数（支持指数退避、抖动、超时）'
 var language = args.language || '与项目当前语言保持一致'
-var target = args.path || args.target || process.cwd()
+var target = args.path || args.target || '.'
 
 phase('Scan')
 log('目标: ' + target + ' (Critic Agent: reviewer)')
@@ -475,11 +478,11 @@ var SEARCHABLE = impl
 var critics = await parallel([
   function(){ return agent('审查以下代码的正确性（逻辑/边界/异常处理），列出所有缺陷:\\n\\n' + SEARCHABLE, {
     label: 'critic:correctness', agentType: 'reviewer',
-    schema: { type:'object', properties:{ defects:{type:'array',items:{type:'object',properties:{severity:{type:'string',enum:['critical','high','medium','low']},title:{type:'string'},description:{type:'string'}},required:['severity','title','description']}}}, severity:{type:'string'} }, required:['defects'] },
+    schema: { type:'object', properties:{ defects:{type:'array',items:{type:'object',properties:{severity:{type:'string',enum:['critical','high','medium','low']},title:{type:'string'},description:{type:'string'}},required:['severity','title','description']}}, severity:{type:'string'} }, required:['defects'] },
   })},
   function(){ return agent('审查以下代码的安全性（注入/权限/敏感信息/输入校验）:\\n\\n' + SEARCHABLE, {
     label: 'critic:security', agentType: 'reviewer',
-    schema: { type:'object', properties:{ defects:{type:'array',items:{type:'object',properties:{severity:{type:'string',enum:['critical','high','medium','low']},title:{type:'string'},description:{type:'string'}},required:['severity','title','description']}}}, severity:{type:'string'} }, required:['defects'] },
+    schema: { type:'object', properties:{ defects:{type:'array',items:{type:'object',properties:{severity:{type:'string',enum:['critical','high','medium','low']},title:{type:'string'},description:{type:'string'}},required:['severity','title','description']}}, severity:{type:'string'} }, required:['defects'] },
   })},
 ])
 
@@ -646,11 +649,11 @@ function bootstrapBuiltinWorkflows() {
     if (!existsSync(WF_DIR)) mkdirSync(WF_DIR, {recursive: true})
     for (const [name, content] of Object.entries(BUILTIN_WORKFLOWS)) {
         const fp = join(WF_DIR, name)
-        const bundledFinalReview = name === 'final-review.mjs'
-        if (!existsSync(fp) || bundledFinalReview) {
+        if (!existsSync(fp)) {
             try {
-                writeFileSync(fp, content, 'utf8');
-                log.info({name}, bundledFinalReview ? '内置最终审查模板已同步' : '内置模板已创建')
+                const bundledPath = join(BUILTIN_RESOURCE_ROOT, 'workflows', name)
+                writeFileSync(fp, existsSync(bundledPath) ? readFileSync(bundledPath, 'utf8') : content, 'utf8');
+                log.info({name}, '内置模板已创建')
             } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
         }
     }
@@ -953,21 +956,37 @@ function cleanupWorktree(wtDir, projectDir) {
 function listWorkflows() {
     if (!existsSync(WF_DIR)) mkdirSync(WF_DIR, {recursive: true})
     const list = []
+    const builtinStates = getBuiltinResourceState({bridgeHome: BRIDGE_HOME}).filter(item => item.type === 'workflow')
     try {
         for (const fn of readdirSync(WF_DIR)) {
             if (!fn.endsWith('.mjs') && !fn.endsWith('.js')) continue
+            const resourceId = fn.replace(/\.(?:mjs|js)$/, '')
+            const builtin = builtinStates.find(item => item.id === resourceId)
             const fp = join(WF_DIR, fn)
             const st = readFileSync(fp, 'utf8')
             const meta = parseMeta(st)
-            list.push({name: fn, size: st.length, description: meta?.description || '', phases: meta?.phases || []})
+            list.push({
+                name: fn,
+                size: st.length,
+                description: meta?.description || '',
+                phases: meta?.phases || [],
+                source: builtin ? 'builtin' : 'custom',
+                enabled: builtin?.enabled ?? true,
+                customized: builtin?.customized ?? false,
+                required: builtin?.required ?? false,
+            })
         }
     } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
     return list
 }
 
 function getWorkflow(name) {
+    const builtinStates = getBuiltinResourceState({bridgeHome: BRIDGE_HOME}).filter(item => item.type === 'workflow')
     // 先尝试原名称，再尝试追加 .mjs / .js 扩展名
     for (const candidate of [name, name + '.mjs', name + '.js']) {
+        const resourceId = candidate.replace(/\.(?:mjs|js)$/, '')
+        const builtin = builtinStates.find(item => item.id === resourceId)
+        if (builtin && !builtin.enabled) continue
         const fp = safeBasename(WF_DIR, candidate, {extensions: ['.mjs', '.js']})
         if (!fp) continue
         if (!existsSync(fp)) continue
@@ -1967,56 +1986,83 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
                                         runKey,
                                     })
                                     effectiveOpts.runtimeMetadata = agentMetadata
-                                    _broadcast({
-                                        type: 'workflow_agent_started',
-                                        workflowId: wfId,
-                                        ...agentMetadata,
-                                        status: 'running',
-                                        ts: Date.now(),
-                                    })
                                     let result
-                                    while (true) {
-                                        try {
-                                            result = await executeAgent(prompt, effectiveOpts, workDir, _broadcast, enhancedLog,
-                                                journalCache, wfId, budgetRef, () => aborted, cacheKey,
-                                                runState._agentAborts, runState._agentHandles)
-                                            break
-                                        } catch (e) {
-                                            if (e.code !== 'AGENT_PAUSED') throw e
-                                            enhancedLog('[Agent:' + agentLabel + '] 等待用户恢复...')
-                                            while (!aborted && runState._agentAborts?.get(agentLabel)) {
-                                                await new Promise(resolveWait => setTimeout(resolveWait, 500))
+                                    let rawWorkflowResult
+                                    const registry = _deps.getAgentRegistry?.(extraArgs?._taskDecision || null, extraArgs?._projectContext || null)
+                                        || createAgentRegistry()
+                                    const requestedAgentId = effectiveOpts.agentType || agentMetadata.role || 'general-purpose'
+                                    const definition = registry.get(requestedAgentId) || registry.get(agentMetadata.role) || registry.get('general-purpose')
+                                    if (!definition) throw Object.assign(new Error(`Workflow Agent 未注册：${requestedAgentId}`), {code: 'AGENT_UNAVAILABLE'})
+                                    const dispatcher = createAgentDispatcher({
+                                        registry,
+                                        publish: event => _broadcast({
+                                            type: event.type === 'agent/started' ? 'workflow_agent_started'
+                                                : event.type === 'agent/completed' ? 'workflow_agent_done' : 'workflow_agent_error',
+                                            workflowId: wfId,
+                                            ...agentMetadata,
+                                            id: agentLabel,
+                                            role: event.role || agentMetadata.role,
+                                            status: event.type === 'agent/started' ? 'running' : event.type === 'agent/completed' ? 'done' : 'error',
+                                            agentResult: event.result || null,
+                                            error: event.code || null,
+                                            ts: Date.now(),
+                                        }),
+                                        execute: async () => {
+                                            while (true) {
+                                                try {
+                                                    rawWorkflowResult = await executeAgent(prompt, effectiveOpts, workDir, _broadcast, enhancedLog,
+                                                        journalCache, wfId, budgetRef, () => aborted, cacheKey,
+                                                        runState._agentAborts, runState._agentHandles)
+                                                    break
+                                                } catch (e) {
+                                                    if (e.code !== 'AGENT_PAUSED') throw e
+                                                    enhancedLog('[Agent:' + agentLabel + '] 等待用户恢复...')
+                                                    while (!aborted && runState._agentAborts?.get(agentLabel)) {
+                                                        await new Promise(resolveWait => setTimeout(resolveWait, 500))
+                                                    }
+                                                    if (aborted) {
+                                                        const abortError = new Error('WorkflowAborted: 工作流已被暂停')
+                                                        abortError.code = 'WORKFLOW_ABORTED'
+                                                        throw abortError
+                                                    }
+                                                    enhancedLog('[Agent:' + agentLabel + '] 已恢复，重新执行')
+                                                }
                                             }
-                                            if (aborted) {
-                                                const abortError = new Error('WorkflowAborted: 工作流已被暂停')
-                                                abortError.code = 'WORKFLOW_ABORTED'
-                                                throw abortError
+                                            const raw = rawWorkflowResult && typeof rawWorkflowResult === 'object' ? rawWorkflowResult : {}
+                                            return {
+                                            status: 'completed',
+                                                summary: typeof rawWorkflowResult === 'string' ? rawWorkflowResult.slice(0, 2000) : String(raw.summary || 'Agent 已返回结构化结果'),
+                                                changedFiles: raw.changedFiles || [], tests: raw.tests || [], findings: raw.findings || [],
+                                                blockers: raw.blockers || [], regressions: raw.regressions || [], nextAction: raw.nextAction || '',
                                             }
-                                            enhancedLog('[Agent:' + agentLabel + '] 已恢复，重新执行')
-                                        }
-                                    }
-                                    _broadcast({
-                                        type: 'workflow_agent_done',
-                                        workflowId: wfId,
-                                        ...agentMetadata,
-                                        status: 'done',
-                                        ts: Date.now(),
+                                        },
+                                    })
+                                    result = await dispatcher.dispatchAgent({
+                                        taskId: String(extraArgs?._taskId || parentSid || wfId),
+                                        stepId: String(extraArgs?._stepId || `${wfId}:${effectiveOpts.phase || currentPhase || 'agent'}`),
+                                        agentRunId: `${wfId}:${agentLabel}`,
+                                        agentId: definition.id,
+                                        role: definition.role,
+                                        goal: prompt,
+                                        workDir,
+                                        targetFiles: Array.isArray(effectiveOpts.targetFiles) ? effectiveOpts.targetFiles : [],
+                                        modelTier: modelRoute.tier || 'balanced',
+                                        permissionMode: effectiveOpts.permissionMode || 'plan',
+                                        acceptanceCriteria: Array.isArray(effectiveOpts.acceptanceCriteria) ? effectiveOpts.acceptanceCriteria : [],
+                                        provider: 'claude-sdk',
+                                        capabilities: {writable: true, resumable: true, modelOverride: true, structuredOutput: true, toolFiltering: true, continuation: true},
+                                        requirements: requirementsForAgentStart({
+                                            options: {permissionMode: effectiveOpts.permissionMode, model: effectiveOpts.model},
+                                            structuredOutput: Boolean(effectiveOpts.schema), continuation: true,
+                                        }),
                                     })
                                     if (journalCache[cacheKey] && !_countedKeys.has(cacheKey)) {
                                         tokenSpent += journalCache[cacheKey].tokenSpent
                                         _countedKeys.add(cacheKey)
                                         runState._tokenSpent = tokenSpent
                                     }
-                                    sendToChild({type: 'agent_result', callId, result})
+                                    sendToChild({type: 'agent_result', callId, result: rawWorkflowResult})
                                 } catch (e) {
-                                    _broadcast({
-                                        type: 'workflow_agent_error',
-                                        workflowId: wfId,
-                                        ...agentMetadata,
-                                        status: e.code === 'AGENT_PAUSED' ? 'paused' : 'error',
-                                        error: String(e.message || e),
-                                        ts: Date.now(),
-                                    })
                                     if (e.code === 'BUDGET_EXCEEDED' && !aborted) aborted = true
                                     sendToChild({type: 'agent_result', callId, error: e.message, code: e.code})
                                 } finally {

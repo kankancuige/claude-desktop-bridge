@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import {createTaskStatePatch, recoverTaskState, isTaskResumable, taskStateForClient, taskStateFromResult, taskStateForStop, taskStateFileId, redactTaskDetail} from './task-state.mjs'
+import {createTaskStatePatch, recoverTaskState, isTaskResumable, taskStateForClient, taskStateForInconclusive, taskStateFromResult, taskStateForStop, taskStateFileId, redactTaskDetail} from './task-state.mjs'
 
 test('success is terminal and never resumable', () => {
     const state = createTaskStatePatch({status: 'succeeded', outcome: 'succeeded', resumable: true, numTurns: 3})
@@ -92,6 +92,19 @@ test('incomplete result remains resumable', () => {
     const state = createTaskStatePatch({status: 'incomplete', outcome: 'incomplete', continuationReason: 'max_turns'})
     assert.equal(state.resumable, true)
     assert.equal(isTaskResumable(state), true)
+})
+
+test('验证不足终态保留既有投影并强制为可继续的 incomplete', () => {
+    const state = taskStateForInconclusive(createTaskStatePatch({
+        status: 'reviewing', taskId: 'task-1', turnId: 'turn-1', startedAt: 100,
+        notifications: {wechat: {state: 'pending', notificationId: 'task-1:task_verification_inconclusive'}},
+    }), {detail: '只完成构建，未执行测试', completedAt: 500})
+    assert.equal(state.status, 'incomplete')
+    assert.equal(state.outcome, 'incomplete')
+    assert.equal(state.resumable, true)
+    assert.equal(state.detail, '只完成构建，未执行测试')
+    assert.equal(state.durationMs, 400)
+    assert.equal(state.notifications.wechat.notificationId, 'task-1:task_verification_inconclusive')
 })
 
 test('result and stop helpers keep the SDK identity for resume', () => {

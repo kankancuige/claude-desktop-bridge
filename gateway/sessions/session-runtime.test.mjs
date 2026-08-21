@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import {createSessionRuntime} from './session-runtime.mjs'
+import {createSessionRuntime, createSessionContextEnvelope} from './session-runtime.mjs'
 
 test('所有 Session 类型共享队列、资源、父任务和生命周期不变量', () => {
     const runtime = createSessionRuntime({workDir: 'D:/project', opts: {permissionMode: 'plan'}})
@@ -17,6 +17,7 @@ test('所有 Session 类型共享队列、资源、父任务和生命周期不�
     assert.equal(runtime.autoContinuationCount, 0)
     assert.equal(runtime.autoContinuationTurns, 0)
     assert.equal(runtime._autoContinuationRequest, null)
+    assert.equal(runtime.contextEnvelope.resumeMode, 'unavailable')
 })
 
 test('恢复身份和 Session 类型特有字段由同一工厂叠加', () => {
@@ -28,4 +29,19 @@ test('恢复身份和 Session 类型特有字段由同一工厂叠加', () => {
     assert.equal(runtime.hasUserTurns, true)
     assert.equal(runtime.agentName, 'scheduler')
     assert.equal(runtime._autoDelete, true)
+})
+
+test('运行态上下文 envelope 不保存 Provider 地址、凭据或工作目录', () => {
+    const runtime = createSessionRuntime({
+        workDir: 'D:/private-project', identity: 'sdk-old',
+        opts: {
+            model: 'model-balanced', permissionMode: 'default',
+            bridgeProviderBaseUrl: 'https://relay.example.test/private',
+            bridgeProviderApiKey: 'secret-token', bridgeContextProfile: 'full',
+        },
+    })
+    const rebuilt = createSessionContextEnvelope(runtime)
+    const serialized = JSON.stringify(rebuilt)
+    assert.equal(rebuilt.resumeMode, 'available')
+    assert.doesNotMatch(serialized, /relay\.example|private-project|secret-token/i)
 })

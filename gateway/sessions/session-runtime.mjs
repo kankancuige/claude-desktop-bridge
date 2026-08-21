@@ -2,6 +2,27 @@ import {initialSessionIdentity} from './session-create-mode.mjs'
 import {createTaskCompletionState} from '../tasks/task-completion.mjs'
 import {createTaskStatePatch} from '../tasks/task-state.mjs'
 import {createTaskWorkflowGate} from '../tasks/task-workflow-gate.mjs'
+import {buildContextEnvelope} from '../context/context-envelope.mjs'
+
+/**
+ * 只把匿名、稳定的运行配置投影给上下文策略；Prompt、凭据和工作目录不进入 envelope。
+ */
+export function createSessionContextEnvelope(session = {}, opts = session.queryOpts || {}) {
+    return buildContextEnvelope({
+        providerIdentity: opts.bridgeProviderBaseUrl || session.providerBaseUrl || 'claude-agent-sdk-default',
+        model: opts.model || 'unknown-model',
+        protocolFamily: 'claude-agent-sdk',
+        resumeSessionId: session.lastSessionId || opts.resume || '',
+        permissionMode: session.permissionMode || opts.permissionMode,
+        thinkingLevel: session.thinkingLevel,
+        contextProfile: session.contextProfile || opts.bridgeContextProfile,
+        skillRoute: session.skillRoute || opts.bridgeSkillRoute,
+        agentRoute: session.loadedAgentRoute || Object.keys(opts.agents || {}).sort(),
+        toolsetRevision: opts.bridgeToolsetRevision,
+        ruleRevision: opts.bridgeRuleRevision,
+        projectContextRevision: opts.bridgeProjectContextRevision,
+    })
+}
 
 export function createSessionRuntime({
     query = null,
@@ -15,7 +36,7 @@ export function createSessionRuntime({
     depth = 0,
     extra = {},
 } = {}) {
-    return {
+    const runtime = {
         query,
         pushStream,
         workDir,
@@ -61,4 +82,6 @@ export function createSessionRuntime({
         depth,
         ...extra,
     }
+    runtime.contextEnvelope = createSessionContextEnvelope(runtime, opts)
+    return runtime
 }

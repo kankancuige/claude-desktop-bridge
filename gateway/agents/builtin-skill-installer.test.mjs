@@ -24,6 +24,9 @@ test('内置数字孪生 Skill 源文件完整可读', () => {
     assert.match(content, /^---\r?\nname: digital-twin-cad/m)
     assert.match(content, /twin\.config\.yaml/)
     assert.match(content, /twin\.manifest\.json/)
+    assert.match(content, /image-procedural/)
+    assert.match(content, /image-proxy/)
+    assert.match(content, /ObjectSculptSpec/)
 })
 
 test('Bridge Memory Skill 源文件包含治理边界', () => {

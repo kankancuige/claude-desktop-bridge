@@ -6,7 +6,7 @@
 
 ## Context
 
-Bridge 使用仓库内 `BRIDGE_RULES.md` 作为所有目标项目的长期规则来源，并通过 `settingSources: []` 隔离用户机器上的 `CLAUDE.md`、`AGENTS.md` 和外部设置。现有文件同时包含跨项目纪律和 Bridge 自身 Vue/Electron/Gateway 约束，导致处理 WinForms、Java 等外部项目时注入无关内容。Codex 全局规则新增数字孪生触发边界后，Bridge 不会自动继承，并且 Bridge 使用的 `~/.claude/skills` 中没有对应 Skill。
+Bridge 使用仓库内 `BRIDGE_RULES.md` 作为所有目标项目的长期规则来源，并通过 `settingSources: []` 隔离用户机器上的 `CLAUDE.md`、`AGENTS.md` 和外部设置。现有文件同时包含跨项目纪律和 Bridge 自身 Vue/Electron/Gateway 约束，导致处理 WinForms、Java 等外部项目时注入无关内容。Codex 全局规则新增数字孪生触发边界后，Bridge 不会自动继承，并且 Bridge 私有的 `BRIDGE_HOME/skills` 中没有对应 Skill。
 
 ## Drivers
 
@@ -22,7 +22,7 @@ Bridge 使用仓库内 `BRIDGE_RULES.md` 作为所有目标项目的长期规则
 2. Gateway 从 `bridge-rules.mjs` 的模块位置解析仓库根目录。只有规范化后的 `workDir` 等于该根目录或位于其子目录时，才追加仓库专属规则；不硬编码本机绝对路径。
 3. `applyContextProfile` 显式接收 `workDir`，完整上下文创建和因模型、权限、Skill 变化触发的重建都通过同一 `makeQueryOptions` 路径选择规则。
 4. `digital-twin-cad` 由确定性 Skill Router 选择。数字孪生语义必须与 CAD/STEP/GLB、节点或设备映射、遥测状态、URDF/SDF、manifest 等集成语义同时出现；明确的遥测模型状态或 CAD/GLB 节点绑定视为直接证据。
-5. Bridge 保存一份内置 `digital-twin-cad/SKILL.md`。仅在路由命中且目标 Skill 不存在时复制到 `~/.claude/skills`；存在同名文件时直接使用且不覆盖。准备失败在 Query 创建前明确失败，不允许静默移除 Skill 后继续宣称完成。
+5. Bridge 保存一份内置 `digital-twin-cad/SKILL.md`。应用包携带源文件，仅在路由命中且 `BRIDGE_HOME/skills` 不存在同名 Skill 时按需复制；存在同名文件时直接使用且不覆盖。不会写入 Claude/Codex 外部 Skill 目录。准备失败在 Query 创建前明确失败，不允许静默移除 Skill 后继续宣称完成。
 
 ## Alternatives
 
@@ -38,7 +38,7 @@ Bridge 使用仓库内 `BRIDGE_RULES.md` 作为所有目标项目的长期规则
 
 - `workDir` 缺失、无效或位于其他项目：只注入通用规则，不猜测为 Bridge 仓库。
 - 内置 Skill 源文件缺失或目标目录不可写：Query 创建失败并返回明确错误；不降级为无 Skill 执行。
-- 用户已有同名 Skill：保留用户文件，不写备份、不覆盖；用户可通过设置页管理。
+- 用户已有同名 Skill：保留 `BRIDGE_HOME/skills` 中的用户文件，不写备份、不覆盖；用户可通过设置页管理。
 - 路由误判：普通 CAD、Viewer 和普通前端反例测试阻止扩大触发范围；调整正则不改变 Session 或 transcript 格式。
 - 回滚：恢复单一规则注入和移除数字孪生路由即可；已复制的用户目录 Skill 保留，避免删除用户可能已修改的文件。
 
@@ -48,7 +48,7 @@ Bridge 使用仓库内 `BRIDGE_RULES.md` 作为所有目标项目的长期规则
 - 正面：数字孪生规则、路由和可执行 Skill 形成可验证闭环。
 - 正面：开发和打包使用同一仓库内 Skill 源，不依赖 Codex 安装状态。
 - 负面：规则由一个文件增加为两个文件，修改长期规则时必须判断归属层。
-- 负面：首次命中数字孪生任务会向 Claude Skill 目录写入一个文件。
+- 负面：首次命中数字孪生任务会向当前用户的 `BRIDGE_HOME/skills` 写入一个文件。
 
 ## Validation
 

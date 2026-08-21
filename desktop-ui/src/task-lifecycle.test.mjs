@@ -34,6 +34,16 @@ test('旧协议下父任务终态或停止事件解除忙碌', () => {
   assert.equal(reduceSessionLifecycle(running, {type: 'generation_stopped'}).canStop, false)
 })
 
+test('旧协议验证不足和暂停会释放输入区并允许继续', () => {
+  const running = createSessionLifecycleState({active: true, canSend: false, canStop: true})
+  for (const type of ['task_verification_inconclusive', 'task_review_paused']) {
+    const terminal = reduceSessionLifecycle(running, {type, taskState: {resumable: true}})
+    assert.equal(terminal.active, false)
+    assert.equal(terminal.canSend, true)
+    assert.equal(terminal.canContinue, true)
+  }
+})
+
 test('权威模式等待聚合快照解除忙碌，终态展示事件不能抢先释放队列', () => {
   const running = reduceSessionLifecycle(createSessionLifecycleState(), {
     type: 'session_lifecycle_snapshot', active: true,
@@ -88,4 +98,27 @@ test('执行中补充指令被拒绝不能解除真实父任务忙碌', () => {
   const supplemental = reduceSessionLifecycle(running, {type: 'local_task_submitted'})
   assert.equal(supplemental.awaitingAcceptance, false)
   assert.equal(reduceSessionLifecycle(supplemental, {type: 'message_rejected'}).active, true)
+})
+
+test('Coordinator 是新协议下任务忙碌和终态的权威', () => {
+  const running = reduceSessionLifecycle(createSessionLifecycleState(), {
+    type: 'task_coordinator_event', taskId: 't', status: 'verifying', event: 'phase/started',
+  })
+  assert.equal(running.active, true)
+  assert.equal(running.canStop, true)
+  const blocked = reduceSessionLifecycle(running, {
+    type: 'task_coordinator_event', taskId: 't', status: 'blocked', event: 'task/blocked',
+  })
+  assert.equal(blocked.active, false)
+  assert.equal(blocked.canContinue, true)
+})
+
+test('RCA 与外部阻塞状态作为可继续的稳定终态释放输入区', () => {
+  for (const status of ['diagnosis_required', 'awaiting_reproduction', 'blocked_external', 'architecture_change_required']) {
+    const state = reduceSessionLifecycle(createSessionLifecycleState({active: true, canStop: true}), {
+      type: 'task_coordinator_event', taskId: 't', status, event: 'rca/completed',
+    })
+    assert.equal(state.active, false)
+    assert.equal(state.canContinue, true)
+  }
 })

@@ -116,6 +116,22 @@ export function createTaskStatePatch(input = {}) {
     return normalizeTaskState({...input, updatedAt: input.updatedAt ?? Date.now()})
 }
 
+export function taskStateForInconclusive(current = {}, {
+    detail = '验证不足，任务尚未完成', completedAt = Date.now(),
+} = {}) {
+    const startedAt = Number(current?.startedAt || 0)
+    return createTaskStatePatch({
+        ...current,
+        status: 'incomplete',
+        outcome: 'incomplete',
+        continuationReason: null,
+        resumable: true,
+        detail,
+        completedAt,
+        durationMs: startedAt ? Math.max(0, completedAt - startedAt) : 0,
+    })
+}
+
 export function taskStateFromResult(result = {}, identity = {}) {
     const outcome = result.outcome === 'succeeded' || result.subtype === 'success'
         ? 'succeeded'

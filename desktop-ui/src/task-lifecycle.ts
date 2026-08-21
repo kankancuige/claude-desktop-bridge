@@ -47,6 +47,15 @@ export function reduceSessionLifecycle(current: SessionLifecycleState, event: an
   if (['task_started', 'task_reviewing', 'task_changes_required', 'task_fixing', 'workflow_started', 'workflow_resumed'].includes(event?.type)) {
     return {...state, active: true, canSend: false, canStop: true, canContinue: false, awaitingAcceptance: false}
   }
+  if (event?.type === 'task_coordinator_event') {
+    const terminal = [
+      'completed', 'failed', 'blocked', 'inconclusive', 'regression_detected', 'paused',
+      'diagnosis_required', 'awaiting_reproduction', 'blocked_external', 'architecture_change_required',
+    ].includes(String(event.status || ''))
+    return terminal
+      ? {...state, received: true, active: false, canSend: true, canStop: false, canContinue: event.status !== 'completed', awaitingAcceptance: false}
+      : {...state, active: true, canSend: false, canStop: true, canContinue: false, awaitingAcceptance: false}
+  }
   if (event?.type === 'generation_stopped') {
     if (state.received) return state
     return {...state, received: true, active: false, canSend: true, canStop: false, canContinue: true}
@@ -71,7 +80,7 @@ export function reduceSessionLifecycle(current: SessionLifecycleState, event: an
       }
     }
   }
-  if (['task_completed', 'task_failed', 'task_review_paused'].includes(event?.type)) {
+  if (['task_completed', 'task_failed', 'task_review_paused', 'task_verification_inconclusive'].includes(event?.type)) {
     // 新版 Gateway 会紧接着发送聚合快照；终态事件只渲染结果，不能在快照前抢先释放队列。
     if (state.received) return state
     const canContinue = event?.type !== 'task_completed' && event?.taskState?.resumable === true

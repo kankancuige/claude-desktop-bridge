@@ -78,6 +78,7 @@ Incomplete: None
 - 只有连续一个发布周期确认 SQLite 与文件模式可互相恢复，才允许讨论移除文件兼容路径；本次不删除旧路径。
 - schema v3 增量增加会话权限、IM 镜像、最近打开时间和 runtime revision 字段。首次协调从 `bridge-session-visibility.json`、`bridge-task-state/*.json`、`bridge-session-mirrors.json` 与 transcript 元数据导入；删除或重建数据库不会删除这些文件。
 - schema v4 增加任务/Workflow 结构化投影。任务状态、revision 和幂等事件在短事务内写入 SQLite，迟到 revision 同时拒绝状态和事件；终态通知意图通过确定性 ID 与 outbox 对账，worker 回写 sent/failed/dead。Workflow 重启恢复将旧存活态降为 paused 并结合 journal 恢复。系统继续双写 task-state JSON 与 Session Event Journal；SQLite 缺失或不可用时回退 journal/JSON。投影不保存最终回复、transcript 或审查正文。
+- 当前 schema v8 继续采用 additive migration，新增 Pitfall Ledger、Execution Report、Verification Campaign 与脱敏 `bridge_model_usage_events` 持久化。旧数据库打开时原表和数据保留，新增表由 schema 初始化补齐；usage 事件只保存哈希 Provider/上下文身份、计数、原因和时间，不保存 Prompt、凭据、路径或 transcript。高于当前版本的数据库明确拒绝打开，避免旧代码误写新格式。
 - session visibility migration v2 修复曾被 v1 空迁移永久跳过的旧主 transcript；只新增 canonical SQLite 索引和 sidecar 可见记录，不移动或复制 JSONL。`agent` 分类、已知 Workflow/Agent 映射和已知定时会话保持隐藏。
 # Bridge 私有配置根目录迁移（2026-08-18）
 
@@ -112,3 +113,17 @@ Incomplete: None
 - 启动日志只记录根目录、迁移状态、文件数量和耗时，不记录 token、API Key 或 Hook 内容。
 - smoke 后核对新会话 JSONL、`bridge-session-map.json`、IM pairing/outbox 和设置修改均只出现在私有目录。
 - 发布前运行 Gateway 全量测试、桌面测试、Node 语法检查、Vue 类型检查、Vite build 和 `git diff --check`。
+
+## 通用 Workbench 增量迁移（2026-08-21）
+
+| 阶段 | 兼容策略 | 成功证据 | 中止与恢复 |
+|---|---|---|---|
+| 1 Project Context / Coordinator | 旧 WebSocket 与 IM 输入继续由 TaskCommand 适配；Light 不扫描项目 | 决策表、项目扫描、任务 revision 测试 | 停用 Coordinator 接线，旧 Session/transcript 不迁移 |
+| 2 Agent / Workflow | 旧 Agent 文件和 Workflow 脚本继续可编辑；结果包装为统一协议 | 能力、权限、文件边界、迟到事件测试 | 停止自动调度，保留主 Session 手工执行 |
+| 3 Verification / Repair | 只启用 Project Context 受信命令；无命令时 `inconclusive` | 临时目标项目 L2 Host Test、取消/超时/回归测试 | 禁用自动 Campaign，不删除目标项目改动或验证记录 |
+| 4 Pitfall / Resource | 新 SQLite 表和内置 manifest 均为 additive；用户定制文件不覆盖 | 项目隔离、checksum、启停、敏感信息检查 | 停止读取新索引，保留用户文件和旧设置 |
+| 5 UI / IM | 桌面继续兼容旧生命周期事件；IM 最终消息仍由 outbox 发送 | 事件恢复、冷却、终态去重测试 | 关闭中间进度，不删除待发 outbox |
+| 6 Completion / Recovery | Coordinator 与旧 task-state 使用独立 task key；旧 JSON/Journal 继续双写 | 完成门禁、全部稳定终态报告、revision 隔离、重启降级和通用 Smoke | 活跃任务降级 `inconclusive`，由用户显式继续并重新验证 |
+| 7 Context cost governance | Context envelope、usage 表和 UI 均为 additive；旧 transcript/resume 不迁移 | 跨模型不可共享、同模型重连未知、cache usage 与重启读取测试 | 停止读取 usage 表和策略事件；保留 transcript、旧会话与 SQLite 附加表 |
+
+本迁移不修改 Claude transcript、Session map、Checkpoint 或用户资源正文，不自动 commit/push，也不删除旧 task-state。回滚代码时保留 `bridge-state.db` 新表和 `<taskId>:coordinator` 行；旧版本会忽略这些附加投影。只有真实桌面重启、真实 Provider、至少一个真实 IM 平台和代表性目标项目验证完成后，才可讨论移除兼容路径。

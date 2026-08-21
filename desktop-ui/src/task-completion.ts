@@ -9,6 +9,22 @@ export interface ParentTaskUiState {
   sequence: number
 }
 
+/**
+ * SDK 的 content block 可能只带换行或空白字符。此类内容不是用户可见回复，
+ * 必须在创建 assistant 消息前剔除，避免渲染出只有 AI 标签的空壳气泡。
+ */
+export function normalizeAssistantText(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+/**
+ * 父任务完成的权威正文来自 Coordinator 终态事件；SDK result 仅表示主回合结束。
+ * 优先使用即时 reply，重连或恢复场景才回退到持久化的 finalReplyText。
+ */
+export function selectSucceededTaskSummary(input: {reply?: unknown; finalReplyText?: unknown}): string {
+  return normalizeAssistantText(input.reply) || normalizeAssistantText(input.finalReplyText)
+}
+
 export function createParentTaskUiState(input: Partial<ParentTaskUiState> = {}): ParentTaskUiState {
   return {
     phase: input.phase || 'idle',
@@ -44,6 +60,7 @@ export function reduceParentTaskUi(current: ParentTaskUiState, event: any): {sta
     task_changes_required: 'changes_required',
     task_fixing: 'fixing',
     task_review_paused: 'review_paused',
+    task_verification_inconclusive: 'incomplete',
     task_failed: 'failed',
     task_completed: 'succeeded',
   }

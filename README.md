@@ -90,11 +90,22 @@
 ```
 用户消息（桌面 WebSocket / 微信 / 飞书 / 钉钉）
   → 协议适配器 → TaskCommandService（校验、去重、排队、路由）
+  → Task Coordinator（Prime / Plan / Dispatch / Completion Gate）
+  → 主 Session 或按任务选择的 Agent / Workflow
+  → Verification Campaign（受信命令、基线、候选、回归）
   → Session PushStream → SDK query()
   → Claude Code CLI (或 DeepSeek/OpenAI 等兼容 API)
-  → SDK 流式响应 → stream_event → broadcast (WebSocket)
-  → 桌面端实时渲染 + IM 平台 mirror 同步
+  → SDK 流式响应 → Coordinator 结构化事件 → broadcast (WebSocket)
+  → 桌面端逐步骤渲染 + IM 关键进度 / 最终通知 outbox
 ```
+
+### 通用 AI 编程工作台
+
+Bridge 负责会话、任务身份、模型和权限决策、Agent/Skill/Workflow 调度、验证证据、Pitfall 索引与消息出口；用户选择的目标项目仍拥有代码、构建、测试、运行时和设备验收。Bridge 不把自身仓库规则、某种语言或某类设备硬编码为目标项目业务。
+
+任务按风险分级：Light 不扫描项目且不启动子 Agent；Focused 通常只启用 1 个 Explorer；Balanced 默认使用 Developer + Tester，最多 2 个 Agent；Power 才执行 Prime、Plan、Implement、Validate、Review、Report，通常启用 3–6 个、最多 8 个 Agent。角色目录只是可选能力，不表示每个任务全部启动。
+
+验证证据分为 L0 未验证、L1 静态检查、L2 Host Test、L3 单次 Runtime、L4 多轮 Runtime、L5 长时间或异常场景、L6 目标项目端到端。`not_verified`、`inconclusive`、环境阻塞和新增回归不能进入完成态；最终通知意图必须先以确定性 ID 持久化，再由 outbox 发送或重试。
 
 ### 确认/权限流程
 
@@ -113,6 +124,9 @@ SDK 触发工具调用 → canUseTool 回调 → 广播确认请求
 |------|------|
 | **多供应商 AI** | DeepSeek / Anthropic / OpenAI / 智谱 / Kimi / Gemini / Codex / Qwen / OpenRouter / Ollama / 火山引擎 + 自定义，支持动态模型列表 |
 | **自动模型路由** | 统一任务决策按 Light / Balanced / Power 选择模型；固定模式尊重用户选择，高风险缺少 Power 时明确阻断 |
+| **任务协调与完成门禁** | Desktop / 微信 / 飞书 / 钉钉共享 Task ID；Coordinator 统一管理阶段、Agent、Workflow、验证、阻塞和最终通知 |
+| **通用验证活动** | 只执行 Project Context 识别的受信命令，支持单次/多轮、基线/候选、失败指纹和回归检测 |
+| **Pitfall Ledger** | 按 global / project / bridge 隔离错误、根因、预防和验证证据，只向相关任务注入有界提醒 |
 | **多平台桌面端** | Windows / macOS / Linux，Electron 原生窗口 + 自定义标题栏 + 系统托盘 |
 | **IM 集成** | 微信 (iLink Bot)、飞书 (企业自建应用)、钉钉 (内部应用 Stream 模式)，支持配对授权、IM 自定义命令远程控制桌面端 |
 | **IM 命令引擎** | 9 条跨平台命令（/p /ss /sw /sws /ns /m /stop /i /h），支持微信/飞书/钉钉远程切换项目/会话/镜像开关，送达状态实时反馈 |
@@ -551,6 +565,8 @@ Claude/Codex 全局规则。操作 Bridge 仓库根目录或其子目录时，Ga
 简单问答不加载这些扩展，执行型任务才升级为完整上下文。明确的数字孪生集成任务会按需准备并加载 Bridge
 内置的 `digital-twin-cad` Skill；普通 CAD、普通前端和仅 Viewer 预览不触发该 Skill，已有同名用户 Skill
 不会被覆盖。
+
+内置 Skill 的分发边界：应用包只携带 Bridge 自己维护的内置 Skill 源文件（当前为 `bridge-memory` 和 `digital-twin-cad`）。首次命中对应路由时，源文件才会复制到当前用户的 `BRIDGE_HOME/skills/`；已有同名文件不覆盖。它不会安装到用户的 Claude/Codex 全局 Skill 目录，也不会把仓库内所有路由名对应的第三方 Skill 自动带上。`protocol-parser`、`device-driver`、`ui-winforms` 等 Skill 需要用户自行放入 Bridge 私有目录后才会参与路由。
 
 ### 压缩模式（Caveman / RTK）
 

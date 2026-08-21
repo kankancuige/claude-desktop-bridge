@@ -13,6 +13,15 @@ export function getSessionRuntimeState(session) {
     }
 }
 
+/**
+ * 部分 Provider 在 PushStream 输入后只发 result，不回传对应的 user 事件。
+ * 此时 result 是该输入已被执行的唯一确认；仅在没有已激活回合时消费队首，
+ * 避免将下一条补充指令误认为当前回合已完成。
+ */
+export function consumePendingSessionInputOnResult(session) {
+    return consumeTaskInput(session, {onlyWhenIdle: true})
+}
+
 function summarizePendingConfirmations(session) {
     const pending = session?.pending
     if (!pending || typeof pending.values !== 'function') return []
@@ -28,3 +37,4 @@ function summarizePendingConfirmations(session) {
         options: entry.type === 'choice' ? (Array.isArray(entry.questions?.[0]?.options) ? entry.questions[0].options.slice(0, 20).map(option => ({label: String(option?.label || '').slice(0, 300)})) : []) : [],
     }))
 }
+import {consumeTaskInput} from './task-input-queue.mjs'

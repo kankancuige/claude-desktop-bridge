@@ -80,3 +80,22 @@ test('IM runner 可直接消费 task_completed.reply 作为最终回复', async 
     assert.equal(result.reason, 'task_completed')
     assert.equal(result.replyText, '完整终态回复')
 })
+
+test('IM runner 将验证不足作为可继续终态，不等待超时', async () => {
+    const service = fakeTaskCommands()
+    const finished = []
+    const running = runImTask({
+        taskCommands: service, sessionId: 's1', source: 'wechat', userId: 'u1', content: '验证', messageId: 'm1',
+        onFinish: result => finished.push(result),
+    })
+    await Promise.resolve()
+    service.publish({
+        type: 'task_verification_inconclusive', turnId: 'turn-1',
+        detail: '只完成构建，尚未执行测试', notificationId: 'n3',
+    })
+    const result = await running
+    assert.equal(result.reason, 'task_verification_inconclusive')
+    assert.match(finished[0].replyText, /只完成构建，尚未执行测试/)
+    assert.equal(finished[0].notificationId, 'n3')
+    assert.equal(service.disposed, true)
+})

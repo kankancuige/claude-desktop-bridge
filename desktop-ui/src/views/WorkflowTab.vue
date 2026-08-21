@@ -29,6 +29,26 @@ async function loadWfScripts() {
   wfLoading.value = false
 }
 
+async function toggleWfScriptEnabled(wf: any) {
+  if (wf.source !== 'builtin' || wf.required) return
+  const previous = wf.enabled !== false
+  wf.enabled = !previous
+  try {
+    const response = await fetch(`${GW}/api/config/builtin-resources/workflow/${encodeURIComponent(wf.name.replace(/\.(?:mjs|js)$/, ''))}`, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({enabled: wf.enabled}),
+    })
+    const data = await response.json()
+    if (!response.ok) throw new Error(data.error || '保存 Workflow 状态失败')
+    Object.assign(wf, data.resource || {})
+    await loadWfScripts()
+  } catch (error) {
+    wf.enabled = previous
+    console.warn('保存 Workflow 状态失败', error)
+  }
+}
+
 function startWfEdit(wf: any) {
   editingWfName.value = wf.name;
   editWfContent.value = '';
@@ -613,12 +633,16 @@ async function copyExportedScript() {
           </div>
           <div class="wf-script-list">
             <div v-for="wf in wfScripts" :key="wf.name" class="wf-script-row"
-                 :class="{ active: editingWfName===wf.name }" @click="startWfEdit(wf)">
+                 :class="{ active: editingWfName===wf.name, disabled: wf.enabled === false }" @click="startWfEdit(wf)">
               <span
                   style="font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1">{{
                   wf.name
                 }}</span>
-              <button class="wf-del-btn" @click.stop="delTarget = wf" title="删除">×</button>
+              <label v-if="wf.source === 'builtin'" class="toggle-switch" @click.stop="toggleWfScriptEnabled(wf)" style="margin-left:auto">
+                <input type="checkbox" :checked="wf.enabled !== false" :disabled="wf.required" @click.stop @change="toggleWfScriptEnabled(wf)"/>
+                <span class="toggle-slider"></span>
+              </label>
+              <button v-else class="wf-del-btn" @click.stop="delTarget = wf" title="删除">×</button>
             </div>
             <div v-if="wfScripts.length===0"
                  style="padding:16px;text-align:center;font-size:12px;color:var(--text-muted)">暂无脚本

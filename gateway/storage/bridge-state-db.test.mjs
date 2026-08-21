@@ -19,11 +19,39 @@ test('创建 SQLite schema、WAL 和可重建状态表', t => {
     assert.equal(existsSync(bridgeStateDbPath(home)), true)
     const tables = store.db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map(row => row.name)
     assert.deepEqual(tables, [
-        'bridge_memory_index', 'bridge_schema', 'bridge_session_index', 'bridge_state_entries',
-        'bridge_task_events', 'bridge_task_state', 'bridge_workflow_state',
+        'bridge_execution_reports', 'bridge_memory_index', 'bridge_model_usage_events', 'bridge_pitfall_links', 'bridge_pitfall_occurrences', 'bridge_pitfalls',
+        'bridge_schema', 'bridge_session_index', 'bridge_state_entries',
+        'bridge_task_events', 'bridge_task_state', 'bridge_verification_campaigns', 'bridge_workflow_state',
     ])
     const journal = store.db.prepare('PRAGMA journal_mode').get()
     assert.equal(String(Object.values(journal)[0]).toLowerCase(), 'wal')
+})
+
+test('Pitfall 按项目隔离、同任务幂等并可重启恢复', t => {
+    const {home, store} = fixture()
+    const pitfall = store.recordPitfall({id: 'p1', projectKey: 'project-a', scope: 'project', fingerprint: 'fp', title: '重复失败', summary: '摘要', tags: ['provider']})
+    assert.equal(pitfall.status, 'observed')
+    assert.equal(store.recordPitfallOccurrence({pitfallId: 'p1', occurrenceId: 'o1', taskId: 'task-1'}), true)
+    assert.equal(store.recordPitfallOccurrence({pitfallId: 'p1', occurrenceId: 'o2', taskId: 'task-1'}), false)
+    assert.deepEqual(store.listPitfalls('project-b'), [])
+    assert.equal(store.updatePitfallStatus('p1', 'confirmed', {rootCause: '根因', prevention: '预防'}), true)
+    store.close()
+    const reopened = new BridgeStateDb({bridgeHome: home})
+    t.after(() => reopened.close())
+    assert.equal(reopened.listPitfalls('project-a')[0].status, 'confirmed')
+    assert.equal(reopened.listPitfalls('project-a')[0].prevention, '预防')
+})
+
+test('Verification Campaign 按项目和任务持久化并可重启恢复', t => {
+    const {home, store} = fixture()
+    const campaign = {campaignId: 'campaign-1', taskId: 'task-1', status: 'candidate_running', createdAt: 10, candidate: []}
+    assert.equal(store.upsertVerificationCampaign({projectKey: 'project-a', campaign, updatedAt: 20}), true)
+    assert.equal(store.getVerificationCampaign('campaign-1').status, 'candidate_running')
+    store.close()
+    const reopened = new BridgeStateDb({bridgeHome: home})
+    t.after(() => reopened.close())
+    assert.equal(reopened.listVerificationCampaigns('project-a', {taskId: 'task-1'}).length, 1)
+    assert.equal(reopened.listVerificationCampaigns('project-b').length, 0)
 })
 
 test('状态条目按 kind/platform/id 原子替换并保持加密载荷字符串', t => {
@@ -201,15 +229,72 @@ test('通知 worker 可按任务标识回写持久化任务投影', t => {
     assert.deepEqual(store.listTaskNotificationIntents('wechat'), [])
 })
 
-test('schema v3 数据库可幂等迁移到 v4 任务与 Workflow 表', () => {
+test('Coordinator 与旧任务投影使用独立 revision 空间并可分别恢复', t => {
+    const {store} = fixture()
+    t.after(() => store.close())
+    store.recordTaskTransition({
+        projectKey: 'D--demo', taskKey: 'task-shared:coordinator', sessionId: 'gw-1', taskId: 'task-shared',
+        revision: 2, state: {
+            status: 'verifying', taskId: 'task-shared', turnId: 'turn-1', revision: 2,
+            plan: {steps: [{stepId: 'task-shared:step:1', phase: 'validate', role: 'test-engineer', status: 'running'}]},
+            verification: {status: 'candidate_running', evidenceLevel: 'L2', testsExecuted: true},
+            notificationIntentPersisted: false, updatedAt: 20,
+        },
+    })
+    store.recordTaskTransition({
+        projectKey: 'D--demo', taskKey: 'task-shared', sessionId: 'gw-1', taskId: 'task-shared',
+        revision: 1_000_000, state: {status: 'running', taskId: 'task-shared', updatedAt: 30},
+    })
+    assert.equal(store.getTaskState('D--demo', 'task-shared').taskKey, 'task-shared')
+    const coordinator = store.getCoordinatorTaskState('D--demo', 'task-shared')
+    assert.equal(coordinator.taskKey, 'task-shared:coordinator')
+    assert.equal(coordinator.state.coordinator.revision, 2)
+    assert.equal(coordinator.state.coordinator.notificationIntentPersisted, false)
+})
+
+test('旧 schema 可幂等迁移到 v8 任务、Workflow、验证、Pitfall、执行报告与 usage 表', () => {
     const home = mkdtempSync(join(tmpdir(), 'bridge-state-db-migrate-'))
     const first = new BridgeStateDb({bridgeHome: home})
     first.db.prepare('UPDATE bridge_schema SET version = 3 WHERE id = 1').run()
     first.close()
     const second = new BridgeStateDb({bridgeHome: home})
-    assert.equal(second.schemaVersion, 4)
+    assert.equal(second.schemaVersion, 8)
     assert.equal(second.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'bridge_task_state'").get()?.name, 'bridge_task_state')
+    assert.equal(second.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'bridge_pitfalls'").get()?.name, 'bridge_pitfalls')
+    assert.equal(second.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'bridge_execution_reports'").get()?.name, 'bridge_execution_reports')
+    assert.equal(second.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'bridge_verification_campaigns'").get()?.name, 'bridge_verification_campaigns')
+    assert.equal(second.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'bridge_model_usage_events'").get()?.name, 'bridge_model_usage_events')
     second.close()
+})
+
+test('模型 usage 事件脱敏、幂等，并可在重启后按会话读取', t => {
+    const {home, store} = fixture()
+    const event = {
+        eventId: 'usage-1', projectKey: 'D--demo', sessionId: 'session-1', model: 'model-balanced',
+        providerKey: 'sha256:1234', contextFingerprint: 'sha256:abcd', policy: 'rebuild_full_history',
+        cacheEligibility: 'unknown', reasonCodes: ['rules_changed'], inputTokens: 10, outputTokens: 2,
+        cacheReadInputTokens: null, cacheCreationInputTokens: null, source: 'partial', durationMs: 40, retryCount: 0, createdAt: 10,
+    }
+    assert.equal(store.appendModelUsageEvent(event), true)
+    assert.equal(store.appendModelUsageEvent(event), false)
+    assert.deepEqual(store.listModelUsageEvents('session-1')[0].reasonCodes, ['rules_changed'])
+    store.close()
+    const reopened = new BridgeStateDb({bridgeHome: home})
+    t.after(() => reopened.close())
+    assert.equal(reopened.listModelUsageEvents('session-1')[0].cacheReadInputTokens, null)
+})
+
+test('执行报告按项目持久化并可在重启后读取', t => {
+    const {home, store} = fixture()
+    assert.equal(store.upsertExecutionReport({
+        projectKey: 'D--demo', sessionId: 'session-1',
+        report: {taskId: 'task-1', status: 'completed', verification: {evidenceLevel: 'L2'}, unresolvedRisks: []},
+    }), true)
+    store.close()
+    const reopened = new BridgeStateDb({bridgeHome: home})
+    t.after(() => reopened.close())
+    assert.equal(reopened.getExecutionReport('task-1').verification.evidenceLevel, 'L2')
+    assert.deepEqual(reopened.listExecutionReports('D--demo').map(item => item.taskId), ['task-1'])
 })
 
 test('有界清理只删除过期终态，不删除运行或审查中的任务', t => {

@@ -4,10 +4,43 @@ import {readFileSync} from 'node:fs'
 
 import {
     createTaskCompletionState,
+    hasPersistedNotificationIntents,
     normalizeReviewOutcome,
+    resolveRequiredNotificationPlatforms,
     resolveFinalReviewPlan,
     transitionTaskCompletion,
 } from './task-completion.mjs'
+
+test('完成门禁只接受已落盘的确定性通知意图', () => {
+    assert.equal(hasPersistedNotificationIntents({platforms: []}), true)
+    assert.equal(hasPersistedNotificationIntents({
+        platforms: ['wechat'], notificationId: 'task-1:task_completed', notifications: {},
+    }), false)
+    assert.equal(hasPersistedNotificationIntents({
+        platforms: ['wechat', 'feishu'],
+        notificationId: 'task-1:task_completed',
+        notifications: {
+            wechat: {state: 'pending', notificationId: 'task-1:task_completed'},
+            feishu: {state: 'sent', notificationId: 'task-1:task_completed'},
+        },
+    }), true)
+    assert.equal(hasPersistedNotificationIntents({
+        platforms: ['wechat'],
+        notificationId: 'task-1:task_completed',
+        notifications: {wechat: {state: 'pending', notificationId: 'other'}},
+    }), false)
+})
+
+test('直接 IM 来源和桌面镜像都进入必需通知平台集合', () => {
+    assert.deepEqual(resolveRequiredNotificationPlatforms({
+        identity: {source: 'wechat', userId: 'u1'},
+        mirrors: {wechat: false, feishu: true, dingtalk: true},
+    }), ['wechat'])
+    assert.deepEqual(resolveRequiredNotificationPlatforms({
+        identity: null,
+        mirrors: {wechat: true, feishu: false, dingtalk: true},
+    }), ['wechat', 'dingtalk'])
+})
 
 test('低风险或无真实差异时跳过 Agent 最终审查', () => {
     assert.deepEqual(resolveFinalReviewPlan({
@@ -160,7 +193,7 @@ test('审查通过只完成一次，重复事件不重复完成或通知', () =>
     assert.deepEqual(duplicate.effects, [])
 })
 
-test('第一次阻断只请求一次修复，复核仍阻断时停止自动循环', () => {
+test('审查阻断最多请求两次修复，第三轮仍阻断时停止自动循环', () => {
     const reviewing = transitionTaskCompletion(createTaskCompletionState(), {
         type: 'primary_result', result: {outcome: 'succeeded'},
         reviewPlan: {required: true, tier: 'power', mode: 'gate', riskDomains: ['correctness']},
@@ -191,8 +224,23 @@ test('第一次阻断只请求一次修复，复核仍阻断时停止自动循�
             advisoryFindings: [], summary: '复核未通过',
         },
     })
-    assert.equal(stillBlocked.state.phase, 'failed')
-    assert.deepEqual(stillBlocked.effects.map(effect => effect.type), ['fail'])
+    assert.equal(stillBlocked.state.phase, 'changes_required')
+    assert.deepEqual(stillBlocked.effects.map(effect => effect.type), ['request_fix'])
+
+    const secondFixing = transitionTaskCompletion(stillBlocked.state, {type: 'fix_started'})
+    const thirdReview = transitionTaskCompletion(secondFixing.state, {
+        type: 'primary_result', result: {outcome: 'succeeded'}, reviewPlan: blocked.state.reviewPlan,
+    })
+    assert.equal(thirdReview.state.reviewRound, 3)
+    const exhausted = transitionTaskCompletion(thirdReview.state, {
+        type: 'review_result', outcome: {
+            passed: false,
+            blockingFindings: [{severity: 'high', title: '第三轮仍有问题'}],
+            advisoryFindings: [], summary: '修复预算耗尽',
+        },
+    })
+    assert.equal(exhausted.state.phase, 'failed')
+    assert.deepEqual(exhausted.effects.map(effect => effect.type), ['fail'])
 })
 
 test('审查暂停和执行失败都不能变成成功', () => {

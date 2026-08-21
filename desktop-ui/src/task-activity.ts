@@ -9,6 +9,8 @@ export type TaskActivityPhase =
   | 'compacting'
   | 'responding'
   | 'reviewing'
+  | 'verifying'
+  | 'blocked'
   | 'fixing'
   | 'completed'
   | 'failed'
@@ -27,6 +29,8 @@ export type TaskActivityEntryKind =
   | 'compacting'
   | 'response'
   | 'review'
+  | 'verification'
+  | 'coordinator'
 
 export interface TaskActivityEntry {
   id: string
@@ -243,11 +247,38 @@ export function reduceTaskActivity(
   if (type === 'task_started') {
     const eventStartedAt = Number(event.startedAt ?? event.taskState?.startedAt)
     const startedAt = Number.isFinite(eventStartedAt) && eventStartedAt > 0 ? eventStartedAt : now
-    state = createTaskActivityState({phase: 'starting', running: true, startedAt, updatedAt: now, expanded: true})
+    const coordinatorEntries = state.running ? state.entries.filter(entry => entry.eventType === 'task_coordinator_event') : []
+    state = createTaskActivityState({phase: 'starting', running: true, startedAt: coordinatorEntries.length ? state.startedAt || startedAt : startedAt, updatedAt: now, expanded: true, entries: coordinatorEntries})
     state = activityState(state, 'starting', true, '任务已接收，正在启动', '', type, now)
     return upsertEntry(state, {
       id: 'task:start', kind: 'task', status: 'completed', title: '任务已接收', startedAt,
       completedAt: now, durationMs: Math.max(0, now - startedAt), eventType: type,
+    }, now)
+  }
+
+  if (type === 'task_coordinator_event') {
+    const phase = String(event.phase || '')
+    const labels: Record<string, string> = {
+      prime: '建立项目上下文', plan: '制定执行计划', implement: '实现代码变更',
+      validate: '验证本次修改', review: '定向审查变更', report: '整理最终报告',
+    }
+    const terminal = [
+      'completed', 'failed', 'blocked', 'inconclusive', 'regression_detected', 'paused',
+      'diagnosis_required', 'awaiting_reproduction', 'blocked_external', 'architecture_change_required',
+    ].includes(String(event.status || ''))
+    const failed = terminal && event.status !== 'completed'
+    const started = event.event === 'phase/started'
+    const completed = event.event === 'phase/completed'
+    const status: TaskActivityEntryStatus = failed ? 'failed' : completed || terminal ? 'completed' : 'running'
+    const evidence = boundedText(event.verification?.evidenceLevel, 20)
+    const detail = [boundedText(event.role, 80), evidence ? `证据 ${evidence}` : '', boundedText(event.detail)].filter(Boolean).join(' · ')
+    const title = labels[phase] || boundedText(event.detail) || '任务协调器'
+    state = activityState(state, phase === 'validate' ? 'verifying' : phase === 'review' ? 'reviewing' : failed ? 'blocked' : 'planning', !terminal, title, detail, type, now)
+    return upsertEntry(state, {
+      id: `coordinator:${event.stepId || phase || event.status || event.revision}`,
+      kind: phase === 'validate' ? 'verification' : 'coordinator', status,
+      title: `${started ? '开始' : completed ? '完成' : ''}${title}`,
+      detail, completedAt: status !== 'running' ? now : 0, eventType: type,
     }, now)
   }
 
@@ -486,8 +517,8 @@ export function reduceTaskActivity(
     ? {phase: 'completed' as const, status: 'completed' as const, title: '任务已完成'}
     : type === 'generation_stopped'
       ? {phase: 'stopped' as const, status: 'stopped' as const, title: '任务已停止'}
-      : ['task_failed', 'task_review_paused', 'stream_error', 'error'].includes(type)
-        ? {phase: 'failed' as const, status: 'failed' as const, title: type === 'task_review_paused' ? '最终审查已暂停' : '任务执行失败'}
+      : ['task_failed', 'task_review_paused', 'task_verification_inconclusive', 'stream_error', 'error'].includes(type)
+        ? {phase: 'failed' as const, status: 'failed' as const, title: type === 'task_review_paused' ? '最终审查已暂停' : type === 'task_verification_inconclusive' ? '任务验证不足' : '任务执行失败'}
         : null
 
   if (terminal) {

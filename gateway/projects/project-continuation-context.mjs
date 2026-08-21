@@ -109,3 +109,30 @@ export function composeContinuationPrompt(prompt, context) {
         String(prompt || ''),
     ].join('\n')
 }
+
+/**
+ * 跨模型时仅传递有界的已确认状态，不假装它等价于完整 transcript。
+ * 该文本只发给新模型，不进入 SQLite usage ledger。
+ */
+export function buildModelHandoffPrompt({prompt, session = {}, maxChars = 6000} = {}) {
+    const limit = Math.max(512, Math.min(6000, Number(maxChars) || 6000))
+    const changedFiles = Array.isArray(session.taskReviewFiles)
+        ? session.taskReviewFiles.map(item => typeof item?.path === 'string' ? item.path : '').filter(Boolean).slice(0, 100)
+        : []
+    const facts = [
+        `任务目标: ${String(session.taskState?.detail || session.taskFinalReplyText || '').trim() || '未提供可确认的前序结果'}`,
+        `任务阶段: ${String(session.taskCompletion?.phase || session.taskState?.status || 'unknown')}`,
+        `已变更文件: ${changedFiles.length ? changedFiles.join(', ') : '未观测到'}`,
+        `验证状态: ${String(session.taskState?.outcome || 'unknown')}`,
+    ]
+    const handoff = facts.join('\n').slice(0, limit)
+    return [
+        '<bridge-model-handoff version="1">',
+        '以下是从另一模型交接的有限摘要，可能遗漏细节；遇到不确定之处必须重新检查，不得把摘要当作完整历史或验证证据。',
+        handoff,
+        '</bridge-model-handoff>',
+        '',
+        '===== 当前用户消息 =====',
+        String(prompt || ''),
+    ].join('\n')
+}

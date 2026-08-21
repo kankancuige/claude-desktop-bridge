@@ -6,7 +6,12 @@ import {transform} from 'esbuild'
 const source = readFileSync(new URL('./task-completion.ts', import.meta.url), 'utf8')
 const compiled = await transform(source, {loader: 'ts', format: 'esm', target: 'es2022'})
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(compiled.code).toString('base64')}`
-const {createParentTaskUiState, reduceParentTaskUi} = await import(moduleUrl)
+const {
+  createParentTaskUiState,
+  reduceParentTaskUi,
+  normalizeAssistantText,
+  selectSucceededTaskSummary,
+} = await import(moduleUrl)
 
 test('SDK result only settles primary turn statistics', () => {
   const reduced = reduceParentTaskUi(createParentTaskUiState({phase: 'running'}), {type: 'result'})
@@ -31,6 +36,12 @@ test('task_completed shows success exactly once', () => {
   assert.equal(duplicate.showCompletion, false)
 })
 
+test('验证不足保持未完成且不显示成功', () => {
+  const reduced = reduceParentTaskUi(createParentTaskUiState({phase: 'running'}), {type: 'task_verification_inconclusive'})
+  assert.equal(reduced.state.phase, 'incomplete')
+  assert.equal(reduced.showCompletion, false)
+})
+
 test('父任务事件按 taskId 和 sequence 丢弃重复与乱序更新', () => {
   const started = reduceParentTaskUi(createParentTaskUiState(), {type: 'task_started', taskId: 'task-1', sequence: 1}).state
   const reviewing = reduceParentTaskUi(started, {type: 'task_reviewing', taskId: 'task-1', sequence: 3}).state
@@ -41,4 +52,22 @@ test('父任务事件按 taskId 和 sequence 丢弃重复与乱序更新', () =>
   const nextTask = reduceParentTaskUi(reviewing, {type: 'task_started', taskId: 'task-2', sequence: 1}).state
   assert.equal(nextTask.phase, 'running')
   assert.equal(nextTask.completionShown, false)
+})
+
+test('成功终态只选择 Gateway 的最终总结，不回填 SDK result 的中间状态消息', () => {
+  assert.equal(selectSucceededTaskSummary({
+    reply: '  已完成：修复空白气泡并通过测试  ',
+    finalReplyText: '旧的持久化总结',
+  }), '已完成：修复空白气泡并通过测试')
+  assert.equal(selectSucceededTaskSummary({
+    reply: '   ',
+    finalReplyText: '  从持久化任务状态恢复的最终总结  ',
+  }), '从持久化任务状态恢复的最终总结')
+  assert.equal(selectSucceededTaskSummary({reply: '\n\t', finalReplyText: ''}), '')
+})
+
+test('空白或非文本 assistant 内容不会创建可见 AI 气泡', () => {
+  assert.equal(normalizeAssistantText('  \n\t '), '')
+  assert.equal(normalizeAssistantText(null), '')
+  assert.equal(normalizeAssistantText('  有效回复  '), '有效回复')
 })

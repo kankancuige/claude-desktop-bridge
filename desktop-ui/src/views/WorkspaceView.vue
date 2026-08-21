@@ -30,6 +30,7 @@ import {useRouter} from 'vue-router'
 import {t, setLocale} from '../i18n'
 import {useResizeHandle} from '../composables/useResizeHandle'
 import {apiFetch, createGatewayWebSocket} from '../api'
+import {nextProjectLoadRetry} from '../project-load-retry'
 import {readWorkspaceShell, writeWorkspaceShell} from '../workspace-persistence'
 import {findSessionTab, sessionRequestStillOwned, sessionTabIdentityKey} from '../session-tab'
 import {
@@ -57,9 +58,16 @@ import {
 } from '../large-input'
 import {buildModelSelectionPayload, describeTaskDecision} from '../model-routing.mjs'
 import type {TaskDecisionDisplay, ModelMode} from '../model-routing.mjs'
+import {resolveModelContextSwitch, type ModelContextSwitchMode} from '../model-context-switch'
 import {mergeWorkflowAgentLogState, normalizeWorkflowLogAgentStatus} from '../agent-event-state.mjs'
 import {formatCompactSummary, isSyntheticCompactUiMessage, normalizeContextUiState} from '../context-usage'
-import {createParentTaskUiState, reduceParentTaskUi, type ParentTaskUiState} from '../task-completion'
+import {
+  createParentTaskUiState,
+  normalizeAssistantText,
+  reduceParentTaskUi,
+  selectSucceededTaskSummary,
+  type ParentTaskUiState,
+} from '../task-completion'
 import {
   createTaskActivityState,
   reduceTaskActivity,
@@ -262,6 +270,10 @@ interface Checkpoint {
 const projects = ref<Project[]>([])
 /** 项目列表 epoch：本地修改（删除/新增）时递增，loadProjects 结果若 epoch 落后则丢弃 */
 let _projectsEpoch = 0
+const projectsLoading = ref(false)
+const projectsLoadError = ref('')
+let _projectLoadRetryAttempt = 0
+let _projectLoadRetryTimer: ReturnType<typeof setTimeout> | null = null
 /** 侧栏中已展开的项目集合（workDir → 是否展开），点击项目卡片切换 */
 const expandedProjects = ref<Set<string>>(new Set())
 /** 已"显示全部"会话的项目集合，用于分页展开/收起 */
@@ -623,7 +635,11 @@ let _pendingResultMessage: Message | null = null
 /** 当前会话的消息列表（按时间序追加） */
 const messages = ref<Message[]>([])
 /** 活动总览由底部悬浮框统一展示；聊天区只保留用户、回复和独立执行步骤。 */
-const renderedMessages = computed(() => messages.value.filter(message => message.role !== 'activity'))
+const renderedMessages = computed(() => messages.value.filter(message => (
+  message.role !== 'activity'
+  // 历史记录或迟到事件也可能携带空 assistant 内容；渲染层再次兜底，防止出现空白 AI 气泡。
+  && (message.role !== 'assistant' || Boolean(normalizeAssistantText(message.text)))
+)))
 
 function clearStaleContinuationActions() {
   for (const item of messages.value) {
@@ -680,7 +696,7 @@ function activityToolActionTitle(toolName: unknown, completed = false): string {
     Grep: '搜索了代码',
     Glob: '查找了文件',
     Skill: '使用了技能',
-    Task: '启动了 Agent',
+    Task: '委派 Agent 执行专项任务',
   }
   const title = titles[name] || `执行了 ${name || '工具'}`
   return completed ? `${title}（完成）` : title
@@ -766,7 +782,12 @@ function taskStepForEvent(event: any, state: TaskActivityState): {key: string; e
   } else if (['workflow_done', 'workflow_paused', 'workflow_error'].includes(type)) {
     const id = activityEventIdentity(event)
     key = `workflow:end:${type}:${id}`; entry = latest(item => item.kind === 'workflow'); title = type === 'workflow_done' ? '工作流已完成' : type === 'workflow_paused' ? '工作流已暂停' : '工作流执行失败'
-  } else if (['task_completed', 'generation_stopped', 'task_failed', 'task_review_paused', 'stream_error', 'error'].includes(type)) {
+  } else if (type === 'task_coordinator_event') {
+    const id = String(event.stepId || event.phase || event.status || event.revision || 'current')
+    key = `coordinator:${event.event}:${id}`
+    entry = entryById(`coordinator:${id}`)
+    title = entry?.title || '任务阶段更新'
+  } else if (['task_completed', 'generation_stopped', 'task_failed', 'task_review_paused', 'task_verification_inconclusive', 'stream_error', 'error'].includes(type)) {
     key = `task:end:${type}`; entry = entryById('task:terminal'); title = entry?.title || '任务已结束'
   } else {
     return null
@@ -826,6 +847,8 @@ interface TabState {
   permissionMode: string
   modelMode: ModelMode
   model: string
+  runtimeModel: string
+  providerUsageEvidence: {source: 'provider_observed' | 'partial' | 'unknown', cacheRead: number | null, cacheCreation: number | null}
   taskDecision: TaskDecisionDisplay | null
   maxTokens: number
   pricing: {inputPrice: number, outputPrice: number, currency: string} | null
@@ -864,6 +887,8 @@ function initialTabState(): TabState {
     permissionMode: 'default',
     modelMode: 'auto',
     model: model.value,
+    runtimeModel: runtimeModel.value,
+    providerUsageEvidence: {...providerUsageEvidence.value},
     taskDecision: null,
     maxTokens: 0,
     pricing: pricing.value,
@@ -903,6 +928,8 @@ function snapshotTabState(): TabState {
     permissionMode: permissionMode.value,
     modelMode: modelMode.value,
     model: model.value,
+    runtimeModel: runtimeModel.value,
+    providerUsageEvidence: {...providerUsageEvidence.value},
     taskDecision: taskDecision.value,
     maxTokens: maxTokens.value,
     pricing: pricing.value,
@@ -942,6 +969,8 @@ function restoreTabState(s: TabState) {
   try { permissionMode.value = s.permissionMode } finally { suppressPermissionSync = false }
   modelMode.value = s.modelMode === 'fixed' ? 'fixed' : 'auto'
   model.value = s.model
+  runtimeModel.value = s.runtimeModel || ''
+  providerUsageEvidence.value = s.providerUsageEvidence || {source: 'unknown', cacheRead: null, cacheCreation: null}
   taskDecision.value = s.taskDecision || null
   maxTokens.value = s.maxTokens
   pricing.value = s.pricing
@@ -1970,6 +1999,12 @@ interface QItem {
   originalText?: string
 }
 
+interface PendingModelContextSwitch {
+  text: string
+  originalText: string
+  attachments?: PendingAttachment[]
+}
+
 interface PendingInput {
   text: string
   originalText: string
@@ -2153,7 +2188,7 @@ onMounted(async () => {
   _ctrlRetryCount = 0
   _controlWSStopped = false
   // 首屏只等待本地 settings、项目目录和工作区壳；供应商网络请求不能阻塞历史会话显示。
-  const projectsTask = loadProjects()
+  const projectsTask = loadProjects(false, true)
   const settingsTask = loadSavedWorkspaceSettings()
   await Promise.allSettled([projectsTask, settingsTask])
   await restoreWorkspaceShell()
@@ -2233,7 +2268,25 @@ async function loadBalance() {
  * 平时保留当前顺序，避免用户正在操作时项目位置突然跳动。
  * 采用"保序合并"策略：已有项目原位更新，新增项目追加末尾，本地空项目保留。
  */
-async function loadProjects(reorder = false) {
+function clearProjectLoadRetry() {
+  if (_projectLoadRetryTimer) {
+    clearTimeout(_projectLoadRetryTimer)
+    _projectLoadRetryTimer = null
+  }
+}
+
+function scheduleProjectLoadRetry() {
+  const next = nextProjectLoadRetry(_projectLoadRetryAttempt, _projectLoadRetryTimer !== null)
+  if (!next) return
+  _projectLoadRetryAttempt = next.attempt
+  _projectLoadRetryTimer = setTimeout(() => {
+    _projectLoadRetryTimer = null
+    void loadProjects(false, true)
+  }, next.delayMs)
+}
+
+async function loadProjects(reorder = false, retryOnFailure = false) {
+  projectsLoading.value = true
   try {
     const myEpoch = _projectsEpoch  // 快照：await 期间若本地有编辑则 epoch 会递增
     const res = await fetch(`${GW}/api/projects`)
@@ -2247,6 +2300,9 @@ async function loadProjects(reorder = false) {
     if (reorder || projects.value.length === 0) {
       projects.value = incoming.sort((a, b) => (b.lastActive || 0) - (a.lastActive || 0))
       if (reorder) _projectsEpoch = 0  // 显式刷新，重置 epoch
+      projectsLoadError.value = ''
+      _projectLoadRetryAttempt = 0
+      clearProjectLoadRetry()
       return
     }
     // 保序合并：已有项目原位更新数据；本地新增的空项目(gateway 暂无)保留；新出现的项目追加到末尾
@@ -2264,7 +2320,17 @@ async function loadProjects(reorder = false) {
       byKey.delete(p.workDir)
     }
     projects.value = kept
-  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
+    projectsLoadError.value = ''
+    _projectLoadRetryAttempt = 0
+    clearProjectLoadRetry()
+  } catch (error: any) {
+    const message = error?.message || String(error)
+    projectsLoadError.value = `项目列表加载失败：${message}`
+    console.warn('项目列表加载失败', error)
+    if (retryOnFailure) scheduleProjectLoadRetry()
+  } finally {
+    projectsLoading.value = false
+  }
 }
 
 /**
@@ -3253,6 +3319,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
       case 'system_init': {
         // 模型初始化信息：显示当前使用的模型和工作目录，同时捕获 contextWindow 和定价
         messages.value.push({role: 'system', text: t('sys.model', {model: msg.model, cwd: msg.cwd}), time: Date.now()})
+        if (typeof msg.model === 'string' && msg.model) runtimeModel.value = msg.model
         const historySessionId = typeof msg.historySessionId === 'string' ? msg.historySessionId.trim() : ''
         if (historySessionId) {
           tab.historySessionId = historySessionId
@@ -3306,6 +3373,15 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
           messages.value.push({role: 'system', text: `上下文已使用 ${normalized.percentage}%，接近自动压缩阈值。`, time: Date.now()})
         }
         saveUsage()
+        break
+      }
+
+      case 'model_usage_observed': {
+        providerUsageEvidence.value = {
+          source: msg.source === 'provider_observed' || msg.source === 'partial' ? msg.source : 'unknown',
+          cacheRead: typeof msg.cacheReadInputTokens === 'number' ? msg.cacheReadInputTokens : null,
+          cacheCreation: typeof msg.cacheCreationInputTokens === 'number' ? msg.cacheCreationInputTokens : null,
+        }
         break
       }
 
@@ -3376,7 +3452,8 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         const assistantBlocks = Array.isArray(msg.message?.content) ? msg.message.content : []
         const hasToolCall = Boolean(tools?.length)
         for (const [blockIndex, block] of assistantBlocks.entries()) {
-          if (block.type === 'text' && block.text) {
+          const assistantText = block.type === 'text' ? normalizeAssistantText(block.text) : ''
+          if (assistantText) {
             const messageTime = Date.now()
             if (hasToolCall) {
               // 带工具调用的文本是执行中的计划/说明，不应伪装成最终 AI 回复气泡。
@@ -3384,14 +3461,14 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
               const stepKey = `assistant-note:${msg.message?.id || messageTime}:${blockIndex}`
               messages.value.push({
                 role: 'task_step',
-                text: block.text,
+                text: assistantText,
                 time: messageTime,
                 taskStep: {
                   id: stepKey,
                   kind: 'planning',
                   status: 'completed',
                   title: '执行说明',
-                  detail: block.text,
+                  detail: assistantText,
                   startedAt: messageTime,
                   updatedAt: messageTime,
                   completedAt: messageTime,
@@ -3402,8 +3479,8 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
                 activityStepKey: stepKey,
               })
             } else {
-              const tk = estimateTokens(block.text)
-              messages.value.push({role: 'assistant', text: block.text, time: messageTime, tools, tokens: tk, cost: estCost(tk)})
+              const tk = estimateTokens(assistantText)
+              messages.value.push({role: 'assistant', text: assistantText, time: messageTime, tools, tokens: tk, cost: estCost(tk)})
             }
           } else if (block.type === 'thinking' && block.thinking) {
             turnThinkingText += block.thinking  // 累计本轮思考文本, result 时估算思考 token
@@ -3679,6 +3756,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
       case 'task_changes_required':
       case 'task_fixing':
       case 'task_review_paused':
+      case 'task_verification_inconclusive':
       case 'task_failed':
       case 'task_completed': {
         const reduced = reduceParentTaskUi(parentTaskUi.value, msg)
@@ -3690,12 +3768,13 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
           if (!reduced.showCompletion) break
           const totalDurationMs = Number(msg.durationMs ?? msg.taskState?.durationMs)
             || (taskActivity.value.startedAt ? Math.max(0, Date.now() - taskActivity.value.startedAt) : 0)
-          const terminalReply = typeof msg.reply === 'string' ? msg.reply.trim() : ''
-          if (_pendingResultMessage) {
-            if (_pendingResultMessage.taskResult) _pendingResultMessage.taskResult.durationMs = totalDurationMs
-            messages.value.push(_pendingResultMessage)
-            _pendingResultMessage = null
-          } else if (terminalReply) {
+          const terminalReply = selectSucceededTaskSummary({
+            reply: msg.reply,
+            finalReplyText: msg.taskState?.finalReplyText || tabTaskState.value?.finalReplyText,
+          })
+          // SDK result 是中间状态，不是父任务最终总结；成功终态到来时必须丢弃它。
+          _pendingResultMessage = null
+          if (terminalReply) {
             messages.value.push({
               role: 'assistant',
               text: terminalReply,
@@ -3705,7 +3784,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
           } else {
             messages.value.push({
               role: 'system',
-              text: '任务已完成',
+              text: '任务已完成，但 Gateway 未返回最终总结。',
               time: Date.now(),
               taskResult: {outcome: 'succeeded', continuationReason: null, resumable: false, originalTask: lastUserMessage, durationMs: totalDurationMs},
             })
@@ -4434,6 +4513,17 @@ async function sendMessage() {
     return
   }
 
+  const switchDecision = resolveModelContextSwitch({
+    mode: modelMode.value,
+    currentModel: runtimeModel.value,
+    nextModel: model.value,
+    hasConversation: Boolean(activeTab.value?.historySessionId || messages.value.some(item => item.role === 'user')),
+  })
+  if (switchDecision.requiresChoice) {
+    pendingModelContextSwitch.value = {text, originalText, attachments}
+    return
+  }
+
   try {
     const sent = await dispatch(text, attachments, originalText)
     if (sent) {
@@ -4549,13 +4639,13 @@ async function buildWireText(text: string, attachments?: PendingAttachment[]): P
  * 消息分发：构建 wire text（含文件引用内容），界面显示用户原文，实际发送 wire 版本。
  * 这样用户在界面上看到的是简洁的 `#文件名` 引用，但模型收到的是含文件内容的完整消息。
  */
-async function dispatch(text: string, attachments?: PendingAttachment[], originalText = text): Promise<boolean> {
+async function dispatch(text: string, attachments?: PendingAttachment[], originalText = text, contextSwitchMode: Exclude<ModelContextSwitchMode, 'cancel'> = 'full_history'): Promise<boolean> {
   // 捕获当前 sessionId，防止 await 期间切换会话导致跨会话发送
   const mySid = sessionId.value
   const selectedAttachments = attachments ?? (pendingAttachments.value.length > 0 ? [...pendingAttachments.value] : undefined)
   const wire = await buildWireText(text, selectedAttachments)
   if (sessionId.value !== mySid) return false
-  const sent = doSend(text, wire, selectedAttachments, originalText)
+  const sent = doSend(text, wire, selectedAttachments, originalText, contextSwitchMode)
   if (sent && selectedAttachments) {
     pendingAttachments.value = pendingAttachments.value.filter(a => !selectedAttachments.includes(a))
   }
@@ -4566,7 +4656,7 @@ async function dispatch(text: string, attachments?: PendingAttachment[], origina
  * 底层 WebSocket 发送：标记 thinking 状态，记录用户原文（用于取消时回填），推送消息。
  * wire 为注入引用文件内容后的版本，若未提供则直接用原文。
  */
-function doSend(text: string, wire?: string, attachments?: PendingAttachment[], originalText = text): boolean {
+function doSend(text: string, wire?: string, attachments?: PendingAttachment[], originalText = text, contextSwitchMode: Exclude<ModelContextSwitchMode, 'cancel'> = 'full_history'): boolean {
   // buildWireText 等异步操作期间 WS 可能已断开，再次检查防止 ! 崩溃
   const socket = ws
   const inputSessionId = sessionId.value
@@ -4587,6 +4677,7 @@ function doSend(text: string, wire?: string, attachments?: PendingAttachment[], 
       model: model.value,
       modelMeta: curModelMeta ? {contextWindow: curModelMeta.contextWindow, pricing: pricing.value} : null,
     }),
+    contextSwitchMode,
     maxContextTokens: contextSafetyCap.value || undefined,
   }
   if (!sendSessionPayload(payload, socket)) return false
@@ -4634,6 +4725,30 @@ function doSend(text: string, wire?: string, attachments?: PendingAttachment[], 
   while (pendingInputTexts.size > 64) pendingInputTexts.delete(pendingInputTexts.keys().next().value!)
   nextTick(() => scrollDown(true))
   return true
+}
+
+async function confirmModelContextSwitch(mode: Exclude<ModelContextSwitchMode, 'cancel'>) {
+  const pending = pendingModelContextSwitch.value
+  if (!pending) return
+  pendingModelContextSwitch.value = null
+  try {
+    if (await dispatch(pending.text, pending.attachments, pending.originalText, mode)) {
+      inputText.value = ''
+    } else {
+      inputText.value = pending.originalText
+      showToast(t('ws.notConnected'))
+    }
+  } catch (error) {
+    console.debug('模型上下文切换发送失败', error)
+    inputText.value = pending.originalText
+    showToast(t('ws.attachmentUploadFailed'))
+  }
+}
+
+function cancelModelContextSwitch() {
+  const pending = pendingModelContextSwitch.value
+  if (pending) inputText.value = pending.originalText
+  pendingModelContextSwitch.value = null
 }
 
 function sendSessionPayload(payload: Record<string, unknown>, socket: WebSocket | null = ws): boolean {
@@ -4957,7 +5072,8 @@ async function loadSlashCommands() {
     const res = await fetch(`${GW}/api/config/commands`)
     if (res.ok) {
       const d = await res.json();
-      slashCommands.value = d.commands || []
+      // Gateway 已按内置资源开关标记可用命令；补全只暴露当前启用项。
+      slashCommands.value = (d.commands || []).filter((command: SlashCmd & {enabled?: boolean}) => command.enabled !== false)
     }
   } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
 }
@@ -5691,6 +5807,7 @@ document.addEventListener('visibilitychange', onPageVisibility)
 // 组件卸载时清理 Monaco 实例及外部 model
 onBeforeUnmount(() => {
   stopActivityClock()
+  clearProjectLoadRetry()
   if (draftPersistTimer) { clearTimeout(draftPersistTimer); draftPersistTimer = null }
   const currentTab = activeTab.value
   if (currentTab) {
@@ -5972,6 +6089,9 @@ function updateThinkingExpanded(msg: Message, event: Event) {
 
 /** 当前选中的模型 ID（默认空，由 loadProviderModels 从 settings 填充） */
 const model = ref('')
+/** 已实际运行的 Query 模型，不能被下拉框预选值覆盖。 */
+const runtimeModel = ref('')
+const pendingModelContextSwitch = ref<PendingModelContextSwitch | null>(null)
 /** 模型路由模式：自动按任务决策选择档位，固定完全尊重用户模型。 */
 const modelMode = ref<ModelMode>('auto')
 /** 当前回合的任务决策摘要，不保存原始 Prompt。 */
@@ -6031,6 +6151,7 @@ const rawMaxTokens = ref(0)
 let contextWarningLevel = 0
 /** 本轮 token 消耗明细：input=输入 / output=纯输出(不含思考) / thinking=思考估算 / total=总量(含思考) */
 const usage = ref({input: 0, output: 0, thinking: 0, total: 0})
+const providerUsageEvidence = ref<{source: 'provider_observed' | 'partial' | 'unknown', cacheRead: number | null, cacheCreation: number | null}>({source: 'unknown', cacheRead: null, cacheCreation: null})
 /** 模型最大上下文 token 数，由 SDK/system_init 动态设置；未知时保持 0 并显示未知 */
 const maxTokens = ref(0)
 /**
@@ -6393,6 +6514,9 @@ const tokenTooltip = computed(() => {
     input: fmtTok(u.input),
     thinking: u.thinking > 0 ? '~' + fmtTok(u.thinking) : '—',
     output: fmtTok(u.output),
+    providerUsage: providerUsageEvidence.value.source === 'provider_observed' ? 'Provider 实测' : providerUsageEvidence.value.source === 'partial' ? 'Provider 部分返回' : 'Provider 未返回用量',
+    cacheRead: providerUsageEvidence.value.cacheRead === null ? '未知' : fmtTok(providerUsageEvidence.value.cacheRead),
+    cacheCreation: providerUsageEvidence.value.cacheCreation === null ? '未知' : fmtTok(providerUsageEvidence.value.cacheCreation),
     costTurn: costThisTurn.toFixed(4),
     costTotal: costTotal.value.toFixed(4),
     remaining: Math.max(0, remaining).toFixed(2),
@@ -6418,6 +6542,8 @@ const tokenTooltip = computed(() => {
         :connected="connected"
         :connecting="connecting"
         :gateway-version="gatewayVersion"
+        :projects-loading="projectsLoading"
+        :projects-load-error="projectsLoadError"
         :has-running-agent="hasAgentRuns && agentRuns.some(a => a.status === 'running' || a.status === 'spawning')"
         :running-agent-count="agentRuns.filter(a => a.status === 'running' || a.status === 'spawning').length"
         :project-page-size="projectPageSize"
@@ -6430,7 +6556,7 @@ const tokenTooltip = computed(() => {
         @go-settings="router.push('/settings')"
         @search="projectSearch = $event"
         @add-project="addProject"
-        @load-projects="loadProjects"
+        @load-projects="(reorder: boolean) => loadProjects(reorder, true)"
         @toggle-project="toggleProject"
         @open-project-directory="openProjectDirectory"
         @new-session="(workDir: string, encodedDir: string, sid?: string) => handleNewSession(workDir, encodedDir, sid)"
@@ -7036,7 +7162,7 @@ const tokenTooltip = computed(() => {
           <!-- 弹性占位，把 token 迷你条和圆环推到右侧 -->
           <div class="spacer"></div>
           <!-- 本轮 token 迷你条：输入 · 思考(~估算) · 纯输出(已扣思考) -->
-          <div v-if="usage.total > 0" class="token-mini" :title="t('ws.tokenMiniTip')">
+          <div v-if="usage.total > 0" class="token-mini" :title="`${tokenTooltip.providerUsage}；缓存读取 ${tokenTooltip.cacheRead}；缓存创建 ${tokenTooltip.cacheCreation}`">
             <span class="tm-item tm-in">↓ {{ fmtTok(usage.input) }}</span>
             <span class="tm-sep">·</span>
             <span class="tm-item tm-think">~{{ fmtTok(usage.thinking) }}</span>
@@ -7146,6 +7272,15 @@ const tokenTooltip = computed(() => {
                 <button class="choice-opt-btn confirm" @click="respondChoiceCustom()">{{ t('ws.send') }}</button>
                 <button class="choice-opt-btn cancel" @click="pendingChoice.customInputActive = false; pendingChoice.customInputText = ''">{{ t('ws.cancel') }}</button>
               </div>
+            </div>
+          </div>
+
+          <div v-if="pendingModelContextSwitch" class="confirm-banner choice">
+            <div class="confirm-banner-question">切换模型会重新建立上下文。不同模型不共享推理缓存，实际计费以 Provider 返回的用量为准。</div>
+            <div class="confirm-banner-options">
+              <button class="choice-opt-btn" @click="confirmModelContextSwitch('full_history')">保留完整历史</button>
+              <button class="choice-opt-btn" @click="confirmModelContextSwitch('handoff_summary')">使用有限交接摘要</button>
+              <button class="choice-opt-btn cancel" @click="cancelModelContextSwitch">取消</button>
             </div>
           </div>
 

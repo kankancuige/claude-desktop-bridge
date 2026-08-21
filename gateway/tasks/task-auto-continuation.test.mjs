@@ -6,6 +6,8 @@ import {isAutoContinuationPrompt, resolveAutoContinuation} from './task-auto-con
 
 const maxTurnsResult = {outcome: 'incomplete', continuationReason: 'max_turns'}
 const gatewaySource = readFileSync(new URL('../index.mjs', import.meta.url), 'utf8')
+const coordinatorSource = readFileSync(new URL('../sessions/session-coordinator.mjs', import.meta.url), 'utf8')
+const streamAdapterSource = readFileSync(new URL('../sessions/sdk-stream-adapter.mjs', import.meta.url), 'utf8')
 
 test('max turns 按任务档位限制自动续跑次数', () => {
     const cases = [
@@ -72,10 +74,12 @@ test('Gateway 自动续跑沿用原 SDK 会话，并在重建完成前串行排�
     assert.match(rebuild, /session\.lastSessionId/)
     assert.match(rebuild, /opts\.resume = session\.lastSessionId/)
     assert.match(rebuild, /maxContextTokens: session\.queryOpts\?\.bridgeContextSafetyCap/)
-    assert.match(rebuild, /session\._rebuildPromise = \(async \(\) =>/)
+    assert.match(rebuild, /sessionCoordinator\.beginRebuild\(session, request\.prompt\)/)
+    assert.match(rebuild, /sessionCoordinator\.attachPromise\(session, rebuildId, rebuildPromise\)/)
+    assert.match(rebuild, /sessionCoordinator\.consumePendingMessages\(session, rebuildId\)/)
     assert.match(rebuild, /session\._autoContinuationRequest !== request/)
     assert.match(rebuild, /session\._autoContinuationRequest = null/)
-    assert.match(gatewaySource, /isAutoContinuationPrompt\(userText\)/)
+    assert.match(streamAdapterSource, /isAutoContinuationPrompt\(userText\)/)
 
     const pumpStart = gatewaySource.indexOf('async function startStreamPump')
     const pumpEnd = gatewaySource.indexOf('// ── 微信文本分段发送', pumpStart)
@@ -89,8 +93,10 @@ test('停止会话先失效 rebuild token，异步续跑完成后不能复活任
     const end = gatewaySource.indexOf('async function startAutoContinuation', start)
     assert.ok(start >= 0 && end > start)
     const stop = gatewaySource.slice(start, end)
-    const invalidate = stop.indexOf('s._rebuildId = null')
+    const invalidate = stop.indexOf('sessionCoordinator.invalidate(s)')
     const close = stop.indexOf('await closeSessionRuntime')
     assert.ok(invalidate >= 0 && close > invalidate)
     assert.match(stop, /s\._autoContinuationRequest = null/)
+    assert.match(coordinatorSource, /invalidate\(session\)/)
+    assert.match(coordinatorSource, /session\._rebuildId = null/)
 })

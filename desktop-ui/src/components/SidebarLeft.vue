@@ -33,6 +33,10 @@ defineProps<{
   connecting: boolean
   /** Gateway 版本号 */
   gatewayVersion: string
+  /** 首屏项目加载是否正在重试 */
+  projectsLoading: boolean
+  /** 项目列表加载失败信息 */
+  projectsLoadError: string
   /** 是否有 agent 运行中 */
   hasRunningAgent: boolean
   /** Agent 运行数量 */
@@ -174,6 +178,12 @@ function visibleSessions(p: Project, showAllSessions: Set<string>, pageSize: num
 
     <!-- 项目列表区域 -->
     <div class="project-list">
+      <div v-if="projectsLoadError" class="project-load-error" role="alert">
+        <span>{{ projectsLoadError }}</span>
+        <button class="project-load-retry" :disabled="projectsLoading" @click="emit('loadProjects', true)">
+          {{ projectsLoading ? '重试中...' : '重试' }}
+        </button>
+      </div>
 
       <!-- 搜索无匹配 -->
       <div v-if="filteredProjects.length === 0 && searchText" class="empty-hint">{{ t('ws.noMatch') }}</div>
@@ -412,6 +422,13 @@ function visibleSessions(p: Project, showAllSessions: Set<string>, pageSize: num
 .list-header-actions { display: flex; gap: 2px; }
 
 .empty-hint { text-align: center; padding: 16px; font-size: 13px; color: var(--text-muted); }
+.project-load-error {
+  display: flex; align-items: center; gap: 8px; margin: 8px 2px 10px; padding: 8px 10px;
+  border: 1px solid var(--error); background: var(--bg-raised); color: var(--error); font-size: 12px;
+}
+.project-load-error span { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.project-load-retry { border: 1px solid var(--error); background: transparent; color: inherit; padding: 3px 7px; cursor: pointer; font: inherit; }
+.project-load-retry:disabled { opacity: .6; cursor: default; }
 .empty-state { text-align: center; padding: 40px 16px; color: var(--text-muted); }
 .empty-state p { margin: 8px 0 4px; font-size: 14px; }
 .empty-state span { font-size: 12px; }

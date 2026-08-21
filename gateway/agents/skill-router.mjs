@@ -1,6 +1,6 @@
 const DIGITAL_TWIN_CONTEXT = /(?:数字孪生|工业孪生|机器人孪生|digital\s+twin|industrial\s+twin|robot\s+twin|twin[._ -]?manifest|twin\.config\.ya?ml|设备三维资产)/i
-const DIGITAL_TWIN_INTEGRATION = /(?:cad|step|glb|gltf|urdf|srdf|sdf|节点|零件|部件|关节|遥测|telemetry|设备映射|component\s*id|device\s*id|manifest|单位|坐标系)/i
-const DIGITAL_TWIN_DIRECT = /(?:(?:cad|glb|gltf).{0,50}(?:节点|零件|部件|node|part).{0,50}(?:绑定|映射|bind|map)|(?:遥测|telemetry).{0,50}(?:模型|节点|关节|model|node|joint).{0,50}(?:状态|变换|state|transform))/i
+const DIGITAL_TWIN_INTEGRATION = /(?:cad|step|glb|gltf|urdf|srdf|sdf|节点|零件|部件|关节|遥测|telemetry|设备映射|component\s*id|device\s*id|manifest|单位|坐标系|参考图|参考图片|reference\s+image|image[- ]?(?:to[- ]?3d|procedural|proxy)|runtime\s+proxy|generative\s+mesh|程序化模型|程序化网格|代理网格|图像建模|mesh\s*proxy|objectsculptspec|three\.js)/i
+const DIGITAL_TWIN_DIRECT = /(?:(?:cad|glb|gltf).{0,50}(?:节点|零件|部件|node|part).{0,50}(?:绑定|映射|bind|map)|(?:遥测|telemetry).{0,50}(?:模型|节点|关节|model|node|joint).{0,50}(?:状态|变换|state|transform)|(?:参考图|参考图片|reference\s+image|image).{0,60}(?:程序化|procedural|代理网格|mesh\s*proxy|three\.js|模型|model).{0,60}(?:孪生|twin|运行时|runtime))/i
 
 function isDigitalTwinIntegration(text) {
     return DIGITAL_TWIN_DIRECT.test(text)

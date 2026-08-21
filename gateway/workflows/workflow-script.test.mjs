@@ -1,10 +1,15 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import {readFileSync} from 'node:fs'
+import {readFileSync, readdirSync} from 'node:fs'
+import {dirname, join} from 'node:path'
+import {fileURLToPath} from 'node:url'
 import {
     MAX_WORKFLOW_SCRIPT_BYTES,
     validateWorkflowContent,
 } from './workflow-runner.mjs'
+import {validateWorkflowSyntax} from './workflow-source.mjs'
+
+const TEST_DIR = dirname(fileURLToPath(import.meta.url))
 
 test('Workflow 内容拒绝空值和纯空白', () => {
     assert.throws(() => validateWorkflowContent(), {code: 'WORKFLOW_SCRIPT_INVALID'})
@@ -18,6 +23,15 @@ test('Workflow 内容按 UTF-8 字节限制为 1MB', () => {
         () => validateWorkflowContent(exact + '中'),
         {code: 'WORKFLOW_SCRIPT_TOO_LARGE'},
     )
+})
+
+test('所有内置 Workflow DSL 按真实 async 包装方式通过语法编译', () => {
+    const root = join(TEST_DIR, '..', 'builtin-resources', 'workflows')
+    const files = readdirSync(root).filter(name => name.endsWith('.mjs')).sort()
+    assert.ok(files.length > 0)
+    for (const name of files) {
+        assert.equal(validateWorkflowSyntax(readFileSync(join(root, name), 'utf8'), {filename: name}), true)
+    }
 })
 
 test('最终审查只覆盖变更文件并允许读取直接调用关系判断回归', () => {

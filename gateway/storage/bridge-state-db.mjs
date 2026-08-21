@@ -3,7 +3,7 @@ import {existsSync, mkdirSync, renameSync} from 'node:fs'
 import {dirname, join} from 'node:path'
 
 const require = createRequire(import.meta.url)
-const SCHEMA_VERSION = 4
+const SCHEMA_VERSION = 8
 
 function isCorruptDatabaseError(error) {
     const code = String(error?.code || '').toUpperCase()
@@ -276,6 +276,90 @@ export class BridgeStateDb {
             );
             CREATE INDEX IF NOT EXISTS idx_bridge_workflow_session
                 ON bridge_workflow_state (project_key, parent_session_id, status, updated_at DESC);
+            CREATE TABLE IF NOT EXISTS bridge_pitfalls (
+                id TEXT PRIMARY KEY,
+                project_key TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                status TEXT NOT NULL,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                root_cause TEXT,
+                prevention TEXT,
+                tags_json TEXT,
+                first_seen_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                confirmed_at INTEGER,
+                mitigated_at INTEGER,
+                expires_at INTEGER,
+                updated_at INTEGER NOT NULL,
+                UNIQUE (project_key, scope, fingerprint)
+            );
+            CREATE INDEX IF NOT EXISTS idx_bridge_pitfall_lookup
+                ON bridge_pitfalls (project_key, scope, status, last_seen_at DESC);
+            CREATE TABLE IF NOT EXISTS bridge_pitfall_occurrences (
+                id TEXT PRIMARY KEY,
+                pitfall_id TEXT NOT NULL,
+                task_id TEXT,
+                context_json TEXT,
+                observed_at INTEGER NOT NULL,
+                UNIQUE (pitfall_id, task_id),
+                FOREIGN KEY (pitfall_id) REFERENCES bridge_pitfalls(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS bridge_pitfall_links (
+                pitfall_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                target TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (pitfall_id, kind, target),
+                FOREIGN KEY (pitfall_id) REFERENCES bridge_pitfalls(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS bridge_execution_reports (
+                task_id TEXT PRIMARY KEY,
+                project_key TEXT NOT NULL,
+                session_id TEXT,
+                status TEXT NOT NULL,
+                evidence_level TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                report_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_bridge_execution_report_project
+                ON bridge_execution_reports (project_key, updated_at DESC);
+            CREATE TABLE IF NOT EXISTS bridge_verification_campaigns (
+                campaign_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                project_key TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                campaign_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_bridge_verification_campaign_task
+                ON bridge_verification_campaigns (project_key, task_id, updated_at DESC);
+            CREATE TABLE IF NOT EXISTS bridge_model_usage_events (
+                event_id TEXT PRIMARY KEY,
+                project_key TEXT,
+                session_id TEXT,
+                model TEXT,
+                provider_key TEXT,
+                context_fingerprint TEXT,
+                policy TEXT,
+                cache_eligibility TEXT,
+                reason_codes_json TEXT NOT NULL,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cache_read_input_tokens INTEGER,
+                cache_creation_input_tokens INTEGER,
+                usage_source TEXT NOT NULL,
+                duration_ms INTEGER,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_bridge_model_usage_session
+                ON bridge_model_usage_events (session_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_bridge_model_usage_project
+                ON bridge_model_usage_events (project_key, created_at DESC);
         `)
         this._ensureColumn('bridge_memory_index', 'scope', "TEXT NOT NULL DEFAULT 'project'")
         this._ensureColumn('bridge_memory_index', 'confidence', 'REAL NOT NULL DEFAULT 1')
@@ -676,6 +760,33 @@ export class BridgeStateDb {
                 tier: state.review.tier,
                 blockingCount: state.review.blockingCount,
             } : null,
+            coordinator: state.plan ? {
+                phase: state.phase || null,
+                revision: state.revision,
+                steps: Array.isArray(state.plan.steps) ? state.plan.steps.slice(0, 12).map(step => ({
+                    stepId: step.stepId,
+                    phase: step.phase,
+                    role: step.role,
+                    status: step.status,
+                    required: step.required !== false,
+                    agentRequired: step.agentRequired === true,
+                })) : [],
+                agents: Object.fromEntries(Object.entries(state.agents || {}).slice(0, 8).map(([id, agent]) => [id, {
+                    role: agent.role,
+                    stepId: agent.stepId,
+                    status: agent.status,
+                }])),
+                workflows: Object.fromEntries(Object.entries(state.workflows || {}).slice(0, 8).map(([id, workflow]) => [id, {
+                    status: workflow.status,
+                }])),
+                verification: state.verification ? {
+                    status: state.verification.status,
+                    evidenceLevel: state.verification.evidenceLevel,
+                    testsExecuted: state.verification.testsExecuted === true,
+                } : null,
+                blockerCodes: Array.isArray(state.blockers) ? state.blockers.slice(0, 12).map(item => item.code) : [],
+                notificationIntentPersisted: state.notificationIntentPersisted === true,
+            } : null,
             updatedAt: state.updatedAt,
         }
         return {
@@ -836,6 +947,33 @@ export class BridgeStateDb {
         return {...row, notifications: parseJson(row.notificationsJson, {}), state: parseJson(row.stateJson, {})}
     }
 
+    getCoordinatorTaskState(projectKey, taskId) {
+        if (!this.available) return null
+        const project = String(projectKey || '')
+        const task = String(taskId || '').trim()
+        if (!project || !task) return null
+        const exact = this._taskSelect('WHERE project_key = ? AND task_key = ?', [project, `${task}:coordinator`])
+        if (exact) {
+            const state = parseJson(exact.stateJson, {})
+            if (state.coordinator) return {...exact, notifications: parseJson(exact.notificationsJson, {}), state}
+        }
+        const rows = this._prepare(`
+            SELECT project_key as projectKey, task_key as taskKey, session_id as sessionId,
+                task_id as taskId, sdk_session_id as sdkSessionId, status, outcome,
+                continuation_reason as continuationReason, phase, review_state as reviewState,
+                model_tier as modelTier, error_code as errorCode, sequence, revision,
+                started_at as startedAt, completed_at as completedAt, updated_at as updatedAt,
+                notifications_json as notificationsJson, state_json as stateJson
+            FROM bridge_task_state WHERE project_key = ? AND task_id = ?
+            ORDER BY updated_at DESC LIMIT 10
+        `).all(project, task)
+        for (const row of rows) {
+            const state = parseJson(row.stateJson, {})
+            if (state.coordinator) return {...row, notifications: parseJson(row.notificationsJson, {}), state}
+        }
+        return null
+    }
+
     listTaskStates(projectKey, {activeOnly = false, limit = 100} = {}) {
         if (!this.available) return []
         const safeLimit = Math.max(1, Math.min(500, Number(limit) || 100))
@@ -983,6 +1121,248 @@ export class BridgeStateDb {
             WHERE project_key = ? AND source_path = ?
         `), Number(usedAt), this.now(), String(projectKey), String(sourcePath))
         return Number(result?.changes || 0) > 0
+    }
+
+    recordPitfall(record = {}) {
+        if (!this.available) return null
+        const id = normalizeEntryId(record.id)
+        const projectKey = String(record.projectKey || '')
+        const scope = ['global', 'project', 'bridge'].includes(record.scope) ? record.scope : 'project'
+        const fingerprint = String(record.fingerprint || '').slice(0, 128)
+        if (!projectKey || !fingerprint) throw new TypeError('pitfall projectKey/fingerprint are required')
+        const timestamp = Number(record.observedAt) || this.now()
+        this._run(this._prepare(`
+            INSERT INTO bridge_pitfalls
+                (id, project_key, scope, fingerprint, status, title, summary, root_cause, prevention,
+                 tags_json, first_seen_at, last_seen_at, confirmed_at, mitigated_at, expires_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project_key, scope, fingerprint) DO UPDATE SET
+                last_seen_at=excluded.last_seen_at, updated_at=excluded.updated_at,
+                title=CASE WHEN bridge_pitfalls.title = '' THEN excluded.title ELSE bridge_pitfalls.title END,
+                summary=CASE WHEN bridge_pitfalls.summary = '' THEN excluded.summary ELSE bridge_pitfalls.summary END,
+                tags_json=excluded.tags_json
+        `), id, projectKey, scope, fingerprint, String(record.status || 'observed').slice(0, 32),
+            String(record.title || '').slice(0, 300), String(record.summary || '').slice(0, 2000),
+            record.rootCause ? String(record.rootCause).slice(0, 2000) : null,
+            record.prevention ? String(record.prevention).slice(0, 2000) : null,
+            safeJson(Array.isArray(record.tags) ? record.tags.slice(0, 30) : [], []), timestamp, timestamp,
+            record.confirmedAt || null, record.mitigatedAt || null, record.expiresAt || null, timestamp)
+        return this.getPitfall(projectKey, fingerprint, scope)
+    }
+
+    recordPitfallOccurrence({pitfallId, occurrenceId, taskId = null, context = {}, observedAt = this.now()} = {}) {
+        if (!this.available) return false
+        const result = this._run(this._prepare(`
+            INSERT OR IGNORE INTO bridge_pitfall_occurrences
+                (id, pitfall_id, task_id, context_json, observed_at)
+            VALUES (?, ?, ?, ?, ?)
+        `), normalizeEntryId(occurrenceId), normalizeEntryId(pitfallId), taskId ? String(taskId).slice(0, 240) : null,
+            safeJson(context, {}), Number(observedAt) || this.now())
+        return Number(result?.changes || 0) > 0
+    }
+
+    countPitfallOccurrences(pitfallId) {
+        if (!this.available) return 0
+        return Number(this._prepare('SELECT COUNT(*) AS count FROM bridge_pitfall_occurrences WHERE pitfall_id = ?').get(normalizeEntryId(pitfallId))?.count || 0)
+    }
+
+    linkPitfall({pitfallId, kind, target, createdAt = this.now()} = {}) {
+        if (!this.available) return false
+        const safeKind = String(kind || '').slice(0, 40)
+        const safeTarget = String(target || '').slice(0, 500)
+        if (!safeKind || !safeTarget) return false
+        const result = this._run(this._prepare(`
+            INSERT OR IGNORE INTO bridge_pitfall_links (pitfall_id, kind, target, created_at)
+            VALUES (?, ?, ?, ?)
+        `), normalizeEntryId(pitfallId), safeKind, safeTarget, Number(createdAt) || this.now())
+        return Number(result?.changes || 0) > 0
+    }
+
+    getPitfall(projectKey, fingerprint, scope = 'project') {
+        if (!this.available) return null
+        const row = this._prepare(`
+            SELECT id, project_key as projectKey, scope, fingerprint, status, title, summary,
+                root_cause as rootCause, prevention, tags_json as tagsJson,
+                first_seen_at as firstSeenAt, last_seen_at as lastSeenAt,
+                confirmed_at as confirmedAt, mitigated_at as mitigatedAt,
+                expires_at as expiresAt, updated_at as updatedAt
+            FROM bridge_pitfalls WHERE project_key = ? AND scope = ? AND fingerprint = ?
+        `).get(String(projectKey || ''), String(scope || 'project'), String(fingerprint || ''))
+        return row ? {...row, tags: parseJson(row.tagsJson, [])} : null
+    }
+
+    listPitfalls(projectKey, {statuses = null, scopes = null, limit = 100, now = this.now()} = {}) {
+        if (!this.available) return []
+        const allowedStatuses = Array.isArray(statuses) ? statuses.filter(Boolean).slice(0, 10) : []
+        const allowedScopes = Array.isArray(scopes) ? scopes.filter(scope => ['global', 'project', 'bridge'].includes(scope)).slice(0, 3) : []
+        const clauses = ['(project_key = ? OR (scope = \'global\' AND project_key = \'*\'))', '(expires_at IS NULL OR expires_at > ?)']
+        const params = [String(projectKey || ''), Number(now)]
+        if (allowedStatuses.length) {
+            clauses.push(`status IN (${allowedStatuses.map(() => '?').join(',')})`)
+            params.push(...allowedStatuses)
+        }
+        if (allowedScopes.length) {
+            clauses.push(`scope IN (${allowedScopes.map(() => '?').join(',')})`)
+            params.push(...allowedScopes)
+        }
+        params.push(Math.max(1, Math.min(500, Number(limit) || 100)))
+        return this._prepare(`
+            SELECT id, project_key as projectKey, scope, fingerprint, status, title, summary,
+                root_cause as rootCause, prevention, tags_json as tagsJson,
+                first_seen_at as firstSeenAt, last_seen_at as lastSeenAt,
+                confirmed_at as confirmedAt, mitigated_at as mitigatedAt,
+                expires_at as expiresAt, updated_at as updatedAt
+            FROM bridge_pitfalls WHERE ${clauses.join(' AND ')}
+            ORDER BY last_seen_at DESC LIMIT ?
+        `).all(...params).map(row => ({...row, tags: parseJson(row.tagsJson, [])}))
+    }
+
+    listRecentPitfalls({limit = 100, now = this.now()} = {}) {
+        if (!this.available) return []
+        return this._prepare(`
+            SELECT id, project_key as projectKey, scope, fingerprint, status, title, summary,
+                root_cause as rootCause, prevention, tags_json as tagsJson,
+                first_seen_at as firstSeenAt, last_seen_at as lastSeenAt,
+                confirmed_at as confirmedAt, mitigated_at as mitigatedAt,
+                expires_at as expiresAt, updated_at as updatedAt
+            FROM bridge_pitfalls WHERE expires_at IS NULL OR expires_at > ?
+            ORDER BY last_seen_at DESC LIMIT ?
+        `).all(Number(now), Math.max(1, Math.min(500, Number(limit) || 100)))
+            .map(row => ({...row, tags: parseJson(row.tagsJson, [])}))
+    }
+
+    updatePitfallStatus(id, status, {rootCause = null, prevention = null, evidence = null, now = this.now()} = {}) {
+        if (!this.available || !['observed', 'candidate', 'confirmed', 'mitigated', 'retired'].includes(status)) return false
+        const timestamp = Number(now)
+        const result = this._run(this._prepare(`
+            UPDATE bridge_pitfalls SET status = ?,
+                root_cause=COALESCE(?, root_cause), prevention=COALESCE(?, prevention),
+                confirmed_at=CASE WHEN ? = 'confirmed' THEN ? ELSE confirmed_at END,
+                mitigated_at=CASE WHEN ? = 'mitigated' THEN ? ELSE mitigated_at END,
+                updated_at=? WHERE id=?
+        `), status, rootCause ? String(rootCause).slice(0, 2000) : null,
+            prevention ? String(prevention).slice(0, 2000) : null,
+            status, timestamp, status, timestamp, timestamp, normalizeEntryId(id))
+        if (evidence) this.linkPitfall({pitfallId: id, kind: 'evidence', target: String(evidence), createdAt: timestamp})
+        return Number(result?.changes || 0) > 0
+    }
+
+    upsertExecutionReport({projectKey, sessionId = null, report, updatedAt = this.now()} = {}) {
+        if (!this.available) return false
+        const taskId = normalizeEntryId(report?.taskId)
+        const safeProjectKey = String(projectKey || '').trim()
+        if (!safeProjectKey) throw new TypeError('Execution Report 缺少 projectKey')
+        const timestamp = Number(updatedAt) || this.now()
+        const result = this._run(this._prepare(`
+            INSERT INTO bridge_execution_reports
+                (task_id, project_key, session_id, status, evidence_level, created_at, updated_at, report_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(task_id) DO UPDATE SET
+                project_key=excluded.project_key,
+                session_id=COALESCE(excluded.session_id, bridge_execution_reports.session_id),
+                status=excluded.status,
+                evidence_level=excluded.evidence_level,
+                updated_at=excluded.updated_at,
+                report_json=excluded.report_json
+            WHERE excluded.updated_at >= bridge_execution_reports.updated_at
+        `), taskId, safeProjectKey, sessionId ? String(sessionId).slice(0, 240) : null,
+            String(report.status || 'unknown').slice(0, 32),
+            String(report.verification?.evidenceLevel || 'L0').slice(0, 8),
+            Number(report.startedAt) || timestamp, timestamp, safeJson(report, {}))
+        return Number(result?.changes || 0) > 0
+    }
+
+    getExecutionReport(taskId) {
+        if (!this.available) return null
+        const row = this._prepare('SELECT report_json as reportJson FROM bridge_execution_reports WHERE task_id = ?')
+            .get(normalizeEntryId(taskId))
+        return row ? parseJson(row.reportJson, null) : null
+    }
+
+    listExecutionReports(projectKey, {limit = 100} = {}) {
+        if (!this.available) return []
+        const safeLimit = Math.max(1, Math.min(500, Number(limit) || 100))
+        const rows = projectKey
+            ? this._prepare('SELECT report_json as reportJson FROM bridge_execution_reports WHERE project_key = ? ORDER BY updated_at DESC LIMIT ?').all(String(projectKey), safeLimit)
+            : this._prepare('SELECT report_json as reportJson FROM bridge_execution_reports ORDER BY updated_at DESC LIMIT ?').all(safeLimit)
+        return rows
+            .map(row => parseJson(row.reportJson, null)).filter(Boolean)
+    }
+
+    upsertVerificationCampaign({projectKey, campaign, updatedAt = this.now()} = {}) {
+        if (!this.available) return false
+        const campaignId = normalizeEntryId(campaign?.campaignId)
+        const taskId = normalizeEntryId(campaign?.taskId)
+        const safeProjectKey = String(projectKey || '').trim()
+        if (!safeProjectKey) throw new TypeError('Verification Campaign 缺少 projectKey')
+        const timestamp = Number(updatedAt) || this.now()
+        const result = this._run(this._prepare(`
+            INSERT INTO bridge_verification_campaigns
+                (campaign_id, task_id, project_key, status, created_at, updated_at, campaign_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(campaign_id) DO UPDATE SET
+                status=excluded.status,
+                updated_at=excluded.updated_at,
+                campaign_json=excluded.campaign_json
+            WHERE excluded.updated_at >= bridge_verification_campaigns.updated_at
+        `), campaignId, taskId, safeProjectKey, String(campaign.status || 'not_started').slice(0, 40),
+            Number(campaign.createdAt) || timestamp, timestamp, safeJson(campaign, {}))
+        return Number(result?.changes || 0) > 0
+    }
+
+    getVerificationCampaign(campaignId) {
+        if (!this.available) return null
+        const row = this._prepare('SELECT campaign_json AS campaignJson FROM bridge_verification_campaigns WHERE campaign_id = ?')
+            .get(normalizeEntryId(campaignId))
+        return row ? parseJson(row.campaignJson, null) : null
+    }
+
+    listVerificationCampaigns(projectKey, {taskId = null, limit = 100} = {}) {
+        if (!this.available) return []
+        const safeLimit = Math.max(1, Math.min(500, Number(limit) || 100))
+        const rows = taskId
+            ? this._prepare('SELECT campaign_json AS campaignJson FROM bridge_verification_campaigns WHERE project_key = ? AND task_id = ? ORDER BY updated_at DESC LIMIT ?').all(String(projectKey || ''), String(taskId), safeLimit)
+            : this._prepare('SELECT campaign_json AS campaignJson FROM bridge_verification_campaigns WHERE project_key = ? ORDER BY updated_at DESC LIMIT ?').all(String(projectKey || ''), safeLimit)
+        return rows.map(row => parseJson(row.campaignJson, null)).filter(Boolean)
+    }
+
+    appendModelUsageEvent(event = {}) {
+        if (!this.available) return false
+        const eventId = normalizeEntryId(event.eventId)
+        const source = ['provider_observed', 'partial', 'unknown'].includes(event.source) ? event.source : 'unknown'
+        const token = value => Number.isSafeInteger(value) && value >= 0 ? value : null
+        const result = this._run(this._prepare(`
+            INSERT INTO bridge_model_usage_events
+                (event_id, project_key, session_id, model, provider_key, context_fingerprint, policy, cache_eligibility,
+                 reason_codes_json, input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens,
+                 usage_source, duration_ms, retry_count, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(event_id) DO NOTHING
+        `), eventId,
+            event.projectKey ? String(event.projectKey).slice(0, 240) : null,
+            event.sessionId ? String(event.sessionId).slice(0, 240) : null,
+            event.model ? String(event.model).slice(0, 240) : null,
+            event.providerKey ? String(event.providerKey).slice(0, 96) : null,
+            event.contextFingerprint ? String(event.contextFingerprint).slice(0, 96) : null,
+            event.policy ? String(event.policy).slice(0, 64) : null,
+            event.cacheEligibility ? String(event.cacheEligibility).slice(0, 64) : null,
+            safeJson(Array.isArray(event.reasonCodes) ? event.reasonCodes.slice(0, 12) : []),
+            token(event.inputTokens), token(event.outputTokens), token(event.cacheReadInputTokens), token(event.cacheCreationInputTokens),
+            source, token(event.durationMs), token(event.retryCount) || 0, token(event.createdAt) || this.now())
+        return Number(result?.changes || 0) > 0
+    }
+
+    listModelUsageEvents(sessionId, {limit = 100} = {}) {
+        if (!this.available) return []
+        const rows = this._prepare(`
+            SELECT event_id as eventId, project_key as projectKey, session_id as sessionId, model, provider_key as providerKey,
+                context_fingerprint as contextFingerprint, policy, cache_eligibility as cacheEligibility,
+                reason_codes_json as reasonCodesJson, input_tokens as inputTokens, output_tokens as outputTokens,
+                cache_read_input_tokens as cacheReadInputTokens, cache_creation_input_tokens as cacheCreationInputTokens,
+                usage_source as source, duration_ms as durationMs, retry_count as retryCount, created_at as createdAt
+            FROM bridge_model_usage_events WHERE session_id = ? ORDER BY created_at DESC LIMIT ?
+        `).all(normalizeEntryId(sessionId), Math.max(1, Math.min(500, Number(limit) || 100)))
+        return rows.map(row => ({...row, reasonCodes: parseJson(row.reasonCodesJson, [])}))
     }
 
     close() {

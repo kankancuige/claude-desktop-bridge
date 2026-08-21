@@ -9,8 +9,64 @@ on:
   workflow_dispatch:
 
 jobs:
+  quality:
+    name: Gateway 与前端质量门禁
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: 安装 Gateway 依赖
+        working-directory: gateway
+        run: npm ci --legacy-peer-deps
+
+      - name: Gateway 单元与契约测试
+        shell: bash
+        run: node --test $(find gateway -path 'gateway/node_modules' -prune -o -name '*.test.mjs' -print)
+
+      - name: Gateway Host Smoke
+        run: node gateway/smoke/general-workbench-smoke.mjs
+
+      - name: Gateway 语法检查
+        shell: bash
+        run: find gateway \( -path 'gateway/node_modules' -o -path 'gateway/builtin-resources/workflows' \) -prune -o -name '*.mjs' -exec node --check {} \;
+
+      - name: 内置资源与敏感内容检查
+        run: node scripts/check-builtin-resources.mjs
+
+      - name: Gateway 生产依赖审计
+        working-directory: gateway
+        run: npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org
+
+      - name: 安装 Desktop UI 依赖
+        working-directory: desktop-ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Vue 类型检查
+        working-directory: desktop-ui
+        run: pnpm exec vue-tsc --noEmit
+
+      - name: 前端生产构建
+        working-directory: desktop-ui
+        run: pnpm exec vite build
+
+      - name: 空白与补丁检查
+        run: git diff --check
+
   build:
     name: ${{ matrix.label }}
+    needs: quality
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

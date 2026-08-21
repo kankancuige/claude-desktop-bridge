@@ -6,6 +6,8 @@ const TASK_PHASES = new Set([
 const BLOCKING_SEVERITIES = new Set(['critical', 'high'])
 const MAX_FINDINGS = 20
 const MAX_TEXT = 1000
+const NOTIFICATION_STATES = new Set(['pending', 'sent', 'failed', 'dead'])
+const NOTIFICATION_PLATFORMS = new Set(['wechat', 'feishu', 'dingtalk'])
 
 function text(value, max = MAX_TEXT) {
     return typeof value === 'string' ? value.trim().slice(0, max) : ''
@@ -13,6 +15,27 @@ function text(value, max = MAX_TEXT) {
 
 function unique(values) {
     return [...new Set(values.filter(Boolean))]
+}
+
+export function hasPersistedNotificationIntents({notifications = {}, platforms = [], notificationId = ''} = {}) {
+    const required = unique((Array.isArray(platforms) ? platforms : [])
+        .map(value => String(value || ''))
+        .filter(value => NOTIFICATION_PLATFORMS.has(value)))
+    if (!required.length) return true
+    const expectedId = text(notificationId, 300)
+    if (!expectedId) return false
+    return required.every(platform => {
+        const item = notifications?.[platform]
+        return item && NOTIFICATION_STATES.has(item.state) && item.notificationId === expectedId
+    })
+}
+
+export function resolveRequiredNotificationPlatforms({identity = null, mirrors = {}} = {}) {
+    const directSource = String(identity?.source || '')
+    if (NOTIFICATION_PLATFORMS.has(directSource)) return [directSource]
+    return unique(Object.entries(mirrors || {})
+        .filter(([platform, enabled]) => enabled === true && NOTIFICATION_PLATFORMS.has(platform))
+        .map(([platform]) => platform))
 }
 
 function normalizeFinding(raw = {}) {
@@ -127,8 +150,8 @@ export function createTaskCompletionState(input = {}) {
         phase: TASK_PHASES.has(input.phase) ? input.phase : 'idle',
         primaryResult: input.primaryResult || null,
         reviewPlan: input.reviewPlan || null,
-        reviewRound: Math.max(0, Math.min(2, Math.trunc(Number(input.reviewRound) || 0))),
-        fixAttempts: Math.max(0, Math.min(1, Math.trunc(Number(input.fixAttempts) || 0))),
+        reviewRound: Math.max(0, Math.min(3, Math.trunc(Number(input.reviewRound) || 0))),
+        fixAttempts: Math.max(0, Math.min(2, Math.trunc(Number(input.fixAttempts) || 0))),
         reviewOutcome: input.reviewOutcome || null,
         detail: text(input.detail, 2000),
         completionEmitted: input.completionEmitted === true,
@@ -207,7 +230,7 @@ export function transitionTaskCompletion(current, event = {}) {
         if (!reviewPlan.required) {
             return finish(createTaskCompletionState({...state, primaryResult, reviewPlan}), 'complete')
         }
-        const reviewRound = state.phase === 'fixing' || state.fixAttempts > 0 ? 2 : 1
+        const reviewRound = state.fixAttempts > 0 ? Math.min(3, state.fixAttempts + 1) : 1
         const next = createTaskCompletionState({
             ...state,
             phase: 'reviewing',
@@ -226,11 +249,11 @@ export function transitionTaskCompletion(current, event = {}) {
         if (outcome.passed) {
             return finish(createTaskCompletionState({...state, reviewOutcome: outcome}), 'complete', outcome.summary)
         }
-        if (state.fixAttempts === 0 && state.reviewRound < 2) {
+        if (state.fixAttempts < 2 && state.reviewRound < 3) {
             const next = createTaskCompletionState({
                 ...state,
                 phase: 'changes_required',
-                fixAttempts: 1,
+                fixAttempts: state.fixAttempts + 1,
                 reviewOutcome: outcome,
                 detail: outcome.summary,
             })

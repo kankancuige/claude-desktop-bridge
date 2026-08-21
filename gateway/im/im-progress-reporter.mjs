@@ -1,5 +1,6 @@
 const TERMINAL_EVENTS = new Set([
-    'task_completed', 'task_failed', 'task_review_paused', 'generation_stopped', 'stream_error', 'error',
+    'task_completed', 'task_failed', 'task_review_paused', 'task_verification_inconclusive',
+    'generation_stopped', 'stream_error', 'error',
 ])
 
 function boundedText(value, max = 120) {
@@ -30,6 +31,19 @@ function toolPhase(event) {
 export function classifyImProgressEvent(event = {}) {
     const type = String(event?.type || '')
     if (TERMINAL_EVENTS.has(type)) return {terminal: true}
+    if (type === 'task_coordinator_event') {
+        const phaseLabels = {
+            prime: '正在建立项目上下文', plan: '正在制定执行计划', implement: '正在实现代码变更',
+            validate: '正在验证本次修改', review: '正在定向审查', report: '正在整理最终报告',
+        }
+        const phase = boundedText(event.phase, 40)
+        const evidence = boundedText(event.verification?.evidenceLevel, 20)
+        return {
+            key: `coordinator:${phase || event.status}:${event.event}`,
+            title: phaseLabels[phase] || boundedText(event.detail) || '任务协调器正在处理',
+            detail: [boundedText(event.role, 60), evidence ? `证据 ${evidence}` : ''].filter(Boolean).join(' · '),
+        }
+    }
     if (type === 'task_started') return {key: 'starting', title: '任务已开始处理', detail: ''}
     if (type === 'task_auto_continuing') {
         const attempt = Math.max(1, Math.trunc(Number(event.attempt) || 1))

@@ -93,7 +93,7 @@ test('工具摘要会截断并脱敏凭据', () => {
 })
 
 test('完成、失败和停止会关闭所有运行步骤并记录总耗时', () => {
-  for (const [type, phase] of [['task_completed', 'completed'], ['stream_error', 'failed'], ['generation_stopped', 'stopped']]) {
+  for (const [type, phase] of [['task_completed', 'completed'], ['task_verification_inconclusive', 'failed'], ['stream_error', 'failed'], ['generation_stopped', 'stopped']]) {
     let state = reduceTaskActivity(createTaskActivityState(), {type: 'task_started'}, 100)
     state = reduceTaskActivity(state, {type: 'tool_use_start', tool_name: 'Read', tool_use_id: 't1'}, 150)
     state = reduceTaskActivity(state, {type, message: '终态'}, 500)
@@ -139,4 +139,20 @@ test('达到单段轮数上限后自动续跑仍保持同一父任务运行', ()
   assert.equal(state.title, '已达到单段轮数上限，正在自动续跑')
   assert.match(state.entries.at(-1).detail, /第 2\/3 次/)
   assert.match(state.entries.at(-1).detail, /累计 80 轮/)
+})
+
+test('Coordinator 阶段、角色、验证证据和阻塞形成独立步骤', () => {
+  let state = reduceTaskActivity(createTaskActivityState(), {
+    type: 'task_coordinator_event', taskId: 't', event: 'phase/started', phase: 'validate',
+    stepId: 's2', role: 'test-engineer', status: 'verifying', verification: {evidenceLevel: 'L2'},
+  }, 100)
+  assert.equal(state.phase, 'verifying')
+  assert.equal(state.entries[0].kind, 'verification')
+  assert.match(state.entries[0].detail, /test-engineer/)
+  assert.match(state.entries[0].detail, /L2/)
+  state = reduceTaskActivity(state, {
+    type: 'task_coordinator_event', taskId: 't', event: 'task/blocked', status: 'blocked', detail: '缺少运行环境',
+  }, 200)
+  assert.equal(state.running, false)
+  assert.equal(state.entries.at(-1).status, 'failed')
 })

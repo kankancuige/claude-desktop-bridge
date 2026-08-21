@@ -4,6 +4,7 @@ const TASK_SOURCES = new Set(['desktop', 'wechat', 'feishu', 'dingtalk', 'workfl
 const PERMISSION_MODES = new Set(['default', 'acceptEdits', 'plan', 'bypassPermissions'])
 const THINKING_LEVELS = new Set(['auto', 'off', 'low', 'medium', 'high', 'xhigh', 'max'])
 const MODEL_MODES = new Set(['auto', 'fixed'])
+const CONTEXT_SWITCH_MODES = new Set(['full_history', 'handoff_summary'])
 const MAX_CONTENT_BYTES = 900_000
 
 function commandError(message, code = 'INVALID_TASK_COMMAND') {
@@ -46,6 +47,7 @@ export function normalizeTaskCommand(input = {}) {
     if (input.permissionMode !== undefined && !PERMISSION_MODES.has(input.permissionMode)) throw commandError('权限模式无效')
     if (input.thinkingLevel !== undefined && !THINKING_LEVELS.has(input.thinkingLevel)) throw commandError('思考档位无效')
     if (input.modelMode !== undefined && !MODEL_MODES.has(input.modelMode)) throw commandError('模型模式无效')
+    if (input.contextSwitchMode !== undefined && !CONTEXT_SWITCH_MODES.has(input.contextSwitchMode)) throw commandError('模型上下文切换模式无效')
     if (input.hasAttachments !== undefined && typeof input.hasAttachments !== 'boolean') throw commandError('附件标记无效')
 
     return {
@@ -60,6 +62,7 @@ export function normalizeTaskCommand(input = {}) {
         modelMode: input.modelMode || 'auto',
         model: optionalString(input.model, 256),
         modelMeta: optionalJsonObject(input.modelMeta),
+        contextSwitchMode: input.contextSwitchMode || 'full_history',
         hasAttachments: input.hasAttachments === true,
         noWorkflow: input.noWorkflow === true,
     }

@@ -35,7 +35,7 @@ const GW = 'http://127.0.0.1:3456'
 // 功能说明: 控制左侧导航高亮状态和右侧内容区显示哪个配置模块
 // 实现方式: ref<string>，默认 'general'；switchTab() 负责切换并懒加载对应数据
 const activeTab = ref('general')
-type TabKey = 'general' | 'skills' | 'agents' | 'commands' | 'hooks' | 'rules' | 'memory' | 'mcp' | 'workflow' | 'im' | 'scheduler' | 'oss'
+type TabKey = 'general' | 'workbench' | 'skills' | 'agents' | 'commands' | 'hooks' | 'rules' | 'memory' | 'mcp' | 'workflow' | 'im' | 'scheduler' | 'oss'
 
 // ── Tab 导航定义列表 ──
 // 功能说明: 左侧导航栏的入口项配置，每个包含 key（标识符）/ label（中文名）/ icon / desc（描述文字）
@@ -50,6 +50,12 @@ const tabs: { key: TabKey; label: string; icon: string; desc: string }[] = [
     label: '常规',
     icon: ri('<circle cx="12" cy="12" r="10"/><path d="M17.5 2.5V10h-7.5"/><path d="M12 2a10 10 0 1 0 9.97 10.57"/>'),
     desc: '模型、权限与连接配置'
+  },
+  {
+    key: 'workbench',
+    label: '架构运行',
+    icon: ri('<path d="M4 4h16v5H4zM4 13h7v7H4zM15 13h5v7h-5z"/>'),
+    desc: '任务证据、Pitfall 与 AI 健康'
   },
   {
     key: 'skills',
@@ -118,6 +124,93 @@ const tabs: { key: TabKey; label: string; icon: string; desc: string }[] = [
     desc: '开源项目版本管理与配置'
   },
 ]
+
+// ── 内置资源统一开关（由所属模块调用，不提供第二个配置入口）──
+async function toggleBuiltinResource(resource: any, refresh?: () => Promise<void>) {
+  if (resource.required) return
+  const previous = resource.enabled
+  resource.enabled = !previous
+  try {
+    const response = await fetch(`${GW}/api/config/builtin-resources/${encodeURIComponent(resource.type)}/${encodeURIComponent(resource.id)}`, {
+      method: 'PUT', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({enabled: resource.enabled}),
+    })
+    const data = await response.json()
+    if (!response.ok) throw new Error(data.error || '保存内置资源状态失败')
+    Object.assign(resource, data.resource || {})
+    await refresh?.()
+  } catch (error: any) {
+    resource.enabled = previous
+    showAlert(error?.message || '保存内置资源状态失败')
+  }
+}
+
+// ── Workbench 架构运行状态 ──
+const workbenchLoading = ref(false)
+const workbenchError = ref('')
+const workbenchProjectKey = ref('')
+const executionReports = ref<any[]>([])
+const workbenchPitfalls = ref<any[]>([])
+const aiLayerHealth = ref<any>(null)
+const ruleDriftCandidates = ref<any[]>([])
+const pitfallDrafts = ref<Record<string, {rootCause: string; prevention: string; evidence: string}>>({})
+
+function workbenchQuery(): string {
+  return workbenchProjectKey.value.trim() ? `?projectKey=${encodeURIComponent(workbenchProjectKey.value.trim())}` : ''
+}
+
+function formatWorkbenchTime(value: unknown): string {
+  const timestamp = Number(value)
+  return Number.isFinite(timestamp) && timestamp > 0 ? new Date(timestamp).toLocaleString('zh-CN') : '未记录'
+}
+
+async function loadWorkbench() {
+  workbenchLoading.value = true
+  workbenchError.value = ''
+  try {
+    const suffix = workbenchQuery()
+    const [reportsResponse, pitfallsResponse, healthResponse] = await Promise.all([
+      fetch(`${GW}/api/workbench/reports${suffix}`),
+      fetch(`${GW}/api/workbench/pitfalls${suffix}`),
+      fetch(`${GW}/api/workbench/ai-health${suffix}`),
+    ])
+    const reportsData = await reportsResponse.json()
+    const pitfallsData = await pitfallsResponse.json()
+    const healthData = await healthResponse.json()
+    if (!reportsResponse.ok) throw new Error(reportsData.error || '加载执行报告失败')
+    if (!pitfallsResponse.ok) throw new Error(pitfallsData.error || '加载 Pitfall 失败')
+    executionReports.value = reportsData.reports || []
+    workbenchPitfalls.value = pitfallsData.pitfalls || []
+    aiLayerHealth.value = healthData.health || null
+    ruleDriftCandidates.value = healthData.driftCandidates || []
+    for (const item of workbenchPitfalls.value) {
+      pitfallDrafts.value[item.id] ||= {rootCause: item.rootCause || '', prevention: item.prevention || '', evidence: ''}
+    }
+  } catch (error: any) {
+    workbenchError.value = error?.message || '加载架构运行状态失败'
+  } finally {
+    workbenchLoading.value = false
+  }
+}
+
+async function updateWorkbenchPitfall(item: any, action: 'confirm' | 'ignore' | 'archive' | 'verify') {
+  const draft = pitfallDrafts.value[item.id] || {rootCause: '', prevention: '', evidence: ''}
+  if (action === 'verify' && !draft.evidence.trim()) {
+    showAlert('请输入缓解验证证据')
+    return
+  }
+  try {
+    const response = await fetch(`${GW}/api/workbench/pitfalls/${encodeURIComponent(item.id)}`, {
+      method: 'PUT', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({action, ...draft}),
+    })
+    const data = await response.json()
+    if (!response.ok) throw new Error(data.error || '更新 Pitfall 失败')
+    await loadWorkbench()
+  } catch (error: any) {
+    showAlert(error?.message || '更新 Pitfall 失败')
+  }
+}
 
 // ── 常规设置数据 (General Tab) - AI 供应商 / API Key / 模型列表 / 会话参数 / 主题语言 ──
 const DEFAULT_SETTINGS = {
@@ -781,6 +874,10 @@ async function loadDisabledSkills() {
   } catch (e) { console.error(e) }
 }
 async function toggleSkillEnabled(skill: any) {
+  if (skill.source === 'builtin') {
+    await toggleBuiltinResource({type: 'skill', id: skill.name, enabled: skill.enabled, required: skill.required}, loadSkills)
+    return
+  }
   const name = skill.name
   const disabled = !disabledSkills.value.includes(name)
   try {
@@ -1064,6 +1161,7 @@ const commands = ref<any[]>([])
 const commandsLoading = ref(false)
 // ── 是否来自 live 查询（true=运行时实时, false=缓存/预设）──
 const commandsLive = ref(false)
+const commandsEnabled = ref(true)
 // ── 搜索关键词（实时过滤）──
 const commandSearch = ref('')
 // ── Commands 来源筛选 ──
@@ -1083,6 +1181,7 @@ async function loadCommands() {
       const data = await res.json();
       commands.value = data.commands || [];
       commandsLive.value = !!data.live
+      commandsEnabled.value = data.builtinEnabled !== false
     }
   } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
   commandsLoading.value = false
@@ -1603,7 +1702,7 @@ const mcpSourceCounts = computed(() => {
 const mcpAll = computed(() => {
   const items: any[] = []
   for (const p of mcpPlugins.value) {
-    items.push({_kind: p.source === 'builtin' ? 'builtin' : 'plugin', name: p.name, source: p.source, enabled: !disabledMcpPlugins.value.includes(p.name), version: p.version, scope: p.scope})
+    items.push({_kind: p.source === 'builtin' ? 'builtin' : 'plugin', name: p.name, source: p.source, enabled: p.enabled !== false, required: p.required === true, version: p.version, scope: p.scope})
   }
   for (const s of mcpServers.value) {
     items.push({_kind: 'server', name: s.name, source: 'custom', enabled: s.enabled !== false, transport: s.transport, command: s.command, url: s.url, args: s.args, env: s.env, headers: s.headers})
@@ -1666,6 +1765,10 @@ async function loadDisabledMcpPlugins() {
 
 // ── 切换 MCP 插件启用/禁用 ──
 async function toggleMcpPlugin(plugin: any) {
+  if (plugin.source === 'builtin') {
+    await toggleBuiltinResource({type: 'mcp', id: plugin.name, enabled: plugin.enabled, required: plugin.required}, loadMcp)
+    return
+  }
   const name = plugin.name
   const disabled = !disabledMcpPlugins.value.includes(name)
   try {
@@ -2234,6 +2337,7 @@ function switchTab(key: TabKey) {
     loadSettings();
     loadProviders()
   }
+  if (key === 'workbench' && !workbenchLoading.value) loadWorkbench()
   if (key === 'oss') {
     loadCavemanConfig()
     loadRtkConfig()
@@ -2254,6 +2358,7 @@ let petPollTimer: ReturnType<typeof setInterval> | null = null
 // 并行加载所有模块数据
 async function loadAllModules() {
   const modules: Array<{ key: string; fn: () => Promise<void> }> = [
+    {key: 'workbench', fn: loadWorkbench},
     {key: 'skills', fn: loadSkills},
     {key: 'disabledSkills', fn: loadDisabledSkills},
     {key: 'agents', fn: loadAgents},
@@ -2289,6 +2394,7 @@ async function retryModule(key: string) {
     hooks: loadHooks, rules: loadRules, memory: loadMemorySummary,
     mcp: loadMcp, disabledMcpPlugins: loadDisabledMcpPlugins, mcpServers: loadMcpServers, im: loadIM, scheduler: loadScheduledTasks,
     preferences: loadPreferences,
+    workbench: loadWorkbench,
   }
   if (map[key]) {
     try {
@@ -2665,6 +2771,95 @@ onUnmounted(() => {
           </div>
         </template>
 
+        <!-- ──── Workbench Tab: 执行报告、Pitfall 与 AI 层健康 ──── -->
+        <template v-if="activeTab === 'workbench'">
+          <div v-if="workbenchLoading && !aiLayerHealth" class="loading-state">加载架构运行状态...</div>
+          <div v-else class="list-panel workbench-panel">
+            <div v-if="workbenchError" class="error-banner">
+              <span>{{ workbenchError }}</span>
+              <button class="retry-btn" @click="loadWorkbench">重试</button>
+            </div>
+            <div class="module-header">
+              <div class="module-header-left">
+                <span class="module-title">架构运行</span>
+                <span class="cat-badge" :class="aiLayerHealth?.healthy ? 'device' : 'danger'">{{ aiLayerHealth?.healthy ? '健康' : '需处理' }}</span>
+              </div>
+              <button class="refresh-btn" :class="{spinning: workbenchLoading}" @click="loadWorkbench" :disabled="workbenchLoading" title="刷新">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 5v4h4M4 13a8.1 8.1 0 0 0 15.5 2M20 19v-4h-4"/></svg>
+              </button>
+            </div>
+
+            <div class="workbench-filter">
+              <label for="workbench-project-key">项目键</label>
+              <input id="workbench-project-key" v-model="workbenchProjectKey" class="text-input" placeholder="全部项目" @keyup.enter="loadWorkbench" />
+              <button class="btn-secondary btn-sm" @click="loadWorkbench">筛选</button>
+            </div>
+
+            <section class="workbench-band">
+              <h3 class="section-title">AI 层健康</h3>
+              <div class="workbench-metrics">
+                <span>资源 {{ aiLayerHealth?.totals?.resources || 0 }}</span>
+                <span>已安装 {{ aiLayerHealth?.totals?.installed || 0 }}</span>
+                <span>已启用 {{ aiLayerHealth?.totals?.enabled || 0 }}</span>
+                <span>本地定制 {{ aiLayerHealth?.totals?.customized || 0 }}</span>
+              </div>
+              <div v-if="!aiLayerHealth?.issues?.length" class="empty-state-sm">未发现资源健康问题</div>
+              <div v-for="issue in aiLayerHealth?.issues || []" :key="issue.code + ':' + issue.resource" class="workbench-row">
+                <span class="cat-badge" :class="issue.severity === 'error' ? 'danger' : 'device'">{{ issue.severity }}</span>
+                <strong>{{ issue.resource }}</strong>
+                <span>{{ issue.detail }}</span>
+              </div>
+              <div v-for="candidate in ruleDriftCandidates" :key="JSON.stringify(candidate)" class="workbench-row">
+                <span class="cat-badge custom-badge">漂移候选</span>
+                <strong>{{ candidate.type }}</strong>
+                <span>{{ candidate.skill || candidate.pitfallId }} · {{ candidate.occurrences || 1 }} 次</span>
+              </div>
+            </section>
+
+            <section class="workbench-band">
+              <h3 class="section-title">执行报告</h3>
+              <div v-if="executionReports.length === 0" class="empty-state-sm">暂无执行报告</div>
+              <div v-for="report in executionReports" :key="report.taskId" class="workbench-report-row">
+                <div class="workbench-row-main">
+                  <strong>{{ report.taskId }}</strong>
+                  <span>{{ formatWorkbenchTime(report.completedAt || report.startedAt) }}</span>
+                </div>
+                <div class="workbench-metrics">
+                  <span>状态 {{ report.status }}</span>
+                  <span>步骤 {{ report.actualSteps?.length || 0 }}/{{ report.plannedSteps?.length || 0 }}</span>
+                  <span>文件 {{ report.changedFiles?.length || 0 }}</span>
+                  <span>证据 {{ report.verification?.evidenceLevel || 'L0' }}</span>
+                  <span>风险 {{ report.unresolvedRisks?.length || 0 }}</span>
+                </div>
+              </div>
+            </section>
+
+            <section class="workbench-band">
+              <h3 class="section-title">Pitfall Ledger</h3>
+              <div v-if="workbenchPitfalls.length === 0" class="empty-state-sm">暂无 Pitfall</div>
+              <div v-for="item in workbenchPitfalls" :key="item.id" class="workbench-pitfall-row">
+                <div class="workbench-row-main">
+                  <strong>{{ item.title }}</strong>
+                  <span class="cat-badge device">{{ item.status }}</span>
+                  <span>{{ item.projectKey }}</span>
+                </div>
+                <p>{{ item.summary }}</p>
+                <div class="workbench-pitfall-fields">
+                  <input v-model="pitfallDrafts[item.id].rootCause" class="text-input" placeholder="根因" />
+                  <input v-model="pitfallDrafts[item.id].prevention" class="text-input" placeholder="预防措施" />
+                  <input v-model="pitfallDrafts[item.id].evidence" class="text-input" placeholder="验证证据" />
+                </div>
+                <div class="workbench-actions">
+                  <button class="btn-secondary btn-sm" @click="updateWorkbenchPitfall(item, 'confirm')">确认</button>
+                  <button class="btn-secondary btn-sm" @click="updateWorkbenchPitfall(item, 'verify')">验证</button>
+                  <button class="btn-text" @click="updateWorkbenchPitfall(item, 'ignore')">忽略</button>
+                  <button class="btn-text" @click="updateWorkbenchPitfall(item, 'archive')">归档</button>
+                </div>
+              </div>
+            </section>
+          </div>
+        </template>
+
         <!-- ──── Skills Tab: 分类标签 + 新建表单 + 列表(含分类徽章) + 全屏 code-editor 编辑 ──── -->
         <template v-if="activeTab === 'skills'">
           <div v-if="skillsLoading && skills.length === 0" class="loading-state">{{ t('common.loading') }}</div>
@@ -2749,7 +2944,7 @@ onUnmounted(() => {
               <!-- 列表: 内置只显示名称+徽章(只读)，自定义可编辑+开关 -->
               <div class="item-list">
                 <div v-for="skill in filteredSkills" :key="skill.name" class="list-item"
-                     :class="{ readonly: skill.source === 'builtin', disabled: skill.source === 'custom' && disabledSkills.includes(skill.name) }"
+                     :class="{ readonly: skill.source === 'builtin', disabled: skill.enabled === false }"
                      @click="skill.content !== null && startEditSkill(skill)" style="opacity:1">
                   <div class="item-icon"
                        v-html="skill.source === 'builtin' ? ri('<rect x=&quot;3&quot; y=&quot;11&quot; width=&quot;18&quot; height=&quot;11&quot; rx=&quot;2&quot; ry=&quot;2&quot;/><path d=&quot;M7 11V7a5 5 0 0 1 10 0v4&quot;/>') : ri('<polygon points=&quot;12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2&quot;/>')"></div>
@@ -2759,23 +2954,23 @@ onUnmounted(() => {
                       <span class="cat-badge" :class="{ device: skill.source === 'builtin' }">{{
                           skill.source === 'builtin' ? t('common.builtin') : t('common.custom')
                         }}</span>
-                      <span v-if="skill.source === 'custom' && disabledSkills.includes(skill.name)" class="cat-badge" style="background:rgba(233,69,96,0.08);color:var(--error)">{{ t('common.disabled') }}</span>
+                      <span v-if="skill.enabled === false" class="cat-badge" style="background:rgba(233,69,96,0.08);color:var(--error)">{{ t('common.disabled') }}</span>
                     </div>
                   </div>
-                  <!-- 仅自定义 skill 可开关/删除；已禁用的才能删除 -->
-                  <template v-if="skill.source === 'custom'">
-                    <button v-if="disabledSkills.includes(skill.name) && pendingDeleteSkill !== skill.name" class="btn-icon" title="删除"
+                  <!-- 内置 Skill 只允许切换运行时加载；自定义 Skill 可在禁用后删除。 -->
+                  <template>
+                    <button v-if="skill.source === 'custom' && disabledSkills.includes(skill.name) && pendingDeleteSkill !== skill.name" class="btn-icon" title="删除"
                             @click.stop="deleteSkill(skill.name)"
                             style="padding:4px 8px;margin-right:6px;color:var(--error);border:1px solid var(--error);border-radius:6px;font-size:12px;background:transparent;cursor:pointer">
                       {{ t('common.delete') }}
                     </button>
-                    <button v-else-if="disabledSkills.includes(skill.name)" class="btn-icon" title="确认删除"
+                    <button v-else-if="skill.source === 'custom' && disabledSkills.includes(skill.name)" class="btn-icon" title="确认删除"
                             @click.stop="deleteSkill(skill.name)"
                             style="padding:4px 8px;margin-right:6px;color:#fff;background:var(--error);border:1px solid var(--error);border-radius:6px;font-size:12px;cursor:pointer">
                       {{ t('common.confirm') }}
                     </button>
                     <label class="toggle-switch" @click.stop="toggleSkillEnabled(skill)" style="margin-right:10px">
-                      <input type="checkbox" :checked="!disabledSkills.includes(skill.name)" @click.stop @change="toggleSkillEnabled(skill)"/>
+                      <input type="checkbox" :checked="skill.enabled !== false" :disabled="skill.required" @click.stop @change="toggleSkillEnabled(skill)"/>
                       <span class="toggle-slider"></span>
                     </label>
                     <svg v-if="skill.content !== null" class="item-arrow" width="14" height="14" viewBox="0 0 24 24"
@@ -2784,7 +2979,6 @@ onUnmounted(() => {
                       <polyline points="9 18 15 12 9 6"/>
                     </svg>
                   </template>
-                  <span v-else class="item-right-tag">{{ t('common.readOnly') }}</span>
                 </div>
                 <div v-if="filteredSkills.length === 0" class="empty-state-sm">{{ t('skills.empty') }}</div>
               </div>
@@ -2873,7 +3067,11 @@ onUnmounted(() => {
                     <div class="item-desc">{{ agent.description || t('common.noDesc') }}</div>
                   </div>
                   <span class="skill-allowed">{{ agent.tools || t('agents.inheritAll') }}</span>
-                  <button v-if="agent.content !== null" class="btn-danger-sm" @click.stop="deleteAgent(agent)"
+                  <label v-if="agent.source === 'builtin'" class="toggle-switch" @click.stop="toggleBuiltinResource({type: 'agent', id: agent.name, enabled: agent.enabled, required: agent.required}, loadAgents)" style="margin-right:10px">
+                    <input type="checkbox" :checked="agent.enabled !== false" :disabled="agent.required" @click.stop @change="toggleBuiltinResource({type: 'agent', id: agent.name, enabled: agent.enabled, required: agent.required}, loadAgents)"/>
+                    <span class="toggle-slider"></span>
+                  </label>
+                  <button v-if="agent.content !== null && agent.source === 'custom'" class="btn-danger-sm" @click.stop="deleteAgent(agent)"
                           :title="t('common.delete')">
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                          stroke-linecap="round" stroke-linejoin="round">
@@ -2908,6 +3106,10 @@ onUnmounted(() => {
                   }}</span>
                 <span class="cat-badge device">{{ t('common.builtin') }} {{ commandsSourceCounts.builtin }}</span>
                 <span class="cat-badge custom-badge">{{ t('common.custom') }} {{ commandsSourceCounts.custom }}</span>
+                <label class="toggle-switch" @click.stop="toggleBuiltinResource({type: 'command', id: 'commands', enabled: commandsEnabled, required: false}, loadCommands)" title="内置命令运行时开关">
+                  <input type="checkbox" :checked="commandsEnabled" @click.stop @change="toggleBuiltinResource({type: 'command', id: 'commands', enabled: commandsEnabled, required: false}, loadCommands)"/>
+                  <span class="toggle-slider"></span>
+                </label>
               </div>
               <div style="display:flex;align-items:center;gap:8px;margin-left:auto">
                 <button class="refresh-btn" :class="{ spinning: commandsLoading }" @click="loadCommands"
@@ -2939,7 +3141,7 @@ onUnmounted(() => {
             </div>
             <div v-if="!commandsLive" class="empty-hint-sm" style="margin:8px 0">{{ t('cmd.cacheHint') }}</div>
             <div class="item-list">
-              <div v-for="cmd in filteredCommands" :key="cmd.name" class="list-item">
+              <div v-for="cmd in filteredCommands" :key="cmd.name" class="list-item" :class="{disabled: cmd.enabled === false}">
                 <div class="item-icon"
                      v-html="ri('<polyline points=&quot;4 17 10 11 4 5&quot;/><line x1=&quot;12&quot; y1=&quot;19&quot; x2=&quot;20&quot; y2=&quot;19&quot;/>')"></div>
                 <div class="item-info">
@@ -2950,6 +3152,7 @@ onUnmounted(() => {
                     <span class="cat-badge" :class="{ device: cmd.source === 'builtin' }" style="margin-left:6px">{{
                         cmd.source === 'builtin' ? t('common.builtin') : t('common.custom')
                       }}</span>
+                    <span v-if="cmd.enabled === false" class="cat-badge" style="background:rgba(233,69,96,0.08);color:var(--error)">{{ t('common.disabled') }}</span>
                   </div>
                   <div class="item-desc">{{ cmd.description || t('common.noDesc') }}</div>
                 </div>
@@ -2986,6 +3189,7 @@ onUnmounted(() => {
             <div class="module-header">
               <div class="module-header-left">
                 <span style="font-family:var(--font-heading);font-size:17px;font-weight:600">{{ t('tab.hooks') }}</span>
+                <span class="cat-badge device">Bridge 生命周期 Hook 必需</span>
                 <span class="cat-badge custom-badge">{{
                     t('common.custom')
                   }} {{
@@ -3120,6 +3324,10 @@ onUnmounted(() => {
                     <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
                   </svg>
                 </button>
+                <label v-if="rule.source === 'builtin'" class="toggle-switch" @click.stop="toggleBuiltinResource({type: 'rule', id: rule.filename.replace(/\\.md$/, ''), enabled: rule.enabled, required: rule.required}, loadRules)" style="margin-right:10px">
+                  <input type="checkbox" :checked="rule.enabled !== false" :disabled="rule.required" @click.stop @change="toggleBuiltinResource({type: 'rule', id: rule.filename.replace(/\\.md$/, ''), enabled: rule.enabled, required: rule.required}, loadRules)"/>
+                  <span class="toggle-slider"></span>
+                </label>
                 <svg class="item-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                      stroke-width="2" stroke-linecap="round" stroke-linejoin="round" @click="startEditRule(rule)">
                   <polyline points="9 18 15 12 9 6"/>
@@ -5362,6 +5570,12 @@ input[type="time"].field-input::-webkit-calendar-picker-indicator {
   color: var(--success);
 }
 
+.cat-badge.danger {
+  background: var(--bg-raised);
+  color: var(--error);
+  border: 1px solid var(--error);
+}
+
 .badge-type {
   background: rgba(233, 69, 96, 0.08);
   color: var(--accent);
@@ -6093,5 +6307,37 @@ input[type="time"].field-input::-webkit-calendar-picker-indicator {
 .tier-info { display:flex; flex-direction:column; gap:1px; min-width:0 }
 .tier-label { font-size:12px; font-weight:600; color:var(--text-primary) }
 .tier-desc { font-size:10px; color:var(--text-muted) }
+
+.builtin-resource-group { margin-top: 20px; }
+.builtin-resource-group .section-title { margin-bottom: 8px; }
+.builtin-resource-row { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:11px 12px; border:1px solid var(--border); border-radius:var(--radius-input); background:var(--bg-raised); margin-bottom:6px; }
+.builtin-resource-info { display:flex; flex-direction:column; gap:3px; min-width:0; }
+.builtin-resource-info strong { color:var(--text-primary); font-size:13px; font-family:var(--font-mono); }
+.builtin-resource-info span { color:var(--text-muted); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.builtin-resource-info small { font-size:11px; }
+.workbench-panel { display:flex; flex-direction:column; gap:0; }
+.module-title { font-family:var(--font-heading); font-size:17px; font-weight:600; }
+.workbench-filter { display:grid; grid-template-columns:auto minmax(220px, 1fr) auto; align-items:center; gap:10px; padding:12px 0 18px; border-bottom:1px solid var(--border); }
+.workbench-filter label { color:var(--text-secondary); font-size:12px; }
+.workbench-band { padding:20px 0; border-bottom:1px solid var(--border); }
+.workbench-band:last-child { border-bottom:0; }
+.workbench-metrics { display:flex; flex-wrap:wrap; gap:8px 16px; color:var(--text-secondary); font-size:12px; margin:8px 0 12px; }
+.workbench-row, .workbench-row-main { display:flex; align-items:center; flex-wrap:wrap; gap:8px; min-width:0; }
+.workbench-row { padding:8px 0; border-top:1px solid var(--border); }
+.workbench-row span:last-child, .workbench-row-main > span:last-child { color:var(--text-muted); font-size:12px; }
+.workbench-report-row, .workbench-pitfall-row { padding:12px 0; border-top:1px solid var(--border); }
+.workbench-report-row:first-of-type, .workbench-pitfall-row:first-of-type { border-top:0; }
+.workbench-pitfall-row p { margin:8px 0; color:var(--text-secondary); font-size:12px; white-space:pre-wrap; overflow-wrap:anywhere; }
+.workbench-pitfall-fields { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:8px; }
+.workbench-actions { display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin-top:10px; }
+@media (max-width: 760px) {
+  .workbench-filter { grid-template-columns:1fr; }
+  .workbench-pitfall-fields { grid-template-columns:1fr; }
+}
+.switch-control { width:38px; height:22px; border:0; border-radius:11px; background:var(--border); padding:2px; cursor:pointer; flex:0 0 auto; transition:background .15s ease; }
+.switch-control.active { background:var(--accent-blue); }
+.switch-control:disabled { opacity:.55; cursor:not-allowed; }
+.switch-knob { display:block; width:18px; height:18px; border-radius:50%; background:#fff; transform:translateX(0); transition:transform .15s ease; }
+.switch-control.active .switch-knob { transform:translateX(16px); }
 
 </style>

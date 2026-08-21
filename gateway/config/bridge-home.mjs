@@ -1,6 +1,7 @@
 import {cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync} from 'node:fs'
 import {homedir} from 'node:os'
 import {isAbsolute, join, normalize, resolve} from 'node:path'
+import {ensureBuiltinResources, migrateLegacyBuiltinResourceState} from './builtin-resources.mjs'
 
 const MIGRATION_VERSION = 1
 const MIGRATION_MARKER = `.bridge-migration-v${MIGRATION_VERSION}.json`
@@ -168,6 +169,8 @@ export function prepareBridgeHome({
     }
 
     mkdirSync(targetRoot, {recursive: true})
+    // 内置资源先补齐到 Bridge 私有目录；只复制缺失或未被用户修改的版本。
+    const builtinResources = ensureBuiltinResources({bridgeHome: targetRoot})
     const markerPath = join(targetRoot, MIGRATION_MARKER)
     let previous = null
     try {
@@ -176,8 +179,9 @@ export function prepareBridgeHome({
         previous = null
     }
     if (previous?.completed === true && previous?.version === MIGRATION_VERSION) {
+        const resourceStateMigration = migrateLegacyBuiltinResourceState({bridgeHome: targetRoot})
         configureClaudeRuntime(targetRoot)
-        return {...previous, markerPath, alreadyComplete: true}
+        return {...previous, markerPath, alreadyComplete: true, builtinResources, resourceStateMigration}
     }
 
     const result = {
@@ -211,6 +215,7 @@ export function prepareBridgeHome({
         }
     }
 
+    const resourceStateMigration = migrateLegacyBuiltinResourceState({bridgeHome: targetRoot})
     result.completed = result.failures.length === 0
     atomicWriteJson(markerPath, result)
     configureClaudeRuntime(targetRoot)
@@ -220,5 +225,5 @@ export function prepareBridgeHome({
         error.failures = result.failures
         throw error
     }
-    return {...result, markerPath, alreadyComplete: false}
+    return {...result, markerPath, alreadyComplete: false, builtinResources, resourceStateMigration}
 }

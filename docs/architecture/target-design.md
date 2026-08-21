@@ -205,12 +205,62 @@ Gateway 保持单进程 modular monolith。`gateway/index.mjs` 是唯一组合�
 | `context/` | Bridge 规则、上下文档位、压缩生命周期和结构化偏好 | `shared/`、`security/`、`tasks/` |
 | `tools/` | 附件、上传和 RTK 等可复用工具支持 | `shared/`、`security/` |
 
-`shared/` 不得反向依赖任何领域目录；IM adapter 不直接修改 Session 内部状态；Workflow 不解释 HTTP、WebSocket 或 IM 协议。跨领域行为由 `index.mjs` 组合，后续再提取显式 coordinator，目录迁移本身不改变公开 API、持久化格式或运行进程数。
+`shared/` 不得反向依赖任何领域目录；IM adapter 不直接修改 Session 内部状态；Workflow 不解释 HTTP、WebSocket 或 IM 协议。`tasks/task-coordinator.mjs` 已承担显式任务权威，跨领域依赖仍由 `index.mjs` 组合；后续瘦身组合根时不得复制 Coordinator 状态或改变公开 API、持久化格式和运行进程数。
 
 ## 上下文规则分层与内置 Skill
 
 - 跨项目规则由 `BRIDGE_RULES.md` 持有；Bridge 仓库专属规则由 `BRIDGE_PROJECT_RULES.md` 持有。完整 Query 创建和重建统一传递当前 `workDir`，只有绝对路径位于运行时仓库根目录或子目录时才追加专属层。
 - 完整会话仅启用 Bridge 私有 `user` setting source，不读取用户机器上的 Claude/Codex 配置、目标项目 `CLAUDE.md`、`AGENTS.md` 或 Codex Skill；轻量问答和聚焦只读上下文继续使用 `settingSources: []`。
 - 数字孪生路由要求孪生上下文与 CAD/STEP/GLB、节点映射、遥测状态、URDF/SDF 或 manifest 集成证据同时出现；CAD/GLB 节点绑定和遥测驱动模型状态可作为直接证据。
-- `digital-twin-cad` 是 Bridge 自带但按需准备的 Skill。首次命中且用户目录不存在同名文件时写入；已有文件不覆盖，源缺失或目录不可写时在 Query 创建前明确失败。
-- 回滚只需恢复单层规则选择并移除路由接线；已经写入用户 Skill 目录的文件不自动删除，防止删除用户后续修改。
+- `digital-twin-cad` 是 Bridge 自带但按需准备的 Skill。应用包携带源文件，首次命中且 `BRIDGE_HOME/skills` 不存在同名文件时写入；已有文件不覆盖，不写入 Claude/Codex 外部目录，源缺失或目录不可写时在 Query 创建前明确失败。其他 Skill 只有在用户自己的 Bridge 私有目录中存在时才可用。
+- 回滚只需恢复单层规则选择并移除路由接线；已经写入 `BRIDGE_HOME/skills` 的文件不自动删除，防止删除用户后续修改。
+
+## 通用 AI 编程工作台目标架构
+
+## 模型上下文连续性、缓存资格与用量证据
+
+Bridge 将三类状态严格分离：会话连续性由 SDK `resume` 和 transcript 负责；Provider 推理缓存资格由 `ContextEnvelope` 判断；账单/用量以 Provider 的真实 response usage 为准。`resume` 不表示 cache hit、免费或折扣，Bridge 也不会导出、传递或伪造任何模型内部推理状态。
+
+- `ContextEnvelope` 只包含版本、Provider 的哈希身份、具体模型、协议族、resume 可用性及规则/Skill/Agent/工具/上下文档位的稳定哈希；不包含 Prompt、凭据、绝对路径、transcript 或思考正文。
+- `same_partition_possible` 只表示同 Provider、同具体模型、同协议和同稳定 envelope 的本地资格可能存在；没有实际 usage 时缓存状态为 `unknown`。
+- 模型或 Provider 切换为 `cross_model_unavailable`。用户可选完整历史、有限 handoff 或取消；handoff 仅含目标、确认状态、变更文件和验证状态，明确不能替代完整历史。
+- `model_usage_observed` 与 SQLite `bridge_model_usage_events` 保存 input、output、cache read、cache creation、策略和时长。缺失字段为 `null`，source 为 `partial` 或 `unknown`，不把未知写为 0 或账单事实。
+- 自动模型路由和进行中的补充消息仍遵守回合边界，运行中的 Query 不因新模型选择而中断。
+
+```text
+Desktop / WeChat / Feishu / DingTalk
+              -> Task Command API
+              -> Task Coordinator
+              -> Project Context + Resource Routing
+              -> Agent / Workflow Execution
+              -> Verification Campaign
+              -> Completion Gate
+              -> Desktop events + IM notification outbox
+```
+
+### 边界与所有权
+
+- Bridge 拥有 Task ID、阶段、模型档位、权限、Agent 生命周期、资源开关、验证状态、Pitfall 索引和通知意图；目标项目拥有代码、构建、测试、运行时、设备与业务验收。
+- Coordinator 是任务状态的唯一权威。Workflow 只编排步骤，Agent 只返回结构化结果，IM 只消费 Coordinator 关键事件与终态 outbox。
+- `bridge_task_state` 仅保存有界投影，不复制 transcript、最终回复或审查正文。Coordinator 使用 `<taskId>:coordinator` 键，与兼容 task-state revision 隔离；Session Event Journal 和旧 JSON 在迁移期继续可读。
+- 新任务由 `TaskWorkbenchRuntime` 直接驱动 Coordinator；SDK result、Workflow 和 Agent 不经过独立完成判断，只能回写结构化结果与生命周期事件。兼容映射不参与新任务生产推进，只负责旧投影恢复与兼容验证。
+
+### 完成与失败契约
+
+- `completed` 必须同时满足步骤、子执行、finding、测试、验证和通知意图门禁。L0/L1 不能替代要求 Runtime 或端到端证据的验收。
+- `paused`、`not_verified`、`inconclusive`、`blocked_environment`、`regression_detected` 和 RCA 终态均提供继续入口或明确下一步，但不是成功。重启中断的活动执行转为 `inconclusive`，不会恢复成虚假的 running。
+- 每个稳定终态都生成 Execution Report；终态后只允许附加报告和 RCA 只读投影，迟到阶段、Agent 或 Workflow 事件不得改写结果。
+- 命令适配器只执行 Project Context 生成的结构化可执行名和参数；Windows shim 在拒绝 shell 元字符后才启用系统 shell，其他命令保持 `shell:false`。
+
+### 非功能目标与证据状态
+
+| 维度 | 目标或当前门禁 |
+|---|---|
+| 上下文成本 | Light 零项目扫描；其余扫描有限深度、文件数和单文件大小 |
+| 并发 | 单任务 Coordinator 串行 revision；最多 8 个已选择 Agent |
+| durability | task-state、Journal、SQLite 投影并存；通知使用确定性 ID 幂等重试 |
+| security | 不持久化凭据/正文；命令白名单、路径边界、timeout/cancellation |
+| observability | 每个阶段事件包含 taskId、stepId、phase、role、sequence 和验证摘要 |
+| availability | SQLite 不可用时保留文件兼容路径；外部环境不可用时明确阻塞 |
+
+延迟、吞吐、长时间稳定性和真实 IM 送达目前没有生产测量数据，不能由单元测试或临时项目 Smoke 代替。

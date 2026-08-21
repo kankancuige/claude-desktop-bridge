@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import {
     buildProjectContinuationContext,
     composeContinuationPrompt,
+    buildModelHandoffPrompt,
     isReferentialContinuation,
 } from './project-continuation-context.mjs'
 
@@ -35,6 +36,17 @@ test('只有明确省略关系的短句触发跨会话接力', () => {
     for (const text of ['检查 Form1 协议实现', '继续分析这个新的日志错误，错误码是 401', '新增一个独立设置页']) {
         assert.equal(isReferentialContinuation(text), false, text)
     }
+})
+
+test('模型 handoff 只发送有限状态摘要，并标注不能替代完整历史', () => {
+    const handoff = buildModelHandoffPrompt({
+        prompt: '继续修复',
+        session: {taskState: {detail: '已定位根因'}, taskCompletion: {phase: 'fixing'}, taskReviewFiles: [{path: 'gateway/index.mjs'}]},
+    })
+    assert.match(handoff, /bridge-model-handoff/)
+    assert.match(handoff, /可能遗漏细节/)
+    assert.match(handoff, /gateway\/index\.mjs/)
+    assert.ok(handoff.endsWith('===== 当前用户消息 =====\n继续修复'))
 })
 
 test('选择最近的实质主会话并跳过断裂续话与 agent transcript', () => {

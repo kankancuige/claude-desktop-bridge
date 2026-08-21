@@ -7,6 +7,8 @@ export function turnFallbackText(reason) {
             return '任务未完成，请在当前会话查看错误并重试'
         case 'task_review_paused':
             return '最终审查已暂停，请在当前会话继续处理'
+        case 'task_verification_inconclusive':
+            return '任务验证不足，已保留当前会话供继续处理'
         case 'stopped':
             return '会话已停止'
         case 'duplicate':

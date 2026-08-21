@@ -1,6 +1,7 @@
 // workflow-child.mjs - Workflow 子进程执行边界
 // Workflow 仅面向可信本地脚本；独立进程和受限 VM context 用于降低误操作影响，不是 OS 级安全沙箱。
 import {createContext, runInContext} from 'node:vm'
+import {stripWorkflowExports} from './workflow-source.mjs'
 
 const MAX_SCRIPT_BYTES = 1024 * 1024
 const MAX_AGENT_PROMPT_BYTES = 1024 * 1024
@@ -145,40 +146,6 @@ function serializeErrorEnvelope(error) {
         error: errorMessage(error),
         code: typeof error?.code === 'string' ? error.code : undefined,
     })
-}
-
-function stripWorkflowExports(source) {
-    let scriptBody = source
-    const metaMatch = /export\s+const\s+meta\s*=\s*\{/.exec(scriptBody)
-    if (metaMatch) {
-        let depth = 0
-        let quote = ''
-        let closeIndex = -1
-        const openIndex = scriptBody.indexOf('{', metaMatch.index)
-        for (let index = openIndex; index < scriptBody.length; index++) {
-            const char = scriptBody[index]
-            if (quote) {
-                if (char === '\\') index++
-                else if (char === quote) quote = ''
-                continue
-            }
-            if (char === '"' || char === "'" || char === '`') {
-                quote = char
-                continue
-            }
-            if (char === '{') depth++
-            else if (char === '}' && --depth === 0) {
-                closeIndex = index
-                break
-            }
-        }
-        if (closeIndex >= 0) {
-            let end = closeIndex + 1
-            while (end < scriptBody.length && /[;\r\n]/.test(scriptBody[end])) end++
-            scriptBody = scriptBody.slice(0, metaMatch.index) + scriptBody.slice(end)
-        }
-    }
-    return scriptBody.replace(/^\s*export\s+/gm, '')
 }
 
 function createHostBridge() {
