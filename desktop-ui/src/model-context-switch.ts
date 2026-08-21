@@ -7,6 +7,17 @@ export interface ModelContextSwitchDecision {
   reason: 'model_changed' | 'stable_model' | 'new_conversation' | 'automatic_routing'
 }
 
+/** SDK 初始化事件缺失模型时，保留 Gateway 已广播或持久化的上一回合实际路由模型。 */
+export function resolveConversationModel({runtimeModel, taskModel, persistedModel}: {
+  runtimeModel?: string
+  taskModel?: string
+  persistedModel?: string | null
+}): string {
+  return String(runtimeModel || '').trim()
+    || String(taskModel || '').trim()
+    || String(persistedModel || '').trim()
+}
+
 export function resolveModelContextSwitch({
   mode, currentModel, nextModel, hasConversation,
 }: {mode: 'auto' | 'fixed'; currentModel?: string; nextModel?: string; hasConversation: boolean}): ModelContextSwitchDecision {

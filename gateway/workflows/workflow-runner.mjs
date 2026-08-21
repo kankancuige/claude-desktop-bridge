@@ -207,7 +207,7 @@ export const meta = {
   ],
 }
 
-const target = args.path || args.target || process.cwd()
+const target = args.path || args.target || '.'
 
 const DIMENSIONS = [
   { key: 'bugs', prompt: '潜在 bug: 空指针、未处理异常、竞态条件、边界条件错误、资源泄漏' },
@@ -295,7 +295,7 @@ export const meta = {
   ],
 }
 
-const target = args.path || args.target || process.cwd()
+const target = args.path || args.target || '.'
 
 const ANGLES = [
   { key: 'logic', prompt: '逻辑错误: 条件判断错误、循环边界、状态机缺陷、死代码' },
@@ -520,7 +520,7 @@ export const meta = {
   ],
 }
 
-const target = args.path || args.target || process.cwd()
+const target = args.path || args.target || '.'
 
 const DIMENSIONS = [
   { key: 'techdebt', prompt: '技术债: TODO/FIXME/HACK 标记、重复代码、过时 API、缺少测试' },

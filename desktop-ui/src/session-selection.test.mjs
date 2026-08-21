@@ -6,7 +6,7 @@ import {transform} from 'esbuild'
 const source = readFileSync(new URL('./session-selection.ts', import.meta.url), 'utf8')
 const compiled = await transform(source, {loader: 'ts', format: 'esm', target: 'es2022'})
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(compiled.code).toString('base64')}`
-const {classifySessionExistsResponse, decideSessionRuntimeRecovery, isSameSessionSelection, resolveExistingSessionTarget, runtimeSessionMatchesHistory, shouldCloseSocketBeforeConnect, shouldReuseConnectedSession, shouldValidateSessionRuntime} = await import(moduleUrl)
+const {classifySessionExistsResponse, decideSessionRuntimeRecovery, isSameSessionSelection, resolveExistingSessionTarget, runtimeSessionMatchesHistory, shouldCloseSocketBeforeConnect, shouldHandleSessionSocketEvent, shouldRecoverMissingRuntimeSessionAfterClose, shouldRefreshSessionTokenAfterClose, shouldReuseConnectedSession, shouldValidateSessionRuntime} = await import(moduleUrl)
 
 const connectedSession = {
   requestedWorkDir: 'D:/work',
@@ -64,6 +64,23 @@ test('同一会话重连时关闭旧的前台 WebSocket', () => {
 
 test('已关闭的旧 WebSocket 不重复关闭', () => {
   assert.equal(shouldCloseSocketBeforeConnect('gateway-a', 'gateway-a', 3), false)
+})
+
+test('迟到的旧 WebSocket 事件不能覆盖已重连会话状态', () => {
+  assert.equal(shouldHandleSessionSocketEvent(false, false), false)
+  assert.equal(shouldHandleSessionSocketEvent(true, false), true)
+  assert.equal(shouldHandleSessionSocketEvent(false, true), true)
+})
+
+test('升级认证失败被浏览器折叠为 1006 时刷新会话 token', () => {
+  assert.equal(shouldRefreshSessionTokenAfterClose(4003), true)
+  assert.equal(shouldRefreshSessionTokenAfterClose(1006), true)
+  assert.equal(shouldRefreshSessionTokenAfterClose(1011), false)
+})
+
+test('Gateway 明确拒绝不存在的运行时会话时进入恢复流程', () => {
+  assert.equal(shouldRecoverMissingRuntimeSessionAfterClose(4000), true)
+  assert.equal(shouldRecoverMissingRuntimeSessionAfterClose(1006), false)
 })
 
 test('exists 响应提供 Gateway ID 时优先使用实际活跃会话', () => {

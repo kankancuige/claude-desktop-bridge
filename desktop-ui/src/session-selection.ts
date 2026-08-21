@@ -107,3 +107,25 @@ export function shouldCloseSocketBeforeConnect(
     && currentSessionId === targetSessionId
     && socketReadyState !== 3
 }
+
+/**
+ * 旧连接的 error/close 可能在新连接打开后迟到；只有仍被 Tab 或前台持有的连接才能改变可见状态。
+ */
+export function shouldHandleSessionSocketEvent(
+  ownsTabSocket: boolean,
+  ownsForegroundSocket: boolean,
+): boolean {
+  return ownsTabSocket || ownsForegroundSocket
+}
+
+/**
+ * 浏览器会把 WebSocket 升级阶段的 401 折叠成 1006；Gateway 重启后必须刷新本地 token 才能恢复会话。
+ */
+export function shouldRefreshSessionTokenAfterClose(closeCode: number): boolean {
+  return closeCode === 4003 || closeCode === 1006
+}
+
+/** Gateway 用 4000 明确表示运行时会话不存在；必须走历史会话的重建流程，不能重连旧 UUID。 */
+export function shouldRecoverMissingRuntimeSessionAfterClose(closeCode: number): boolean {
+  return closeCode === 4000
+}

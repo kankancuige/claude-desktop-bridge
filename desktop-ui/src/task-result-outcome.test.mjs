@@ -37,6 +37,13 @@ test('execution failure is not presented as success', () => {
   assert.equal(result.messageKey, 'sys.executionFailed')
 })
 
+test('stopped task remains resumable without being presented as success', () => {
+  const result = normalizeTaskResult({continuationReason: 'stopped', resumable: true})
+  assert.equal(result.outcome, 'failed')
+  assert.equal(result.resumable, true)
+  assert.equal(result.tone, 'error')
+})
+
 test('continuation prompt includes original goal and remaining verification', () => {
   const prompt = buildContinuationPrompt({
     originalTask: '为当前项目增加按钮并完成验证',

@@ -2,20 +2,19 @@
 
 ## 目的与边界
 
-本清单为通用 AI 编程工作台架构改造建立可审查的本地 Git 基线候选。它不是提交记录，也不授权暂存、提交、推送、删除或覆盖任何现有工作区内容。
+本清单为通用 AI 编程工作台架构改造建立可审查、可回滚的本地 Git 基线。用户已于 2026-08-21 明确授权创建本地提交；该授权不包含推送、删除或覆盖范围外内容。
 
-审查基准为 `main` 的 `4441ab5 feat(core): release 1.5.0 with durable session recovery`。当前本地分支相对 `origin/main` 已领先一个历史提交；该历史提交不在本次候选范围内重写或修改。
+本次基线的父提交为 `d08792f feat(workbench): establish durable agent workspace architecture`。创建本次提交前，本地 `main` 相对 `origin/main` 已领先两个历史提交；既有提交不在本次范围内重写或修改。
 
 ## 只读采集结果
 
 | 项目 | 结果 |
 |---|---|
-| 工作区条目 | 118 |
-| Gateway | 89 |
-| Desktop | 16 |
-| 架构文档 | 10 |
-| 交付工具 | 2 |
-| README | 1 |
+| 候选文件 | 45 |
+| Gateway | 24 |
+| Desktop | 17 |
+| 架构文档 | 4 |
+| 生成物或二进制候选 | 0 |
 | `git diff --check` | 通过 |
 | 行尾提示 | Git 提示现有 LF 文件下次写入时可能变为 CRLF；不是空白错误 |
 
@@ -34,7 +33,7 @@
 
 ### `gateway/builtin-resources/skills/cad-viewer/scripts/viewer/dist`
 
-该目录中有未跟踪的浏览器构建产物。它位于内置资源发布包中，而非普通 `node_modules` 或仓库外的临时输出；因此当前结论是“保留并等待 `node scripts/check-builtin-resources.mjs` 确认”，不是“自动删除”或“自动提交”。若资源检查不把该产物视为发布内容，必须先由用户确认处理方式。
+该目录已属于父提交，不在本次 45 个候选文件中。本轮不删除、不重建也不重复暂存；`node scripts/check-builtin-resources.mjs` 已确认当前内置资源清单完整。
 
 ### 未发现的排除项
 
@@ -63,9 +62,10 @@ Workflow DSL 由 `gateway/workflows/workflow-script.test.mjs` 的包装编译路
 ## 当前状态
 
 - P0.1 Step 1 已完成：候选范围和资源例外已记录。
-- P0.1 Step 2 已完成（2026-08-21）：`node --test` 发现并通过 476 项 Gateway 测试；`node scripts/check-builtin-resources.mjs` 通过 61 项；`pnpm exec vue-tsc --noEmit` 与 `pnpm exec vite build` 通过；`git diff --check` 通过。
-- P0.1 Step 3 未开始：没有创建本地 Git 提交的用户授权。
-- P0.3 的后续本地改动已复验：会话生命周期定向回归 49 项、Electron 边界测试 11 项、Gateway/Electron 语法检查和 Desktop 类型检查均通过；基线提交前仍需重新执行完整 P0.1 门禁。
+- P0.1 Step 2 已完成（2026-08-21 fresh）：发现 120 个 Gateway 测试文件并通过 489/489 项测试；内置资源检查通过 61 项；Desktop 类型检查与 Vite 生产构建通过；`git diff --check` 通过。
+- P0.1 Step 3 已获用户授权：本提交仅包含清单中的 45 个候选文件，不推送；提交 SHA 和提交后工作树状态由 Git 记录及交接结果提供。
+- 候选路径与内容已复查：没有生成物、二进制、凭据、私钥或真实用户绝对路径；扫描命中仅为 `task-*` CSS 类名和路径解码示例注释。
+- P0.3 的后续本地改动已复验：会话生命周期定向回归 49 项、Electron 边界测试 11 项、Gateway/Electron 语法检查和 Desktop 类型检查均通过；真实桌面补充、停止、重连和崩溃恢复 L3 已通过。
 
 ### 非阻塞观察项
 

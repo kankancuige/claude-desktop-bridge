@@ -30,7 +30,10 @@ test('所有内置 Workflow DSL 按真实 async 包装方式通过语法编译',
     const files = readdirSync(root).filter(name => name.endsWith('.mjs')).sort()
     assert.ok(files.length > 0)
     for (const name of files) {
-        assert.equal(validateWorkflowSyntax(readFileSync(join(root, name), 'utf8'), {filename: name}), true)
+        const source = readFileSync(join(root, name), 'utf8')
+        assert.equal(validateWorkflowSyntax(source, {filename: name}), true)
+        // 受限子进程明确移除了 process，内置脚本只能消费 Gateway 传入的 args。
+        assert.doesNotMatch(source, /\bprocess\s*\./, `${name} 不得访问受限宿主 API`)
     }
 })
 

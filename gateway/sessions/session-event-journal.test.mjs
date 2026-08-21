@@ -19,6 +19,12 @@ test('事件序号连续，关键事件落盘且任务状态可投影', () => {
     assert.match(readFileSync(path, 'utf8'), /task\/accepted/)
 })
 
+test('任务状态日志保留实际路由模型以支持重启后的上下文切换判断', () => {
+    const journal = new SessionEventJournal({path: journalPath()})
+    journal.append('task/state-changed', {taskState: journalTaskState({status: 'succeeded', model: 'model-a'})})
+    assert.equal(journal.projectTaskState().model, 'model-a')
+})
+
 test('尾部半行被忽略并在重新打开时修复', () => {
     const path = journalPath()
     writeFileSync(path, '{"seq":4,"time":1,"type":"task/accepted","payload":{}}\n{"seq":5', 'utf8')

@@ -58,6 +58,11 @@ export interface TaskActivityState {
   expanded: boolean
 }
 
+/** 只有 Gateway 明确发出的审查生命周期事件才允许渲染审查活动。 */
+export function isReviewLifecycleEvent(type: unknown): boolean {
+  return type === 'task_reviewing' || type === 'task_changes_required'
+}
+
 export interface TaskActivityFreshness {
   level: 'active' | 'waiting' | 'stale' | 'idle'
   idleMs: number
@@ -468,7 +473,10 @@ export function reduceTaskActivity(
     }, now)
   }
 
-  if (type === 'primary_completed' || type === 'task_reviewing' || type === 'task_changes_required') {
+  // 主回答完成并不等于进入审查。Light 任务会直接收口，只有 Gateway 明确广播审查事件才显示审查活动。
+  if (type === 'primary_completed') return state
+
+  if (isReviewLifecycleEvent(type)) {
     const changes = type === 'task_changes_required'
     const title = changes ? '审查发现需要修复的问题' : '正在进行定向审查'
     state = activityState(state, 'reviewing', true, title, boundedText(event.detail), type, now)

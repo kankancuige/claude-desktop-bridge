@@ -12,7 +12,8 @@ export const meta = {
   ],
 }
 
-const target = args.path || args.target || process.cwd()
+// Workflow 子进程不暴露 process；目标目录只能由 Gateway 受控注入。
+const target = args.path || args.target || '.'
 
 const DIMENSIONS = [
   { key: 'techdebt', prompt: '技术债: TODO/FIXME/HACK 标记、重复代码、过时 API、缺少测试' },

@@ -7,7 +7,8 @@ export const meta = {
   ],
 }
 
-const target = args.target || process.cwd()
+// Workflow 子进程不暴露 process；目标目录只能由 Gateway 受控注入。
+const target = args.path || args.target || '.'
 const evidence = args.evidence && typeof args.evidence === 'object' ? args.evidence : {}
 phase('Diagnose')
 const diagnosis = await agent(

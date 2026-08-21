@@ -20,6 +20,69 @@ test('简单问答和项目结构探索区分上下文能力', () => {
     assert.equal(inspect.risk, 'low')
 })
 
+test('仅回复且明确禁止副作用的补充指令不能被否定词中的修改误判为执行任务', () => {
+    const decision = decideTask({
+        text: '补充指令验收：请仅回复“补充指令已按顺序处理”。不要调用工具、执行命令、读取或修改文件。',
+    })
+    assert.equal(decision.action, 'query')
+    assert.equal(decision.complexity, 'light')
+    assert.equal(decision.modelTier, 'light')
+    assert.equal(decision.contextProfile, 'light')
+    assert.equal(decision.finalReview, 'none')
+    assert.ok(decision.reasons.includes('explicit_read_only'))
+    assert.equal(decision.reasons.includes('explicit_execution_request'), false)
+})
+
+test('限定概括格式且禁止副作用时不能被否定词中的修改误判为执行任务', () => {
+    const decision = decideTask({
+        text: '请仅用两句话概括当前项目的核心模块职责，不要调用工具或修改文件。',
+    })
+    assert.equal(decision.action, 'query')
+    assert.equal(decision.complexity, 'light')
+    assert.equal(decision.modelTier, 'light')
+    assert.equal(decision.contextProfile, 'light')
+    assert.equal(decision.finalReview, 'none')
+    assert.ok(decision.reasons.includes('explicit_read_only'))
+    assert.equal(decision.reasons.includes('explicit_execution_request'), false)
+})
+
+test('说明格式且禁止副作用时不能被否定词中的修改误判为执行任务', () => {
+    const decision = decideTask({
+        text: '请用一句话说明当前项目由哪些主要模块组成，不要调用工具或修改文件。',
+    })
+    assert.equal(decision.action, 'query')
+    assert.equal(decision.complexity, 'light')
+    assert.equal(decision.modelTier, 'light')
+    assert.equal(decision.contextProfile, 'light')
+    assert.equal(decision.finalReview, 'none')
+    assert.ok(decision.reasons.includes('explicit_read_only'))
+    assert.equal(decision.reasons.includes('explicit_execution_request'), false)
+})
+
+test('补充注明格式且禁止副作用时仍保持只读任务', () => {
+    const decision = decideTask({
+        text: '补充：最后一行注明这些模块通过 Gateway 协作，不要调用工具或修改文件。',
+    })
+    assert.equal(decision.action, 'query')
+    assert.equal(decision.complexity, 'light')
+    assert.equal(decision.modelTier, 'light')
+    assert.equal(decision.contextProfile, 'light')
+    assert.equal(decision.finalReview, 'none')
+    assert.ok(decision.reasons.includes('explicit_read_only'))
+    assert.equal(decision.reasons.includes('explicit_execution_request'), false)
+})
+
+test('仅回复即使提及持久化或会话也不能升级为高风险审查任务', () => {
+    const decision = decideTask({
+        text: '模型 A 持久化验收：请仅回复“模型 A 已持久化”。不要调用工具、执行命令、读取或修改文件。',
+    })
+    assert.equal(decision.action, 'query')
+    assert.equal(decision.risk, 'low')
+    assert.equal(decision.modelTier, 'light')
+    assert.equal(decision.finalReview, 'none')
+    assert.deepEqual(decision.hardTriggers, [])
+})
+
 test('附件只作为存在性证据，不读取附件正文做风险判断', () => {
     const decision = decideTask({text: '看看这个', attachmentEvidence: true})
     assert.equal(decision.action, 'inspect')

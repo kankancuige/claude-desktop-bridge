@@ -10,6 +10,8 @@ const OPERATE_SIGNALS = /(?:部署|发布|安装依赖|提交代码|commit|push|
 const BUG_SIGNALS = /(?:bug|缺陷|报错|异常|错误|崩溃|卡住|失败|死锁|竞态|race condition|null pointer|内存泄漏)/i
 const PLAN_SIGNALS = /(?:方案对比|比较优劣|权衡利弊|架构决策|技术选型|怎么选|选哪个)/i
 const RESEARCH_SIGNALS = /(?:调研|research|竞品分析|对比市面|深入分析)/i
+// 明确限定输出形式并禁止副作用时，否定语句中的“修改”等词不能反向触发实现任务。
+const NO_SIDE_EFFECT_REPLY_SIGNAL = /(?:(?:只|仅)(?:(?:用|以)[^。；;，,\n]{0,40}?)?|(?:用[^。；;，,\n]{0,40})?)(?:回复|回答|概括|说明|列出|总结|注明)[\s\S]{0,160}?(?:不要|不|无需|不用|不需要)[\s\S]{0,80}?(?:调用工具|执行命令|读取|修改|写入|创建|删除)/i
 
 const HARD_TRIGGER_RULES = [
     {code: 'authentication_or_secret', risk: 'critical', pattern: /(?:认证|鉴权|授权|权限|api\s*key|apikey|token|密码|密钥|secret|credential|oauth|签名验证)/i},
@@ -61,25 +63,29 @@ export function decideTask(input = {}) {
         }
     }
 
-    const readOnly = READ_ONLY_SIGNALS.test(normalized) && !DIRECT_WRITE_OVERRIDE.test(normalized)
-    const explicitWrite = WRITE_SIGNALS.test(normalized) || DIRECT_WRITE_OVERRIDE.test(normalized)
+    // “仅回复且禁止副作用”是完整的只读意图，不能把否定语句中的“修改”当成写入请求。
+    const explicitNoSideEffectReply = NO_SIDE_EFFECT_REPLY_SIGNAL.test(normalized)
+    const readOnly = explicitNoSideEffectReply || (READ_ONLY_SIGNALS.test(normalized) && !DIRECT_WRITE_OVERRIDE.test(normalized))
+    const explicitWrite = !explicitNoSideEffectReply && (WRITE_SIGNALS.test(normalized) || DIRECT_WRITE_OVERRIDE.test(normalized))
     const attachmentEvidence = input.attachmentEvidence === true
     const codeEvidence = hasCodeOrFileEvidence(normalized) || attachmentEvidence
     const reasons = []
     const hardTriggers = []
     let risk = 'low'
 
-    for (const rule of HARD_TRIGGER_RULES) {
-        if (!rule.pattern.test(normalized)) continue
-        hardTriggers.push(rule.code)
-        risk = maxRisk(risk, rule.risk)
-    }
+    if (!explicitNoSideEffectReply) {
+        for (const rule of HARD_TRIGGER_RULES) {
+            if (!rule.pattern.test(normalized)) continue
+            hardTriggers.push(rule.code)
+            risk = maxRisk(risk, rule.risk)
+        }
 
-    if (input.diffRisk?.hasCriticalPath) {
-        hardTriggers.push('critical_code_path')
-        risk = maxRisk(risk, input.diffRisk.risk || 'high')
-    } else if (input.diffRisk?.risk && RISK_ORDER[input.diffRisk.risk] !== undefined) {
-        risk = maxRisk(risk, input.diffRisk.risk)
+        if (input.diffRisk?.hasCriticalPath) {
+            hardTriggers.push('critical_code_path')
+            risk = maxRisk(risk, input.diffRisk.risk || 'high')
+        } else if (input.diffRisk?.risk && RISK_ORDER[input.diffRisk.risk] !== undefined) {
+            risk = maxRisk(risk, input.diffRisk.risk)
+        }
     }
 
     let action = 'query'
@@ -87,13 +93,13 @@ export function decideTask(input = {}) {
     else if (REFACTOR_SIGNALS.test(normalized)) action = 'refactor'
     else if (REVIEW_SIGNALS.test(normalized) || readOnly && /(?:审查|检查|audit|review)/i.test(normalized)) action = 'review'
     else if (explicitWrite) action = 'implement'
-    else if (INSPECT_SIGNALS.test(normalized) || codeEvidence) action = 'inspect'
+    else if (!explicitNoSideEffectReply && (INSPECT_SIGNALS.test(normalized) || codeEvidence)) action = 'inspect'
 
     if (action === 'implement' || action === 'operate' || action === 'refactor') risk = maxRisk(risk, 'medium')
     if (action === 'review' && (codeEvidence || normalized.length > 80)) risk = maxRisk(risk, 'medium')
     if (action === 'refactor' && /(?:整体|完整|全面|跨模块|多个模块|系统级)/i.test(normalized)) risk = maxRisk(risk, 'high')
 
-    const simpleQuestion = normalized.length <= 160 && SIMPLE_QUESTION_SIGNALS.test(normalized) && !codeEvidence
+    const simpleQuestion = (explicitNoSideEffectReply || (normalized.length <= 160 && SIMPLE_QUESTION_SIGNALS.test(normalized))) && !codeEvidence
     let contextProfile = 'full'
     if (readOnly) contextProfile = simpleQuestion ? 'light' : 'focused'
     else if (action === 'query' && simpleQuestion) contextProfile = 'light'

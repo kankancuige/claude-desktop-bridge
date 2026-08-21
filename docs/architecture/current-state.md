@@ -118,4 +118,4 @@ Incomplete: None
 - `Repair Loop` 对同类失败最多自动尝试两种策略；重复策略进入 RCA，新回归冻结候选。`Pitfall Ledger` 使用 SQLite 按 global/project/bridge 隔离，正文只保存脱敏摘要和引用。
 - 完成门禁要求必需步骤结束、Agent/Workflow 无活动实例、阻断 finding 已关闭、实际测试和必要验证通过，并且确定性通知意图已持久化。成功及所有稳定非成功终态都生成状态一致的 Execution Report；`paused`、验证不足、环境阻塞、回归和 RCA 终态都不会显示为完成。Coordinator 与旧 task-state 使用独立 SQLite task key，避免两套 revision 互相覆盖；重启时活动 Coordinator 投影降级为 `inconclusive` 并要求显式继续和重新验证。
 - `gateway/smoke/general-workbench-smoke.mjs` 使用临时 Node 目标项目验证 Light、Focused、Balanced、Power、L2 Host Test、修复循环、Pitfall、桌面事件、IM 终态去重和 SQLite 投影。该 Smoke 不等于真实 Provider、真实 IM 或真实业务项目端到端验收。
-- 2026-08-21 当前代码门禁为 Gateway 449/449、桌面端 106/106、249 个普通 Gateway MJS、9 个内置 Workflow DSL、61 项内置资源和 Vue 类型检查全部通过；Vite 与 Windows NSIS 构建通过。真实 Provider、桌面冷启动、至少一个真实 IM 平台和代表性业务项目 L3–L6 仍是外部验收 blocker。
+- 2026-08-21 当前代码门禁为 Gateway 449/449、桌面端 106/106、249 个普通 Gateway MJS、9 个内置 Workflow DSL、61 项内置资源和 Vue 类型检查全部通过；Vite 与 Windows NSIS 构建通过。源码 Desktop 冷启动、普通消息、补充消息、停止、重连和崩溃恢复 L3 已通过；有限 handoff、Provider usage、真实 IM、安装/升级和代表性业务项目仍分别属于后续 L4–L6/P3 验收，不能由本地门禁替代。

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
-import {mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs'
+import {mkdtempSync, readFileSync, rmSync, statSync, writeFileSync} from 'node:fs'
+import {createHash} from 'node:crypto'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import test from 'node:test'
@@ -8,6 +9,15 @@ import {ensureBuiltinResources, getBuiltinResourceState, migrateLegacyBuiltinRes
 function withBridgeHome(run) {
     const bridgeHome = mkdtempSync(join(tmpdir(), 'bridge-builtin-'))
     try { return run(bridgeHome) } finally { rmSync(bridgeHome, {recursive: true, force: true}) }
+}
+
+function checksumSingleFile(relativePath, content) {
+    return createHash('sha256')
+        .update(relativePath)
+        .update('\0')
+        .update(content)
+        .update('\0')
+        .digest('hex')
 }
 
 test('首次启动安装内置资源并记录状态', () => withBridgeHome((bridgeHome) => {
@@ -29,6 +39,35 @@ test('用户修改内置资源后升级不会覆盖并标记 customized', () => 
     assert.ok(result.customized.includes('agent:build-error-resolver'))
     assert.match(readFileSync(file, 'utf8'), /用户修改/)
     assert.equal(getBuiltinResourceState({bridgeHome}).find(item => item.id === 'build-error-resolver').customized, true)
+}))
+
+test('未自定义的旧内置资源升级时覆盖文件内容并刷新状态', () => withBridgeHome((bridgeHome) => {
+    ensureBuiltinResources({bridgeHome})
+    const relativePath = 'workflows/code-review.mjs'
+    const target = join(bridgeHome, relativePath)
+    const oldContent = '// historical builtin workflow\n'
+    writeFileSync(target, oldContent, 'utf8')
+    const targetMetadata = `${relativePath}|${Buffer.byteLength(oldContent, 'utf8')}|${Math.trunc(statSync(target).mtimeMs)}`
+    const statePath = join(bridgeHome, 'builtin-resource-state.json')
+    const state = JSON.parse(readFileSync(statePath, 'utf8'))
+    state.resources['workflow:code-review'] = {
+        ...state.resources['workflow:code-review'],
+        version: '1',
+        sourceChecksum: checksumSingleFile(relativePath, oldContent),
+        sourceMetadata: 'workflows/code-review.mjs|historical',
+        targetChecksum: checksumSingleFile(relativePath, oldContent),
+        targetMetadata,
+        customized: false,
+    }
+    writeFileSync(statePath, JSON.stringify(state, null, 2), 'utf8')
+
+    const result = ensureBuiltinResources({bridgeHome})
+    assert.ok(result.updated.includes('workflow:code-review'))
+    assert.equal(
+        readFileSync(target, 'utf8'),
+        readFileSync(join('gateway', 'builtin-resources', relativePath), 'utf8'),
+    )
+    assert.equal(getBuiltinResourceState({bridgeHome}).find(item => item.type === 'workflow' && item.id === 'code-review').customized, false)
 }))
 
 test('资源开关持久化且必需资源不能关闭', () => withBridgeHome((bridgeHome) => {

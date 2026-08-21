@@ -19,7 +19,7 @@ import {query, deleteSession, forkSession} from './providers/claude-agent-sdk-ru
 import {BRIDGE_HOME, prepareBridgeHome} from './config/bridge-home.mjs'
 import {getBuiltinResourceState, setBuiltinResourceEnabled} from './config/builtin-resources.mjs'
 import {createLogger, logHttpRequest} from './shared/logger.mjs'
-import {buildSessionStopResponse, getSessionStopScope, hasStoppableSessionWork} from './sessions/session-stop.mjs'
+import {buildSessionStopResponse, getSessionStopScope, hasStoppableSessionWork, resolvePrimaryStopTurnId, selectCancelledInputTurns} from './sessions/session-stop.mjs'
 import {resolveSessionResume} from './sessions/session-resume.mjs'
 import {consumePendingSessionInputOnResult, getSessionRuntimeState} from './sessions/session-runtime-state.mjs'
 import {classifyTranscriptFile} from './projects/transcript-classifier.mjs'
@@ -130,6 +130,7 @@ import {
 import {applySkillRoute, routeSkills} from './agents/skill-router.mjs'
 import {ensureBuiltinSkillsAvailable} from './agents/builtin-skill-installer.mjs'
 import {buildSystemInitEvent} from './sessions/session-init-event.mjs'
+import {resolveResumeModel} from './sessions/session-resume-model.mjs'
 import {resolveRtkCommandArgs} from './tools/rtk-command.mjs'
 import {describeAttachment, isImageAttachment} from './tools/attachment-type.mjs'
 import {cleanupUploadDir, prepareUploadDir} from './tools/upload-storage.mjs'
@@ -841,6 +842,8 @@ function updateTaskState(session, sessionId, next) {
     session.taskState = createTaskStatePatch({
         ...(next && typeof next === 'object' ? next : {}),
         permissionMode: next?.permissionMode || session.permissionMode || session.taskState?.permissionMode || 'default',
+        // Query 配置是实际执行模型的权威来源；保留旧状态仅为恢复早期历史会话的兼容降级。
+        model: next?.model || session.queryOpts?.model || session.taskState?.model || null,
     })
     saveTaskState(session, sessionId)
     appendSessionEvent(session, 'task/state-changed', {taskState: journalTaskState(session.taskState)})
@@ -872,6 +875,7 @@ function taskStateFromCompletion(session, detail = '') {
         finalReplyAvailable: Boolean(session?.taskFinalReplyText || session?.taskState?.finalReplyText),
         notifications: session?.taskState?.notifications || {},
         permissionMode: session?.permissionMode || session?.taskState?.permissionMode || 'default',
+        model: session?.queryOpts?.model || session?.taskState?.model || null,
         sdkSessionId: session?.lastSessionId,
         historySessionId: session?.lastSessionId,
         taskId: session?.taskCompletionTaskId || null,
@@ -1164,10 +1168,10 @@ function failPendingSessionInputs(sessionId, s, error) {
     return pending.length
 }
 
-function cancelPendingSessionInputs(sessionId, s) {
+function cancelPendingSessionInputs(sessionId, s, activeTurnId = null) {
     const pending = taskInputQueue.drain(s)
     s._pendingSources = []
-    for (const input of pending) {
+    for (const input of selectCancelledInputTurns(pending, activeTurnId)) {
         const identity = createTurnIdentity(input.source, input.userId, IM_SOURCES)
         broadcastTurn(sessionId, {
             type: 'generation_stopped',
@@ -1260,7 +1264,7 @@ async function stopSessionGeneration(sessionId, s) {
             broadcastTaskLifecycle(sessionId)
             return {stopped: true, scope: 'workflow', cancelledInputs: 0, turnId: null}
         }
-        const stoppedTurnId = s.activeTurnId || null
+        const stoppedTurnId = resolvePrimaryStopTurnId(s)
         const stoppedTurnIdentity = s.activeTurnIdentity ? {...s.activeTurnIdentity} : null
         updateTaskCompletion(s, sessionId, {type: 'user_stopped', detail: '用户已暂停任务'})
         if (s.coordinatorTaskId && taskWorkbench) {
@@ -1287,7 +1291,7 @@ async function stopSessionGeneration(sessionId, s) {
             log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '停止生成时保存 checkpoint 失败')
         }
         s.pendingTurn = null
-        const cancelledInputs = cancelPendingSessionInputs(sessionId, s)
+        const cancelledInputs = cancelPendingSessionInputs(sessionId, s, stoppedTurnId)
         s._pendingTurns = []
         s._generating = false
         s.activeTurnId = null
@@ -4901,6 +4905,8 @@ async function autoTriggerWorkflow(sessionId, msgContent, taskDecision = null) {
         : requestedTier
     runWfScript(matchedWf, sessionId, {
         task: msgContent,
+        // Workflow 子进程不公开 process.cwd()；仅由会话上下文注入已校验的目标目录。
+        path: sessions.get(sessionId)?.workDir || '.',
         _workflowTier: workflowTier,
         _modelTiers: wfCfg.modelTiers || {},
         _fixedModel: sessions.get(sessionId)?.modelMode === 'fixed'
@@ -5408,19 +5414,25 @@ async function handleHttpRequest(req, res) {
         const persistedCatalogState = bridgeStateDb?.available
             ? persistedCatalogIds.map(id => id ? bridgeStateDb.getSessionCatalog(persistedCatalogKey, id) : null).find(Boolean) || null
             : null
-        const persistedPermissionState = createMode.mode === 'resume'
+        const persistedResumeState = createMode.mode === 'resume'
             ? (loadTaskState(workDir, resumeSid || body.resume) || null)
             : createMode.mode === 'fork'
                 ? (loadTaskState(workDir, forkSourceId) || null)
                 : null
-        const persistedPermissionMode = VALID_PERMISSION_MODES.has(persistedPermissionState?.permissionMode)
-            ? persistedPermissionState.permissionMode
+        const persistedPermissionMode = VALID_PERMISSION_MODES.has(persistedResumeState?.permissionMode)
+            ? persistedResumeState.permissionMode
             : VALID_PERMISSION_MODES.has(persistedCatalogState?.permissionMode)
                 ? persistedCatalogState.permissionMode
             : null
         if (persistedPermissionMode && persistedPermissionMode !== 'default' && body.permissionMode === 'default') {
             body.permissionMode = persistedPermissionMode
         }
+        const resumedModel = resolveResumeModel({
+            createMode: createMode.mode,
+            requestedModel: body.model,
+            persistedModel: persistedResumeState?.model,
+        })
+        if (resumedModel) body.model = resumedModel
         try {
             const cliS = loadCliSettings();
             const pushStream = new PushStream()
@@ -9452,6 +9464,7 @@ async function submitTaskCommand(command) {
         updateTaskState(s, sessionId, {
             status: 'running', outcome: null, continuationReason: null,
             resumable: Boolean(s.lastSessionId), sdkSessionId: s.lastSessionId, historySessionId: s.lastSessionId,
+            model: taskRoute.model,
             taskId: s.taskCompletionTaskId || null, turnId: s.taskCompletionTurnId || null,
             sequence: s._taskCompletionSequence || 0, startedAt: s.taskStartedAt || Date.now(),
             completedAt: 0, durationMs: 0,

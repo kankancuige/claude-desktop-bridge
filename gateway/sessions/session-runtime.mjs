@@ -58,6 +58,7 @@ export function createSessionRuntime({
         taskState: createTaskStatePatch({
             status: 'idle', outcome: null, continuationReason: null, resumable: false,
             sdkSessionId: identity, historySessionId: identity,
+            model: opts.model,
         }),
         eventJournal: null,
         _taskWorkflowGate: createTaskWorkflowGate(),

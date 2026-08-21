@@ -12,7 +12,8 @@ export const meta = {
   ],
 }
 
-const target = args.path || args.target || process.cwd()
+// Workflow 子进程不暴露 process；目标目录只能由 Gateway 受控注入。
+const target = args.path || args.target || '.'
 
 const DIMENSIONS = [
   { key: 'bugs', prompt: '潜在 bug: 空指针、未处理异常、竞态条件、边界条件错误、资源泄漏' },

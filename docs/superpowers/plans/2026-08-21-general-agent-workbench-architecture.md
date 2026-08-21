@@ -677,11 +677,13 @@ Run: `node --test <全部 Gateway 测试>; node scripts/check-builtin-resources.
 
 Expected: 记录精确命令、通过数和失败项。Workflow DSL 只由其专用包装编译测试验证，不以 `node --check` 直接检查 DSL 源文件。
 
-- [ ] **Step 3: 等待并执行明确授权的本地提交**
+- [x] **Step 3: 等待并执行明确授权的本地提交**
 
 Run: `git add <候选清单>; git commit -m "..."; git status --short; git rev-parse HEAD`
 
 Expected: 仅在用户明确授权“创建本地基线提交”后执行；提交后保留所有排除项和用户已有改动。
+
+2026-08-21 状态：用户已明确授权仅创建本地基线、不推送；fresh 门禁通过 489/489 项 Gateway 测试、61 项内置资源检查、Desktop 类型检查、Vite 生产构建和 `git diff --check`。提交 SHA 与提交后工作树状态由 Git 记录及交接结果提供。
 
 #### P0.2：真实 Provider 与 Desktop 冷启动验收
 
@@ -693,13 +695,15 @@ Expected: 仅在用户明确授权“创建本地基线提交”后执行；提�
 - L3 Desktop Cold Start 记录 Electron 启动、Gateway child process、项目目录与会话列表加载、首条任务气泡、最终总结气泡的位置。
 - L4 Provider 记录真实模型请求、同模型重连、模型切换 `full_history | handoff_summary | cancel` 的可见策略及 Provider 实测 usage；未知字段保持 `null`。
 
-- [ ] **Step 1: 固化可执行的受控验收脚本与断言**
+- [x] **Step 1: 固化可执行的受控验收脚本与断言**
 
 覆盖：启动后左侧项目/会话可见；普通回答非空；详细步骤只追加独立气泡；最终总结只出现在最后一个完成气泡；跨模型不报告共享推理缓存。
 
 - [ ] **Step 2: 在用户明确授权启动 Desktop/Gateway 与真实 Provider 后执行 L3-L4**
 
 Expected: 凭据只从环境或既有配置读取，不打印、不写入文档；结果按 `verified`、`failed` 或 `not_verified` 写入矩阵，L2 不得替代 L3/L4。
+
+2026-08-21 状态：源码 Desktop 冷启动、普通消息、补充消息、停止、重连和崩溃恢复的 L3 已通过；固定模型完整历史与取消已验证。有限 handoff 和 Provider 实测 usage 仍属 L4/L5 未关闭项，因此本合并步骤保持未勾选。
 
 #### P0.3：补充指令、停止、重连与崩溃恢复
 
@@ -724,7 +728,7 @@ Run: `node --test gateway/sessions/*.test.mjs gateway/tasks/task-lifecycle.test.
 
 Expected: 同一故障路径既验证状态机又验证下游 UI/IM 消费事件；无真实授权时只关闭 L2。
 
-- [ ] **Step 3: 在用户授权的真实环境执行 L3 恢复验收**
+- [x] **Step 3: 在用户授权的真实环境执行 L3 恢复验收**
 
 Expected: 手工触发停止、网络中断/重连和受控 Gateway 崩溃；保留实际日志证据但不记录 token、prompt 或绝对路径。
 
@@ -732,7 +736,7 @@ Expected: 手工触发停止、网络中断/重连和受控 Gateway 崩溃；保
 
 #### P1.1：输入队列与 SDK Stream Adapter
 
-状态：已实现，P0.3 回归通过后才可标记阶段关闭。
+状态：已实现并关闭；P0.3 的真实补充、停止、重连和崩溃恢复 L3 已于 2026-08-21 通过。
 
 #### P1.2：Abort Tree 与 Cleanup Registry
 

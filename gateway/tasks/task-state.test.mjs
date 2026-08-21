@@ -11,7 +11,7 @@ test('success is terminal and never resumable', () => {
 
 test('reviewing and changes_required remain resumable intermediate states', () => {
     const reviewing = createTaskStatePatch({status: 'reviewing', resumable: false, review: {round: 1, tier: 'power', summary: '审查中'}})
-    assert.equal(reviewing.version, 5)
+    assert.equal(reviewing.version, 6)
     assert.equal(reviewing.status, 'reviewing')
     assert.equal(reviewing.outcome, null)
     assert.equal(reviewing.resumable, true)
@@ -26,12 +26,13 @@ test('reviewing and changes_required remain resumable intermediate states', () =
 test('running state becomes an interrupted resumable task after gateway restart', () => {
     const state = recoverTaskState({status: 'running', sdkSessionId: 'sdk-1', resumable: true}, {now: 123})
     assert.deepEqual(state, {
-        version: 5,
+        version: 6,
         status: 'interrupted',
         outcome: 'failed',
         continuationReason: 'execution_error',
         resumable: true,
         permissionMode: 'default',
+        model: null,
         subtype: null,
         sdkSessionId: 'sdk-1',
         historySessionId: null,
@@ -139,6 +140,14 @@ test('父任务身份和事件序号可跨重启持久化', () => {
     assert.equal(restored.taskId, 'gw-1:turn-2')
     assert.equal(restored.turnId, 'turn-2')
     assert.equal(taskStateForClient(restored).sequence, 4)
+})
+
+test('实际路由模型跨重启保留并投影给客户端', () => {
+    const restored = recoverTaskState(createTaskStatePatch({
+        status: 'succeeded', model: 'model-a', taskId: 'gw-1:turn-2',
+    }))
+    assert.equal(restored.model, 'model-a')
+    assert.equal(taskStateForClient(restored).model, 'model-a')
 })
 
 test('任务起止时间和总耗时可持久化并投影给客户端', () => {

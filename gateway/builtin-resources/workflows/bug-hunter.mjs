@@ -12,7 +12,8 @@ export const meta = {
   ],
 }
 
-const target = args.path || args.target || process.cwd()
+// Workflow 子进程不暴露 process；目标目录只能由 Gateway 受控注入。
+const target = args.path || args.target || '.'
 
 const ANGLES = [
   { key: 'logic', prompt: '逻辑错误: 条件判断错误、循环边界、状态机缺陷、死代码' },

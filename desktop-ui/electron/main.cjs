@@ -20,6 +20,7 @@ const {openDirectoryInShell} = require('./open-directory.cjs')
 const { checkForUpdates, downloadUpdate, quitAndInstall } = require('./updater.cjs')
 const {resolveBridgeHome} = require('./bridge-home.cjs')
 const {decideGatewayRestart} = require('./gateway-restart-policy.cjs')
+const {resolveGatewayRuntimePath} = require('./gateway-runtime-path.cjs')
 
 const BRIDGE_HOME = resolveBridgeHome()
 
@@ -151,7 +152,7 @@ function getGatewaySecurePayloadKey() {
  * ── 启动 gateway 子进程 ──
  * 功能说明: 以 ELECTRON_RUN_AS_NODE 模式启动 gateway/index.mjs
  * 实现方式:
- *   1. 根据 VITE_DEV_SERVER_URL 判断开发/生产环境，决定 gateway 目录路径
+ *   1. 根据 Electron 打包状态决定 gateway 目录路径
  *   2. 开发环境: 相对于 __dirname 的 ../../gateway
  *   3. 生产环境: process.resourcesPath 下的 gateway 目录（打包后 extraResources）
  *   4. 重定向 stdout/stderr 到主进程输出 + 日志文件
@@ -161,10 +162,11 @@ function getGatewaySecurePayloadKey() {
 function startGateway() {
   if (gatewayProcess || isQuitting || !ownsAppInstance) return
   // ── 计算 gateway 目录和入口文件路径 ──
-  const isDev = !!process.env.VITE_DEV_SERVER_URL
-  const gatewayDir = isDev
-    ? path.join(__dirname, '../../gateway')
-    : path.join(process.resourcesPath, 'gateway')
+  const gatewayDir = resolveGatewayRuntimePath({
+    isPackaged: app.isPackaged,
+    electronDir: __dirname,
+    resourcesPath: process.resourcesPath,
+  })
   const gatewayEntry = path.join(gatewayDir, 'index.mjs')
 
   logToFile(`Starting gateway: ${gatewayEntry}`)

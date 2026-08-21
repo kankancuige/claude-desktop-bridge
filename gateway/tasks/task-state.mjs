@@ -1,4 +1,4 @@
-const VERSION = 5
+const VERSION = 6
 const MAX_DETAIL_LENGTH = 2000
 const MAX_REPLY_LENGTH = 12000
 const STATUSES = new Set(['idle', 'running', 'reviewing', 'changes_required', 'fixing', 'review_paused', 'succeeded', 'incomplete', 'failed', 'stopped', 'interrupted'])
@@ -54,6 +54,8 @@ export function normalizeTaskState(raw = {}, {recoverRunning = false, now = Date
         continuationReason: reason,
         resumable,
         permissionMode: PERMISSION_MODES.has(input.permissionMode) ? input.permissionMode : 'default',
+        // 仅持久化实际路由的模型标识，用于重启后判断跨模型上下文策略；不包含 Provider 配置。
+        model: text(input.model, 256) || null,
         subtype: text(input.subtype, 120) || null,
         sdkSessionId: text(input.sdkSessionId, 160) || null,
         historySessionId: text(input.historySessionId, 160) || null,
@@ -200,6 +202,7 @@ export function taskStateForClient(state) {
         continuationReason: normalized.continuationReason,
         resumable: normalized.resumable,
         permissionMode: normalized.permissionMode,
+        model: normalized.model,
         subtype: normalized.subtype,
         taskId: normalized.taskId,
         turnId: normalized.turnId,

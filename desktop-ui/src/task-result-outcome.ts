@@ -1,5 +1,5 @@
 export type TaskOutcome = 'succeeded' | 'incomplete' | 'failed'
-export type ContinuationReason = 'max_turns' | 'max_budget' | 'execution_error' | 'structured_output' | 'unknown_error' | null
+export type ContinuationReason = 'max_turns' | 'max_budget' | 'execution_error' | 'structured_output' | 'unknown_error' | 'stopped' | null
 
 export interface RawTaskResult {
   subtype?: string

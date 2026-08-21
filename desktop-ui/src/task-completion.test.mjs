@@ -8,10 +8,26 @@ const compiled = await transform(source, {loader: 'ts', format: 'esm', target: '
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(compiled.code).toString('base64')}`
 const {
   createParentTaskUiState,
+  mergeParentTaskSnapshot,
   reduceParentTaskUi,
   normalizeAssistantText,
+  removeSupersededAssistantMessages,
   selectSucceededTaskSummary,
+  shouldShowPendingResultForTerminal,
 } = await import(moduleUrl)
+
+test('终态快照不会抢先吞掉尚未抵达的最终总结事件', () => {
+  const pending = mergeParentTaskSnapshot(createParentTaskUiState({phase: 'running', taskId: 'task-1'}), {
+    status: 'succeeded', taskId: 'task-1', sequence: 8,
+  })
+  assert.equal(pending.phase, 'succeeded')
+  assert.equal(pending.completionShown, false)
+
+  const shown = mergeParentTaskSnapshot(createParentTaskUiState({phase: 'succeeded', taskId: 'task-1', completionShown: true}), {
+    status: 'succeeded', taskId: 'task-1', sequence: 9,
+  })
+  assert.equal(shown.completionShown, true)
+})
 
 test('SDK result only settles primary turn statistics', () => {
   const reduced = reduceParentTaskUi(createParentTaskUiState({phase: 'running'}), {type: 'result'})
@@ -70,4 +86,30 @@ test('空白或非文本 assistant 内容不会创建可见 AI 气泡', () => {
   assert.equal(normalizeAssistantText('  \n\t '), '')
   assert.equal(normalizeAssistantText(null), '')
   assert.equal(normalizeAssistantText('  有效回复  '), '有效回复')
+})
+
+test('Coordinator 最终总结覆盖同正文的 SDK assistant 气泡', () => {
+  const visible = removeSupersededAssistantMessages([
+    {role: 'assistant', text: '最终总结'},
+    {role: 'user', text: '上一轮也要求总结'},
+    {role: 'assistant', text: '最终总结'},
+    {role: 'system', text: '任务已完成'},
+    {role: 'user', text: '本轮任务'},
+    {role: 'assistant', text: '最终总结'},
+    {role: 'assistant', text: '最终总结', taskResult: {outcome: 'succeeded'}},
+  ])
+  assert.deepEqual(visible.map(item => item.role), ['assistant', 'user', 'assistant', 'system', 'user', 'assistant'])
+  assert.equal(visible.at(-1).taskResult.outcome, 'succeeded')
+})
+
+test('Completion Gate 拒绝成功时不追加 SDK 的成功统计', () => {
+  assert.equal(shouldShowPendingResultForTerminal({
+    terminalType: 'task_verification_inconclusive', pendingOutcome: 'succeeded',
+  }), false)
+  assert.equal(shouldShowPendingResultForTerminal({
+    terminalType: 'task_failed', pendingOutcome: 'succeeded',
+  }), false)
+  assert.equal(shouldShowPendingResultForTerminal({
+    terminalType: 'task_failed', pendingOutcome: 'failed',
+  }), true)
 })

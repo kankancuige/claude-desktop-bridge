@@ -5,6 +5,8 @@ import {
     getSessionStopScope,
     hasStoppablePrimaryWork,
     hasStoppableSessionWork,
+    resolvePrimaryStopTurnId,
+    selectCancelledInputTurns,
 } from './session-stop.mjs'
 
 test('空闲 Session 不应报告可停止', () => {
@@ -64,4 +66,29 @@ test('停止响应明确说明会话是否可以继续', () => {
     })
     assert.equal(buildSessionStopResponse({}, {stopped: true, scope: 'workflow'}).scope, 'workflow')
     assert.equal(buildSessionStopResponse({}, {stopped: true, scope: 'primary'}).scope, 'primary')
+})
+
+test('停止时活动回合只由主停止终态通知，排队补充输入单独取消', () => {
+    const pending = [
+        {turnId: 'active-turn', messageId: 'current'},
+        {turnId: 'follow-up-turn', messageId: 'follow-up'},
+    ]
+    assert.deepEqual(
+        selectCancelledInputTurns(pending, 'active-turn').map(input => input.turnId),
+        ['follow-up-turn'],
+    )
+    assert.deepEqual(
+        selectCancelledInputTurns(pending, null).map(input => input.turnId),
+        ['active-turn', 'follow-up-turn'],
+    )
+})
+
+test('重建阶段停止使用已持久化的父任务 turnId 去重', () => {
+    assert.equal(resolvePrimaryStopTurnId({
+        activeTurnId: 'active-turn', taskCompletionTurnId: 'task-turn',
+    }), 'active-turn')
+    assert.equal(resolvePrimaryStopTurnId({
+        activeTurnId: null, taskCompletionTurnId: 'task-turn',
+    }), 'task-turn')
+    assert.equal(resolvePrimaryStopTurnId({}), null)
 })

@@ -112,7 +112,9 @@ function metadataPath(filePath, root = dirname(filePath)) {
 
 function copyResource(source, target) {
     mkdirSync(dirname(target), {recursive: true})
-    cpSync(source, target, {recursive: true, dereference: true, force: false, errorOnExist: false, preserveTimestamps: true})
+    // 调用方仅在目标缺失或已确认仍等于上一版内置资源时进入；此处必须实际覆盖，
+    // 否则状态会宣称升级完成而磁盘仍保留旧脚本。用户自定义资源会在调用前被排除。
+    cpSync(source, target, {recursive: true, dereference: true, force: true, errorOnExist: false, preserveTimestamps: true})
 }
 
 function loadResourceState(bridgeHome) {
@@ -156,7 +158,16 @@ export function ensureBuiltinResources({bridgeHome} = {}) {
             ? previous.sourceChecksum
             : checksumPath(source, BUILTIN_RESOURCE_ROOT)
         const targetMetadata = metadataPath(target, targetRoot)
-        const targetChecksum = targetMetadata && previous.targetMetadata === targetMetadata && previous.targetChecksum
+        const versionUpgraded = Boolean(previous.version && previous.version !== resource.version)
+        // 旧版本曾在未实际覆盖文件时写入新 checksum。资源版本升级时，只有磁盘文件
+        // 自上次同步后未变且未标记为用户定制，才重新校验并允许修复这类错误状态。
+        const repairStaleBuiltin = versionUpgraded
+            && previous.customized !== true
+            && Boolean(targetMetadata)
+            && previous.targetMetadata === targetMetadata
+        const targetChecksum = repairStaleBuiltin
+            ? checksumPath(target, targetRoot)
+            : targetMetadata && previous.targetMetadata === targetMetadata && previous.targetChecksum
             ? previous.targetChecksum
             : checksumPath(target, targetRoot)
         let customized = false
@@ -165,7 +176,7 @@ export function ensureBuiltinResources({bridgeHome} = {}) {
             result.installed.push(resourceKey(resource))
         } else if (targetChecksum === sourceChecksum) {
             result.skipped.push(resourceKey(resource))
-        } else if (previous.sourceChecksum && targetChecksum === previous.sourceChecksum) {
+        } else if ((previous.sourceChecksum && targetChecksum === previous.sourceChecksum) || repairStaleBuiltin) {
             copyResource(source, target)
             result.updated.push(resourceKey(resource))
         } else {

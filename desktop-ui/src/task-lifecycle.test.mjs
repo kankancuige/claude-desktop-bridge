@@ -44,12 +44,12 @@ test('旧协议验证不足和暂停会释放输入区并允许继续', () => {
   }
 })
 
-test('权威模式等待聚合快照解除忙碌，终态展示事件不能抢先释放队列', () => {
+test('权威模式终态事件立即解除忙碌，后续聚合快照继续保持空闲', () => {
   const running = reduceSessionLifecycle(createSessionLifecycleState(), {
     type: 'session_lifecycle_snapshot', active: true,
     capabilities: {canSend: false, canStop: true, canContinue: false},
   })
-  assert.equal(reduceSessionLifecycle(running, {type: 'task_completed'}).active, true)
+  assert.equal(reduceSessionLifecycle(running, {type: 'task_completed'}).active, false)
   const terminal = reduceSessionLifecycle(running, {
     type: 'session_lifecycle_snapshot', active: false,
     capabilities: {canSend: true, canStop: false, canContinue: false},

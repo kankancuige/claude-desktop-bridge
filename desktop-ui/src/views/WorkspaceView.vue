@@ -46,7 +46,7 @@ import {
   upsertSessionDraft,
   writeSessionDraftStore,
 } from '../session-drafts'
-import {decideSessionRuntimeRecovery, isSameSessionSelection, shouldCloseSocketBeforeConnect, shouldReuseConnectedSession, shouldValidateSessionRuntime} from '../session-selection'
+import {decideSessionRuntimeRecovery, isSameSessionSelection, shouldCloseSocketBeforeConnect, shouldHandleSessionSocketEvent, shouldRecoverMissingRuntimeSessionAfterClose, shouldRefreshSessionTokenAfterClose, shouldReuseConnectedSession, shouldValidateSessionRuntime} from '../session-selection'
 import {applySessionVisibilityEvent} from '../project-sessions'
 import {buildSessionCreateRequest} from '../session-create-mode'
 import {attachmentKindLabel} from '../attachment-description'
@@ -58,18 +58,22 @@ import {
 } from '../large-input'
 import {buildModelSelectionPayload, describeTaskDecision} from '../model-routing.mjs'
 import type {TaskDecisionDisplay, ModelMode} from '../model-routing.mjs'
-import {resolveModelContextSwitch, type ModelContextSwitchMode} from '../model-context-switch'
+import {resolveConversationModel, resolveModelContextSwitch, type ModelContextSwitchMode} from '../model-context-switch'
 import {mergeWorkflowAgentLogState, normalizeWorkflowLogAgentStatus} from '../agent-event-state.mjs'
 import {formatCompactSummary, isSyntheticCompactUiMessage, normalizeContextUiState} from '../context-usage'
 import {
   createParentTaskUiState,
+  mergeParentTaskSnapshot,
   normalizeAssistantText,
+  removeSupersededAssistantMessages,
   reduceParentTaskUi,
   selectSucceededTaskSummary,
+  shouldShowPendingResultForTerminal,
   type ParentTaskUiState,
 } from '../task-completion'
 import {
   createTaskActivityState,
+  isReviewLifecycleEvent,
   reduceTaskActivity,
   taskActivityFreshness,
   type TaskActivityEntry,
@@ -164,6 +168,8 @@ interface PersistedTaskState {
   outcome: 'succeeded' | 'incomplete' | 'failed' | null
   continuationReason: ContinuationReason | 'stopped' | null
   resumable: boolean
+  /** Gateway 恢复的上一回合实际模型，用于跨模型上下文策略。 */
+  model?: string | null
   subtype?: string | null
   numTurns?: number
   detail?: string
@@ -635,7 +641,7 @@ let _pendingResultMessage: Message | null = null
 /** 当前会话的消息列表（按时间序追加） */
 const messages = ref<Message[]>([])
 /** 活动总览由底部悬浮框统一展示；聊天区只保留用户、回复和独立执行步骤。 */
-const renderedMessages = computed(() => messages.value.filter(message => (
+const renderedMessages = computed(() => removeSupersededAssistantMessages(messages.value).filter(message => (
   message.role !== 'activity'
   // 历史记录或迟到事件也可能携带空 assistant 内容；渲染层再次兜底，防止出现空白 AI 气泡。
   && (message.role !== 'assistant' || Boolean(normalizeAssistantText(message.text)))
@@ -651,6 +657,13 @@ function currentActivityMessage(): Message | null {
   return [...messages.value].reverse().find(message => message.role === 'activity' && message.activity) || null
 }
 
+function findLastMessageIndex(predicate: (message: Message) => boolean): number {
+  for (let index = messages.value.length - 1; index >= 0; index--) {
+    if (predicate(messages.value[index])) return index
+  }
+  return -1
+}
+
 function syncTaskActivityMessage({forceNew = false, placeAfterLatestUser = false} = {}) {
   if (!taskActivity.value.entries.length) return
   let message = forceNew ? null : currentActivityMessage()
@@ -663,10 +676,10 @@ function syncTaskActivityMessage({forceNew = false, placeAfterLatestUser = false
 
   if (!placeAfterLatestUser) return
   const messageIndex = messages.value.indexOf(message)
-  const userIndex = messages.value.findLastIndex(item => item.role === 'user')
+  const userIndex = findLastMessageIndex(item => item.role === 'user')
   if (messageIndex >= 0 && userIndex >= 0 && messageIndex < userIndex) {
     messages.value.splice(messageIndex, 1)
-    const nextUserIndex = messages.value.findLastIndex(item => item.role === 'user')
+    const nextUserIndex = findLastMessageIndex(item => item.role === 'user')
     messages.value.splice(nextUserIndex + 1, 0, message)
   }
   if (userIndex >= 0) message.activityUserLinked = true
@@ -768,7 +781,7 @@ function taskStepForEvent(event: any, state: TaskActivityState): {key: string; e
     key = `wait:done:${id}:${entry.id}`; title = '确认已完成，继续执行'
   } else if (type === 'context_compacting' || type === 'context_compacted') {
     key = `context:${type}`; entry = entryById('context:compaction'); title = entry?.title || '上下文处理'
-  } else if (type === 'primary_completed' || type === 'task_reviewing' || type === 'task_changes_required') {
+  } else if (isReviewLifecycleEvent(type)) {
     key = `review:start:${type}`; entry = entryById('task:review'); title = entry?.title || '开始定向审查'
   } else if (type === 'task_fixing') {
     key = 'review:fixing'; entry = entryById('task:fixing'); title = entry?.title || '开始修复审查问题'
@@ -860,6 +873,8 @@ interface TabState {
   taskActivity: TaskActivityState
   sessionLifecycle: SessionLifecycleState
   pendingResultMessage: Message | null
+  workflowRunState: WfRunState | null
+  workflowPanelVisible: boolean
 }
 
 /** 创建初始标签页状态（所有字段有默认值） */
@@ -900,6 +915,8 @@ function initialTabState(): TabState {
     taskActivity: createTaskActivityState(),
     sessionLifecycle: createSessionLifecycleState(),
     pendingResultMessage: null,
+    workflowRunState: null,
+    workflowPanelVisible: false,
   }
 }
 
@@ -941,6 +958,13 @@ function snapshotTabState(): TabState {
     taskActivity: {...taskActivity.value},
     sessionLifecycle: {...sessionLifecycle.value},
     pendingResultMessage: _pendingResultMessage ? {..._pendingResultMessage} : null,
+    workflowRunState: wfRunState.value ? {
+      ...wfRunState.value,
+      phases: [...wfRunState.value.phases],
+      logs: [...wfRunState.value.logs],
+      agents: [...wfRunState.value.agents],
+    } : null,
+    workflowPanelVisible: showWfPanel.value,
   }
 }
 
@@ -982,6 +1006,13 @@ function restoreTabState(s: TabState) {
   taskActivity.value = createTaskActivityState(s.taskActivity)
   sessionLifecycle.value = createSessionLifecycleState(s.sessionLifecycle)
   _pendingResultMessage = s.pendingResultMessage ? {...s.pendingResultMessage} : null
+  wfRunState.value = s.workflowRunState ? {
+    ...s.workflowRunState,
+    phases: [...s.workflowRunState.phases],
+    logs: [...s.workflowRunState.logs],
+    agents: [...s.workflowRunState.agents],
+  } : null
+  showWfPanel.value = s.workflowPanelVisible === true
 }
 
 interface TabSession {
@@ -3048,7 +3079,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         }
       }
 
-      let msg
+      let msg: any
       try {
         msg = JSON.parse(e.data)
       } catch {
@@ -3068,6 +3099,11 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
       switch (msg.type) {
       case 'connected': {
         // Gateway 在连接握手中返回当前会话的镜像状态；刷新/重连时以服务端持久化值覆盖本地快照。
+        const ownsTabSocket = tab?.websocket === thisWs
+        const ownsForegroundSocket = ws === thisWs
+        if (!shouldHandleSessionSocketEvent(ownsTabSocket, ownsForegroundSocket)) break
+        if (ownsTabSocket && tab) tab.state.connected = true
+        if (fg && ownsForegroundSocket) connected.value = true
         const connectedMirrors = msg.mirrors && typeof msg.mirrors === 'object' ? msg.mirrors : null
         if (connectedMirrors) {
           for (const p of IM_PLATFORMS) {
@@ -3091,14 +3127,10 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
       case 'session_lifecycle_snapshot': {
         if (msg.task && typeof msg.task === 'object') {
           tabTaskState.value = msg.task as PersistedTaskState
+          if (typeof msg.task.model === 'string' && msg.task.model) runtimeModel.value = msg.task.model
           const persistedStatus = String(msg.task.status || 'idle')
-          parentTaskUi.value = createParentTaskUiState({
-            phase: (['running', 'reviewing', 'changes_required', 'fixing', 'review_paused', 'succeeded', 'incomplete', 'failed'].includes(persistedStatus)
-              ? persistedStatus
-              : 'idle') as ParentTaskUiState['phase'],
-            completionShown: persistedStatus === 'succeeded',
-            detail: String(msg.task.detail || ''),
-            taskId: String(msg.task.taskId || ''),
+          parentTaskUi.value = mergeParentTaskSnapshot(parentTaskUi.value, {
+            ...msg.task,
             sequence: Number(msg.sequence || msg.task.sequence || 0),
           })
           if (persistedStatus === 'succeeded') clearStaleContinuationActions()
@@ -3134,14 +3166,9 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         }
         if (msg.taskState && typeof msg.taskState === 'object') {
           tabTaskState.value = msg.taskState as PersistedTaskState
+          if (typeof msg.taskState.model === 'string' && msg.taskState.model) runtimeModel.value = msg.taskState.model
           const persistedStatus = String(msg.taskState.status || 'idle')
-          parentTaskUi.value = createParentTaskUiState({
-            phase: (['running', 'reviewing', 'changes_required', 'fixing', 'review_paused', 'succeeded', 'incomplete', 'failed'].includes(persistedStatus)
-              ? persistedStatus
-              : 'idle') as ParentTaskUiState['phase'],
-            completionShown: persistedStatus === 'succeeded',
-            detail: String(msg.taskState.detail || ''),
-          })
+          parentTaskUi.value = mergeParentTaskSnapshot(parentTaskUi.value, msg.taskState)
           if (persistedStatus === 'succeeded') clearStaleContinuationActions()
         }
         if (fg && Array.isArray(msg.pendingConfirmations) && msg.pendingConfirmations.length > 0) {
@@ -3783,8 +3810,9 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
             })
           } else {
             messages.value.push({
-              role: 'system',
-              text: '任务已完成，但 Gateway 未返回最终总结。',
+              // 仍用末尾 AI 气泡收口，避免把最终状态混入中间系统时间线。
+              role: 'assistant',
+              text: '任务已完成，但 Gateway 未返回最终总结。请查看上方执行步骤和验证结果。',
               time: Date.now(),
               taskResult: {outcome: 'succeeded', continuationReason: null, resumable: false, originalTask: lastUserMessage, durationMs: totalDurationMs},
             })
@@ -3803,11 +3831,14 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         } else {
           const totalDurationMs = Number(msg.durationMs ?? msg.taskState?.durationMs)
             || (taskActivity.value.startedAt ? Math.max(0, Date.now() - taskActivity.value.startedAt) : 0)
-          if (_pendingResultMessage) {
+          if (_pendingResultMessage && shouldShowPendingResultForTerminal({
+            terminalType: msg.type,
+            pendingOutcome: _pendingResultMessage.taskResult?.outcome,
+          })) {
             if (_pendingResultMessage.taskResult) _pendingResultMessage.taskResult.durationMs = totalDurationMs
             messages.value.push(_pendingResultMessage)
-            _pendingResultMessage = null
           }
+          _pendingResultMessage = null
           status.value = 'idle'
           if (fg) {
             const detail = String(msg.detail || t('sys.taskIncompleteShort'))
@@ -4241,7 +4272,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
     const tab = tabSessions.value.find(t => t.id === myTabId)
     const ownsTabSocket = tab?.websocket === thisWs
     const ownsForegroundSocket = ws === thisWs
-    if (!ownsTabSocket && !ownsForegroundSocket) return
+    if (!shouldHandleSessionSocketEvent(ownsTabSocket, ownsForegroundSocket)) return
     if (ownsTabSocket && tab) tab.websocket = null
     if (ownsForegroundSocket) ws = null
     if (tab) tab.state.connected = false
@@ -4251,23 +4282,41 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
       connected.value = false; status.value = 'idle'
       syncPetState('disconnected', { bubble: petPick(BUBBLE_DISCONNECTED, myProject) })
     }
+    if (shouldRecoverMissingRuntimeSessionAfterClose(event.code) && isFg() && myTabId) {
+      // Gateway 重启后内存中的 runtime UUID 不再存在；使用已有历史会话重建，不能继续重连旧 UUID。
+      cancelSessionReconnect(myTabId)
+      void switchToTab(myTabId, true).catch(error => {
+        console.error('[workspaceWS] 运行会话恢复失败:', error)
+      })
+      return
+    }
     const reconnectable = event.code === 4003 || event.code === 1001 || event.code === 1006
         || event.code === 1011 || event.code === 1012 || event.code === 1013
+    const refreshToken = shouldRefreshSessionTokenAfterClose(event.code)
     if (reconnectable && isFg() && myTabId) {
       showToast('会话连接已断开，正在自动重连...', 5000)
-      scheduleSessionReconnect(myTabId, mySid, event.code === 4003)
+      scheduleSessionReconnect(myTabId, mySid, refreshToken)
     } else if (isFg()) {
       showToast(`会话连接已关闭（${event.code || 1006}）`, 6000)
     }
   }
   thisWs.onerror = () => {
     const tab = tabSessions.value.find(t => t.id === myTabId)
+    const ownsTabSocket = tab?.websocket === thisWs
+    const ownsForegroundSocket = ws === thisWs
+    if (!shouldHandleSessionSocketEvent(ownsTabSocket, ownsForegroundSocket)) return
     if (tab) tab.state.connected = false
-    if (isFg()) {
+    const foreground = isFg()
+    if (foreground) {
       dispatchBridgeNotice(classifyBridgeFailure({source: 'websocket', path: `/ws/${mySid}`, serverCode: 'SESSION_CHANNEL_ERROR'}))
       connected.value = false
       syncPetState('error', { message: 'Connection error', bubble: petPick(BUBBLE_ERROR_CONN, myProject) })
       setTimeout(() => syncPetState('disconnected'), 3000)
+    }
+    // Chromium 在握手失败或连接重置时可能只派发 error；不能依赖随后一定到达 onclose。
+    // 复用同一 tab 的单一退避 timer，onclose 若随后到达会被 timer 去重。
+    if (foreground && myTabId) {
+      scheduleSessionReconnect(myTabId, mySid, true)
     }
   }
 }
@@ -4501,21 +4550,32 @@ async function sendMessage() {
   }
 
   if (taskBusy.value) {
-    // thinking/队列清空中/子Agent还在跑: 新消息进入排队，避免打断正在执行的 Agent
-    queueId++
-    msgQueue.value.push({id: queueId, text, originalText, time: Date.now(), attachments})
-    saveDraftForTab(activeTab.value, originalText, true)
-    // 附件归属当前队列项，避免下一条消息误带上本条附件。
-    if (attachments) pendingAttachments.value = []
-    inputText.value = ''
-    if (prepared.converted) showToast(`输入内容较长，已自动转为 TXT 附件（${formatAttachmentSize(prepared.bytes)}）`)
-    nextTick(() => scrollDown(true))
+    // Gateway 是补充指令的唯一队列权威。前端延后派发会把同一父任务拆成新任务，
+    // 导致中间就出现总结气泡；这里直接提交，由 Gateway 按 turnId 和 messageId 持久化、去重与取消。
+    try {
+      const sent = await dispatch(text, attachments, originalText)
+      if (sent) {
+        inputText.value = ''
+        if (prepared.converted) showToast(`输入内容较长，已自动转为 TXT 附件（${formatAttachmentSize(prepared.bytes)}）`)
+      } else {
+        showToast(t('ws.notConnected'))
+      }
+    } catch (error) {
+      console.error(error)
+      inputText.value = originalText
+      saveDraftForTab(activeTab.value, originalText, true)
+      showToast(t('ws.attachmentUploadFailed'))
+    }
     return
   }
 
   const switchDecision = resolveModelContextSwitch({
     mode: modelMode.value,
-    currentModel: runtimeModel.value,
+    currentModel: resolveConversationModel({
+      runtimeModel: runtimeModel.value,
+      taskModel: taskDecision.value?.model,
+      persistedModel: tabTaskState.value?.model,
+    }),
     nextModel: model.value,
     hasConversation: Boolean(activeTab.value?.historySessionId || messages.value.some(item => item.role === 'user')),
   })
@@ -4683,18 +4743,23 @@ function doSend(text: string, wire?: string, attachments?: PendingAttachment[], 
   if (!sendSessionPayload(payload, socket)) return false
 
   // SIDE_EFFECT: 只有 WebSocket 接受消息后才提交本地回合状态。
+  // 补充输入仍属于 Gateway 中的同一父任务，不能重置父任务视图或抹掉正在运行的 Agent 状态。
   status.value = 'thinking'
   sessionLifecycle.value = reduceSessionLifecycle(sessionLifecycle.value, {type: 'local_task_submitted'})
-  parentTaskUi.value = createParentTaskUiState({phase: 'running'})
-  clearStaleContinuationActions()
+  if (!wasTaskRunning) {
+    parentTaskUi.value = createParentTaskUiState({phase: 'running'})
+    clearStaleContinuationActions()
+  }
   applyTaskActivityEvent(
     wasTaskRunning ? {type: 'task_input_added', source: '桌面端'} : {type: 'task_started'},
   )
-  _pendingResultMessage = null
-  startTaskDurationTimer()
-  lastUserMessage = originalText
-  turnThinkingText = ''  // 新一轮开始: 清空本轮思考文本累计，result 时重新估算
-  clearAgentRuns()       // 新一轮开始: 清空上一轮的 agent 运行卡片
+  if (!wasTaskRunning) {
+    _pendingResultMessage = null
+    startTaskDurationTimer()
+    lastUserMessage = originalText
+    turnThinkingText = ''  // 新一轮开始: 清空本轮思考文本累计，result 时重新估算
+    clearAgentRuns()       // 新一轮开始: 清空上一轮的 agent 运行卡片
+  }
   // resume 走 SDK，claude.exe 自带完整历史，无需前端手动注入 <context>
   const userMessage: Message = {
     role: 'user',

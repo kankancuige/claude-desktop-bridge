@@ -6,7 +6,7 @@ import {transform} from 'esbuild'
 const source = readFileSync(new URL('./task-activity.ts', import.meta.url), 'utf8')
 const compiled = await transform(source, {loader: 'ts', format: 'esm', target: 'es2022'})
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(compiled.code).toString('base64')}`
-const {createTaskActivityState, reduceTaskActivity, taskActivityFreshness} = await import(moduleUrl)
+const {createTaskActivityState, reduceTaskActivity, taskActivityFreshness, isReviewLifecycleEvent} = await import(moduleUrl)
 
 test('任务事件按开始、思考、工具、回复和审查阶段更新活动状态', () => {
   let state = createTaskActivityState()
@@ -41,6 +41,17 @@ test('任务事件按开始、思考、工具、回复和审查阶段更新活�
   state = reduceTaskActivity(state, {type: 'task_reviewing', detail: '检查改动'}, 700)
   assert.equal(state.phase, 'reviewing')
   assert.equal(state.entries.at(-1).title, '正在进行定向审查')
+})
+
+test('Light 主回复完成不会伪装成定向审查', () => {
+  let state = reduceTaskActivity(createTaskActivityState(), {type: 'task_started'}, 100)
+  state = reduceTaskActivity(state, {type: 'text_delta'}, 200)
+  state = reduceTaskActivity(state, {type: 'primary_completed', primaryOutcome: 'succeeded'}, 300)
+
+  assert.equal(state.phase, 'responding')
+  assert.equal(state.entries.some(entry => entry.id === 'task:review'), false)
+  assert.equal(isReviewLifecycleEvent('primary_completed'), false)
+  assert.equal(isReviewLifecycleEvent('task_reviewing'), true)
 })
 
 test('Agent、工作流、上下文压缩和权限等待形成可更新步骤', () => {
