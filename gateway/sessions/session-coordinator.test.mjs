@@ -26,3 +26,35 @@ test('取消和过期重建不会覆盖后继 rebuild 状态', () => {
     assert.equal(coordinator.fail(session, second.token), true)
     assert.equal(session._pendingMessages, null)
 })
+
+test('Coordinator 统一保存 context policy、取消原因和可观察快照', () => {
+    const coordinator = createSessionCoordinator()
+    const session = {}
+    coordinator.setContextPolicy(session, {mode: 'handoff_summary', cacheEligibility: 'cross_model_unavailable'})
+    coordinator.beginTurn(session)
+    assert.equal(coordinator.snapshot(session).contextPolicy.mode, 'handoff_summary')
+    coordinator.cancel(session, 'timeout')
+    assert.deepEqual(coordinator.snapshot(session), {
+        rebuilding: false,
+        rebuildId: null,
+        pendingMessages: 0,
+        cancelled: true,
+        cancelReason: 'timeout',
+        timeoutActive: false,
+        timeoutReason: null,
+        contextPolicy: {mode: 'handoff_summary', cacheEligibility: 'cross_model_unavailable'},
+    })
+})
+
+test('timeout 归属 Coordinator，过期 query 和取消后均不能触发 timeout', () => {
+    const coordinator = createSessionCoordinator()
+    const session = {}
+    const query = {}
+    assert.equal(coordinator.beginTimeout(session, query, 'stream_idle_timeout'), true)
+    assert.equal(coordinator.isTimeoutCurrent(session, query), true)
+    assert.equal(coordinator.isTimeoutCurrent(session, {}), false)
+    assert.equal(coordinator.snapshot(session).timeoutReason, 'stream_idle_timeout')
+    coordinator.cancel(session, 'user_stop')
+    assert.equal(coordinator.isTimeoutCurrent(session, query), false)
+    assert.equal(coordinator.snapshot(session).timeoutActive, false)
+})

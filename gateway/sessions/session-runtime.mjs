@@ -3,6 +3,21 @@ import {createTaskCompletionState} from '../tasks/task-completion.mjs'
 import {createTaskStatePatch} from '../tasks/task-state.mjs'
 import {createTaskWorkflowGate} from '../tasks/task-workflow-gate.mjs'
 import {buildContextEnvelope} from '../context/context-envelope.mjs'
+import {createCleanupRegistry} from './cleanup-registry.mjs'
+import {createRuntimeDiagnostics} from './runtime-diagnostics.mjs'
+
+async function closeWithTimeout(value, timeoutMs = 5000) {
+    if (!value || typeof value.then !== 'function') return
+    let timer
+    try {
+        await Promise.race([
+            Promise.resolve(value),
+            new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('cleanup timeout')), timeoutMs) }),
+        ])
+    } finally {
+        clearTimeout(timer)
+    }
+}
 
 /**
  * 只把匿名、稳定的运行配置投影给上下文策略；Prompt、凭据和工作目录不进入 envelope。
@@ -82,6 +97,32 @@ export function createSessionRuntime({
         activeTurnIdentity: null,
         depth,
         ...extra,
+    }
+    runtime.cleanupRegistry = extra.cleanupRegistry || createCleanupRegistry({parentSignal: extra.parentSignal || null})
+    runtime.diagnostics = extra.diagnostics || createRuntimeDiagnostics()
+    runtime.cleanupRegistry.register('query', async () => {
+        const closing = runtime.query?.return?.()
+        await closeWithTimeout(closing)
+    }, 'session-query')
+    runtime.cleanupRegistry.register('stream', () => runtime.pushStream?.close(), 'session-push-stream')
+    runtime.cleanupRegistry.register('watchdog', () => {
+        if (runtime._streamWatchdogTimer) clearTimeout(runtime._streamWatchdogTimer)
+        runtime._streamWatchdogTimer = null
+        runtime._streamWatchdogQuery = null
+    }, 'session-watchdog')
+    runtime.newCleanupRegistry = () => {
+        runtime.cleanupRegistry = createCleanupRegistry({parentSignal: extra.parentSignal || null})
+        runtime.cleanupRegistry.register('query', async () => {
+            const closing = runtime.query?.return?.()
+            await closeWithTimeout(closing)
+        }, 'session-query')
+        runtime.cleanupRegistry.register('stream', () => runtime.pushStream?.close(), 'session-push-stream')
+        runtime.cleanupRegistry.register('watchdog', () => {
+            if (runtime._streamWatchdogTimer) clearTimeout(runtime._streamWatchdogTimer)
+            runtime._streamWatchdogTimer = null
+            runtime._streamWatchdogQuery = null
+        }, 'session-watchdog')
+        return runtime.cleanupRegistry
     }
     runtime.contextEnvelope = createSessionContextEnvelope(runtime, opts)
     return runtime

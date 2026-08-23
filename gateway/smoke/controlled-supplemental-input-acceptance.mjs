@@ -29,7 +29,7 @@ if (process.env.BRIDGE_RUN_CONTROLLED_SUPPLEMENTAL_ACCEPTANCE !== '1') {
     let completionAfterResultCount = null
     let settled = false
     let settleTimer = null
-    const timeout = setTimeout(() => finish(new Error('真实补充指令验收未在 70 秒内完成两个 Provider 回合')), 70_000)
+    const timeout = setTimeout(() => finish(new Error(`真实补充指令验收未在 70 秒内完成两个 Provider 回合；accepted=${accepted.length}; results=${resultCount}; completions=${completionCount}; events=${eventTypes.slice(-20).join(',')}`)), 70_000)
     const ws = new WebSocket(`ws://127.0.0.1:3456/ws/${sessionId}`, {headers: {'x-bridge-token': token}})
 
     function finish(error) {

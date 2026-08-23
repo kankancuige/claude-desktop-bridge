@@ -35,3 +35,25 @@ test('收到权威生命周期后不再被迟到的展示状态反向判忙', ()
   }), false)
   assert.equal(isTaskBusy({lifecycleReceived: true, lifecycleActive: true, status: 'idle'}), true)
 })
+
+test('父任务终态覆盖迟到的 active 快照，但运行中的 Workflow 仍保持忙碌', () => {
+  assert.equal(isTaskBusy({
+    lifecycleReceived: true,
+    lifecycleActive: true,
+    parentPhase: 'succeeded',
+    workflowStatus: 'done',
+  }), false)
+  assert.equal(isTaskBusy({
+    lifecycleReceived: true,
+    lifecycleActive: true,
+    parentPhase: 'succeeded',
+    workflowStatus: 'running',
+  }), true)
+  assert.equal(isTaskBusy({
+    lifecycleReceived: true,
+    lifecycleActive: true,
+    taskStatus: 'succeeded',
+    workflowStatus: 'done',
+  }), false)
+  assert.equal(isTaskBusy({status: 'thinking', activityRunning: true, taskStatus: 'incomplete'}), false)
+})

@@ -207,3 +207,47 @@ test('Codex relay reports retry count and upstream request id after persistent o
         else process.env.BRIDGE_ALLOW_LOCAL_PROVIDER = oldAllowLocal
     }
 })
+
+test('Codex relay injects an explicit test-only idle delay before contacting upstream', async () => {
+    const oldAllowLocal = process.env.BRIDGE_ALLOW_LOCAL_PROVIDER
+    const oldFaults = process.env.BRIDGE_TEST_CODEX_RELAY_FAULTS
+    const oldDelay = process.env.BRIDGE_TEST_CODEX_RELAY_IDLE_BEFORE_UPSTREAM_MS
+    process.env.BRIDGE_ALLOW_LOCAL_PROVIDER = '1'
+    process.env.BRIDGE_TEST_CODEX_RELAY_FAULTS = '1'
+    process.env.BRIDGE_TEST_CODEX_RELAY_IDLE_BEFORE_UPSTREAM_MS = '80'
+    let upstreamAt = 0
+    const startedAt = Date.now()
+    const upstream = createServer(async (req, res) => {
+        for await (const _chunk of req) { /* consume request */ }
+        upstreamAt = Date.now()
+        res.writeHead(200, {'content-type': 'application/json'})
+        res.end(JSON.stringify({
+            id: 'resp-idle', model: 'gpt-5.6-sol', status: 'completed',
+            output: [{type: 'message', content: [{type: 'output_text', text: 'after idle'}]}],
+        }))
+    })
+    const upstreamPort = await listen(upstream)
+    const proxyPort = await reservePort()
+    try {
+        const relay = await startCodexRelayProxy({
+            upstream: `http://127.0.0.1:${upstreamPort}/api/codex/backend-api/codex`,
+            apiKey: 'relay-secret', model: 'gpt-5.6-sol', port: proxyPort,
+        })
+        const response = await fetch(`${getCodexRelayProxyUrl()}/v1/messages`, {
+            method: 'POST',
+            headers: {'content-type': 'application/json', authorization: `Bearer ${relay.token}`},
+            body: JSON.stringify({model: 'claude-opus-4', messages: [{role: 'user', content: 'timeout'}]}),
+        })
+        assert.equal(response.status, 200)
+        assert.ok(upstreamAt - startedAt >= 70)
+    } finally {
+        await stopCodexRelayProxy()
+        await close(upstream)
+        if (oldAllowLocal === undefined) delete process.env.BRIDGE_ALLOW_LOCAL_PROVIDER
+        else process.env.BRIDGE_ALLOW_LOCAL_PROVIDER = oldAllowLocal
+        if (oldFaults === undefined) delete process.env.BRIDGE_TEST_CODEX_RELAY_FAULTS
+        else process.env.BRIDGE_TEST_CODEX_RELAY_FAULTS = oldFaults
+        if (oldDelay === undefined) delete process.env.BRIDGE_TEST_CODEX_RELAY_IDLE_BEFORE_UPSTREAM_MS
+        else process.env.BRIDGE_TEST_CODEX_RELAY_IDLE_BEFORE_UPSTREAM_MS = oldDelay
+    }
+})

@@ -12,6 +12,7 @@ function hasSpecificDeviceDriverSignal(text) {
 }
 
 const MEMORY_DIRECT = /(?:记住|记录下来|沉淀|整理|更新|删除|忘记|写入|保存).{0,80}(?:记忆|memory|项目约定|项目规则)|(?:记忆|memory|项目约定|项目规则).{0,80}(?:记住|记录|沉淀|整理|更新|删除|忘记|写入|保存)/i
+const INDUSTRIAL_SOLUTION_DIRECT = /(?:工业拧紧|智能拧紧|拧紧设备|扭矩校验|扭矩扳手|数字工厂|工位规划|工位管理|技术方案|项目技术方案|技术协议|招标响应|投标响应|实施方案|验收方案|方案书|MES|MOM|KMIS|LIMS|PLM|生产追溯|质量追溯|信创适配|车间大屏)/i
 
 const ROUTES = [
     {
@@ -21,6 +22,10 @@ const ROUTES = [
     {
         name: 'digital-twin-cad',
         match: isDigitalTwinIntegration,
+    },
+    {
+        name: 'industrial-tightening-solution',
+        match: text => INDUSTRIAL_SOLUTION_DIRECT.test(text),
     },
     {
         name: 'protocol-parser',

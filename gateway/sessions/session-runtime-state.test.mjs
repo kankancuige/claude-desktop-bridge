@@ -11,6 +11,7 @@ test('空闲的长连接 runtime 不应被标记为正在生成', () => {
         generating: false,
         pendingInputs: 0,
         pendingConfirmations: [],
+        diagnostics: {count: 0, byPhase: {}, byError: {}},
     })
 })
 

@@ -19,7 +19,7 @@ function withTempClaudeHome(run) {
 }
 
 test('内置数字孪生 Skill 源文件完整可读', () => {
-    assert.deepEqual(BUILTIN_SKILL_NAMES, ['bridge-memory', 'digital-twin-cad'])
+    assert.deepEqual(BUILTIN_SKILL_NAMES, ['bridge-memory', 'digital-twin-cad', 'industrial-tightening-solution'])
     const content = readFileSync(builtinSkillSourcePath('digital-twin-cad'), 'utf8')
     assert.match(content, /^---\r?\nname: digital-twin-cad/m)
     assert.match(content, /twin\.config\.yaml/)
@@ -27,6 +27,14 @@ test('内置数字孪生 Skill 源文件完整可读', () => {
     assert.match(content, /image-procedural/)
     assert.match(content, /image-proxy/)
     assert.match(content, /ObjectSculptSpec/)
+})
+
+test('工业拧紧技术方案 Skill 源文件包含通用边界和验收方法', () => {
+    const content = readFileSync(builtinSkillSourcePath('industrial-tightening-solution'), 'utf8')
+    assert.match(content, /^---\r?\nname: industrial-tightening-solution/m)
+    assert.match(content, /项目技术方案/)
+    assert.match(content, /验收矩阵/)
+    assert.doesNotMatch(content, /(?:sk-[A-Za-z0-9]{20,}|API_KEY\s*[:=]|Bearer\s+[A-Za-z0-9._-]{24,})/)
 })
 
 test('Bridge Memory Skill 源文件包含治理边界', () => {
@@ -45,6 +53,12 @@ test('首次命中时安装内置 Skill，重复调用不覆盖已有内容', ()
     const second = ensureBuiltinSkillsAvailable(['digital-twin-cad'], {bridgeHome})
     assert.deepEqual(second, {available: ['digital-twin-cad'], installed: []})
     assert.equal(readFileSync(target, 'utf8'), '用户自定义内容')
+}))
+
+test('首次命中时安装工业拧紧技术方案 Skill', () => withTempClaudeHome(bridgeHome => {
+    const result = ensureBuiltinSkillsAvailable(['industrial-tightening-solution'], {bridgeHome})
+    assert.deepEqual(result, {available: ['industrial-tightening-solution'], installed: ['industrial-tightening-solution']})
+    assert.match(readFileSync(join(bridgeHome, 'skills', 'industrial-tightening-solution', 'SKILL.md'), 'utf8'), /name: industrial-tightening-solution/)
 }))
 
 test('未知 Skill 由现有配置负责，不产生内置文件', () => withTempClaudeHome(bridgeHome => {

@@ -68,6 +68,7 @@
         "to": "gateway",
         "filter": [
           "**/*",
+          "node_modules/**/*",
           "!.env",
           "!.env.*",
           "!bridge-logs/**",
@@ -83,6 +84,17 @@
           "!node_modules/**/tests/**",
           "!node_modules/**/example/**",
           "!node_modules/**/examples/**"
+        ]
+      },
+      {
+        "from": "../gateway/node_modules",
+        "to": "gateway/node_modules",
+        "filter": [
+          "**/*",
+          "!**/test/**",
+          "!**/tests/**",
+          "!**/example/**",
+          "!**/examples/**"
         ]
       },
       {

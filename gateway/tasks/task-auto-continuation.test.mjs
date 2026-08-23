@@ -93,7 +93,7 @@ test('停止会话先失效 rebuild token，异步续跑完成后不能复活任
     const end = gatewaySource.indexOf('async function startAutoContinuation', start)
     assert.ok(start >= 0 && end > start)
     const stop = gatewaySource.slice(start, end)
-    const invalidate = stop.indexOf('sessionCoordinator.invalidate(s)')
+    const invalidate = stop.indexOf('sessionCoordinator.cancel(s, \'stop_generation\')')
     const close = stop.indexOf('await closeSessionRuntime')
     assert.ok(invalidate >= 0 && close > invalidate)
     assert.match(stop, /s\._autoContinuationRequest = null/)

@@ -3793,6 +3793,8 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
           if (msg.type === 'task_started') status.value = 'thinking'
         } else if (msg.type === 'task_completed') {
           if (!reduced.showCompletion) break
+          // Completion Gate 已收口父任务；任何旧 Workflow 投影都不能继续锁住输入区。
+          wfRunState.value = null
           const totalDurationMs = Number(msg.durationMs ?? msg.taskState?.durationMs)
             || (taskActivity.value.startedAt ? Math.max(0, Date.now() - taskActivity.value.startedAt) : 0)
           const terminalReply = selectSucceededTaskSummary({
@@ -5108,6 +5110,7 @@ const taskBusy = computed(() => isTaskBusy({
   runningAgentTotal: runningAgentTotal.value,
   workflowStatus: wfRunState.value?.status,
   parentPhase: parentTaskUi.value.phase,
+  taskStatus: tabTaskState.value?.status,
   flushingQueue: flushingQueue.value,
 }))
 

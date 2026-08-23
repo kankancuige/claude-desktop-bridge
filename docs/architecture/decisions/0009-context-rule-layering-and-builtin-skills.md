@@ -22,7 +22,8 @@ Bridge 使用仓库内 `BRIDGE_RULES.md` 作为所有目标项目的长期规则
 2. Gateway 从 `bridge-rules.mjs` 的模块位置解析仓库根目录。只有规范化后的 `workDir` 等于该根目录或位于其子目录时，才追加仓库专属规则；不硬编码本机绝对路径。
 3. `applyContextProfile` 显式接收 `workDir`，完整上下文创建和因模型、权限、Skill 变化触发的重建都通过同一 `makeQueryOptions` 路径选择规则。
 4. `digital-twin-cad` 由确定性 Skill Router 选择。数字孪生语义必须与 CAD/STEP/GLB、节点或设备映射、遥测状态、URDF/SDF、manifest 等集成语义同时出现；明确的遥测模型状态或 CAD/GLB 节点绑定视为直接证据。
-5. Bridge 保存一份内置 `digital-twin-cad/SKILL.md`。应用包携带源文件，仅在路由命中且 `BRIDGE_HOME/skills` 不存在同名 Skill 时按需复制；存在同名文件时直接使用且不覆盖。不会写入 Claude/Codex 外部 Skill 目录。准备失败在 Query 创建前明确失败，不允许静默移除 Skill 后继续宣称完成。
+5. `industrial-tightening-solution` 由确定性 Skill Router 选择，覆盖工业拧紧、扭矩校验、工位/追溯、MES/MOM/KMIS、技术方案/协议/招标响应和验收等项目方案语义；普通代码任务不加载它。
+6. Bridge 保存内置 `digital-twin-cad/SKILL.md` 与 `industrial-tightening-solution/`（含通用 references）。应用包携带源文件，仅在路由命中且 `BRIDGE_HOME/skills` 不存在同名 Skill 时按需复制；存在同名文件时直接使用且不覆盖。不会写入 Claude/Codex 外部 Skill 目录。准备失败在 Query 创建前明确失败，不允许静默移除 Skill 后继续宣称完成。
 
 ## Alternatives
 
@@ -62,5 +63,5 @@ Bridge 使用仓库内 `BRIDGE_RULES.md` 作为所有目标项目的长期规则
 
 - Bridge 支持多个独立仓库副本或可配置的自开发仓库路径。
 - Claude Agent SDK 提供不依赖用户目录的内存 Skill 注册接口。
-- 新增第二个 Bridge 内置 Skill，需要统一版本、更新和禁用策略。
+- 新增 Bridge 内置 Skill，需要统一版本、更新和禁用策略；当前技术方案 Skill 已纳入 manifest、资源健康检查和路由测试。
 - 数字孪生路由出现可测量的误触发或漏触发。

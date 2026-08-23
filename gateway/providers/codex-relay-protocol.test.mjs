@@ -66,6 +66,15 @@ test('Responses reasoning summary JSON is exposed as Anthropic thinking', () => 
     assert.deepEqual(message.content[1], {type: 'text', text: '已完成。'})
 })
 
+test('Responses JSON 缺失 usage 字段时保留未知，不补零', () => {
+    const message = fromResponsesJson({
+        id: 'resp-usage-partial', model: 'gpt-5.6-sol', status: 'completed',
+        output: [{type: 'message', content: [{type: 'output_text', text: '已收到'}]}],
+        usage: {output_tokens: 8},
+    }, 'gpt-5.6-sol')
+    assert.deepEqual(message.usage, {input_tokens: null, output_tokens: 8})
+})
+
 test('Responses JSON failed status is not converted into a successful message', () => {
     assert.throws(() => fromResponsesJson({status: 'failed', error: {message: 'upstream failed'}}), /upstream failed/)
 })

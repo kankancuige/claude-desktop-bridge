@@ -30,7 +30,12 @@ export function createTaskLifecycleSnapshot({sessionId = '', runtime = {}, task 
     const taskStatus = String(task?.status || 'idle')
     const runtimeGenerating = runtime?.generating === true
     const taskWorkflowPending = runtime?.taskWorkflowPending === true
-    const runtimeActive = runtimeGenerating || taskWorkflowPending
+    // SDK result/cleanup 可能在父任务已完成后仍短暂保留 generating=true。
+    // 该残留不是可停止的用户工作；真正的 Workflow pending 仍必须保持 busy。
+    const taskHasTerminalOutcome = ['succeeded', 'incomplete', 'failed'].includes(String(task?.outcome || ''))
+        && number(task?.completedAt) > 0
+    const taskTerminal = TERMINAL_TASK_PHASES.has(taskStatus) || taskHasTerminalOutcome
+    const runtimeActive = (runtimeGenerating && !taskTerminal) || taskWorkflowPending
     const taskActive = ACTIVE_TASK_PHASES.has(taskStatus)
     const workflowActive = orderedWorkflows.some(workflow => ACTIVE_WORKFLOW_STATUSES.has(String(workflow?.status || '')))
     const active = runtimeActive || taskActive || workflowActive

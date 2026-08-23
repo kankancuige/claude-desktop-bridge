@@ -116,8 +116,8 @@ export function toResponsesRequest(body, targetModel = body?.model) {
 
 function responseUsage(usage) {
     return {
-        input_tokens: Number(usage?.input_tokens || 0),
-        output_tokens: Number(usage?.output_tokens || 0),
+        input_tokens: usage && Object.hasOwn(usage, 'input_tokens') ? Number.isSafeInteger(Number(usage.input_tokens)) && Number(usage.input_tokens) >= 0 ? Number(usage.input_tokens) : null : null,
+        output_tokens: usage && Object.hasOwn(usage, 'output_tokens') ? Number.isSafeInteger(Number(usage.output_tokens)) && Number(usage.output_tokens) >= 0 ? Number(usage.output_tokens) : null : null,
     }
 }
 
@@ -185,7 +185,7 @@ export function createResponsesSseTranslator(requestedModel) {
                 id: String(response?.id || `msg_${Date.now()}`),
                 type: 'message', role: 'assistant', model: String(response?.model || requestedModel || ''),
                 content: [], stop_reason: null, stop_sequence: null,
-                usage: {input_tokens: 0, output_tokens: 0},
+                usage: {input_tokens: null, output_tokens: null},
             },
         })
     }
@@ -262,7 +262,7 @@ export function createResponsesSseTranslator(requestedModel) {
         } else if (event === 'response.completed') {
             const response = data.response || data
             for (const key of indexes.keys()) output += closeBlock(key)
-            output += sseEvent('message_delta', {type: 'message_delta', delta: {stop_reason: toolSeen ? 'tool_use' : 'end_turn', stop_sequence: null}, usage: {output_tokens: Number(response?.usage?.output_tokens || 0)}})
+            output += sseEvent('message_delta', {type: 'message_delta', delta: {stop_reason: toolSeen ? 'tool_use' : 'end_turn', stop_sequence: null}, usage: {output_tokens: responseUsage(response?.usage).output_tokens}})
             output += sseEvent('message_stop', {type: 'message_stop'})
             stopped = true
         } else if (event === 'response.failed' || event === 'error') {

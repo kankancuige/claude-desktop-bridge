@@ -7,6 +7,9 @@ const MODULE_DIR = dirname(fileURLToPath(import.meta.url))
 const BUILTIN_SKILL_SOURCES = new Map([
     ['bridge-memory', join(MODULE_DIR, 'builtin-skills', 'bridge-memory', 'SKILL.md')],
     ['digital-twin-cad', join(MODULE_DIR, 'builtin-skills', 'digital-twin-cad', 'SKILL.md')],
+    // 技术方案 Skill 的参考资料由 builtin-resources 目录统一随包发布；这里保留
+    // 按需安装入口，使路由命中时仍能使用与资源 manifest 相同的源文件。
+    ['industrial-tightening-solution', join(MODULE_DIR, '..', 'builtin-resources', 'skills', 'industrial-tightening-solution', 'SKILL.md')],
 ])
 
 export const BUILTIN_SKILL_NAMES = Object.freeze([...BUILTIN_SKILL_SOURCES.keys()])

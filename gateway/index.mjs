@@ -86,6 +86,7 @@ import {createTaskStatePatch, recoverTaskState, taskStateForClient, taskStateFor
 import {clearPlatformEntries, platformEntryFilePath} from './im/platform-entry-store.mjs'
 import {createTurnIdentity, shouldDeliverTurnEvent, shouldRouteMirror} from './tasks/turn-routing.mjs'
 import {normalizeWeChatBaseUrl} from './im/wechat-url.mjs'
+import {sendManualImText} from './im/manual-im-send.mjs'
 import {migrateAdapterConfig, readAdapterConfig, writeAdapterConfig} from './im/adapter-config.mjs'
 import {configureSecurePayloadMasterKey} from './security/secure-payload.mjs'
 import {extractWebSocketToken} from './security/websocket-auth.mjs'
@@ -158,6 +159,7 @@ import {
     parseTokenCount,
 } from './context/context-lifecycle.mjs'
 import {resolveContextReusePolicy} from './context/context-cache-policy.mjs'
+import {resolveProviderCapabilityProfile} from './providers/provider-capability-profile.mjs'
 import {createModelUsageEvent} from './context/model-usage.mjs'
 let _proxyStarting = null
 // 同一项目只允许一个后台索引任务，避免连续新建会话重复扫描同一目录。
@@ -520,6 +522,25 @@ function withTimeout(promise, ms) {
 
 async function closeSessionRuntime(session, {sessionId = '', reason = 'unknown', timeoutMs = 5000} = {}) {
     if (!session) return {pushStreamClosed: true, queryClosed: true}
+    if (session.cleanupRegistry?.abort) {
+        const registry = session.cleanupRegistry
+        const snapshot = await registry.abort(reason)
+        sessionCoordinator.clearTimeout(session)
+        const queryEntry = snapshot.entries.find(entry => entry.kind === 'query')
+        const streamEntry = snapshot.entries.find(entry => entry.kind === 'stream')
+        session.diagnostics?.record?.({
+            phase: 'cleanup',
+            cleanupOutcome: [queryEntry, streamEntry].some(entry => entry?.status === 'failed') ? 'failed' : 'cleaned',
+            errorCode: reason,
+        })
+        // Registry 完成后换新实例，允许同一 Session 在重建时继续注册下一代资源。
+        session.newCleanupRegistry?.()
+        return {
+            pushStreamClosed: !streamEntry || !['failed', 'running', 'registered'].includes(streamEntry.status),
+            queryClosed: !queryEntry || !['failed', 'running', 'registered'].includes(queryEntry.status),
+            cleanup: snapshot,
+        }
+    }
     let pushStreamClosed = true
     let queryClosed = true
     try {
@@ -1185,18 +1206,30 @@ function clearStreamWatchdog(session, query = null) {
     if (!session) return
     if (query && session._streamWatchdogQuery && session._streamWatchdogQuery !== query) return
     if (session._streamWatchdogTimer) clearTimeout(session._streamWatchdogTimer)
+    if (session._streamWatchdogCleanup) void session._streamWatchdogCleanup()
+    session._streamWatchdogCleanup = null
     session._streamWatchdogTimer = null
     session._streamWatchdogQuery = null
+    sessionCoordinator.clearTimeout(session, query)
 }
 
 function armStreamWatchdog(sessionId, session, query) {
     if (!session || !query || session.query !== query || STREAM_IDLE_TIMEOUT_MS <= 0) return
     clearStreamWatchdog(session)
     session._streamWatchdogQuery = query
+    sessionCoordinator.beginTimeout(session, query, 'stream_idle_timeout')
     session._streamWatchdogTimer = setTimeout(() => {
-        if (sessions.get(sessionId) !== session || session.query !== query || !session._generating) return
+        const hasActiveWork = Boolean(session._generating || session.activeTurnId
+            || session._rebuildPromise || session._pendingInputs?.length)
+        if (sessions.get(sessionId) !== session || session.query !== query || !hasActiveWork
+            || !sessionCoordinator.isTimeoutCurrent(session, query)) return
         session._streamWatchdogTriggered = query
         const detail = `API 超过 ${Math.round(STREAM_IDLE_TIMEOUT_MS / 1000)} 秒未返回新事件，已自动中断当前执行；已有修改和会话上下文已保留，可继续执行。`
+        session.diagnostics?.record?.({
+            phase: 'timeout',
+            errorCode: 'stream_idle_timeout',
+            durationMs: Math.max(0, Date.now() - Number(session.taskStartedAt || Date.now())),
+        })
         const timeoutIdentity = session.activeTurnIdentity ? {...session.activeTurnIdentity} : null
         log.error({sessionId: sessionId?.slice(0, 8), timeoutMs: STREAM_IDLE_TIMEOUT_MS}, 'SDK 流长时间无事件，自动收口')
         const transition = updateTaskCompletion(session, sessionId, {type: 'runtime_failed', detail})
@@ -1240,6 +1273,10 @@ function armStreamWatchdog(sessionId, session, query) {
             log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, 'SDK 流超时关闭失败')
         })
     }, STREAM_IDLE_TIMEOUT_MS)
+    session._streamWatchdogCleanup = session.cleanupRegistry?.register?.('timer', () => {
+        if (session._streamWatchdogTimer) clearTimeout(session._streamWatchdogTimer)
+        session._streamWatchdogTimer = null
+    }, 'stream-idle-watchdog') || null
     session._streamWatchdogTimer.unref?.()
 }
 
@@ -1276,7 +1313,8 @@ async function stopSessionGeneration(sessionId, s) {
         s.autoContinuationCount = 0
         s.autoContinuationTurns = 0
         // 先失效异步 rebuild token，再等待 SDK 关闭；否则 makeQueryOptions 完成后可能复活已停止任务。
-        sessionCoordinator.invalidate(s)
+        sessionCoordinator.cancel(s, 'stop_generation')
+        s.diagnostics?.record?.({phase: 'cancel', cleanupOutcome: 'requested', errorCode: 'stop_generation'})
         for (const id of [...(s.pending?.keys() || [])]) settlePending(sessionId, id, {
             behavior: 'deny',
             message: '已取消',
@@ -8622,10 +8660,7 @@ async function handleHttpRequest(req, res) {
         return
     }
 
-    // ── POST /api/wechat/send —— 主动推送消息到微信 ──
-    // 功能说明: 前端手动推送文本消息到指定微信用户，自动分段发送长文本
-    // 实现方式: 从 adapters.json 或 channels/ 获取 botToken → sendWeChatChunks 分段发送
-    // 关键数据流: POST {userId, text} → 取 token → sendWeChatChunks → 200 {sent, parts}
+    // 主动消息必须经过已运行适配器，保留配对校验、outbox、重试和平台协议实现。
     if (req.method === 'POST' && url.pathname === '/api/wechat/send') {
         try {
             const {userId, text} = await readBody(req);
@@ -8634,30 +8669,20 @@ async function handleHttpRequest(req, res) {
                 res.end(JSON.stringify({error: 'userId and text required'}));
                 return
             }
-            ;let t, u;
-            try {
-                const a = loadAdapterConfig({strict: true});
-                t = a.wechat?.botToken;
-                u = normalizeWeChatBaseUrl(a.wechat?.baseUrl)
-            } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
-            ;
-            if (!t) {
-                try {
-                    const a = readJSON(join(BRIDGE_HOME, 'channels', 'wechat', 'default', 'account.json'));
-                    t = a.token;
-                    u = normalizeWeChatBaseUrl(a.baseUrl)
-                } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
-            }
-            ;
-            if (!t) {
-                res.writeHead(500);
-                res.end(JSON.stringify({error: 'wechat bot token not configured'}));
+            const delivery = await sendManualImText({
+                hook: getAdapterHook('wechat'),
+                platform: 'wechat',
+                userId,
+                text,
+                notificationId: `manual-wechat-${Date.now()}`,
+            })
+            if (delivery.error === 'adapter_unavailable') {
+                res.writeHead(503)
+                res.end(JSON.stringify({error: 'wechat adapter unavailable'}))
                 return
             }
-            ;const bn = u.replace(/\/+$/, '') + '/';
-            const r = await sendWeChatChunks(bn, t, userId, '', text);
-            res.writeHead(200);
-            res.end(JSON.stringify({sent: r.sent, parts: r.parts}))
+            res.writeHead(delivery.sent ? 200 : 202)
+            res.end(JSON.stringify(delivery))
         } catch (e) {
             res.writeHead(500);
             res.end(JSON.stringify({error: e.message}))
@@ -9530,6 +9555,7 @@ async function submitTaskCommand(command) {
         const contextReusePolicy = resolveContextReusePolicy({
             previous: previousContextEnvelope,
             next: nextContextEnvelope,
+            providerCapability: resolveProviderCapabilityProfile(providerBaseUrl),
             switchIntent: command.contextSwitchMode,
         })
         if (contextReusePolicy.mode === 'handoff_summary') {
@@ -9548,7 +9574,12 @@ async function submitTaskCommand(command) {
                 reasonCodes: contextReusePolicy.reasonCodes,
                 requiresUserChoice: contextReusePolicy.requiresUserChoice,
             })
-            s._lastContextReusePolicy = contextReusePolicy
+            sessionCoordinator.setContextPolicy(s, contextReusePolicy)
+            s.diagnostics?.record?.({
+                phase: 'rebuild',
+                rebuildReason: contextReusePolicy.reasonCodes?.join(',') || 'context_changed',
+                usageSource: contextReusePolicy.cacheEligibility,
+            })
             if (permChanged) s.permissionMode = newPerm
             if (thinkChanged) s.thinkingLevel = newThink
             if (modelChanged) {

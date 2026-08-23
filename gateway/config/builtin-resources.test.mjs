@@ -29,6 +29,8 @@ test('首次启动安装内置资源并记录状态', () => withBridgeHome((brid
     assert.equal(memory.enabled, true)
     assert.equal(memory.customized, false)
     assert.match(readFileSync(join(bridgeHome, 'skills', 'bridge-memory', 'SKILL.md'), 'utf8'), /name: bridge-memory/)
+    assert.match(readFileSync(join(bridgeHome, 'skills', 'industrial-tightening-solution', 'SKILL.md'), 'utf8'), /name: industrial-tightening-solution/)
+    assert.ok(statSync(join(bridgeHome, 'skills', 'industrial-tightening-solution', 'references', 'acceptance-and-evidence.md')).isFile())
 }))
 
 test('用户修改内置资源后升级不会覆盖并标记 customized', () => withBridgeHome((bridgeHome) => {

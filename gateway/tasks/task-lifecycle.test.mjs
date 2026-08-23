@@ -45,3 +45,22 @@ test('终态只有在全部子执行结束后才允许发送或继续', () => {
     assert.equal(snapshot.sequence, 7)
     assert.deepEqual(snapshot.capabilities, {canSend: true, canStop: false, canContinue: true})
 })
+
+test('父任务已进入成功终态时忽略 SDK 清理残留的 generating 标志', () => {
+    const snapshot = createTaskLifecycleSnapshot({
+        runtime: {generating: true, taskWorkflowPending: false},
+        task: {status: 'succeeded', resumable: false, sequence: 8},
+        workflows: [{wfId: 'done', status: 'done', startedAt: 5}],
+    })
+    assert.equal(snapshot.active, false)
+    assert.deepEqual(snapshot.capabilities, {canSend: true, canStop: false, canContinue: false})
+})
+
+test('成功结果投影暂时显示 idle 时仍忽略清理残留', () => {
+    const snapshot = createTaskLifecycleSnapshot({
+        runtime: {generating: true},
+        task: {status: 'idle', outcome: 'succeeded', completedAt: 1234},
+    })
+    assert.equal(snapshot.active, false)
+    assert.equal(snapshot.capabilities.canSend, true)
+})

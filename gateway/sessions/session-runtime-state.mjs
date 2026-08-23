@@ -10,6 +10,7 @@ export function getSessionRuntimeState(session) {
         generating: Boolean(session?._generating || pendingInputs || pendingMessages || session?._rebuildPromise),
         pendingInputs,
         pendingConfirmations: summarizePendingConfirmations(session),
+        diagnostics: session?.diagnostics?.summary?.() || {count: 0, byPhase: {}, byError: {}},
     }
 }
 

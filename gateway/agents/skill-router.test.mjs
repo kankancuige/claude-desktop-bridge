@@ -65,3 +65,21 @@ test('数字孪生参考图和程序化代理任务加载专用 Skill', () => {
         assert.deepEqual(routeSkills({text, profile: 'full'}), ['digital-twin-cad'], text)
     }
 })
+
+test('工业拧紧项目技术方案任务加载专用 Skill', () => {
+    for (const text of [
+        '编写智能拧紧项目技术方案，覆盖工位、扭矩追溯和验收',
+        '根据招标响应整理 MES/KMIS 接口和实施方案',
+        '评审车间大屏与扭矩校验台的技术协议',
+    ]) {
+        const expected = text.includes('技术协议')
+            ? ['industrial-tightening-solution', 'protocol-parser']
+            : ['industrial-tightening-solution']
+        assert.deepEqual(routeSkills({text, profile: 'full'}), expected, text)
+    }
+})
+
+test('普通代码任务不加载工业拧紧技术方案 Skill', () => {
+    assert.deepEqual(routeSkills({text: '修复一个普通 JavaScript 函数的单元测试', profile: 'full'}), [])
+    assert.deepEqual(routeSkills({text: '这个 industrial-tightening-solution Skill 是干什么的？', profile: 'focused'}), [])
+})

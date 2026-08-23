@@ -45,3 +45,15 @@ test('运行态上下文 envelope 不保存 Provider 地址、凭据或工作目
     assert.equal(rebuilt.resumeMode, 'available')
     assert.doesNotMatch(serialized, /relay\.example|private-project|secret-token/i)
 })
+
+test('Session Runtime 为 query、stream 和 watchdog 建立统一 Cleanup Registry', async () => {
+    const runtime = createSessionRuntime({workDir: 'D:/project'})
+    assert.ok(runtime.cleanupRegistry)
+    assert.equal(runtime.cleanupRegistry.signal.aborted, false)
+    const first = runtime.cleanupRegistry
+    const replacement = runtime.newCleanupRegistry()
+    assert.notEqual(replacement, first)
+    assert.equal(first.snapshot().state, 'active')
+    await replacement.abort('test')
+    assert.equal(replacement.snapshot().state, 'aborted')
+})

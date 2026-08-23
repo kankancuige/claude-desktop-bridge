@@ -4,7 +4,7 @@
  */
 import assert from 'node:assert/strict'
 import {readFileSync} from 'node:fs'
-import {join} from 'node:path'
+import {isAbsolute, join} from 'node:path'
 import WebSocket from 'ws'
 import {BRIDGE_HOME} from '../config/bridge-home.mjs'
 
@@ -13,11 +13,18 @@ if (process.env.BRIDGE_RUN_CONTROLLED_PROVIDER_ACCEPTANCE !== '1') {
 } else {
   const baseUrl = 'http://127.0.0.1:3456'
   const token = readFileSync(join(BRIDGE_HOME, 'bridge-token'), 'utf8').trim()
+  const requestedWorkDir = String(process.env.BRIDGE_CONTROLLED_PROVIDER_WORK_DIR || '').trim()
+  assert.ok(!requestedWorkDir || isAbsolute(requestedWorkDir), '受控项目工作目录必须是绝对路径')
+  const requestedTimeoutMs = Number.parseInt(process.env.BRIDGE_CONTROLLED_PROVIDER_TIMEOUT_MS || '55000', 10)
+  assert.ok(Number.isInteger(requestedTimeoutMs) && requestedTimeoutMs >= 30_000 && requestedTimeoutMs <= 180_000,
+    '受控 Provider 验收超时必须在 30–180 秒之间')
+  // 仅在显式验收时切换目标项目，且不输出该路径，避免常规 smoke 误用或泄露目录。
+  const workDir = requestedWorkDir || process.cwd()
   const prompt = '这是受控运行验收。请仅回复“运行验收已收到”。不要调用工具，不要执行命令，不要读取或修改任何文件。'
   const createResponse = await fetch(`${baseUrl}/api/sessions`, {
     method: 'POST',
     headers: {'Content-Type': 'application/json', 'x-bridge-token': token},
-    body: JSON.stringify({workDir: process.cwd(), permissionMode: 'plan', maxTurns: 1}),
+    body: JSON.stringify({workDir, permissionMode: 'plan', maxTurns: 1}),
   })
   assert.equal(createResponse.status, 201, 'Gateway 未能创建受控验收会话')
   const {sessionId} = await createResponse.json()
@@ -31,7 +38,7 @@ if (process.env.BRIDGE_RUN_CONTROLLED_PROVIDER_ACCEPTANCE !== '1') {
     let taskCompletionCount = 0
     let terminalReplyLength = 0
     let settleTimer = null
-    const timeout = setTimeout(() => finish(new Error('真实 Provider 在 55 秒内未返回 result 事件')), 55_000)
+    const timeout = setTimeout(() => finish(new Error(`真实 Provider 在 ${Math.round(requestedTimeoutMs / 1000)} 秒内未返回 result 事件`)), requestedTimeoutMs)
     const ws = new WebSocket(`ws://127.0.0.1:3456/ws/${sessionId}`, {
       headers: {'x-bridge-token': token},
     })

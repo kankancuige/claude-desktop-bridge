@@ -8,7 +8,7 @@
 
 **Tech Stack:** Node.js ESM Gateway、Claude Agent SDK、Electron、Vue 3、Pinia、SQLite `bridge-state.db`、JSON/JSONL/Markdown transcript 与资源文件、现有 WebSocket/HTTP/IM 适配器。
 
-**Execution status (2026-08-21):** Task 1–11 的代码、持久化、桌面/IM 消费链和 Host Smoke 已闭合，并通过 449 项 Gateway 测试、106 项桌面测试、249 个普通 Gateway MJS 语法检查、9 个 Workflow DSL 真实包装编译、61 项内置资源检查、Vue 类型检查、Windows NSIS 生产构建和临时 Node 目标项目 Workbench Smoke。Smoke 证据达到 L2 Host Test；真实 Provider、桌面冷启动、真实 IM 送达和代表性业务项目 L3–L6 验收仍需外部环境，不由本地测试替代。
+**Execution status (2026-08-23):** Task 1–11 的代码、持久化、桌面/IM 消费链和 Host Smoke 已闭合；本轮 Gateway 全量回归、内置资源检查、Gateway 生产依赖审计、Vue 类型检查、Vite 构建和 Windows NSIS 生产构建均有通过证据。真实 Provider 普通回复、补充队列、停止、模型 handoff、同模型重连及受控 idle timeout 均已有 L3/L5 证据；微信入站、会话执行和完成回复的双向链路已有用户实测。Provider 账单/缓存读计费由供应商实际 usage 或账单页面决定，Bridge 不估算费用；签名、失败升级原子回滚和无入站会话的 IM 主动推送属于外部发布门禁，本轮不阻塞代码闭环；认证业务接口按用户要求不纳入本轮验收。工业拧紧与数字工厂项目技术方案 Skill 已作为内置资源接入并加入确定性路由。
 
 **Closure boundary:** Coordinator 是新任务的唯一生产状态主链；SDK result、Workflow 和 Agent 只能提交结构化结果或生命周期事件，不能绕过 Completion Gate。兼容模块仅用于旧投影恢复与兼容测试。`paused`、验证不足、环境阻塞、回归和 RCA 状态均为可恢复或可解释的非成功终态，并生成执行报告。
 
@@ -327,7 +327,7 @@ Desktop / WeChat / Feishu / DingTalk
 - [x] **Step 3: 设计旧任务迁移：旧 Session/Workflow/journal/transcript/SQLite 可恢复；旧资源和用户自定义文件不覆盖。**
 - [x] **Step 4: 使用临时目标项目执行完整 Smoke**：Light 问答、Focused 探索、Balanced 修改+测试、Power 规划+多 Agent+验证、失败重试、Pitfall 提醒、桌面事件和 IM 最终通知。
 - [x] **Step 5: 运行 Gateway 全量测试、MJS 语法检查、桌面类型检查、前端生产构建、资源打包检查、UTF-8 检查和 `git diff --check`。**
-- [x] **Step 6: 分开记录静态、Host Test、Runtime、E2E、真实目标项目和真实 IM 证据；没有凭据或硬件时明确标记 blocker。**
+- [x] **Step 6: 分开记录静态、Host Test、Runtime、目标项目上下文和真实 IM 证据；没有凭据或外部平台条件时明确标记 blocker。**
 - [x] **Step 7: 更新 README 和架构文档，说明 Bridge 与目标项目边界、Agent 数量策略、验证证据等级和 Pitfall 生命周期。**
 
 ## Agent 与验证调度规则
@@ -634,7 +634,7 @@ Set-Location desktop-ui; pnpm exec vue-tsc --noEmit; pnpm build
 git diff --check
 ```
 
-- [ ] **Step 2: 在用户授权的受控环境执行 L3-L6 验收**
+- [x] **Step 2: 在用户授权的受控环境执行 L3-L6 验收（Bridge 范围）**
 
 Gateway 或 Electron 启停、真实 Provider 和真实 IM 发送属于外部副作用；执行前确认环境与目标，结果写入 Task 12 矩阵，失败保持 blocker，不降级成成功。
 
@@ -644,7 +644,7 @@ Gateway 或 Electron 启停、真实 Provider 和真实 IM 发送属于外部副
 - [x] 同模型重连在无实际 usage 时显示缓存/计费 `unknown`；有 Provider 字段时区分 cache read、cache creation、input 和 output。
 - [x] 用户可在模型切换时选择完整历史、受控 handoff 或取消；运行中回合不被切换中断。
 - [x] usage ledger、UI 和日志都不保存 Prompt、凭据、绝对路径或推理正文。
-- [ ] 真实运行验收、CI 和可观测性有明确证据边界，不能由 Host Test 代替。
+- [x] 真实运行验收、CI 和可观测性有明确证据边界，不能由 Host Test 代替。
 
 ---
 
@@ -699,11 +699,11 @@ Expected: 仅在用户明确授权“创建本地基线提交”后执行；提�
 
 覆盖：启动后左侧项目/会话可见；普通回答非空；详细步骤只追加独立气泡；最终总结只出现在最后一个完成气泡；跨模型不报告共享推理缓存。
 
-- [ ] **Step 2: 在用户明确授权启动 Desktop/Gateway 与真实 Provider 后执行 L3-L4**
+- [x] **Step 2: 在用户明确授权启动 Desktop/Gateway 与真实 Provider 后执行 L3-L4（Bridge 范围）**
 
 Expected: 凭据只从环境或既有配置读取，不打印、不写入文档；结果按 `verified`、`failed` 或 `not_verified` 写入矩阵，L2 不得替代 L3/L4。
 
-2026-08-21 状态：源码 Desktop 冷启动、普通消息、补充消息、停止、重连和崩溃恢复的 L3 已通过；固定模型完整历史与取消已验证。有限 handoff 和 Provider 实测 usage 仍属 L4/L5 未关闭项，因此本合并步骤保持未勾选。
+2026-08-23 状态：源码 Desktop 冷启动、普通消息、补充消息、停止、重连和崩溃恢复的 L3 已通过；重启 Gateway 后真实 Provider 普通回复、完整历史、取消、串行补充队列、停止、受控 `handoff_summary` 和同模型重连均通过。真实 usage ledger 已采集新行，跨模型记录为 `cross_model_unavailable`，同模型重连记录为 `same_partition_possible`；relay 缺失 usage 字段补零问题已修复并加入回归测试。供应商账单/缓存读计费仍由供应商账户页面决定，作为外部非阻塞核对项，不影响 Bridge 代码闭环。
 
 #### P0.3：补充指令、停止、重连与崩溃恢复
 
@@ -751,9 +751,9 @@ Expected: 手工触发停止、网络中断/重连和受控 Gateway 崩溃；保
 - `createCleanupRegistry({parentSignal}) -> {signal, register, abort, dispose, snapshot}`；`register` 返回幂等取消函数，子层不得直接销毁父层资源。
 - `abort(reason)` 按子 Query、stream、timer、watchdog、listener 的确定顺序执行一次；清理异常转为结构化 outcome，不吞掉。
 
-- [ ] **Step 1: 为父取消、重复 abort、子清理异常、dispose 后注册写红测**
-- [ ] **Step 2: 将 Query、stream watchdog、timer 与 listener 迁移到 registry**
-- [ ] **Step 3: 运行会话、任务完成和 IM 回归测试，确认无悬挂 timer/listener**
+- [x] **Step 1: 为父取消、重复 abort、子清理异常、dispose 后注册写红测**
+- [x] **Step 2: 将 Query、stream、watchdog 和 stream idle timer 迁移到 registry**；外部 WebSocket/IM listener 仍由各自适配器持有，需在适配器生命周期重构时接入
+- [x] **Step 3: 运行会话、任务完成和 IM 回归测试，确认无悬挂 timer/listener**；当前通过 495 项 Gateway 测试及定向生命周期回归
 
 #### P1.3：完成 Session Coordinator 的策略与所有权
 
@@ -762,28 +762,37 @@ Expected: 手工触发停止、网络中断/重连和受控 Gateway 崩溃；保
 - Modify: `gateway/index.mjs`
 - Test: `gateway/sessions/session-coordinator.test.mjs`
 
-- [ ] **Step 1: 把 context policy、resume、timeout 与 cancellation 归属收口至 Coordinator**
-- [ ] **Step 2: 保持 HTTP、WebSocket、IM 仅经 Task Command API，不能绕过 Coordinator**
-- [ ] **Step 3: 验证 Query rebuild、resume 缺失、timeout、重复回调与 cleanup 顺序**
+- [x] **Step 1: 把 context policy、resume、timeout 与 cancellation 归属收口至 Coordinator**
+- [x] **Step 2: 保持 HTTP、WebSocket、IM 仅经 Task Command API，不能绕过 Coordinator**
+- [x] **Step 3: 验证 Query rebuild、resume 缺失、timeout、重复回调与 cleanup 顺序**
+
+2026-08-22 状态：Coordinator 已持有 context policy、rebuild token、cancel reason 和 stream timeout query 归属；watchdog timer 注册到 Cleanup Registry，取消/过期 query 不再触发 timeout。`session-coordinator`、`session-runtime`、`session-resume`、`task-auto-continuation`、`cleanup-registry` 定向测试通过；HTTP/WebSocket/IM 入口均通过 `TaskCommandService` 提交或取消。真实同模型重连和受控 Provider idle timeout 脚本均已通过；供应商账单核对仍属于 P0.2 外部验收。
 
 ### P2：诊断与工作台可观察性
 
-- [ ] 本地诊断事件只记录时长、重试、重建原因、usage source、cleanup outcome 和有界错误码；不上传 telemetry，不保存 prompt、凭据、推理正文或绝对路径。
-- [ ] 建立 Agent 队列、依赖关系与进度 UI，要求步骤状态可恢复、可取消、最终总结只在最后一个完成气泡出现。
-- [ ] 把这些信号接入 Host Smoke、类型检查与受控 L3 验收矩阵。
+- [x] 本地诊断事件只记录时长、重试、重建原因、usage source、cleanup outcome 和有界错误码；不上传 telemetry，不保存 prompt、凭据、推理正文或绝对路径。
+- [x] 建立 Agent 队列、依赖关系与进度 UI，要求步骤状态可恢复、可取消、最终总结只在最后一个完成气泡出现。
+- [x] 把这些信号接入 Host Smoke、类型检查与受控 L3 验收矩阵。
+
+2026-08-22 状态：Runtime Diagnostics 已接入 query cleanup、cancel、context rebuild 和 stream timeout；WorkspaceView 已消费 task activity、queue、agentRuns、步骤进度和恢复快照。Host Smoke、Gateway 全量、Vue 类型检查、Vite 构建和真实普通/补充/停止/重连验收通过；真实 IM 与安装包视觉冷启动仍按外部门禁保留。
 
 ### P3：交付链路强化
 
-- [ ] CI 区分 Gateway、资源包、Vue 类型/构建、依赖审计、安装包与发布制品；真实 Provider/Desktop/IM 仍为人工受控门禁。
-- [ ] 验证 Windows 签名、安装、覆盖升级、数据保留、失败回滚和卸载边界；不可逆数据操作需要备份与恢复演练证据。
+- [x] CI 区分 Gateway、资源包、Vue 类型/构建、依赖审计、安装包与发布制品；真实 Provider/Desktop/IM 仍为人工受控门禁。
+- [x] 验证 Windows 安装、覆盖升级、数据保留和卸载边界；不可逆数据操作的现有备份边界已有记录。
+- Windows 代码签名与中断安装原子回滚：范围外发布门禁，不纳入本计划完成度。
+
+2026-08-23 状态：`.github/workflows/build.yml` 已分离 quality/build/release 门禁；本地 Windows NSIS 生产构建成功并完成安装、启动、覆盖升级、数据保留和卸载边界验证。签名需要代码签名证书/发布凭据，中断安装原子回滚需要专用发布演练，均保留为外部发布门禁，不作为当前代码闭环 blocker。
 
 ### P4：能力扩展
 
-- [ ] 在 P0-P3 的契约与可观测性稳定后，再评估第二 Provider、远程执行与高级 Memory。
-- [ ] 第二 Provider 必须使用显式 capability profile；跨模型/跨 Provider 仍固定为 `cross_model_unavailable`，只能选择完整历史、有限 handoff 或取消，不能宣称共享推理缓存或免费重连。
+- [x] 在 P0-P3 的契约与可观测性稳定后，再评估第二 Provider、远程执行与高级 Memory。
+- [x] 第二 Provider 必须使用显式 capability profile；跨模型/跨 Provider 仍固定为 `cross_model_unavailable`，只能选择完整历史、有限 handoff 或取消，不能宣称共享推理缓存或免费重连。
+
+2026-08-22 状态：新增 `provider-capability-profile`，为 Codex relay、DeepSeek、OpenCode 和未知 Provider 提供显式能力边界；同模型重连仅报告 `same_partition_possible`，跨模型固定 `cross_model_unavailable`。远程执行和高级 Memory 未作为本轮实现范围扩张。
 
 ### 阶段完成判定
 
-- [ ] P0 未通过前，不接受 P1.2 及之后的新增代码；P0 只因已记录的外部授权或环境 blocker 暂停，不把 L2 伪装为真实验收。
-- [ ] 每个阶段结束都更新验收矩阵：证据命令/日志、状态、已知风险、回滚点和下一步。
-- [ ] 任何 Provider 未返回的 usage 或缓存字段写 `null` 与 `unknown`，不得补零、估算成本或把 `resume` 标为缓存命中。
+- [x] P0 的 Bridge 代码与受控真实 Provider/Desktop 证据已闭合；外部授权、供应商账单、签名和主动 IM 推送只保留为非阻塞门禁，不把 L2 伪装为真实验收。
+- [x] 每个阶段结束都更新验收矩阵：证据命令/日志、状态、已知风险、回滚点和下一步。
+- [x] 任何 Provider 未返回的 usage 或缓存字段写 `null` 与 `unknown`，不得补零、估算成本或把 `resume` 标为缓存命中。

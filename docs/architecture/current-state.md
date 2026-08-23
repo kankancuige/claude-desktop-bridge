@@ -75,8 +75,8 @@ Incomplete: None
 
 - `gateway/context/BRIDGE_RULES.md` 是所有目标项目共享的长期规则；Bridge 自身 Vue/Electron/Gateway 和会话生命周期约束已移入 `BRIDGE_PROJECT_RULES.md`。
 - `bridge-rules.mjs` 从模块位置解析仓库根目录，只接受绝对 `workDir`，并通过目录包含关系选择专属规则；空路径、相对路径、相邻目录和前缀相似目录均按外部项目处理。
-- `skill-router.mjs` 使用确定性语义选择 `digital-twin-cad`。普通 CAD、普通 GLB Viewer 和普通前端不命中；只有明确连接或驱动实现时才联合加载 `device-driver`。
-- `builtin-skill-installer.mjs` 在首次命中时将应用包内置 Skill 写入 `BRIDGE_HOME/skills`；已有同名文件属于用户且不会覆盖，准备失败会在 Query 创建前终止。当前 Bridge 内置源为 `bridge-memory` 和 `digital-twin-cad`，其他路由名不代表随应用打包。
+- `skill-router.mjs` 使用确定性语义选择 `digital-twin-cad` 和 `industrial-tightening-solution`。普通 CAD、普通 GLB Viewer、普通前端和普通代码任务不命中；只有明确连接或驱动实现时才联合加载 `device-driver`。
+- `builtin-skill-installer.mjs` 在首次命中时将应用包内置 Skill 写入 `BRIDGE_HOME/skills`；已有同名文件属于用户且不会覆盖，准备失败会在 Query 创建前终止。当前 Bridge 内置源为 `bridge-memory`、`digital-twin-cad` 和 `industrial-tightening-solution`；技术方案 Skill 的通用 references 与 manifest 一起发布，其他路由名不代表随应用打包。
 - 本层不读取 Codex/Claude 外部全局规则，不改变 Session、transcript、HTTP/WebSocket、IM 或持久化格式。
 
 ## 配置所有权补充（迁移前基线，2026-08-18）
@@ -118,4 +118,4 @@ Incomplete: None
 - `Repair Loop` 对同类失败最多自动尝试两种策略；重复策略进入 RCA，新回归冻结候选。`Pitfall Ledger` 使用 SQLite 按 global/project/bridge 隔离，正文只保存脱敏摘要和引用。
 - 完成门禁要求必需步骤结束、Agent/Workflow 无活动实例、阻断 finding 已关闭、实际测试和必要验证通过，并且确定性通知意图已持久化。成功及所有稳定非成功终态都生成状态一致的 Execution Report；`paused`、验证不足、环境阻塞、回归和 RCA 终态都不会显示为完成。Coordinator 与旧 task-state 使用独立 SQLite task key，避免两套 revision 互相覆盖；重启时活动 Coordinator 投影降级为 `inconclusive` 并要求显式继续和重新验证。
 - `gateway/smoke/general-workbench-smoke.mjs` 使用临时 Node 目标项目验证 Light、Focused、Balanced、Power、L2 Host Test、修复循环、Pitfall、桌面事件、IM 终态去重和 SQLite 投影。该 Smoke 不等于真实 Provider、真实 IM 或真实业务项目端到端验收。
-- 2026-08-21 当前代码门禁为 Gateway 449/449、桌面端 106/106、249 个普通 Gateway MJS、9 个内置 Workflow DSL、61 项内置资源和 Vue 类型检查全部通过；Vite 与 Windows NSIS 构建通过。源码 Desktop 冷启动、普通消息、补充消息、停止、重连和崩溃恢复 L3 已通过；有限 handoff、Provider usage、真实 IM、安装/升级和代表性业务项目仍分别属于后续 L4–L6/P3 验收，不能由本地门禁替代。
+- 2026-08-23 当前代码门禁为 Gateway 全量测试、62 项内置资源检查、桌面端 Vue 类型检查和 Vite 生产构建全部通过；Windows NSIS 生产打包成功。源码 Desktop 冷启动、普通消息、补充消息、停止、重连和崩溃恢复 L3 已通过；真实 Provider 普通回复、handoff、同模型重连、补充队列、停止和受控 idle timeout 均通过，usage ledger 保留 `provider_observed` 与未知字段 `null`；微信入站、会话执行和完成回复双向链路已有用户实测。Provider 账单/缓存读计费、无入站会话的 IM 主动推送、安装/升级签名与失败回滚仍分别属于供应商/发布外部门禁，不能由本地代码门禁替代；认证业务接口按当前范围不验收。

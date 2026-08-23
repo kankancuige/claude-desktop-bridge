@@ -566,7 +566,7 @@ Claude/Codex 全局规则。操作 Bridge 仓库根目录或其子目录时，Ga
 内置的 `digital-twin-cad` Skill；普通 CAD、普通前端和仅 Viewer 预览不触发该 Skill，已有同名用户 Skill
 不会被覆盖。
 
-内置 Skill 的分发边界：应用包只携带 Bridge 自己维护的内置 Skill 源文件（当前为 `bridge-memory` 和 `digital-twin-cad`）。首次命中对应路由时，源文件才会复制到当前用户的 `BRIDGE_HOME/skills/`；已有同名文件不覆盖。它不会安装到用户的 Claude/Codex 全局 Skill 目录，也不会把仓库内所有路由名对应的第三方 Skill 自动带上。`protocol-parser`、`device-driver`、`ui-winforms` 等 Skill 需要用户自行放入 Bridge 私有目录后才会参与路由。
+内置 Skill 的分发边界：应用包只携带 Bridge 自己维护的内置 Skill 源文件（当前为 `bridge-memory`、`digital-twin-cad` 和 `industrial-tightening-solution`）。首次命中对应路由时，源文件才会复制到当前用户的 `BRIDGE_HOME/skills/`；已有同名文件不覆盖。它不会安装到用户的 Claude/Codex 全局 Skill 目录，也不会把仓库内所有路由名对应的第三方 Skill 自动带上。`protocol-parser`、`device-driver`、`ui-winforms` 等 Skill 需要用户自行放入 Bridge 私有目录后才会参与路由。
 
 ### 压缩模式（Caveman / RTK）
 

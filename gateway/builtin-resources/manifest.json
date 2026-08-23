@@ -3,6 +3,7 @@
   "resources": [
     {"id":"bridge-memory","type":"skill","source":"skills/bridge-memory/SKILL.md","target":"skills/bridge-memory/SKILL.md","version":"1","defaultEnabled":true,"required":false,"description":"Bridge 项目记忆管理"},
     {"id":"digital-twin-cad","type":"skill","source":"skills/digital-twin-cad/SKILL.md","target":"skills/digital-twin-cad/SKILL.md","version":"1","defaultEnabled":true,"required":false,"description":"数字孪生 CAD 资产与节点映射"},
+    {"id":"industrial-tightening-solution","type":"skill","source":"skills/industrial-tightening-solution","target":"skills/industrial-tightening-solution","version":"1","defaultEnabled":true,"required":false,"description":"工业拧紧与数字工厂项目技术方案"},
     {"id":"avalonia-ui","type":"skill","source":"skills/avalonia-ui/SKILL.md","target":"skills/avalonia-ui/SKILL.md","version":"1","defaultEnabled":true,"required":false,"description":"Avalonia UI 开发"},
     {"id":"cad","type":"skill","source":"skills/cad","target":"skills/cad","version":"1","defaultEnabled":true,"required":false,"description":"STEP-first CAD 建模"},
     {"id":"cad-viewer","type":"skill","source":"skills/cad-viewer","target":"skills/cad-viewer","version":"1","defaultEnabled":true,"required":false,"description":"CAD Viewer 预览"},

@@ -29,6 +29,7 @@ import {NotificationOutbox} from './notification-outbox.mjs'
 import {startNotificationWorker, sendOrQueue} from './notification-worker.mjs'
 import {splitTextByUtf8Bytes} from '../shared/text-chunks.mjs'
 import {normalizeWeChatBaseUrl} from './wechat-url.mjs'
+import {classifyWeChatSendStatus} from './wechat-send-status.mjs'
 import {loadPairedUsers, savePairedUsers} from './paired-users.mjs'
 import {readAdapterConfig} from './adapter-config.mjs'
 import {turnFallbackText} from './im-turn-finish.mjs'
@@ -227,6 +228,7 @@ export function startWeChatAdapter(token, {taskCommands, stateStore = null, onNo
                     continue
                 }
                 if ((data.ret && data.ret !== 0) || (data.errcode && data.errcode !== 0)) {
+                    log.warn(classifyWeChatSendStatus(res, data), 'getupdates 返回错误')
                     await wait(5000);
                     continue
                 }
@@ -529,10 +531,10 @@ export function startWeChatAdapter(token, {taskCommands, stateStore = null, onNo
                     base_info: {channel_version: '0.1.0'},
                 }),
             })
-            if (!res.ok) return false
-            const d = await res.json()
-            if (d.ret && d.ret !== 0) {
-                log.error({ret: d.ret, errmsg: d.errmsg}, 'sendmessage 返回错误')
+            const d = await res.json().catch(() => ({}))
+            const status = classifyWeChatSendStatus(res, d)
+            if (!status.ok) {
+                log.error(status, 'sendmessage 返回错误')
                 return false
             }
             log.debug({textLength: text.length}, 'sendMsg ok')

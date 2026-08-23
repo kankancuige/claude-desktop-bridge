@@ -14,6 +14,7 @@ const MAX_UPSTREAM_ATTEMPTS = 4
 const RETRYABLE_STATUS_CODES = new Set([408, 409, 425, 429, 500, 502, 503, 504, 529])
 const RETRYABLE_NETWORK_CODES = new Set(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENETUNREACH', 'EHOSTUNREACH'])
 const OVERLOAD_PATTERN = /\b(?:overload(?:ed)?|server(?:s)?\s+(?:are\s+)?busy|capacity|temporar(?:y|ily)\s+unavailable|try\s+again\s+later)\b/i
+const TEST_IDLE_DELAY_MAX_MS = 2 * 60 * 1000
 
 let proxyServer = null
 let proxyPort = 0
@@ -146,6 +147,20 @@ function waitForRetry(delayMs, signal) {
     })
 }
 
+function controlledIdleDelayMs() {
+    if (process.env.BRIDGE_TEST_CODEX_RELAY_FAULTS !== '1') return 0
+    const delayMs = Number.parseInt(process.env.BRIDGE_TEST_CODEX_RELAY_IDLE_BEFORE_UPSTREAM_MS || '', 10)
+    return Number.isInteger(delayMs) && delayMs > 0 && delayMs <= TEST_IDLE_DELAY_MAX_MS ? delayMs : 0
+}
+
+async function injectControlledIdleBeforeUpstream(signal) {
+    const delayMs = controlledIdleDelayMs()
+    if (!delayMs) return
+    // 只由显式测试变量开启；不发送请求到真实上游，供 Gateway watchdog 验收。
+    log.warn({delayMs}, 'Codex relay controlled idle fault enabled')
+    await waitForRetry(delayMs, signal)
+}
+
 function upstreamRequestId(detail, headers) {
     const headerId = headers?.['x-request-id'] || headers?.['request-id']
     if (headerId) return String(headerId).slice(0, 200)
@@ -260,6 +275,7 @@ async function handleRequest(req, res) {
         const raw = await readRequestBody(req)
         const body = JSON.parse(raw.toString('utf8'))
         const request = toResponsesRequest(body, route.model)
+        await injectControlledIdleBeforeUpstream(abort.signal)
         const result = await requestUpstreamWithRetry(route, JSON.stringify(request), {stream: Boolean(body.stream), signal: abort.signal})
         const upstream = result.upstream
         if (upstream.res.statusCode < 200 || upstream.res.statusCode >= 300) {
