@@ -28,6 +28,8 @@ export function createTaskWorkbenchRuntime({coordinator, pitfallService = null, 
         if (existing) return snapshot
         return transition(snapshot.taskId, {
             type: 'agent/started', stepId: step.stepId, agentRunId: `${snapshot.taskId}:primary`, role: step.role,
+            agentType: step.agentType || step.role, name: step.agentName || step.role,
+            purpose: step.purpose || `执行 ${step.role || 'Agent'} 专项任务。`, goal: snapshot.plan?.goal || '',
         })
     }
 
@@ -93,7 +95,9 @@ export function createTaskWorkbenchRuntime({coordinator, pitfallService = null, 
             })
             let next = transition(taskId, {
                 type: result.status === 'completed' ? 'agent/completed' : 'agent/failed',
-                stepId: step.stepId, agentRunId: result.agentRunId, role: result.role, result,
+                stepId: step.stepId, agentRunId: result.agentRunId, role: result.role,
+                agentType: step.agentType || result.role, name: step.agentName || result.role,
+                purpose: step.purpose || `执行 ${result.role || 'Agent'} 专项任务。`, goal: snapshot.plan?.goal || '', result,
             })
             const task = tasks.get(taskId)
             if (task) {

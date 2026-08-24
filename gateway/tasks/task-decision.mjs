@@ -7,6 +7,8 @@ const INSPECT_SIGNALS = /(?:查询|查找|搜索|定位|扫描|浏览|读取|目
 const REVIEW_SIGNALS = /(?:审查|审阅|review|检查代码|代码检查|找问题|安全审计|安全审查|漏洞扫描|全面检查)/i
 const REFACTOR_SIGNALS = /(?:重构|架构调整|架构设计|迁移|模块拆分|重新设计|整体优化|完整优化)/i
 const OPERATE_SIGNALS = /(?:部署|发布|安装依赖|提交代码|commit|push|启动服务|停止服务|运行测试|构建项目|编译项目)/i
+const WORKFLOW_EXECUTION_SIGNALS = /(?:执行到(?:最后|结束)|一直执行到(?:最后|结束)|按计划执行|执行计划|完成所有(?:task|任务|步骤)|跑完(?:所有)?(?:task|任务|步骤)|继续执行剩余)/i
+const MISSION_EXECUTION_SIGNALS = /(?:mission|自主执行|自主推进|持续监控|持续运行|直到目标达成)/i
 const BUG_SIGNALS = /(?:bug|缺陷|报错|异常|错误|崩溃|卡住|失败|死锁|竞态|race condition|null pointer|内存泄漏)/i
 const PLAN_SIGNALS = /(?:方案对比|比较优劣|权衡利弊|架构决策|技术选型|怎么选|选哪个)/i
 const RESEARCH_SIGNALS = /(?:调研|research|竞品分析|对比市面|深入分析)/i
@@ -116,6 +118,9 @@ export function decideTask(input = {}) {
     if (risk === 'high' || risk === 'critical') modelTier = 'power'
 
     const mutatesCode = action === 'implement' || action === 'operate' || action === 'refactor'
+    const executionMode = MISSION_EXECUTION_SIGNALS.test(normalized)
+        ? 'mission'
+        : WORKFLOW_EXECUTION_SIGNALS.test(normalized) ? 'workflow' : 'session'
     let finalReview = 'none'
     if (risk === 'high' || risk === 'critical') finalReview = 'power'
     else if (complexity === 'power' && mutatesCode) finalReview = 'power'
@@ -138,6 +143,7 @@ export function decideTask(input = {}) {
         modelTier,
         contextProfile,
         workflow: workflowFor(normalized, action),
+        executionMode,
         finalReview,
         reasons: uniqueBounded(reasons.length ? reasons : ['default_balanced_task']),
         hardTriggers: uniqueBounded(hardTriggers),

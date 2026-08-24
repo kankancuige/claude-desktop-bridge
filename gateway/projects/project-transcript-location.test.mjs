@@ -9,7 +9,8 @@ import {
     findSessionTranscript,
     listProjectTranscriptCandidates,
 } from './project-transcript-location.mjs'
-import {BridgeStateDb} from '../storage/bridge-state-db.mjs'
+import {createPostgresStateFixture} from '../test-support/postgres-state-fixture.mjs'
+import {createSessionRepository} from '../storage/repositories/session-repository.mjs'
 
 function createClaudeHome() {
     const bridgeHome = mkdtempSync(join(tmpdir(), 'bridge-transcript-'))
@@ -164,20 +165,20 @@ test('会话索引命中快速路径，文件删除后清理陈旧索引并回�
     writeFileSync(join(projectDir, `${sessionId}.jsonl`), JSON.stringify({
         type: 'user', cwd: 'D:\\work\\project', message: {content: 'first'},
     }))
-    const store = new BridgeStateDb({bridgeHome})
+    const {store} = createPostgresStateFixture()
     t.after(() => store.close())
 
     assert.deepEqual(
-        listProjectTranscriptCandidates({bridgeHome, encodedDir, workDir, stateStore: store}).map(item => item.id),
+        listProjectTranscriptCandidates({bridgeHome, encodedDir, workDir, repository: createSessionRepository({stateStore: store})}).map(item => item.id),
         [sessionId],
     )
     assert.equal(store.listSessionIndex(encodedDir).length, 1)
     assert.deepEqual(
-        listProjectTranscriptCandidates({bridgeHome, encodedDir, workDir, stateStore: store}).map(item => item.id),
+        listProjectTranscriptCandidates({bridgeHome, encodedDir, workDir, repository: createSessionRepository({stateStore: store})}).map(item => item.id),
         [sessionId],
     )
 
     unlinkSync(join(projectDir, `${sessionId}.jsonl`))
-    assert.deepEqual(listProjectTranscriptCandidates({bridgeHome, encodedDir, workDir, stateStore: store}), [])
+    assert.deepEqual(listProjectTranscriptCandidates({bridgeHome, encodedDir, workDir, repository: createSessionRepository({stateStore: store})}), [])
     assert.deepEqual(store.listSessionIndex(encodedDir), [])
 })

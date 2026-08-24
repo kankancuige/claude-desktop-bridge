@@ -23,6 +23,8 @@ function checksumSingleFile(relativePath, content) {
 test('首次启动安装内置资源并记录状态', () => withBridgeHome((bridgeHome) => {
     const result = ensureBuiltinResources({bridgeHome})
     assert.ok(result.installed.includes('skill:bridge-memory'))
+    assert.ok(result.installed.includes('skill:diagram-design'))
+    assert.ok(result.installed.includes('skill:ln-75-architecture-diagram-builder'))
     const state = getBuiltinResourceState({bridgeHome})
     const memory = state.find(item => item.type === 'skill' && item.id === 'bridge-memory')
     assert.equal(memory.installed, true)
@@ -31,6 +33,10 @@ test('首次启动安装内置资源并记录状态', () => withBridgeHome((brid
     assert.match(readFileSync(join(bridgeHome, 'skills', 'bridge-memory', 'SKILL.md'), 'utf8'), /name: bridge-memory/)
     assert.match(readFileSync(join(bridgeHome, 'skills', 'industrial-tightening-solution', 'SKILL.md'), 'utf8'), /name: industrial-tightening-solution/)
     assert.ok(statSync(join(bridgeHome, 'skills', 'industrial-tightening-solution', 'references', 'acceptance-and-evidence.md')).isFile())
+    assert.match(readFileSync(join(bridgeHome, 'skills', 'ln-75-architecture-diagram-builder', 'SKILL.md'), 'utf8'), /name: ln-75-architecture-diagram-builder/)
+    assert.match(readFileSync(join(bridgeHome, 'skills', 'diagram-design', 'SKILL.md'), 'utf8'), /name: diagram-design/)
+    assert.ok(statSync(join(bridgeHome, 'skills', 'diagram-design', 'references', 'style-guide.md')).isFile())
+    assert.ok(statSync(join(bridgeHome, 'skills', 'diagram-design', 'scripts')).isDirectory())
 }))
 
 test('用户修改内置资源后升级不会覆盖并标记 customized', () => withBridgeHome((bridgeHome) => {

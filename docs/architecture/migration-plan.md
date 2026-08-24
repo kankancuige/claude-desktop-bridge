@@ -52,7 +52,16 @@ Incomplete: None
 - Gateway 目录迁移只改变内部模块位置，不修改 Electron `extraResources` 递归打包规则、`node gateway/index.mjs` 启动契约、HTTP/WebSocket 接口、配置键或持久化文件位置。
 - 历史 implementation plan 保留旧路径作为当时证据；README、当前架构文档、静态 wiring 测试和有效源码引用随迁移同步更新。
 
-## SQLite 运行状态与 Memory 索引迁移（2026-08-18）
+## 已废止：SQLite 运行状态与 Memory 索引迁移（2026-08-18）
+
+> 本节保留为历史决策记录，不再描述当前实现。2026-08-23 用户确认移除 SQLite 后，运行时、依赖、导出器、导入器和专用测试均已删除；以下旧阶段表不作为执行依据。
+
+## 当前执行边界：PostgreSQL-only 代码闭合（2026-08-23）
+
+- PostgreSQL `bridge` schema 是唯一结构化运行时入口；Gateway 未配置 PostgreSQL 时拒绝启动。
+- Memory、Session、IM、Workbench、Pitfall、Workflow 和 usage 均经 `StorageGateway`/`PostgresStateCompat`，不创建、不读取、不 fallback 到 SQLite。
+- JSONL transcript、Markdown Memory 和用户配置仍保留为 Claude SDK/用户编辑兼容格式，不属于 SQLite 运行时。
+- 代码门禁包括：SQLite 模块/依赖删除、PostgreSQL 配置失败传播、状态投影 FIFO flush、Memory/Pitfall 失败码、Gateway 全量测试、语法检查和静态引用扫描。
 
 ### 状态转换
 
@@ -91,6 +100,18 @@ Incomplete: None
 - 不变项：HTTP/WebSocket、Session ID、transcript JSONL、Rule/Skill/Agent/Hook 文件格式和供应商 API 契约。
 - 非目标：替换 Claude Agent SDK、删除旧目录、引入 SQLite、云同步。
 
+## 统一 StorageGateway 与 PostgreSQL 主库（2026-08-23）
+
+用户已确认采用统一存储入口，并移除 SQLite 作为正常运行时结构化主库。该迁移不等于删除所有文件：Claude SDK 当前依赖 JSONL transcript 的真实路径，Rules/Skills/Memory 仍需要用户可编辑的 Markdown 兼容形式；这些内容必须由 `StorageGateway` 统一提供数据库读取、写入和 SDK 文件适配。
+
+- 目标主库：PostgreSQL 17.11，统一承载任务、会话索引、IM 队列、Workbench、Memory 元数据/向量、Pitfall、报告、验证活动和 usage。
+- 统一入口：Gateway/Session/IM/Workbench/Memory 只能调用 `StorageGateway`，禁止新增直接 `.db`、SQL、JSON 状态文件或 Memory 目录扫描入口。
+- 迁移策略：SQLite 导出 manifest -> PostgreSQL 参数化导入 -> 行数/校验和/行为校验 -> 切换运行时 -> SQLite 只读备份 -> 完成恢复演练后再清理。
+- JSONL 策略：数据库保存事件和正文归档后，按 SDK 要求生成受控临时 transcript 文件；在适配层验证前不得删除现有 JSONL。
+- Markdown 策略：正文进入 PostgreSQL 内容表并保留版本/hash；Gateway 提供编辑和导出接口，Memory 召回只读统一入口，不允许业务层自行拼路径。
+- 回滚条件：PostgreSQL 健康检查、事务回滚、重启恢复、导入一致性或 SDK transcript 适配任一失败，停止切换并从 SQLite 只读备份恢复旧运行态。
+- 当前状态：PostgreSQL 17.11 与 `vector 0.8.6` 已启用。Gateway 的 Session/任务/IM/Workbench/Pitfall/报告/验证/usage 运行时调用方已切换到 `PostgresStateCompat`；SQLite 不再创建或读取，只保留迁移导出和只读回滚备份。Markdown 正文同步保存到 PostgreSQL `content_documents`，Claude SDK JSONL transcript 仍保留真实文件路径以满足 resume 契约。
+
 ## 阶段
 
 | 阶段 | 入口门禁 | 变更 | 成功证据 | 中止条件 | 回滚或前滚 |
@@ -127,3 +148,19 @@ Incomplete: None
 | 7 Context cost governance | Context envelope、usage 表和 UI 均为 additive；旧 transcript/resume 不迁移 | 跨模型不可共享、同模型重连未知、cache usage 与重启读取测试 | 停止读取 usage 表和策略事件；保留 transcript、旧会话与 SQLite 附加表 |
 
 本迁移不修改 Claude transcript、Session map、Checkpoint 或用户资源正文，不自动 commit/push，也不删除旧 task-state。回滚代码时保留 `bridge-state.db` 新表和 `<taskId>:coordinator` 行；旧版本会忽略这些附加投影。只有真实桌面重启、真实 Provider、至少一个真实 IM 平台和代表性目标项目验证完成后，才可讨论移除兼容路径。
+
+## 2026-08-23 增量证据
+
+- `gateway/storage/storage-gateway.mjs` 已通过参数化查询、3 秒连接超时、statement timeout、事务回滚和 close 测试；本机 PostgreSQL 17.11 schema 初始化及真实连接探针通过。
+- SQLite v8 已导出并导入 PostgreSQL `bridge` schema；结构化状态 1,523 行、Memory 36 条、transcript 79 条的行数和 checksum 证据已保留在迁移备份目录。
+- `BridgeMemoryService.retrieveAsync()`、Memory 管理 API 和 PostgreSQL `content_documents` 共用 StorageGateway；保存、召回、停用、启用、重建和删除均有定向测试。
+- PostgreSQL 连接和 Memory embedding 选项统一存放在 `BRIDGE_HOME/storage-config.json`；环境变量仅作为显式覆盖。配置文件缺失或 JSON 无效时以 `STORAGE_CONFIG_FILE_MISSING`/`STORAGE_CONFIG_FILE_INVALID` 阻止启动，不回退 SQLite。
+- `/api/health` 在启用 `BRIDGE_MEMORY_BACKEND=postgres-pgvector` 时返回 PostgreSQL database/server version；本机已验证 `vector 0.8.6` 和 `vector(1536)`，但没有配置真实 embedding endpoint 时仍只使用关键词召回，不能把扩展安装等同于语义质量验收。
+- SQLite 已退出 Gateway 正常运行时；旧 SQLite 表和导出文件仅用于回滚演练。`PostgresStateCompat` 以 PostgreSQL 为事实源并提供同步读取、FIFO 异步写入、断线 degraded 和关闭前 flush；IM 空表不回读 JSON，Memory 运行时从 PostgreSQL 正文读取。
+
+### 2026-08-23 SQLite runtime removal evidence
+
+- PostgreSQL acceptance：健康、schema、pgvector、事务回滚和内容计数通过。
+- Gateway cold start/restart：`/api/health` 返回 `stateStoreMode=postgres`、`stateStoreDegraded=false`、`serverVersion=17.11`；启动日志明确 `SQLite runtime 已禁用`。
+- Gateway test gate：554 项项目测试全部通过。递归纳入 `node_modules` 的 5 个失败来自 pino/thread-stream 自带测试，不属于项目。
+- Residual gates：未配置真实 embedding endpoint，因此语义召回质量仍未验收；真实 Provider/IM 送达和 pg_dump 恢复演练属于外部环境门禁，不标记为已验证。

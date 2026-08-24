@@ -80,7 +80,7 @@ export function listProjectTranscriptCandidates({
     bridgeHome,
     encodedDir,
     workDir,
-    stateStore = null,
+    repository = null,
     limit = 24,
     maxBytesPerFile = 512 * 1024,
 } = {}) {
@@ -89,7 +89,8 @@ export function listProjectTranscriptCandidates({
     const projectsRoot = join(bridgeHome, 'projects')
     if (!existsSync(projectsRoot)) return []
     const requestedProjectDir = join(projectsRoot, decodedDir)
-    const indexed = stateStore?.available ? stateStore.listSessionIndex(decodedDir, {limit: 500}) : []
+    const sessionRepository = repository
+    const indexed = sessionRepository ? sessionRepository.list({projectKey: decodedDir, limit: 500}) : []
     if (indexed.length > 0 && existsSync(requestedProjectDir)) {
         try {
             const diskFiles = new Map(readdirSync(requestedProjectDir)
@@ -101,13 +102,13 @@ export function listProjectTranscriptCandidates({
                 const filename = diskFiles.get(row.sessionId)
                 const filePath = filename ? join(requestedProjectDir, filename) : row.transcriptPath
                 if (!filename || !existsSync(filePath)) {
-                    stateStore.removeSessionIndex(row.transcriptPath)
+                    sessionRepository.removeByTranscriptPath(row.transcriptPath)
                     stale = true
                     continue
                 }
                 const stat = statSync(filePath)
                 if (!stat.isFile() || stat.mtimeMs !== Number(row.mtime) || stat.size !== Number(row.size) || !transcriptMatchesWorkDir(filePath, decodedDir, workDir)) {
-                    stateStore.removeSessionIndex(row.transcriptPath)
+                    sessionRepository.removeByTranscriptPath(row.transcriptPath)
                     stale = true
                     continue
                 }
@@ -177,15 +178,15 @@ export function listProjectTranscriptCandidates({
             }
         })
         .filter(Boolean)
-    if (stateStore?.available) {
+    if (sessionRepository) {
         const currentPaths = new Set(files.map(candidate => candidate.filePath))
-        for (const indexedItem of stateStore.listSessionIndex(decodedDir, {limit: 500})) {
-            if (!currentPaths.has(indexedItem.transcriptPath)) stateStore.removeSessionIndex(indexedItem.transcriptPath)
+        for (const indexedItem of sessionRepository.list({projectKey: decodedDir, limit: 500})) {
+            if (!currentPaths.has(indexedItem.transcriptPath)) sessionRepository.removeByTranscriptPath(indexedItem.transcriptPath)
         }
         for (const candidate of files) {
             try {
                 const stat = statSync(candidate.filePath)
-                stateStore.upsertSessionIndex({
+                sessionRepository.upsert({
                     projectKey: decodedDir,
                     sessionId: candidate.id,
                     workDir,

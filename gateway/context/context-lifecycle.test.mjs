@@ -11,7 +11,8 @@ import {
     contextUsageEvent,
 } from './context-lifecycle.mjs'
 
-const gatewaySource = readFileSync(new URL('../index.mjs', import.meta.url), 'utf8')
+const gatewaySource = readFileSync(new URL('../gateway-runtime-impl.mjs', import.meta.url), 'utf8')
+const streamServiceSource = readFileSync(new URL('../runtime/sdk-stream-service.mjs', import.meta.url), 'utf8')
 
 test('parseTokenCount supports K/M suffixes and rejects invalid values', () => {
     assert.equal(parseTokenCount('256K'), 256000)
@@ -68,11 +69,11 @@ test('context usage event carries the effective auto compact threshold', () => {
 })
 
 test('Gateway 上下文采样有超时且不会永久占用 in-flight 状态', () => {
-    const start = gatewaySource.indexOf('async function refreshContextUsage')
-    const end = gatewaySource.indexOf('function maybeRefreshContextUsage', start)
+    const start = streamServiceSource.indexOf('async function refreshContextUsage')
+    const end = streamServiceSource.indexOf('function maybeRefreshContextUsage', start)
     assert.ok(start >= 0 && end > start)
-    const source = gatewaySource.slice(start, end)
-    assert.match(source, /withTimeout\(Promise\.resolve\(session\.query\.getContextUsage\(\)\), 5_000\)/)
+    const source = streamServiceSource.slice(start, end)
+    assert.match(source, /withTimeout\(Promise\.resolve\(session\.query\.getContextUsage\(\)\), timeoutMs\)/)
     assert.match(source, /finally \{\s*session\._contextUsageInFlight = null/)
 })
 

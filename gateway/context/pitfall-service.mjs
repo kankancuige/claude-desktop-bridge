@@ -22,17 +22,18 @@ function tags(input = {}) {
     ].map(value => String(value || '').trim().toLowerCase()).filter(Boolean))].slice(0, 30)
 }
 
-export function createPitfallService({stateStore, now = () => Date.now(), cooldownMs = DEFAULT_COOLDOWN_MS} = {}) {
-    if (!stateStore?.available) throw new TypeError('Pitfall Service 需要可用 SQLite')
+export function createPitfallService({repository = null, now = () => Date.now(), cooldownMs = DEFAULT_COOLDOWN_MS} = {}) {
+    const pitfallRepository = repository
+    if (!pitfallRepository) throw Object.assign(new TypeError('Pitfall Service 需要可用 PostgreSQL Pitfall Repository'), {code: 'PITFALL_STORAGE_REQUIRED'})
     return {
         recordPitfallOccurrence(input = {}) {
             const scope = SCOPES.has(input.scope) ? input.scope : 'project'
             const projectKey = scope === 'global' ? '*' : String(input.projectKey || '')
             if (!projectKey) throw new TypeError('Pitfall 缺少 projectKey')
             const fingerprint = String(input.fingerprint || createFailureFingerprint(input)).slice(0, 128)
-            const existing = stateStore.getPitfall(projectKey, fingerprint, scope)
+            const existing = pitfallRepository.get({projectKey, fingerprint, scope})
             const timestamp = now()
-            const pitfall = stateStore.recordPitfall({
+            const pitfall = pitfallRepository.recordPitfall?.({
                 id: existing?.id || `pitfall-${randomUUID()}`,
                 projectKey,
                 scope,
@@ -46,23 +47,25 @@ export function createPitfallService({stateStore, now = () => Date.now(), cooldo
                 observedAt: timestamp,
                 expiresAt: input.expiresAt || null,
             })
-            const inserted = stateStore.recordPitfallOccurrence({
+            const inserted = pitfallRepository.recordOccurrence({
                 pitfallId: pitfall.id,
                 occurrenceId: occurrenceId(pitfall.id, input.taskId),
                 taskId: input.taskId || null,
                 context: {phase: String(input.phase || '').slice(0, 80), provider: String(input.provider || '').slice(0, 120), scenario: String(input.scenario || '').slice(0, 120)},
                 observedAt: timestamp,
             })
-            const count = stateStore.countPitfallOccurrences(pitfall.id)
-            if (inserted && count >= 2 && pitfall.status === 'observed') stateStore.updatePitfallStatus(pitfall.id, 'candidate', {now: timestamp})
+            const count = pitfallRepository.countOccurrences
+                ? pitfallRepository.countOccurrences(pitfall.id)
+                : pitfallRepository.listOccurrences?.({pitfallId: pitfall.id, limit: 10000})?.length || 0
+            if (inserted && count >= 2 && pitfall.status === 'observed') pitfallRepository.updateStatus(pitfall.id, 'candidate', {now: timestamp})
             const withinCooldown = Boolean(existing && timestamp - Number(existing.lastSeenAt || 0) < cooldownMs)
-            return {...stateStore.getPitfall(projectKey, fingerprint, scope), occurrenceRecorded: inserted, notify: inserted && !withinCooldown, occurrenceCount: count}
+            return {...pitfallRepository.get({projectKey, fingerprint, scope}), occurrenceRecorded: inserted, notify: inserted && !withinCooldown, occurrenceCount: count}
         },
         findRelevantPitfalls(context = {}) {
             const projectKey = String(context.projectKey || '')
             if (!projectKey) return []
             const wanted = new Set(tags(context))
-            return stateStore.listPitfalls(projectKey, {statuses: ['candidate', 'confirmed', 'mitigated'], scopes: ['global', 'project', 'bridge'], limit: 100, now: now()})
+            return pitfallRepository.findRelevant({projectKey, statuses: ['candidate', 'confirmed', 'mitigated'], scopes: ['global', 'project', 'bridge'], limit: 100, now: now()})
                 .map(item => ({...item, score: item.tags.reduce((score, tag) => score + (wanted.has(tag) ? 1 : 0), 0)}))
                 .filter(item => item.scope === 'global' || item.scope === 'bridge' && context.bridgeTask === true || item.projectKey === projectKey)
                 .filter(item => wanted.size === 0 ? item.status === 'confirmed' : item.score > 0)
@@ -71,14 +74,14 @@ export function createPitfallService({stateStore, now = () => Date.now(), cooldo
         },
         transitionPitfall(id, status, details = {}) {
             if (!STATUSES.has(status)) throw new TypeError('Pitfall 状态无效')
-            return stateStore.updatePitfallStatus(id, status, {...details, now: now()})
+            return pitfallRepository.updateStatus(id, status, {...details, now: now()})
         },
         verifyPitfallPrevention(id, evidence) {
             if (!String(evidence || '').trim()) throw new TypeError('Pitfall 缓解验证缺少证据')
-            return stateStore.updatePitfallStatus(id, 'mitigated', {evidence: redact(evidence, 500), now: now()})
+            return pitfallRepository.updateStatus(id, 'mitigated', {evidence: redact(evidence, 500), now: now()})
         },
         list(projectKey, options = {}) {
-            return stateStore.listPitfalls(projectKey, options)
+            return pitfallRepository.findRelevant({projectKey, ...options})
         },
     }
 }

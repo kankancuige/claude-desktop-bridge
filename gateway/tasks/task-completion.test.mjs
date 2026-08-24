@@ -159,7 +159,10 @@ test('定向审查只接受本次变更文件上的发现', () => {
 })
 
 test('Gateway 使用本次 checkpoint 文件约束审查结果范围', () => {
-    const source = readFileSync(new URL('../index.mjs', import.meta.url), 'utf8')
+    const source = [
+        readFileSync(new URL('../gateway-runtime-impl.mjs', import.meta.url), 'utf8'),
+        readFileSync(new URL('../runtime/final-review-runtime.mjs', import.meta.url), 'utf8'),
+    ].join('\n')
     assert.match(source, /normalizeReviewOutcome\(result,\s*plan,\s*\{files:\s*checkpoint\.files\}\)/)
 })
 

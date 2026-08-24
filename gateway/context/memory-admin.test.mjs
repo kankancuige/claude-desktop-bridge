@@ -3,7 +3,7 @@ import {mkdtempSync, mkdirSync} from 'node:fs'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import test from 'node:test'
-import {BridgeStateDb} from '../storage/bridge-state-db.mjs'
+import {createPostgresStateFixture} from '../test-support/postgres-state-fixture.mjs'
 import {createMemoryService} from './memory-service.mjs'
 import {
     deleteProjectMemory,
@@ -13,13 +13,24 @@ import {
     setProjectMemoryEnabled,
 } from './memory-admin.mjs'
 
+function syncMemoryRepository(store) {
+    return {
+        list: ({projectKey, status = 'active', limit = 100} = {}) => store.listMemoryIndex(projectKey, {status, limit}),
+        get: ({projectKey, sourceKey} = {}) => store.listMemoryIndex(projectKey, {status: null, limit: 500}).find(row => row.sourcePath === sourceKey) || null,
+        put: ({projectKey, sourceKey, title, body, bodyHash, scope, status, metadata, updatedAt} = {}) => store.upsertMemoryIndex({projectKey, sourcePath: sourceKey, title, body, contentHash: bodyHash, scope, status, keywords: metadata?.keywords || '', mtime: metadata?.mtime || 0, size: metadata?.size || Buffer.byteLength(body || ''), confidence: metadata?.confidence ?? 1, lastVerifiedAt: metadata?.lastVerifiedAt || null, updatedAt}),
+        disable: ({projectKey, sourceKey, updatedAt} = {}) => store.upsertMemoryIndex({...syncMemoryRepository(store).get({projectKey, sourceKey}), projectKey, sourcePath: sourceKey, status: 'disabled', updatedAt}),
+        remove: ({projectKey, sourceKey} = {}) => store.removeMemoryIndex(projectKey, sourceKey),
+        markUsed: ({projectKey, sourceKey, usedAt} = {}) => store.markMemoryUsed(projectKey, sourceKey, usedAt),
+    }
+}
+
 function fixture() {
     const bridgeHome = mkdtempSync(join(tmpdir(), 'bridge-memory-admin-'))
     const encodedDir = 'D--demo'
     const workDir = 'D:\\demo'
     mkdirSync(join(bridgeHome, 'projects', encodedDir), {recursive: true})
-    const stateStore = new BridgeStateDb({bridgeHome})
-    const memoryService = createMemoryService({bridgeHome, stateStore})
+    const {store: stateStore} = createPostgresStateFixture()
+    const memoryService = createMemoryService({bridgeHome, memoryRepository: syncMemoryRepository(stateStore)})
     return {bridgeHome, encodedDir, workDir, stateStore, memoryService}
 }
 

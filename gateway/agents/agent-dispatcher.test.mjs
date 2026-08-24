@@ -37,3 +37,27 @@ test('合法结构化结果发出统一生命周期事件', async () => {
     assert.equal(result.status, 'completed')
     assert.deepEqual(events, ['agent/started', 'agent/completed'])
 })
+
+test('Agent 运行只消费一次有界 Mailbox 消息，不产生轮询', async () => {
+    const consumed = []
+    const mailbox = {consume: options => { consumed.push(options); return [{messageId: 'm1', summary: '继续验证'}]}}
+    let received = null
+    const dispatcher = createAgentDispatcher({
+        registry: createAgentRegistry(), mailbox,
+        execute: async input => { received = input.mailboxMessages; return {status: 'completed', summary: '完成'} },
+    })
+    await dispatcher.dispatchAgent(base)
+    assert.deepEqual(received, [{messageId: 'm1', summary: '继续验证'}])
+    assert.deepEqual(consumed, [{toAgent: 'developer', taskId: 't', limit: 20}])
+})
+
+test('Agent 执行失败时不丢失已 claim 的 Mailbox 消息', async () => {
+    const states = []
+    const mailbox = {
+        consume: () => [{messageId: 'm1', summary: '继续'}],
+        ack: (id, value) => states.push([id, value.status]),
+    }
+    const dispatcher = createAgentDispatcher({registry: createAgentRegistry(), mailbox, execute: async () => { throw new Error('provider down') }})
+    await assert.rejects(() => dispatcher.dispatchAgent(base), /provider down/)
+    assert.deepEqual(states, [['m1', 'pending']])
+})

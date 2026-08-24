@@ -28,7 +28,11 @@ test('真实任务决策和 Gateway 入口接线保持一致', () => {
     assert.equal(shouldCaptureTurnCheckpoint(query), false)
     assert.equal(shouldCaptureTurnCheckpoint(implementation), true)
 
-    const source = readFileSync(resolve(import.meta.dirname, '..', 'index.mjs'), 'utf8')
+    const source = [
+        readFileSync(resolve(import.meta.dirname, '..', 'gateway-runtime-impl.mjs'), 'utf8'),
+        readFileSync(resolve(import.meta.dirname, '..', 'runtime', 'task-command-runtime.mjs'), 'utf8'),
+        readFileSync(resolve(import.meta.dirname, '..', 'runtime', 'session-artifact-runtime.mjs'), 'utf8'),
+    ].join('\n')
     assert.match(source, /captureFiles:\s*shouldCaptureTurnCheckpoint\(taskDecision\)/)
     assert.match(source, /if \(s\.pendingTurn\.captureFiles === false\)/)
 })

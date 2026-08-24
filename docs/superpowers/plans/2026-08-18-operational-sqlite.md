@@ -1,4 +1,6 @@
-# Operational SQLite Implementation Plan
+# 已废止：Operational SQLite Implementation Plan
+
+> 2026-08-23 起不再执行。本项目已统一到 PostgreSQL；本文件仅保留历史实现记录。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

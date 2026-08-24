@@ -159,6 +159,7 @@ const messages: Record<Locale, Record<string, string>> = {
     'header.title': '配置管理',
     'header.sub': 'Claude Desktop Bridge Settings',
     'tab.general': '常规', 'tab.general.desc': '模型、权限与连接配置',
+    'tab.workbench': '架构运行', 'tab.workbench.desc': '任务证据、Pitfall 与 AI 健康',
     'tab.builtin-resources': '内置资源', 'tab.builtin-resources.desc': '统一管理随安装提供的资源',
     'tab.skills': 'Skills', 'tab.skills.desc': 'AI 技能模块管理',
     'tab.agents': 'Agents', 'tab.agents.desc': '自定义子代理管理',
@@ -394,6 +395,7 @@ const messages: Record<Locale, Record<string, string>> = {
     'ws.collapse': '收起',
     'ws.showAllProjects': '显示全部项目 ({n})',
     'ws.settings': '设置',
+    'ws.workbench': '协作工作台',
     'ws.workflow': '工作流',
     'ws.refreshReorder': '刷新（按最近活跃重新排序）',
 
@@ -666,6 +668,7 @@ const messages: Record<Locale, Record<string, string>> = {
     'header.title': 'Settings',
     'header.sub': 'Claude Desktop Bridge Settings',
     'tab.general': 'General', 'tab.general.desc': 'Model, permissions & connection',
+    'tab.workbench': 'Architecture runtime', 'tab.workbench.desc': 'Task evidence, Pitfall & AI health',
     'tab.builtin-resources': 'Built-in Resources', 'tab.builtin-resources.desc': 'Manage bundled resources',
     'tab.skills': 'Skills', 'tab.skills.desc': 'AI skill modules',
     'tab.agents': 'Agents', 'tab.agents.desc': 'Custom sub-agents',
@@ -877,6 +880,7 @@ const messages: Record<Locale, Record<string, string>> = {
     'ws.collapse': 'Collapse',
     'ws.showAllProjects': 'Show all projects ({n})',
     'ws.settings': 'Settings',
+    'ws.workbench': 'Collaboration workbench',
     'ws.workflow': 'Workflow',
     'ws.refreshReorder': 'Refresh (reorder by recent activity)',
 

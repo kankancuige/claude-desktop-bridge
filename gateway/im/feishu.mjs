@@ -45,7 +45,6 @@ import {readAdapterConfig} from './adapter-config.mjs'
 import {turnFallbackText} from './im-turn-finish.mjs'
 import {normalizeImMessageId, validateImText} from './im-input.mjs'
 import {runImTask} from './im-task-runner.mjs'
-import {platformEntryFilePath} from './platform-entry-store.mjs'
 import {PendingConfirmRegistry} from './pending-confirm.mjs'
 import {findLatestAdapterUserForSession} from './adapter-bindings.mjs'
 import {BRIDGE_HOME} from '../config/bridge-home.mjs'
@@ -60,7 +59,7 @@ const GW = () => gatewayHttpBase()              // Gateway 本地 HTTP 地址
 // 实现方式: 使用闭包保存内部状态，返回镜像钩子供 Gateway 调用。
 //          返回 null 表示凭据加载失败，适配器无法启动。
 // 关键数据流: adapters.json 加载凭据 → 创建 Client + WSClient → 注册事件处理器 → 启动 WS → 返回钩子对象
-export function startFeishuAdapter(token, {taskCommands, stateStore = null, onNotificationStateChange = null} = {}) {
+export function startFeishuAdapter(token, {taskCommands, repository, onNotificationStateChange = null} = {}) {
     let appId, appSecret
     let stopped = false
     let connectionError = null
@@ -114,18 +113,14 @@ export function startFeishuAdapter(token, {taskCommands, stateStore = null, onNo
     const sessionQueue = new SessionTaskQueue({maxDepth: 8})
     const messageDeduper = new ImMessageDeduper()
     const payloadCodec = new SecurePayloadCodec(join(BRIDGE_HOME, 'bridge-store-key'))
-    const legacyInboxFile = join(BRIDGE_HOME, 'bridge-im-inbox.json')
-    const legacyOutboxFile = join(BRIDGE_HOME, 'bridge-notification-outbox.json')
     const inbox = new ImInbox({
-        filePath: platformEntryFilePath(BRIDGE_HOME, 'bridge-im-inbox', 'feishu'), legacyFilePath: legacyInboxFile,
         platform: 'feishu', payloadCodec,
-        stateStore,
+        repository,
         onPersistError: error => log.error({err: error}, 'IM inbox 持久化失败'),
     })
     const outbox = new NotificationOutbox({
-        filePath: platformEntryFilePath(BRIDGE_HOME, 'bridge-notification-outbox', 'feishu'), legacyFilePath: legacyOutboxFile,
         platform: 'feishu', payloadCodec,
-        stateStore,
+        repository,
         onPersistError: error => log.error({err: error}, '通知 outbox 持久化失败'),
     })
     // pendingConfirm TTL 清理：5 分钟超时自动清除，防止异常路径下残留

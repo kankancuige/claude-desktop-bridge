@@ -3,7 +3,9 @@ import assert from 'node:assert/strict'
 import {readFileSync} from 'node:fs'
 import {createModelUsageEvent, normalizeProviderUsage} from './model-usage.mjs'
 
-const gatewaySource = readFileSync(new URL('../index.mjs', import.meta.url), 'utf8')
+const gatewaySource = readFileSync(new URL('../gateway-runtime-impl.mjs', import.meta.url), 'utf8')
+const streamServiceSource = readFileSync(new URL('../runtime/sdk-stream-service.mjs', import.meta.url), 'utf8')
+const streamRuntimeSource = readFileSync(new URL('../runtime/sdk-stream-runtime.mjs', import.meta.url), 'utf8')
 
 test('Provider usage 保留实际 cache 字段，并把缺失字段标为 partial 而非零', () => {
     assert.deepEqual(normalizeProviderUsage({
@@ -40,8 +42,8 @@ test('usage event 只包含脱敏 envelope 投影，不包含 Prompt、凭据或
 })
 
 test('Gateway 仅在 SDK result 上创建脱敏 usage ledger 事件', () => {
-    const resultBranch = gatewaySource.slice(gatewaySource.indexOf("if (sdkMsg.type === 'result'"), gatewaySource.indexOf("if (sdkMsg.type === 'result') s._generating = false"))
+    const resultBranch = streamRuntimeSource
     assert.match(resultBranch, /recordProviderUsage\(sessionId, s, sdkMsg\)/)
-    assert.match(gatewaySource, /appendModelUsageEvent\(event\)/)
-    assert.doesNotMatch(gatewaySource.slice(gatewaySource.indexOf('function recordProviderUsage'), gatewaySource.indexOf('function maybeRefreshContextUsage')), /prompt|apiKey|rawPath/i)
+    assert.match(streamServiceSource, /appendModelUsageEvent\?\.\(event\)/)
+    assert.doesNotMatch(streamServiceSource.slice(streamServiceSource.indexOf('function recordProviderUsage'), streamServiceSource.indexOf('function maybeRefreshContextUsage')), /prompt|apiKey|rawPath/i)
 })

@@ -7,7 +7,7 @@ Incomplete: None
 
 ## 目标边界
 
-- 保持 Electron + Vue + 单 Gateway 的 modular monolith；新增 Bridge 私有 SQLite 运行状态库，不引入数据库服务或云同步。
+- 保持 Electron + Vue + 单 Gateway 的 modular monolith；使用本机 PostgreSQL 作为唯一结构化运行状态库，不引入云同步。
 - transcript 继续由 Claude SDK 持有；桌面端只新增有界的 session draft store。
 - API 层统一产生脱敏错误事件，页面继续负责业务语义和可执行重试。
 - 会话入口明确区分恢复、分支和空白新建；按需接力只读取 transcript，不新增任务正文数据库。
@@ -18,14 +18,14 @@ Incomplete: None
 
 - `config/bridge-home.mjs` 是根目录唯一解析入口；业务模块不得自行拼接 `homedir()/.claude*`。
 - `settings.json` 保存 Bridge 自有 MCP、Hooks 和 SDK兼容设置；供应商凭据继续由 `bridge-provider.json` 隔离管理。
-- `rules/`、`skills/`、`agents/`、`hooks/` 和 `workflows/` 保持可读文件格式，不放入 SQLite。
+- `rules/`、`skills/`、`agents/`、`hooks/` 和 `workflows/` 保持可读文件格式，并通过 StorageGateway 管理数据库副本。
 - `projects/` 同时保存 SDK transcript 与 Bridge 的 session map、journal、checkpoint、snapshot 和 preference；所有消费者使用同一根目录。
-- `bridge-state.db` 只保存 IM inbox/outbox、消息去重、会话索引和 Memory 文件索引；不保存 transcript 正文、规则正文或凭据。
+- PostgreSQL `bridge` schema 保存 IM inbox/outbox、消息去重、会话索引和 Memory 正文/索引；不保存凭据，transcript 仍保留 SDK 兼容 JSONL 路径。
 - 会话目录以 `(project_key, session_id)` 为唯一身份，统一保存可重建 transcript 元数据以及权限、IM 镜像和最近打开状态；项目列表优先读取目录并按 mtime/size 增量协调，JSON/JSONL 与 sidecar 文件保持兼容事实源和降级路径。
 - `project_key` 必须由 transcript 的真实 `cwd` 生成；同一 `cwd` 的 canonical 与旧编码目录合并协调。`transcript_path` 保留物理位置并全局唯一，项目键转移时原子继承权限和 IM 镜像投影。
-- SQLite 使用 WAL、短事务和 schema version；不可用时显式降级到旧文件状态并广播 `state_store_degraded`，不得静默丢失任务。
-- SQLite 的 `bridge_task_state`、`bridge_task_events` 和 `bridge_workflow_state` 只保存状态字段、revision、时间、计数和投影元数据；最终回复、transcript、事件正文和审查详细文本继续留在文件事实源。
-- 任务终态与通知采用 at-least-once 契约：终态投影包含待投递意图，outbox 在网络调用前持久化并使用确定性 notification ID 去重；worker 结果回写任务投影，重启对账补建缺失记录。不得把跨平台网络调用包在 SQLite 事务内。
+- PostgreSQL 使用短事务、statement timeout 和 schema version；不可用时启动失败或进入明确 degraded，禁止静默切换事实源。
+- PostgreSQL 的 `task_state`、`task_events` 和 `workflow_state` 只保存状态字段、revision、时间、计数和投影元数据；最终回复和凭据不写入状态投影。
+- 任务终态与通知采用 at-least-once 契约：终态投影包含待投递意图，outbox 在网络调用前持久化并使用确定性 notification ID 去重；worker 结果回写任务投影，重启对账补建缺失记录。不得把跨平台网络调用包在 PostgreSQL 事务内。
 - Gateway 重启时，数据库中的 `starting/running` Workflow 不得继续显示为存活进程；恢复层将其转换为 `paused`，由 journal 补充阶段、token 和受控参数后再 resume。
 - 完整上下文只启用 Bridge 私有 `user` setting source；focused/light 继续关闭 setting source、MCP、Agent 和 Hook。
 - 首次兼容迁移复制已知资源和 Bridge 数据，目标已存在时不覆盖；写入迁移清单后正常运行只访问新目录。旧目录保留供人工回退，绝不自动删除。
@@ -104,7 +104,7 @@ interface BridgeNotice {
 | 方案 | 结论 | 原因 |
 |---|---|---|
 | 保存完整 Vue 消息树 | 不采用 | 重复 transcript、结构易漂移、可能保存敏感运行态 |
-| 新增 SQLite 运行状态与派生索引 | 部分采用 | 用于原子 IM 重试、去重和有界检索，不复制配置或正文 |
+| 新增 PostgreSQL 运行状态与派生索引 | 采用 | 用于原子 IM 重试、去重和有界检索，不复制凭据 |
 | JSONL 为正文事实源 + 本地有界草稿 | 采用 | 与 Claude SDK 一致、改动可逆、能覆盖中断原文恢复 |
 | 每个 fetch 手写 toast | 不采用 | 109 个调用点易漏且提示不一致 |
 | 共享传输错误事件 + 业务调用方补充 | 采用 | 可覆盖网络共性，同时避免后台轮询刷屏 |
@@ -224,7 +224,7 @@ Bridge 将三类状态严格分离：会话连续性由 SDK `resume` 和 transcr
 - `ContextEnvelope` 只包含版本、Provider 的哈希身份、具体模型、协议族、resume 可用性及规则/Skill/Agent/工具/上下文档位的稳定哈希；不包含 Prompt、凭据、绝对路径、transcript 或思考正文。
 - `same_partition_possible` 只表示同 Provider、同具体模型、同协议和同稳定 envelope 的本地资格可能存在；没有实际 usage 时缓存状态为 `unknown`。
 - 模型或 Provider 切换为 `cross_model_unavailable`。用户可选完整历史、有限 handoff 或取消；handoff 仅含目标、确认状态、变更文件和验证状态，明确不能替代完整历史。
-- `model_usage_observed` 与 SQLite `bridge_model_usage_events` 保存 input、output、cache read、cache creation、策略和时长。缺失字段为 `null`，source 为 `partial` 或 `unknown`，不把未知写为 0 或账单事实。
+- `model_usage_observed` 与 PostgreSQL `model_usage_events` 保存 input、output、cache read、cache creation、策略和时长。缺失字段为 `null`，source 为 `partial` 或 `unknown`，不把未知写为 0 或账单事实。
 - 自动模型路由和进行中的补充消息仍遵守回合边界，运行中的 Query 不因新模型选择而中断。
 
 ```text
@@ -258,9 +258,9 @@ Desktop / WeChat / Feishu / DingTalk
 |---|---|
 | 上下文成本 | Light 零项目扫描；其余扫描有限深度、文件数和单文件大小 |
 | 并发 | 单任务 Coordinator 串行 revision；最多 8 个已选择 Agent |
-| durability | task-state、Journal、SQLite 投影并存；通知使用确定性 ID 幂等重试 |
+| durability | task-state、Journal、PostgreSQL 投影并存；通知使用确定性 ID 幂等重试 |
 | security | 不持久化凭据/正文；命令白名单、路径边界、timeout/cancellation |
 | observability | 每个阶段事件包含 taskId、stepId、phase、role、sequence 和验证摘要 |
-| availability | SQLite 不可用时保留文件兼容路径；外部环境不可用时明确阻塞 |
+| availability | PostgreSQL 不可用时明确阻止启动或进入 degraded；外部环境不可用时明确阻塞 |
 
 延迟、吞吐、长时间稳定性和真实 IM 送达目前没有生产测量数据，不能由单元测试或临时项目 Smoke 代替。

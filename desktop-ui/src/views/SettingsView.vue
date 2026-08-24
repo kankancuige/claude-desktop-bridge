@@ -154,6 +154,7 @@ const workbenchPitfalls = ref<any[]>([])
 const aiLayerHealth = ref<any>(null)
 const ruleDriftCandidates = ref<any[]>([])
 const pitfallDrafts = ref<Record<string, {rootCause: string; prevention: string; evidence: string}>>({})
+const workbenchProjectOptions = ref<string[]>([])
 
 function workbenchQuery(): string {
   return workbenchProjectKey.value.trim() ? `?projectKey=${encodeURIComponent(workbenchProjectKey.value.trim())}` : ''
@@ -162,6 +163,30 @@ function workbenchQuery(): string {
 function formatWorkbenchTime(value: unknown): string {
   const timestamp = Number(value)
   return Number.isFinite(timestamp) && timestamp > 0 ? new Date(timestamp).toLocaleString('zh-CN') : '未记录'
+}
+
+function workbenchReportStatus(value: unknown): string {
+  const labels: Record<string, string> = {succeeded: '已成功', completed: '已完成', failed: '失败', blocked: '已阻塞', incomplete: '未闭合', inconclusive: '验证不足', regression_detected: '发现回归'}
+  const status = String(value || '').toLowerCase()
+  return labels[status] || status || '未记录'
+}
+
+function workbenchReportTitle(report: any): string {
+  const title = String(report?.title || report?.summary || '').trim()
+  return title || '未命名任务'
+}
+
+function workbenchReportStep(step: any): string {
+  return [String(step?.phase || '未命名阶段'), String(step?.role || '未指定角色'), workbenchReportStatus(step?.status)].join(' · ')
+}
+
+async function loadWorkbenchProjects() {
+  const response = await fetch(`${GW}/api/workbench/projects`)
+  const data = await response.json()
+  if (!response.ok) throw new Error(data.error || '加载项目列表失败')
+  workbenchProjectOptions.value = Array.isArray(data.projects)
+    ? data.projects.map((value: unknown) => String(value || '').trim()).filter(Boolean)
+    : []
 }
 
 async function loadWorkbench() {
@@ -437,8 +462,6 @@ async function loadSettings() {
     petType.value = settings.value.pet
   }
   loadProviders()
-  loadCavemanConfig()
-  loadRtkConfig()
 }
 
 // ── 加载供应商列表 + 叠加动态模型 ──
@@ -2327,27 +2350,11 @@ async function doUnbind() {
   unbindId.value = ''
 }
 
-// ── Tab 切换 + 懒加载 ──
-// 功能说明: 更新 activeTab，首次访问对应 Tab 时自动加载数据（避免不必要的 API 请求）
-//   general 检查 settings===null（未加载），其他 Tab 检查列表长度===0
-function switchTab(key: TabKey) {
-  activeTab.value = key
-  // 所有模块在 onMounted 时已并行自动加载；general 的 settings 首次检查保留
-  if (key === 'general' && !settings.value) {
-    loadSettings();
-    loadProviders()
-  }
-  if (key === 'workbench' && !workbenchLoading.value) loadWorkbench()
-  if (key === 'oss') {
-    loadCavemanConfig()
-    loadRtkConfig()
-    loadPetOptions()
-  }
-}
-
-// ── 自动加载所有模块 + 失败重试基础设施 ──
-// 模块加载失败标记，key 为模块名
+// ── 按 Tab 懒加载 + 失败重试基础设施 ──
+// 只在首次进入 Tab 时加载数据；同一 Tab 的并发进入/重试共享一个请求，避免重复扫描和请求。
 const loadErrors = ref<Record<string, boolean>>({})
+const loadedModules = ref<Record<string, boolean>>({})
+const loadingModules = new Map<string, Promise<void>>()
 // 每个模块独立重试计数
 const retryCount = ref<Record<string, number>>({})
 const MAX_RETRIES = 3
@@ -2355,29 +2362,51 @@ const MAX_RETRIES = 3
 let retryTimer: ReturnType<typeof setInterval> | null = null
 let petPollTimer: ReturnType<typeof setInterval> | null = null
 
-// 并行加载所有模块数据
-async function loadAllModules() {
-  const modules: Array<{ key: string; fn: () => Promise<void> }> = [
-    {key: 'workbench', fn: loadWorkbench},
-    {key: 'skills', fn: loadSkills},
-    {key: 'disabledSkills', fn: loadDisabledSkills},
-    {key: 'agents', fn: loadAgents},
-    {key: 'commands', fn: loadCommands},
-    {key: 'hooks', fn: loadHooks},
-    {key: 'rules', fn: loadRules},
-    {key: 'memory', fn: loadMemorySummary},
-    {key: 'mcp', fn: loadMcp},
-    {key: 'disabledMcpPlugins', fn: loadDisabledMcpPlugins},
-    {key: 'mcpServers', fn: loadMcpServers},
-    {key: 'im', fn: loadIM},
-    {key: 'modelTiers', fn: loadModelTiers},
-    {key: 'scheduler', fn: loadScheduledTasks},
-  ]
-  await Promise.all(modules.map(m =>
-      m.fn().catch(() => {
-        loadErrors.value[m.key] = true
-      })
-  ))
+const tabLoaders: Partial<Record<TabKey, () => Promise<void>>> = {
+  general: async () => { await Promise.all([loadSettings(), loadModelTiers()]) },
+  workbench: () => Promise.all([loadWorkbench(), loadWorkbenchProjects()]).then(() => undefined),
+  skills: () => Promise.all([loadSkills(), loadDisabledSkills()]).then(() => undefined),
+  agents: loadAgents,
+  commands: loadCommands,
+  hooks: loadHooks,
+  rules: loadRules,
+  memory: () => Promise.all([loadMemorySummary(), loadPreferences()]).then(() => undefined),
+  mcp: refreshMcp,
+  im: loadIM,
+  scheduler: loadScheduledTasks,
+  oss: async () => {
+    await Promise.all([loadCavemanConfig(), loadRtkConfig()])
+    loadPetOptions()
+  },
+}
+
+async function loadTabModule(key: TabKey, force = false): Promise<void> {
+  if (!force && loadedModules.value[key]) return
+  if (loadingModules.has(key)) return loadingModules.get(key)
+  const loader = tabLoaders[key]
+  if (!loader) {
+    loadedModules.value[key] = true
+    return
+  }
+  const request = (async () => {
+    delete loadErrors.value[key]
+    try {
+      await loader()
+      loadedModules.value[key] = true
+    } catch (error) {
+      loadErrors.value[key] = true
+      throw error
+    } finally {
+      loadingModules.delete(key)
+    }
+  })()
+  loadingModules.set(key, request)
+  return request
+}
+
+function switchTab(key: TabKey) {
+  activeTab.value = key
+  void loadTabModule(key).catch(() => {})
 }
 
 function moduleLoadFailed(key: string): boolean {
@@ -2389,20 +2418,8 @@ async function retryModule(key: string) {
   if (count >= MAX_RETRIES) return
   retryCount.value[key] = count + 1
   delete loadErrors.value[key]
-  const map: Record<string, () => Promise<void>> = {
-    skills: loadSkills, disabledSkills: loadDisabledSkills, agents: loadAgents, commands: loadCommands,
-    hooks: loadHooks, rules: loadRules, memory: loadMemorySummary,
-    mcp: loadMcp, disabledMcpPlugins: loadDisabledMcpPlugins, mcpServers: loadMcpServers, im: loadIM, scheduler: loadScheduledTasks,
-    preferences: loadPreferences,
-    workbench: loadWorkbench,
-  }
-  if (map[key]) {
-    try {
-      await map[key]()
-    } catch {
-      loadErrors.value[key] = true
-    }
-  }
+  if (!(key in tabLoaders)) return
+  try { await loadTabModule(key as TabKey, true) } catch { loadErrors.value[key] = true }
 }
 
 // 30 秒间隔自动重试，全部成功后停止
@@ -2447,10 +2464,7 @@ function loadPetOptions() {
 }
 
 onMounted(() => {
-  loadSettings()
-  loadAllModules()
-  loadPreferences()
-  loadPetOptions()
+  void loadTabModule('general').catch(() => {})
   startAutoRetryLoop()
 })
 
@@ -2791,7 +2805,10 @@ onUnmounted(() => {
 
             <div class="workbench-filter">
               <label for="workbench-project-key">项目键</label>
-              <input id="workbench-project-key" v-model="workbenchProjectKey" class="text-input" placeholder="全部项目" @keyup.enter="loadWorkbench" />
+              <select id="workbench-project-key" v-model="workbenchProjectKey" class="field-input" @change="loadWorkbench">
+                <option value="">全部项目</option>
+                <option v-for="projectKey in workbenchProjectOptions" :key="projectKey" :value="projectKey">{{ projectKey }}</option>
+              </select>
               <button class="btn-secondary btn-sm" @click="loadWorkbench">筛选</button>
             </div>
 
@@ -2821,16 +2838,19 @@ onUnmounted(() => {
               <div v-if="executionReports.length === 0" class="empty-state-sm">暂无执行报告</div>
               <div v-for="report in executionReports" :key="report.taskId" class="workbench-report-row">
                 <div class="workbench-row-main">
-                  <strong>{{ report.taskId }}</strong>
+                  <strong>{{ workbenchReportTitle(report) }}</strong>
                   <span>{{ formatWorkbenchTime(report.completedAt || report.startedAt) }}</span>
                 </div>
+                <p v-if="report.summary" class="workbench-report-summary">{{ report.summary }}</p>
                 <div class="workbench-metrics">
-                  <span>状态 {{ report.status }}</span>
+                  <span>状态 {{ workbenchReportStatus(report.status) }}</span>
                   <span>步骤 {{ report.actualSteps?.length || 0 }}/{{ report.plannedSteps?.length || 0 }}</span>
                   <span>文件 {{ report.changedFiles?.length || 0 }}</span>
                   <span>证据 {{ report.verification?.evidenceLevel || 'L0' }}</span>
                   <span>风险 {{ report.unresolvedRisks?.length || 0 }}</span>
                 </div>
+                <div v-if="report.actualSteps?.length" class="workbench-report-details"><span v-for="step in report.actualSteps" :key="step.stepId">{{ workbenchReportStep(step) }}<em v-if="step.summary">：{{ step.summary }}</em></span></div>
+                <div v-if="report.unresolvedRisks?.length" class="workbench-report-details risk"><span v-for="risk in report.unresolvedRisks" :key="risk">风险：{{ risk }}</span></div>
               </div>
             </section>
 
@@ -6315,7 +6335,16 @@ input[type="time"].field-input::-webkit-calendar-picker-indicator {
 .builtin-resource-info strong { color:var(--text-primary); font-size:13px; font-family:var(--font-mono); }
 .builtin-resource-info span { color:var(--text-muted); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .builtin-resource-info small { font-size:11px; }
-.workbench-panel { display:flex; flex-direction:column; gap:0; }
+.workbench-panel {
+  display:flex;
+  flex-direction:column;
+  gap:0;
+  height:min(720px, calc(100vh - 190px));
+  min-height:320px;
+  overflow-y:auto;
+  overscroll-behavior:contain;
+  scrollbar-gutter:stable;
+}
 .module-title { font-family:var(--font-heading); font-size:17px; font-weight:600; }
 .workbench-filter { display:grid; grid-template-columns:auto minmax(220px, 1fr) auto; align-items:center; gap:10px; padding:12px 0 18px; border-bottom:1px solid var(--border); }
 .workbench-filter label { color:var(--text-secondary); font-size:12px; }
@@ -6326,6 +6355,10 @@ input[type="time"].field-input::-webkit-calendar-picker-indicator {
 .workbench-row { padding:8px 0; border-top:1px solid var(--border); }
 .workbench-row span:last-child, .workbench-row-main > span:last-child { color:var(--text-muted); font-size:12px; }
 .workbench-report-row, .workbench-pitfall-row { padding:12px 0; border-top:1px solid var(--border); }
+.workbench-report-summary { margin:5px 0 0; color:var(--text-secondary); font-size:12px; line-height:1.45; }
+.workbench-report-details { display:grid; gap:4px; margin-top:7px; color:var(--text-secondary); font-size:11px; line-height:1.4; }
+.workbench-report-details em { color:var(--text-muted); font-style:normal; }
+.workbench-report-details.risk { color:var(--warning); }
 .workbench-report-row:first-of-type, .workbench-pitfall-row:first-of-type { border-top:0; }
 .workbench-pitfall-row p { margin:8px 0; color:var(--text-secondary); font-size:12px; white-space:pre-wrap; overflow-wrap:anywhere; }
 .workbench-pitfall-fields { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:8px; }

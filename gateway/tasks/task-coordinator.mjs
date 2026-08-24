@@ -1,4 +1,5 @@
 import {ACTIVE_COORDINATOR_STATUSES, COORDINATOR_STATUSES, TERMINAL_COORDINATOR_STATUSES} from './task-contract.mjs'
+import {createTaskRunBudget} from './task-execution-mode.mjs'
 
 const STATUS_SET = new Set(COORDINATOR_STATUSES)
 const PHASE_TO_STATUS = {prime: 'planning', plan: 'planning', implement: 'running', validate: 'verifying', review: 'reviewing', report: 'running'}
@@ -9,6 +10,50 @@ function clone(value) {
 
 function nowValue(event, fallback = Date.now()) {
     return Number.isFinite(Number(event.at)) ? Number(event.at) : fallback
+}
+
+function boundedText(value, max = 240) {
+    return typeof value === 'string' ? value.replace(/[\0\r\n]+/g, ' ').trim().slice(0, max) : ''
+}
+
+function agentProjection(event, previous = {}, updatedAt) {
+    const result = event.result && typeof event.result === 'object' ? event.result : null
+    const status = event.type === 'agent/started' ? 'running' : event.type.split('/')[1]
+    const startedAt = previous.startedAt || (status === 'running' ? updatedAt : null)
+    const endedAt = status === 'completed' || status === 'failed' ? updatedAt : previous.endedAt || null
+    return {
+        ...previous,
+        agentRunId: boundedText(event.agentRunId, 240),
+        agentType: boundedText(event.agentType || previous.agentType || event.role, 120),
+        name: boundedText(event.name || previous.name || event.agentType || event.role || 'Agent', 120),
+        role: boundedText(event.role || previous.role || 'developer', 80),
+        purpose: boundedText(event.purpose || previous.purpose || `执行 ${event.role || event.agentType || 'Agent'} 专项任务。`, 240),
+        goal: boundedText(event.goal || previous.goal, 240),
+        stepId: boundedText(event.stepId || previous.stepId, 240) || null,
+        status,
+        result: result ? clone(result) : previous.result || null,
+        resultSummary: boundedText(result?.summary || previous.resultSummary, 400),
+        changedFileCount: Array.isArray(result?.changedFiles) ? Math.min(result.changedFiles.length, 200) : Number(previous.changedFileCount || 0),
+        testCount: Array.isArray(result?.tests) ? Math.min(result.tests.length, 50) : Number(previous.testCount || 0),
+        startedAt,
+        endedAt,
+        updatedAt,
+    }
+}
+
+function appendAgentTimeline(snapshot, event, agent) {
+    const timeline = Array.isArray(snapshot.timeline) ? snapshot.timeline : []
+    timeline.push({
+        type: event.type,
+        agentRunId: agent.agentRunId,
+        agentType: agent.agentType,
+        name: agent.name,
+        stepId: agent.stepId,
+        status: agent.status,
+        summary: agent.resultSummary || agent.purpose,
+        at: agent.updatedAt,
+    })
+    snapshot.timeline = timeline.slice(-40)
 }
 
 function terminalEvidenceStatus(snapshot) {
@@ -57,8 +102,17 @@ export function createTaskSnapshot({plan, now = Date.now()} = {}) {
         revision: 1,
         sequence: 0,
         plan: clone(plan),
+        execution: {
+            mode: String(plan.executionMode || 'session'),
+            currentStepId: null,
+            completedStepCount: 0,
+            totalStepCount: Array.isArray(plan.steps) ? plan.steps.length : 0,
+            continuationCount: 0,
+            budget: createTaskRunBudget(plan.continuationPolicy || {}, plan.executionMode || 'session'),
+        },
         agents: {},
         workflows: {},
+        timeline: [],
         findings: [],
         verification: {status: 'not_started', evidenceLevel: 'L0', testsExecuted: false},
         blockers: [],
@@ -76,7 +130,30 @@ function setStepStatus(snapshot, event, status) {
         step.status = status
         step.updatedAt = nowValue(event, snapshot.updatedAt)
         if (event.summary) step.summary = String(event.summary).slice(0, 2000)
+        if (status === 'running') snapshot.execution.currentStepId = step.stepId
+        if (status === 'completed' || status === 'skipped') {
+            snapshot.execution.completedStepCount = snapshot.plan.steps.filter(item => ['completed', 'skipped'].includes(item.status)).length
+            if (snapshot.execution.currentStepId === step.stepId) snapshot.execution.currentStepId = null
+        }
     }
+}
+
+function readyPendingStep(snapshot) {
+    return snapshot?.plan?.steps?.find(step => step.status === 'pending' && (Array.isArray(step.dependsOn) ? step.dependsOn : []).every(dependency => {
+        const prerequisite = snapshot.plan.steps.find(item => item.stepId === dependency)
+        return prerequisite && ['completed', 'skipped'].includes(prerequisite.status)
+    })) || null
+}
+
+function stepFor(snapshot, stepId) {
+    return snapshot?.plan?.steps?.find(step => step.stepId === String(stepId || '')) || null
+}
+
+function dependenciesComplete(snapshot, step) {
+    return (Array.isArray(step?.dependsOn) ? step.dependsOn : []).every(dependency => {
+        const prerequisite = stepFor(snapshot, dependency)
+        return prerequisite && ['completed', 'skipped'].includes(prerequisite.status)
+    })
 }
 
 export function transitionTask(current, event = {}) {
@@ -97,6 +174,8 @@ export function transitionTask(current, event = {}) {
 
     switch (event.type) {
         case 'phase/started':
+            if (!stepFor(next, event.stepId) || !dependenciesComplete(next, stepFor(next, event.stepId))) return current
+            if (next.execution.currentStepId && next.execution.currentStepId !== String(event.stepId)) return current
             next.phase = String(event.phase || '')
             next.status = PHASE_TO_STATUS[next.phase] || 'running'
             setStepStatus(next, event, 'running')
@@ -141,10 +220,9 @@ export function transitionTask(current, event = {}) {
         case 'agent/completed':
         case 'agent/failed': {
             const id = String(event.agentRunId || '')
-            const status = event.type === 'agent/started' ? 'running' : event.type.split('/')[1]
-            if (id) next.agents[id] = {
-                ...(next.agents[id] || {}), role: event.role || 'developer', stepId: event.stepId || null,
-                status, result: event.result ? clone(event.result) : next.agents[id]?.result || null, updatedAt: next.updatedAt,
+            if (id) {
+                next.agents[id] = agentProjection(event, next.agents[id], next.updatedAt)
+                appendAgentTimeline(next, event, next.agents[id])
             }
             break
         }
@@ -217,6 +295,49 @@ export function createTaskCoordinator({persist = () => {}, publish = () => {}, n
         publish(clone(snapshot), clone(event))
         return clone(snapshot)
     }
+    const transition = (taskId, event) => {
+        const current = tasks.get(String(taskId || ''))
+        if (!current) return null
+        const next = transitionTask(current, event)
+        if (next === current) return clone(current)
+        return commit(next, {...event, taskId: current.taskId, revision: next.revision, sequence: next.sequence})
+    }
+    const dispatchTask = taskId => {
+        const snapshot = tasks.get(String(taskId || ''))
+        if (!snapshot) return null
+        const nextStep = readyPendingStep(snapshot)
+        if (!nextStep) return clone(snapshot)
+        return transition(taskId, {type: 'phase/started', phase: nextStep.phase, stepId: nextStep.stepId, role: nextStep.role})
+    }
+    const startPlannedTask = ({taskId} = {}) => {
+        const snapshot = tasks.get(String(taskId || ''))
+        if (!snapshot) return null
+        if (TERMINAL_COORDINATOR_STATUSES.has(snapshot.status)) return clone(snapshot)
+        return dispatchTask(snapshot.taskId)
+    }
+    const advancePlannedTask = ({taskId, stepId, result = {}, evidence = null} = {}) => {
+        const snapshot = tasks.get(String(taskId || ''))
+        if (!snapshot) return {nextStepId: null, status: 'not_found', reasons: ['task_not_found'], snapshot: null}
+        const step = stepFor(snapshot, stepId)
+        if (!step) return {nextStepId: null, status: snapshot.status, reasons: ['step_not_found'], snapshot: clone(snapshot)}
+        if (snapshot.execution.currentStepId !== step.stepId) return {nextStepId: snapshot.execution.currentStepId, status: snapshot.status, reasons: ['step_not_current'], snapshot: clone(snapshot)}
+        if (result?.status === 'blocked' || result?.blocked === true) {
+            const paused = transition(snapshot.taskId, {type: 'task/blocked', code: result.code || 'step_blocked', detail: result.summary || result.reason || '步骤阻塞'})
+            return {nextStepId: step.stepId, status: paused.status, reasons: ['step_blocked'], snapshot: paused}
+        }
+        if (result?.waitingForEvent === true) {
+            const paused = transition(snapshot.taskId, {type: 'task/waiting-user', detail: result.summary || '等待外部事件'})
+            return {nextStepId: step.stepId, status: paused.status, reasons: ['waiting_for_event'], snapshot: paused}
+        }
+        const passed = result?.status === 'completed' || result?.completed === true || evidence?.passed === true
+        if (!passed) return {nextStepId: step.stepId, status: snapshot.status, reasons: ['acceptance_not_met'], snapshot: clone(snapshot)}
+        const completed = transition(snapshot.taskId, {type: 'phase/completed', phase: step.phase, stepId: step.stepId, summary: result.summary || evidence?.summary || ''})
+        const nextStep = readyPendingStep(completed)
+        const next = nextStep ? dispatchTask(completed.taskId) : completed
+        return {nextStepId: nextStep?.stepId || null, status: next.status, reasons: [], snapshot: next}
+    }
+    const pausePlannedTask = ({taskId, reason = 'manual_pause'} = {}) => transition(taskId, {type: 'task/paused', detail: boundedText(reason, 400)})
+    const resumePlannedTask = ({taskId} = {}) => transition(taskId, {type: 'task/resumed'})
     return {
         accept(plan) {
             const existing = tasks.get(plan?.taskId)
@@ -230,22 +351,18 @@ export function createTaskCoordinator({persist = () => {}, publish = () => {}, n
             return clone(snapshot)
         },
         transition(taskId, event) {
-            const current = tasks.get(String(taskId || ''))
-            if (!current) return null
-            const next = transitionTask(current, event)
-            if (next === current) return clone(current)
-            return commit(next, {...event, taskId: current.taskId, revision: next.revision, sequence: next.sequence})
+            return transition(taskId, event)
         },
         getTaskSnapshot(taskId) {
             return clone(tasks.get(String(taskId || '')) || null)
         },
         dispatchTask(taskId) {
-            const snapshot = tasks.get(String(taskId || ''))
-            if (!snapshot) return null
-            const nextStep = snapshot.plan.steps.find(step => step.status === 'pending')
-            if (!nextStep) return clone(snapshot)
-            return this.transition(taskId, {type: 'phase/started', phase: nextStep.phase, stepId: nextStep.stepId, role: nextStep.role})
+            return dispatchTask(taskId)
         },
+        startPlannedTask,
+        advancePlannedTask,
+        pausePlannedTask,
+        resumePlannedTask,
         isActive(taskId) {
             return ACTIVE_COORDINATOR_STATUSES.has(tasks.get(String(taskId || ''))?.status)
         },

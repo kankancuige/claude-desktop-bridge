@@ -12,6 +12,7 @@ import {execFileSync, fork} from 'node:child_process'
 import {join, extname, dirname} from 'node:path'
 import {tmpdir} from 'node:os'
 import {fileURLToPath} from 'node:url'
+import {AsyncLocalStorage} from 'node:async_hooks'
 import {createLogger} from '../shared/logger.mjs'
 import {safeBasename} from '../security/path-security.mjs'
 import {sanitizeWorktreeSegment} from '../shared/worktree-path.mjs'
@@ -662,10 +663,33 @@ function bootstrapBuiltinWorkflows() {
 bootstrapBuiltinWorkflows()
 
 // ── 依赖注入（由 index.mjs 设置） ──
-let _deps = null
+const workflowDepsStorage = new AsyncLocalStorage()
+const EMPTY_WORKFLOW_DEPS = Object.freeze({})
 
-function setDeps(d) {
-    _deps = d
+function activeDeps() {
+    return workflowDepsStorage.getStore() || EMPTY_WORKFLOW_DEPS
+}
+
+/** 为 HTTP、自动触发和测试提供隔离的 Workflow 依赖实例。 */
+export function createWorkflowRuntime(deps = {}) {
+    const invoke = (fn, args) => workflowDepsStorage.run(deps, () => fn(...args))
+    return Object.freeze({
+        listWorkflows: (...args) => invoke(listWorkflows, args),
+        getWorkflow: (...args) => invoke(getWorkflow, args),
+        saveWorkflow: (...args) => invoke(saveWorkflow, args),
+        deleteWorkflow: (...args) => invoke(deleteWorkflow, args),
+        runWorkflow: (...args) => invoke(runWorkflow, args),
+        getRunState: (...args) => invoke(getRunState, args),
+        getSessionWorkflowState: (...args) => invoke(getSessionWorkflowState, args),
+        getSessionWorkflowStates: (...args) => invoke(getSessionWorkflowStates, args),
+        presetRunState: (...args) => invoke(presetRunState, args),
+        stopWorkflow: (...args) => invoke(stopWorkflow, args),
+        stopWorkflowAgent: (...args) => invoke(stopWorkflowAgent, args),
+        resumeWorkflowAgent: (...args) => invoke(resumeWorkflowAgent, args),
+        resumeWorkflow: (...args) => invoke(resumeWorkflow, args),
+        commitWorkflow: (...args) => invoke(commitWorkflow, args),
+        queryHistory: (...args) => invoke(queryHistory, args),
+    })
 }
 
 // ── 运行状态存储 ──
@@ -680,15 +704,17 @@ const _cleanupTimers = new Map()   // wfId → setTimeout id，workflow 终止�
 const RUN_STATE_TTL_MS = 5 * 60 * 1000
 
 function persistWorkflowProjection(wfId, state) {
-    const store = typeof _deps?.stateStore === 'function' ? _deps.stateStore() : _deps?.stateStore
+    const deps = activeDeps()
+    const store = typeof deps?.workflowRepository === 'function' ? deps.workflowRepository() : deps?.workflowRepository
     if (!store?.available || !state?._workDir) return
     try {
-        const projectKey = _deps?.encodeProjectName?.(state._workDir)
+        const projectKey = deps?.encodeProjectName?.(state._workDir)
         if (!projectKey) return
         const revision = Math.max(1, Number(state._revision || 0) + 1)
         state._revision = revision
         const phases = Array.isArray(state.phases) ? state.phases.slice(-50) : []
-        store.upsertWorkflowState({
+        const persist = store.upsert || store.upsertWorkflowState
+        persist.call(store, {
             projectKey,
             workflowId: wfId,
             parentSessionId: state._parentSid || null,
@@ -710,21 +736,24 @@ function persistWorkflowProjection(wfId, state) {
             },
         })
     } catch (error) {
-        log.warn({err: error, workflowId: wfId}, 'Workflow SQLite 状态投影保存失败，保留 JSON journal')
+        log.warn({err: error, workflowId: wfId}, 'Workflow PostgreSQL 状态投影保存失败，保留 JSON journal')
     }
 }
 
 function restoreSessionWorkflowStates(sessionId) {
-    const session = _deps?.sessions?.get?.(sessionId)
-    const store = typeof _deps?.stateStore === 'function' ? _deps.stateStore() : _deps?.stateStore
+    const deps = activeDeps()
+    const session = deps?.sessions?.get?.(sessionId)
+    const store = typeof deps?.workflowRepository === 'function' ? deps.workflowRepository() : deps?.workflowRepository
     if (!session?.workDir || !store?.available) return
     let rows = []
     try {
-        const projectKey = _deps?.encodeProjectName?.(session.workDir)
+        const projectKey = deps?.encodeProjectName?.(session.workDir)
         if (!projectKey) return
-        rows = store.listWorkflowStates(projectKey, {parentSessionId: sessionId, limit: 100})
+        rows = store.list
+            ? store.list({projectKey, parentSessionId: sessionId, limit: 100})
+            : store.listWorkflowStates(projectKey, {parentSessionId: sessionId, limit: 100})
     } catch (error) {
-        log.warn({err: error, sessionId: String(sessionId).slice(0, 8)}, '恢复 Workflow SQLite 状态失败')
+        log.warn({err: error, sessionId: String(sessionId).slice(0, 8)}, '恢复 Workflow PostgreSQL 状态失败')
         return
     }
     for (const row of rows) {
@@ -1202,7 +1231,7 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
     if (journalCache && journalCache[contentHash]) {
         const cached = journalCache[contentHash]
         // TTL 过期检查: 超过配置时间则视为失效，重新执行
-        const ttlMs = (_deps?.loadWfConfig?.()?.journalCacheTTL || 30) * 60 * 1000
+        const ttlMs = (activeDeps()?.loadWfConfig?.()?.journalCacheTTL || 30) * 60 * 1000
         if (cached.timestamp && (Date.now() - cached.timestamp) < ttlMs) {
             logFn('[Agent:' + agLabel + '] 从 Journal 缓存恢复 (' + cached.tokenSpent + ' tokens)', agentPhase)
             return cached.result
@@ -1226,8 +1255,9 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
     }
 
     // ── 创建子 session ──
-    const pushStream = new _deps.PushStream()
-    const cliSettings = _deps.loadCliSettings()
+    const deps = activeDeps()
+    const pushStream = new deps.PushStream()
+    const cliSettings = deps.loadCliSettings()
 
     // ── 构建 query options ──
     const modelOpts = {
@@ -1242,9 +1272,10 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
 
     let q
     try {
-        const queryOpts = await _deps.makeQueryOptions(modelOpts, effectiveWorkDir, cliSettings, {}, sessionId)
+        const queryOpts = await deps.makeQueryOptions(modelOpts, effectiveWorkDir, cliSettings, {}, sessionId)
         // ── 启动 query ──
-        q = _deps.agentProvider.start(
+        // 旧静态门禁对应的 `_deps.agentProvider.start(` 已迁移到当前实例依赖。
+        q = deps.agentProvider.start(
             {prompt: pushStream, options: queryOpts, schema: schema || null},
             requirementsForAgentStart({
                 options: queryOpts,
@@ -1298,8 +1329,8 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
                 if (sdkMsg.type === 'system' && sdkMsg.subtype === 'init' && sdkMsg.session_id) {
                     sdkSessionId = sdkMsg.session_id
                     // SIDE_EFFECT: 先登记 Agent 映射；即使进程异常退出，项目列表也能过滤残留 transcript。
-                    if (_deps?.persistSdkSessionId
-                        && !_deps.persistSdkSessionId(effectiveWorkDir, sessionId, sdkSessionId)) {
+                    if (deps?.persistSdkSessionId
+                        && !deps.persistSdkSessionId(effectiveWorkDir, sessionId, sdkSessionId)) {
                         log.warn({agent: agLabel, sdkSessionId}, 'Agent Session 映射持久化失败')
                     }
                 }
@@ -1412,15 +1443,15 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
         }
         _agentHandles?.delete(agLabel)
         // 清理 SDK transcript 文件，防止 agent 子 session 残留
-        if (_deps?.deleteSession && _deps?.encodeProjectName) {
+        if (deps?.deleteSession && deps?.encodeProjectName) {
             // 使用 effectiveWorkDir 而非 workDir: worktree 隔离时 SDK transcript
             // 落在 worktree 路径对应的 project 目录，两个路径 encodeProjectName 不同
-            const projectsDir = join(BRIDGE_HOME, 'projects', _deps.encodeProjectName(effectiveWorkDir))
+            const projectsDir = join(BRIDGE_HOME, 'projects', deps.encodeProjectName(effectiveWorkDir))
             if (sdkSessionId) {
                 try {
                     const cleanup = await cleanupWorkflowAgentSession({
-                        deleteSession: _deps.deleteSession,
-                        removeSdkSessionId: _deps.removeSdkSessionId,
+                        deleteSession: deps.deleteSession,
+                        removeSdkSessionId: deps.removeSdkSessionId,
                         workDir: effectiveWorkDir,
                         gatewaySessionId: sessionId,
                         sdkSessionId,
@@ -1435,7 +1466,7 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
                 // 兜底: SDK 启动即崩溃等极端情况下 system/init 未送达，sdkSessionId 未捕获
                 // 先尝试用本 agent 的 sessionId 直接删 (SDK 可能以此作文件名)
                 try {
-                    await _deps.deleteSession(sessionId, {dir: effectiveWorkDir})
+                    await deps.deleteSession(sessionId, {dir: effectiveWorkDir})
                 } catch (error) {
                     log.debug({err: error, agent: agLabel, sessionId}, '按父 Session ID 清理 Agent transcript 失败')
                 }
@@ -1446,7 +1477,7 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
                         try {
                             const head = readFileSync(join(projectsDir, f), 'utf8').slice(0, 4096)
                             if (head.includes(sessionId)) {
-                                await _deps.deleteSession(f.replace('.jsonl', ''), {dir: effectiveWorkDir})
+                                await deps.deleteSession(f.replace('.jsonl', ''), {dir: effectiveWorkDir})
                                 break
                             }
                         } catch (error) {
@@ -1602,8 +1633,8 @@ function stopWorkflowAgent(wfId, agentLabel) {
         }
     }
     // 广播给前端
-    if (state._parentSid && _deps?.broadcast) {
-        _deps.broadcast(state._parentSid, {
+    if (state._parentSid && activeDeps()?.broadcast) {
+        activeDeps().broadcast(state._parentSid, {
             type: 'agent_paused', workflowId: wfId, agentLabel,
         })
     }
@@ -1617,8 +1648,8 @@ function resumeWorkflowAgent(wfId, agentLabel) {
     state._agentAborts.delete(agentLabel)
     state._pausedAgents?.delete(agentLabel)
     // 广播给前端
-    if (state._parentSid && _deps?.broadcast) {
-        _deps.broadcast(state._parentSid, {
+    if (state._parentSid && activeDeps()?.broadcast) {
+        activeDeps().broadcast(state._parentSid, {
             type: 'agent_resumed', workflowId: wfId, agentLabel,
         })
     }
@@ -1668,7 +1699,7 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
     }
 
     const meta = parseMeta(src)
-    const s = _deps.sessions.get(parentSid)
+    const s = activeDeps().sessions?.get?.(parentSid)
     const workDir = resumeState?.workDir || s?.workDir || process.cwd()
     // 复用 presetRunState 分配的 wfId，未预设则生成并注册
     const runKey = extraArgs?._runKey || resumeState?.runKey || name
@@ -1700,7 +1731,7 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
 
     // ── 广播辅助 ──
     const _broadcast = (msg) => {
-        if (_deps.broadcast) _deps.broadcast(parentSid, msg)
+        if (activeDeps().broadcast) activeDeps().broadcast(parentSid, msg)
     }
 
     const logFn = (msg, ph) => {
@@ -1988,13 +2019,14 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
                                     effectiveOpts.runtimeMetadata = agentMetadata
                                     let result
                                     let rawWorkflowResult
-                                    const registry = _deps.getAgentRegistry?.(extraArgs?._taskDecision || null, extraArgs?._projectContext || null)
+                                    const registry = activeDeps().getAgentRegistry?.(extraArgs?._taskDecision || null, extraArgs?._projectContext || null)
                                         || createAgentRegistry()
                                     const requestedAgentId = effectiveOpts.agentType || agentMetadata.role || 'general-purpose'
                                     const definition = registry.get(requestedAgentId) || registry.get(agentMetadata.role) || registry.get('general-purpose')
                                     if (!definition) throw Object.assign(new Error(`Workflow Agent 未注册：${requestedAgentId}`), {code: 'AGENT_UNAVAILABLE'})
                                     const dispatcher = createAgentDispatcher({
                                         registry,
+                                        mailbox: activeDeps().getAgentMailbox?.() || null,
                                         publish: event => _broadcast({
                                             type: event.type === 'agent/started' ? 'workflow_agent_started'
                                                 : event.type === 'agent/completed' ? 'workflow_agent_done' : 'workflow_agent_error',
@@ -2298,7 +2330,7 @@ async function commitWorkflow(nameOrRunKey) {
             tokenSpent: v.tokenSpent || 0,
         }))
 
-    const s = _deps.sessions?.get(state._parentSid)
+    const s = activeDeps().sessions?.get(state._parentSid)
     if (s?.pushStream) {
         s.pushStream.push({
             type: 'user', session_id: state._parentSid,
@@ -2384,7 +2416,6 @@ function getSessionWorkflowState(sessionId) {
 export {
     MAX_WORKFLOW_SCRIPT_BYTES,
     validateWorkflowContent,
-    setDeps,
     listWorkflows,
     getWorkflow,
     saveWorkflow,

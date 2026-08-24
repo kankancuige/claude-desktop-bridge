@@ -102,6 +102,12 @@ test('普通实现使用 Balanced 并只做本次修改的定向验证', () => {
     assert.equal(decision.finalReview, 'none')
 })
 
+test('执行到最后一个任务使用 workflow，普通会话保持 session', () => {
+    assert.equal(decideTask({text: '按计划执行到最后一个task'}).executionMode, 'workflow')
+    assert.equal(decideTask({text: '自主推进直到目标达成'}).executionMode, 'mission')
+    assert.equal(decideTask({text: '修复这个问题'}).executionMode, 'session')
+})
+
 test('复杂代码修改使用 Power 并要求定向最终审查，纯调研不触发代码审查', () => {
     const refactor = decideTask({text: '重构当前模块的状态处理，保留现有接口'})
     assert.equal(refactor.action, 'refactor')

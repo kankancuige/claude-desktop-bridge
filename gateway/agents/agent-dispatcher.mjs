@@ -32,7 +32,7 @@ function assertChangedFiles(input, result, definition) {
     }
 }
 
-export function createAgentDispatcher({registry, execute, publish = () => {}} = {}) {
+export function createAgentDispatcher({registry, execute, publish = () => {}, mailbox = null} = {}) {
     if (!registry || typeof registry.get !== 'function' || typeof execute !== 'function') throw new TypeError('Agent Dispatcher 缺少 registry/execute')
     return {
         async dispatchAgent(rawInput) {
@@ -42,14 +42,17 @@ export function createAgentDispatcher({registry, execute, publish = () => {}} = 
             if (input.permissionMode === 'plan' && definition.writable) throw dispatchError('只读权限不允许写入 Agent', 'AGENT_PERMISSION_DENIED')
             assertAgentCapabilities(input.capabilities || {}, input.requirements || {}, {provider: input.provider || 'unknown'})
             const agentRunId = String(input.agentRunId || `${input.stepId}:agent:1`)
+            const mailboxMessages = mailbox?.consume?.({toAgent: definition.role, taskId: input.taskId, limit: 20}) || []
             publish({type: 'agent/started', taskId: input.taskId, stepId: input.stepId, agentRunId, role: definition.role})
             try {
-                const rawResult = await execute({...input, agentRunId, definition})
+                const rawResult = await execute({...input, agentRunId, definition, mailboxMessages})
                 const result = normalizeAgentResult(rawResult, {...input, agentRunId, role: definition.role})
                 assertChangedFiles(input, result, definition)
+                for (const message of mailboxMessages) mailbox?.ack?.(message.messageId, {status: result.status === 'completed' ? 'consumed' : 'failed'})
                 publish({type: result.status === 'completed' ? 'agent/completed' : 'agent/failed', taskId: input.taskId, stepId: input.stepId, agentRunId, role: definition.role, result})
                 return result
             } catch (error) {
+                for (const message of mailboxMessages) mailbox?.ack?.(message.messageId, {status: 'pending'})
                 publish({type: 'agent/failed', taskId: input.taskId, stepId: input.stepId, agentRunId, role: definition.role, code: error?.code || 'AGENT_EXECUTION_FAILED'})
                 throw error
             }

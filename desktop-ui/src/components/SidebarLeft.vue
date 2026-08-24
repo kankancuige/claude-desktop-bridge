@@ -61,6 +61,7 @@ defineProps<{
 // ── Emits ──
 // ═══════════════════════════════════════════
 const emit = defineEmits<{
+  (e: 'goWorkbench'): void
   (e: 'goSettings'): void
   (e: 'search', v: string): void
   (e: 'addProject'): void
@@ -130,12 +131,20 @@ function visibleSessions(p: Project, showAllSessions: Set<string>, pageSize: num
           <div class="brand-sub">AI Workspace</div>
         </div>
       </div>
+      <div class="sidebar-top-actions">
+      <button class="icon-btn" :title="t('ws.workbench')" @click="emit('goWorkbench')">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>
+          <rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>
+        </svg>
+      </button>
       <button class="icon-btn" :title="t('ws.settings')" @click="emit('goSettings')">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
           <circle cx="12" cy="12" r="3"/>
           <path d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72 1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
         </svg>
       </button>
+      </div>
     </div>
 
     <!-- 搜索框 + 新增项目按钮 -->
@@ -373,6 +382,7 @@ function visibleSessions(p: Project, showAllSessions: Set<string>, pageSize: num
 }
 
 .app-brand { display: flex; align-items: center; gap: 10px; }
+.sidebar-top-actions { display: flex; align-items: center; gap: 2px; }
 .brand-mark {
   display: flex; align-items: center; justify-content: center;
   width: 36px; height: 36px; border-radius: 10px;

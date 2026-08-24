@@ -117,3 +117,71 @@ test('终态后只允许附加执行报告，迟到状态事件不能改写终�
     assert.equal(withReport.executionReport.status, 'completed')
     assert.equal(coordinator.transition(taskPlan.taskId, {type: 'task/status', status: 'failed'}).status, 'completed')
 })
+
+test('Agent 投影包含身份、目的、结果计数和有界时间线，不持久化正文', () => {
+    const coordinator = createTaskCoordinator({now: () => 10})
+    coordinator.accept(plan())
+    let state = coordinator.transition('t1', {
+        type: 'agent/started', agentRunId: 'agent-1', agentType: 'test-engineer', name: '验证 Agent',
+        role: 'test-engineer', stepId: 't1:step:1', purpose: '执行最小充分测试', goal: '确认回归风险', at: 11,
+    })
+    assert.equal(state.agents['agent-1'].name, '验证 Agent')
+    assert.equal(state.agents['agent-1'].purpose, '执行最小充分测试')
+    state = coordinator.transition('t1', {
+        type: 'agent/completed', agentRunId: 'agent-1', agentType: 'test-engineer', name: '验证 Agent',
+        role: 'test-engineer', stepId: 't1:step:1', result: {
+            status: 'completed', summary: '测试通过', changedFiles: ['a.mjs', 'b.mjs'], tests: [{name: 'node --test'}],
+            prompt: '不得保存这段正文',
+        }, at: 12,
+    })
+    assert.equal(state.agents['agent-1'].resultSummary, '测试通过')
+    assert.equal(state.agents['agent-1'].changedFileCount, 2)
+    assert.equal(state.agents['agent-1'].testCount, 1)
+    assert.equal(state.agents['agent-1'].endedAt, 12)
+    assert.equal(state.timeline.length, 2)
+    assert.equal(state.timeline.at(-1).summary, '测试通过')
+})
+
+test('Agent 时间线最多保留最近 40 条', () => {
+    const coordinator = createTaskCoordinator({now: () => 1})
+    coordinator.accept(plan())
+    for (let index = 0; index < 25; index += 1) {
+        const id = `agent-${index}`
+        coordinator.transition('t1', {type: 'agent/started', agentRunId: id, role: 'developer', at: index + 2})
+        coordinator.transition('t1', {type: 'agent/completed', agentRunId: id, role: 'developer', result: {status: 'completed', summary: `完成 ${index}`}, at: index + 3})
+    }
+    const state = coordinator.getTaskSnapshot('t1')
+    assert.equal(state.timeline.length, 40)
+    assert.equal(state.timeline[0].agentRunId, 'agent-5')
+})
+
+test('Workflow 调度遵守步骤依赖并在快照中记录执行预算', () => {
+    const coordinator = createTaskCoordinator()
+    const planValue = plan()
+    planValue.executionMode = 'workflow'
+    planValue.continuationPolicy = {maxRounds: 4, maxTokens: 8000}
+    coordinator.accept(planValue)
+    let snapshot = coordinator.dispatchTask(planValue.taskId)
+    assert.equal(snapshot.execution.mode, 'workflow')
+    assert.equal(snapshot.execution.currentStepId, planValue.steps[0].stepId)
+    snapshot = coordinator.transition(planValue.taskId, {type: 'phase/completed', stepId: planValue.steps[0].stepId, phase: planValue.steps[0].phase})
+    snapshot = coordinator.dispatchTask(planValue.taskId)
+    assert.equal(snapshot.execution.currentStepId, planValue.steps[1].stepId)
+    assert.equal(snapshot.execution.completedStepCount, 1)
+})
+
+test('计划推进 API 拒绝跳步，并在阻塞恢复后从原步骤继续', () => {
+    const coordinator = createTaskCoordinator()
+    const taskPlan = createTaskPlan({taskId: 'strict-plan', turnId: 't', sessionId: 's', phases: ['implement', 'validate', 'report']})
+    coordinator.accept(taskPlan)
+    const started = coordinator.startPlannedTask({taskId: taskPlan.taskId})
+    assert.equal(started.execution.currentStepId, taskPlan.steps[0].stepId)
+    assert.equal(coordinator.transition(taskPlan.taskId, {type: 'phase/started', phase: 'validate', stepId: taskPlan.steps[1].stepId}).execution.currentStepId, taskPlan.steps[0].stepId)
+    const blocked = coordinator.advancePlannedTask({taskId: taskPlan.taskId, stepId: taskPlan.steps[0].stepId, result: {status: 'blocked', code: 'needs_event'}})
+    assert.equal(blocked.status, 'blocked')
+    assert.equal(blocked.nextStepId, taskPlan.steps[0].stepId)
+    const resumed = coordinator.resumePlannedTask({taskId: taskPlan.taskId})
+    assert.equal(resumed.status, 'running')
+    const advanced = coordinator.advancePlannedTask({taskId: taskPlan.taskId, stepId: taskPlan.steps[0].stepId, result: {status: 'completed', summary: '完成'}})
+    assert.equal(advanced.nextStepId, taskPlan.steps[1].stepId)
+})

@@ -7,7 +7,7 @@ import {createAgentRegistry} from '../agents/agent-registry.mjs'
 import {createPitfallService} from '../context/pitfall-service.mjs'
 import {createImProgressPolicy} from '../im/im-progress-policy.mjs'
 import {buildProjectContext} from '../projects/project-context.mjs'
-import {BridgeStateDb} from '../storage/bridge-state-db.mjs'
+import {createPostgresStateFixture} from '../test-support/postgres-state-fixture.mjs'
 import {mapVerificationToCoordinator} from '../tasks/coordinator-compatibility.mjs'
 import {createRepairLoop} from '../tasks/repair-loop.mjs'
 import {createTaskCoordinator} from '../tasks/task-coordinator.mjs'
@@ -40,7 +40,7 @@ async function run() {
     const root = mkdtempSync(join(tmpdir(), 'bridge-workbench-smoke-'))
     const projectDir = join(root, 'target-project')
     const bridgeHome = join(root, 'bridge-home')
-    const stateStore = new BridgeStateDb({bridgeHome, required: true})
+    const {store: stateStore} = createPostgresStateFixture()
     try {
         writeFileSync(join(root, '.keep'), '', 'utf8')
         mkdirSync(projectDir, {recursive: true})
@@ -246,11 +246,11 @@ async function run() {
                 balanced: 'developer_and_host_test', power: 'full_phase_multi_agent_projection',
                 verification: verification.evidenceLevel, repair: 'duplicate_strategy_to_rca',
                 pitfall: 'candidate_after_distinct_tasks', desktopEvents: events.length,
-                imFinal: 'outbox_owned_and_deduplicated', persistence: 'sqlite_coordinator_projection',
+                imFinal: 'outbox_owned_and_deduplicated', persistence: 'postgres_coordinator_projection',
             },
         }, null, 2)}\n`)
     } finally {
-        stateStore.close()
+        await stateStore.close()
         rmSync(root, {recursive: true, force: true})
     }
 }

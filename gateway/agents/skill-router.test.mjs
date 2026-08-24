@@ -83,3 +83,39 @@ test('普通代码任务不加载工业拧紧技术方案 Skill', () => {
     assert.deepEqual(routeSkills({text: '修复一个普通 JavaScript 函数的单元测试', profile: 'full'}), [])
     assert.deepEqual(routeSkills({text: '这个 industrial-tightening-solution Skill 是干什么的？', profile: 'focused'}), [])
 })
+
+test('证据型当前与目标架构图联合加载两个图示 Skill', () => {
+    for (const text of [
+        '根据仓库证据绘制当前架构图',
+        '生成目标系统上下文图和部署图',
+        '用 Mermaid 输出架构演进图',
+        '重绘 draw.io 的系统容器图',
+    ]) {
+        assert.deepEqual(routeSkills({text, profile: 'full'}), [
+            'ln-75-architecture-diagram-builder',
+            'diagram-design',
+        ], text)
+    }
+})
+
+test('普通图示产物只加载 diagram-design Skill', () => {
+    for (const text of [
+        '生成订单处理流程图 SVG',
+        '绘制数据库 ER 图',
+        '创建用户旅程图 HTML',
+    ]) {
+        const expected = text.includes('数据库') ? ['diagram-design', 'db-sql'] : ['diagram-design']
+        assert.deepEqual(routeSkills({text, profile: 'full'}), expected, text)
+    }
+})
+
+test('架构解释、审查和 Skill 说明不加载架构图 Skill', () => {
+    for (const text of [
+        '解释一下当前项目的架构是什么',
+        '审查目标架构是否合理，不需要画图',
+        'ln-75-architecture-diagram-builder Skill 是干什么的？',
+        'diagram-design 是否有必要使用？',
+    ]) {
+        assert.deepEqual(routeSkills({text, profile: 'focused'}), [], text)
+    }
+})

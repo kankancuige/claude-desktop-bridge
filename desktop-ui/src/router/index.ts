@@ -46,6 +46,12 @@ const router = createRouter({
             component: () => import('../views/SettingsView.vue'),
         },
 
+        {
+            path: '/workbench',
+            name: 'workbench',
+            component: () => import('../views/WorkbenchView.vue'),
+        },
+
         // Workflow DAG 设计器已嵌入 Settings → Workflow Tab 内，不再独立路由
 
     ],

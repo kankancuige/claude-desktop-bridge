@@ -112,7 +112,7 @@ export function composeContinuationPrompt(prompt, context) {
 
 /**
  * 跨模型时仅传递有界的已确认状态，不假装它等价于完整 transcript。
- * 该文本只发给新模型，不进入 SQLite usage ledger。
+ * 该文本只发给新模型，不进入 usage ledger。
  */
 export function buildModelHandoffPrompt({prompt, session = {}, maxChars = 6000} = {}) {
     const limit = Math.max(512, Math.min(6000, Number(maxChars) || 6000))

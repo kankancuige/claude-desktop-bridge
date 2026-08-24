@@ -5,6 +5,7 @@ import {createTaskWorkflowGate} from '../tasks/task-workflow-gate.mjs'
 import {buildContextEnvelope} from '../context/context-envelope.mjs'
 import {createCleanupRegistry} from './cleanup-registry.mjs'
 import {createRuntimeDiagnostics} from './runtime-diagnostics.mjs'
+import {createTaskRunBudget} from '../tasks/task-run-budget.mjs'
 
 async function closeWithTimeout(value, timeoutMs = 5000) {
     if (!value || typeof value.then !== 'function') return
@@ -88,6 +89,8 @@ export function createSessionRuntime({
         turnToolCount: 0,
         autoContinuationCount: 0,
         autoContinuationTurns: 0,
+        _taskRunBudget: createTaskRunBudget(opts.bridgeTaskDecision?.continuationPolicy || {}, opts.bridgeTaskDecision?.executionMode || 'session'),
+        _lastContinuationFingerprint: null,
         _autoContinuationRequest: null,
         _pendingSources: [],
         _pendingTurns: [],

@@ -1,6 +1,4 @@
 import crypto from 'node:crypto'
-import {existsSync, readFileSync, renameSync, unlinkSync, writeFileSync, mkdirSync} from 'node:fs'
-import {dirname, join} from 'node:path'
 
 export function summarizeNotificationEntries(entries, platform) {
     const prefix = `${platform}:`
@@ -11,76 +9,31 @@ export function summarizeNotificationEntries(entries, platform) {
     return result
 }
 
-export function readNotificationSummary(filePath, platform) {
-    try {
-        const data = JSON.parse(readFileSync(filePath, 'utf8'))
-        return summarizeNotificationEntries(data?.entries, platform)
-    } catch {
-        return {pending: 0, failed: 0, dead: 0, sent: 0}
-    }
-}
-
 function notificationEnqueueResult(key, platform, duplicate, state, structured) {
     const id = key.slice(platform.length + 1)
     return structured ? {id, duplicate, state} : id
 }
 
 export class NotificationOutbox {
-    constructor({filePath, legacyFilePath = null, platform, payloadCodec, maxEntries = 2_000, maxAttempts = 8, sentTtlMs = 24 * 60 * 60 * 1000, onPersistError = null, stateStore = null} = {}) {
-        if (!filePath || !platform || !payloadCodec) throw new TypeError('filePath, platform and payloadCodec are required')
-        this.filePath = filePath
-        this.legacyFilePath = legacyFilePath && legacyFilePath !== filePath ? legacyFilePath : null
+    constructor({platform, payloadCodec, maxEntries = 2_000, maxAttempts = 8, sentTtlMs = 24 * 60 * 60 * 1000, onPersistError = null, repository = null} = {}) {
+        if (!platform || !payloadCodec || !repository?.loadEntries || !repository?.replaceEntries) throw new TypeError('platform, payloadCodec and repository are required')
         this.platform = String(platform)
         this.payloadCodec = payloadCodec
         this.maxEntries = maxEntries
         this.maxAttempts = maxAttempts
         this.sentTtlMs = sentTtlMs
         this.onPersistError = typeof onPersistError === 'function' ? onPersistError : null
-        this.stateStore = stateStore?.available ? stateStore : null
+        this.repository = repository
         this._entries = new Map()
-        const loadedFromLegacy = this._load()
-        if (loadedFromLegacy && this._entries.size > 0) this._persist()
+        this._load()
     }
 
     _load() {
-        if (this.stateStore) {
-            const persisted = this.stateStore.loadEntries('outbox', this.platform)
-            for (const [key, value] of persisted) {
-                if (value && typeof value === 'object' && Number.isFinite(value.updatedAt)) this._entries.set(key, value)
-            }
-            this._cleanup()
-            if (this._entries.size > 0) return false
-        }
-        const sourcePath = !existsSync(this.filePath) && this.legacyFilePath && existsSync(this.legacyFilePath)
-            ? this.legacyFilePath
-            : this.filePath
-        let loadedFromLegacy = false
-        try {
-            const data = JSON.parse(readFileSync(sourcePath, 'utf8'))
-            const prefix = `${this.platform}:`
-            for (const [key, value] of Object.entries(data?.entries || {})) {
-                if (!key.startsWith(prefix)) continue
-                if (value && typeof value === 'object' && Number.isFinite(value.updatedAt)) this._entries.set(key, value)
-            }
-            loadedFromLegacy = sourcePath !== this.filePath || Boolean(this.stateStore && this._entries.size > 0)
-        } catch (error) {
-            if (error?.code !== 'ENOENT' && existsSync(sourcePath)) this._quarantineCorruptFile(error, sourcePath)
+        const persisted = this.repository.loadEntries({kind: 'outbox', platform: this.platform})
+        for (const [key, value] of persisted) {
+            if (value && typeof value === 'object' && Number.isFinite(value.updatedAt)) this._entries.set(key, value)
         }
         this._cleanup()
-        return loadedFromLegacy
-    }
-
-    _quarantineCorruptFile(error, sourcePath = this.filePath) {
-        this.onPersistError?.(error)
-        const corruptPath = `${sourcePath}.corrupt-${Date.now()}`
-        try {
-            renameSync(sourcePath, corruptPath)
-            return true
-        } catch (renameError) {
-            if (renameError?.code === 'ENOENT') return true
-            this.onPersistError?.(renameError)
-            return false
-        }
     }
 
     _cleanup(now = Date.now()) {
@@ -103,45 +56,9 @@ export class NotificationOutbox {
     }
 
     _persist() {
-        if (this.stateStore) {
-            this._cleanup()
-            try {
-                this.stateStore.replaceEntries('outbox', this.platform, this._entries)
-                return true
-            } catch (error) {
-                this.onPersistError?.(error)
-                return false
-            }
-        }
         this._cleanup()
-        const merged = new Map()
-        const prefix = `${this.platform}:`
         try {
-            const disk = JSON.parse(readFileSync(this.filePath, 'utf8'))
-            for (const [key, value] of Object.entries(disk?.entries || {})) {
-                if (!key.startsWith(prefix) && value && typeof value === 'object' && Number.isFinite(value.updatedAt)) {
-                    merged.set(key, value)
-                }
-            }
-        } catch (error) {
-            if (error?.code !== 'ENOENT' && !this._quarantineCorruptFile(error)) return false
-        }
-        for (const [key, value] of this._entries) {
-            merged.set(key, value)
-        }
-        try {
-            mkdirSync(dirname(this.filePath), {recursive: true})
-            const tmp = join(dirname(this.filePath), `.${this.filePath.split(/[\\/]/).pop()}.tmp`)
-            const json = JSON.stringify({version: 1, entries: Object.fromEntries(merged)})
-            writeFileSync(tmp, json, {encoding: 'utf8', mode: 0o600})
-            try {
-                renameSync(tmp, this.filePath)
-            } catch (renameError) {
-                writeFileSync(this.filePath, json, {encoding: 'utf8', mode: 0o600})
-                try { unlinkSync(tmp) } catch (cleanupError) {
-                    this.onPersistError?.(new AggregateError([renameError, cleanupError], 'outbox 临时文件清理失败'))
-                }
-            }
+            this.repository.replaceEntries({kind: 'outbox', platform: this.platform, entries: this._entries})
             return true
         } catch (error) {
             this.onPersistError?.(error)

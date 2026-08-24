@@ -26,7 +26,7 @@ import { collectClipboardFiles } from '../clipboard-files'
 defineOptions({name: 'WorkspaceView'})
 import {ref, shallowRef, nextTick, onMounted, onActivated, onDeactivated, onBeforeUnmount, computed, watch, defineAsyncComponent} from 'vue'
 import * as monaco from 'monaco-editor'
-import {useRouter} from 'vue-router'
+import {useRouter, useRoute} from 'vue-router'
 import {t, setLocale} from '../i18n'
 import {useResizeHandle} from '../composables/useResizeHandle'
 import {apiFetch, createGatewayWebSocket} from '../api'
@@ -92,6 +92,8 @@ const GlobalToast = defineAsyncComponent(() => import('../components/GlobalToast
 const SidebarLeft = defineAsyncComponent(() => import('../components/SidebarLeft.vue'))
 
 const router = useRouter()
+const route = useRoute()
+const taskFocus = ref<{taskId: string; turnId: string; located: boolean; message: string} | null>(null)
 // Gateway 后端地址：本地网关统一代理所有 API 请求
 const GW = 'http://127.0.0.1:3456'
 
@@ -2211,6 +2213,20 @@ async function loadGatewayVersion() {
   }
 }
 
+async function openWorkbenchSessionFromRoute() {
+  const encodedDir = String(route.query.encodedDir || '').trim()
+  const requestedSessionId = String(route.query.sessionId || '').trim()
+  const requestedTaskId = String(route.query.taskId || '').trim()
+  const requestedTurnId = String(route.query.turnId || '').trim()
+  if (!encodedDir || !requestedSessionId) return
+  const project = projects.value.find(item => item.encodedDir === encodedDir || item.sessions.some(session => session.id === requestedSessionId))
+  if (!project) return
+  await handleNewSession(project.workDir, project.encodedDir, requestedSessionId)
+  const located = messages.value.some(message => String((message as any).taskId || '') === requestedTaskId || String((message as any).turnId || '') === requestedTurnId)
+  taskFocus.value = requestedTaskId || requestedTurnId ? {taskId: requestedTaskId, turnId: requestedTurnId, located, message: located ? '' : '任务回合不可定位，已打开对应会话。'} : null
+  await router.replace({path: '/', query: {encodedDir, sessionId: requestedSessionId}})
+}
+
 // 组件挂载：加载项目列表、余额、模型列表、斜杠命令、IM 绑定状态
 // 同时注册全局键盘快捷键（Esc 关闭弹窗）
 onMounted(async () => {
@@ -2223,6 +2239,7 @@ onMounted(async () => {
   const settingsTask = loadSavedWorkspaceSettings()
   await Promise.allSettled([projectsTask, settingsTask])
   await restoreWorkspaceShell()
+  await openWorkbenchSessionFromRoute()
 
   // 余额、实时模型、命令和 IM 状态属于非关键数据，后台加载且互不阻塞。
   void Promise.allSettled([
@@ -6595,6 +6612,7 @@ const tokenTooltip = computed(() => {
 
 <template>
   <div class="app">
+    <div v-if="taskFocus?.message" class="task-focus-notice" role="status">{{ taskFocus.message }}</div>
     <!-- 侧栏：展开时项目列表 + 会话管理，折叠后窄竖条 -->
     <template v-if="showSidebar">
       <div class="sidebar-wrapper" :style="{ width: sidebarWidth + 'px', transition: leftDragging ? 'none' : '' }">
@@ -6621,6 +6639,7 @@ const tokenTooltip = computed(() => {
         :show-hidden-section="showHiddenSection"
         :batch-mode="batchMode"
         :selected-sessions="selectedSessionIds"
+        @go-workbench="router.push('/workbench')"
         @go-settings="router.push('/settings')"
         @search="projectSearch = $event"
         @add-project="addProject"

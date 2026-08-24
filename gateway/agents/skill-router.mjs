@@ -13,6 +13,8 @@ function hasSpecificDeviceDriverSignal(text) {
 
 const MEMORY_DIRECT = /(?:记住|记录下来|沉淀|整理|更新|删除|忘记|写入|保存).{0,80}(?:记忆|memory|项目约定|项目规则)|(?:记忆|memory|项目约定|项目规则).{0,80}(?:记住|记录|沉淀|整理|更新|删除|忘记|写入|保存)/i
 const INDUSTRIAL_SOLUTION_DIRECT = /(?:工业拧紧|智能拧紧|拧紧设备|扭矩校验|扭矩扳手|数字工厂|工位规划|工位管理|技术方案|项目技术方案|技术协议|招标响应|投标响应|实施方案|验收方案|方案书|MES|MOM|KMIS|LIMS|PLM|生产追溯|质量追溯|信创适配|车间大屏)/i
+const ARCHITECTURE_DIAGRAM_DIRECT = /(?:当前架构图|现状架构图|目标架构图|架构演进图|系统上下文图|容器图|组件图|部署图|架构关系图|架构拓扑图|架构视图|architecture\s+(?:diagram|view)|system\s+context|container\s+diagram|component\s+diagram|deployment\s+diagram)/i
+const DIAGRAM_DESIGN_DIRECT = /(?:绘制|画|生成|创建|重绘|输出|导出|可视化).{0,80}(?:架构(?:图|视图)?|系统(?:上下文|容器|组件|部署)?图?|流程图|时序图|状态(?:机)?图|实体关系图|er\s*(?:图|diagram)?|数据模型图|时间线|泳道图|雷达图|甘特图|散点图|数据流图|部署图|依赖图|uml|故事地图|看板|用户旅程|安全矩阵|sankey|鱼骨图|wardley|diagram|mermaid|draw\.io|drawio|svg|png|html)/i
 
 const ROUTES = [
     {
@@ -26,6 +28,14 @@ const ROUTES = [
     {
         name: 'industrial-tightening-solution',
         match: text => INDUSTRIAL_SOLUTION_DIRECT.test(text),
+    },
+    {
+        name: 'ln-75-architecture-diagram-builder',
+        match: text => ARCHITECTURE_DIAGRAM_DIRECT.test(text),
+    },
+    {
+        name: 'diagram-design',
+        match: text => DIAGRAM_DESIGN_DIRECT.test(text),
     },
     {
         name: 'protocol-parser',

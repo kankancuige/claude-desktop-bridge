@@ -81,7 +81,11 @@ test('停止父任务时清空 Workflow 门禁和延迟结果', () => {
 })
 
 test('Gateway 将内部 Workflow 回合与用户主任务结果分支处理', () => {
-    const source = readFileSync(new URL('../index.mjs', import.meta.url), 'utf8')
+    const source = [
+        readFileSync(new URL('../gateway-runtime-impl.mjs', import.meta.url), 'utf8'),
+        readFileSync(new URL('../runtime/task-command-runtime.mjs', import.meta.url), 'utf8'),
+        readFileSync(new URL('../runtime/sdk-stream-runtime.mjs', import.meta.url), 'utf8'),
+    ].join('\n')
     assert.match(source, /_internalWorkflowResultTurnId\s*=\s*consumedWorkflowResult/)
     assert.match(source, /s\._taskWorkflowGate\s*=\s*createTaskWorkflowGate\(\)\s*\r?\n\s*s\._internalWorkflowResultTurnId\s*=\s*null/)
     assert.match(source, /finishTaskWorkflowResultTurn\(\s*s\._taskWorkflowGate,\s*s\._internalWorkflowResultTurnId,?\s*\)/)

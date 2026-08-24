@@ -35,7 +35,6 @@ import {readAdapterConfig} from './adapter-config.mjs'
 import {turnFallbackText} from './im-turn-finish.mjs'
 import {normalizeImMessageId, validateImText} from './im-input.mjs'
 import {runImTask} from './im-task-runner.mjs'
-import {platformEntryFilePath} from './platform-entry-store.mjs'
 import {PendingConfirmRegistry} from './pending-confirm.mjs'
 import {findLatestAdapterUserForSession} from './adapter-bindings.mjs'
 import {BRIDGE_HOME} from '../config/bridge-home.mjs'
@@ -52,7 +51,7 @@ const POLL_TIMEOUT = 35000                        // 长轮询超时(毫秒)，�
 // 实现方式: 使用闭包保存内部状态(onConfirmRequest/onConfirmResolved/findUserForSession/sendToUser)，
 //          返回镜像钩子供 Gateway 调用。
 // 关键数据流: adapters.json 加载 token → 生成配对码 → 启动 poll() → 返回钩子对象
-export function startWeChatAdapter(token, {taskCommands, stateStore = null, onNotificationStateChange = null} = {}) {
+export function startWeChatAdapter(token, {taskCommands, repository, onNotificationStateChange = null} = {}) {
     let botToken, baseUrl
     let stopped = false
     let activePollController = null
@@ -134,18 +133,14 @@ export function startWeChatAdapter(token, {taskCommands, stateStore = null, onNo
     const sessionQueue = new SessionTaskQueue({maxDepth: 8})
     const messageDeduper = new ImMessageDeduper()
     const payloadCodec = new SecurePayloadCodec(join(BRIDGE_HOME, 'bridge-store-key'))
-    const legacyInboxFile = join(BRIDGE_HOME, 'bridge-im-inbox.json')
-    const legacyOutboxFile = join(BRIDGE_HOME, 'bridge-notification-outbox.json')
     const inbox = new ImInbox({
-        filePath: platformEntryFilePath(BRIDGE_HOME, 'bridge-im-inbox', 'wechat'), legacyFilePath: legacyInboxFile,
         platform: 'wechat', payloadCodec,
-        stateStore,
+        repository,
         onPersistError: error => log.error({err: error}, 'IM inbox 持久化失败'),
     })
     const outbox = new NotificationOutbox({
-        filePath: platformEntryFilePath(BRIDGE_HOME, 'bridge-notification-outbox', 'wechat'), legacyFilePath: legacyOutboxFile,
         platform: 'wechat', payloadCodec,
-        stateStore,
+        repository,
         onPersistError: error => log.error({err: error}, '通知 outbox 持久化失败'),
     })
     // pendingConfirm TTL 清理：60s 间隔扫描，清理超时条目防止内存泄漏

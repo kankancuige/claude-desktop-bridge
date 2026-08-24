@@ -47,7 +47,6 @@ import {readAdapterConfig} from './adapter-config.mjs'
 import {turnFallbackText} from './im-turn-finish.mjs'
 import {normalizeImMessageId, validateImText} from './im-input.mjs'
 import {runImTask} from './im-task-runner.mjs'
-import {platformEntryFilePath} from './platform-entry-store.mjs'
 import {PendingConfirmRegistry} from './pending-confirm.mjs'
 import {findLatestAdapterUserForSession} from './adapter-bindings.mjs'
 import {BRIDGE_HOME} from '../config/bridge-home.mjs'
@@ -63,7 +62,7 @@ const GW = () => gatewayHttpBase()              // Gateway 本地 HTTP 地址
 //          返回 null 表示凭据加载失败，适配器无法启动。
 // 关键数据流: adapters.json 加载凭据 → 获取 access_token → 创建 DWClient → 注册回调
 //          → connect() → 返回钩子对象
-export function startDingTalkAdapter(token, {taskCommands, stateStore = null, onNotificationStateChange = null} = {}) {
+export function startDingTalkAdapter(token, {taskCommands, repository, onNotificationStateChange = null} = {}) {
     let appKey, appSecret
     let stopped = false
     let connectionError = null
@@ -203,18 +202,14 @@ export function startDingTalkAdapter(token, {taskCommands, stateStore = null, on
     const sessionQueue = new SessionTaskQueue({maxDepth: 8})
     const messageDeduper = new ImMessageDeduper()
     const payloadCodec = new SecurePayloadCodec(join(BRIDGE_HOME, 'bridge-store-key'))
-    const legacyInboxFile = join(BRIDGE_HOME, 'bridge-im-inbox.json')
-    const legacyOutboxFile = join(BRIDGE_HOME, 'bridge-notification-outbox.json')
     const inbox = new ImInbox({
-        filePath: platformEntryFilePath(BRIDGE_HOME, 'bridge-im-inbox', 'dingtalk'), legacyFilePath: legacyInboxFile,
         platform: 'dingtalk', payloadCodec,
-        stateStore,
+        repository,
         onPersistError: error => log.error({err: error}, 'IM inbox 持久化失败'),
     })
     const outbox = new NotificationOutbox({
-        filePath: platformEntryFilePath(BRIDGE_HOME, 'bridge-notification-outbox', 'dingtalk'), legacyFilePath: legacyOutboxFile,
         platform: 'dingtalk', payloadCodec,
-        stateStore,
+        repository,
         onPersistError: error => log.error({err: error}, '通知 outbox 持久化失败'),
     })
     // pendingConfirm TTL 清理：5 分钟超时自动清除，防止异常路径下残留

@@ -18,7 +18,7 @@ Incomplete: None
 | `ProviderRegistry` | 校验 Agent 能力并统一启动/释放 Provider | `agent/claude-sdk`、`AGENT_CAPABILITY_UNSUPPORTED` |
 | Claude SDK | 在 Gateway 强制设置的 `CLAUDE_CONFIG_DIR` 下写入 `~/.claude-desktop-bridge/projects/.../*.jsonl` | `providers/claude-agent-sdk-runtime.mjs`、`system/init.session_id` |
 | `bridge-session-map.json` | Gateway UUID 与 SDK conversation ID 双向映射 | `persistSdkSessionId` |
-| `bridge-state.db/bridge_session_index` | 保存可重建的会话目录、权限和 IM 镜像投影；不保存对话正文 | `sessions/session-catalog.mjs`、`storage/bridge-state-db.mjs` |
+| `bridge.session_index` | 保存可重建的会话目录、权限和 IM 镜像投影；不保存对话正文 | `sessions/session-catalog.mjs`、`storage/postgres-state-compat.mjs` |
 
 ## 当前关键流程
 
@@ -33,7 +33,7 @@ Incomplete: None
 9. 任务接收：`task/accepted` 先同步写入并 `fsync`；写入失败返回 `session_event_persist_failed` 且回滚输入。后续状态、Workflow/Agent、停止和 runtime 失败写入安全事件投影。
 10. Agent 启动：主 Session、定时 Session、query 重建和 Workflow Agent 都通过 `agent/claude-sdk` Provider；只有 Provider 注册适配器可以直接调用 SDK `query()`。
 11. 重启恢复：优先从连续 journal 投影任务状态；尾部半行自动修复，中间损坏或序号中断会隔离为 `.corrupt-*` 并回退 `bridge-task-state`。
-12. 项目扫描：按 transcript 内真实 `cwd` 聚合 canonical 与旧编码物理目录；SQLite 使用 canonical project key，JSONL 保留原路径。旧空 visibility sidecar 仅修复明确分类为 `main` 的 transcript，Agent/Workflow transcript 继续过滤。
+12. 项目扫描：按 transcript 内真实 `cwd` 聚合 canonical 与旧编码物理目录；PostgreSQL 使用 canonical project key，JSONL 保留原路径。旧空 visibility sidecar 仅修复明确分类为 `main` 的 transcript，Agent/Workflow transcript 继续过滤。
 13. Tab 恢复：Gateway runtime 404 且有 SDK history ID 时重建 runtime；没有 history ID 时清除失效 UUID并要求重新发送；网络、5xx 或无效响应才进入重连。
 
 ## 静态检查仍未关闭的风险
@@ -68,8 +68,8 @@ Incomplete: None
 - `gateway/index.mjs` 仍是 OBSERVED 的唯一组合根和启动入口；Electron 继续按该路径启动，独立运行命令仍为 `node gateway/index.mjs`。
 - 领域源码和测试已归入 `shared/`、`security/`、`providers/`、`sessions/`、`projects/`、`tasks/`、`agents/`、`workflows/`、`im/`、`context/` 和 `tools/`，测试与源码同目录。
 - Gateway 根目录只保留组合入口、package/env 文件、OCR 运行资产、就近说明和人工 smoke 脚本；目录迁移未修改 HTTP/WebSocket API、配置键、transcript、journal、通知 outbox 或其他用户数据路径。
-- `index.mjs` 仍接近 10,000 行，目录分类只提高职责可发现性，尚未完成 HTTP router、Session coordinator、SDK stream adapter 和 project repository 的提取。
-- 目录迁移后的静态证据为 156 个 MJS 语法检查和 Gateway 296/296 单元测试通过；桌面类型检查、生产构建与真实 IM runtime smoke 在最终门禁阶段补充。
+- `index.mjs` 仍是组合根和启动入口，但 HTTP REST 业务路由已迁入 `gateway/http/*-routes.mjs`，认证/CORS/Adapter 边界与分发位于 `gateway/http/request-handler.mjs`；Session coordinator、SDK stream adapter 和 StorageGateway 仍由组合根接线。
+- 2026-08-24 代码闭合证据为 Gateway `572/572`、HTTP handler 直接契约测试、全量 MJS 语法检查和 `git diff --check`；桌面类型检查、生产构建与真实 IM/Provider runtime smoke 仍属于外部验收。
 
 ## 上下文规则与内置 Skill 补充（2026-08-18）
 
@@ -85,7 +85,7 @@ Incomplete: None
 - Electron 主进程也从 `~/.claude/bridge-token` 和 `~/.claude/bridge-store-key` 读取 Gateway token 与旧安全载荷密钥。
 - Claude Agent SDK 是唯一执行 Provider；SDK 默认使用 `~/.claude`，除非 Query 子进程显式收到 `CLAUDE_CONFIG_DIR`。
 - 设置页可管理 `rules/` 和 `hooks/`，但完整 Query 关闭了所有 `settingSources`，因此自定义 Rule/Hook 没有进入实际会话执行链路。
-- Bridge 使用位于 `BRIDGE_HOME` 的 SQLite 运行状态库保存可重建的 IM、会话、任务和 Workflow 结构化投影；Claude transcript、事件正文、规则、Skill、Agent、Workflow 定义和附件正文仍保持 Markdown、JSON、JSONL 或脚本文件事实源。
+- Bridge 使用 PostgreSQL `bridge` schema 保存可重建的 IM、会话、任务和 Workflow 结构化投影；Claude transcript、事件正文、规则、Skill、Agent、Workflow 定义和附件正文仍保持 Markdown、JSON、JSONL 或脚本文件兼容格式。
 
 ## Bridge 私有配置实现补充（2026-08-18）
 
@@ -97,17 +97,52 @@ Incomplete: None
 - `settings.json` 保存前剥离模型、供应商地址和凭据；`bridge-provider.json` 是供应商配置唯一事实源。
 - 该阶段当时的静态证据为 Gateway 334/334、桌面端 94/94 和 169 个 Gateway MJS；当前证据见文末 2026-08-21 补充。尚未重启真实桌面进程执行旧数据迁移和 IM runtime smoke。
 
-## SQLite 与 Memory 实现补充（2026-08-18）
+## PostgreSQL 统一存储与 Memory 实现补充（2026-08-23）
 
-- `BRIDGE_HOME/bridge-state.db` 已保存 IM inbox/outbox、会话索引和 Memory Markdown 派生索引；Rules、Skills、MCP、Agents、Hooks、Provider 配置、Memory 正文和 Claude transcript 继续使用文件事实源。
-- Electron 使用内置 `node:sqlite`，Node 20 可选加载 `better-sqlite3`。数据库使用 WAL、5 秒 busy timeout 和 schema v7；除原会话、任务和 Workflow 投影外，当前还包含 Pitfall、Execution Report 与 Verification Campaign 表。驱动不可用时显式进入文件模式，确认损坏时隔离数据库并在健康接口暴露原因和隔离计数。
-- 项目与会话列表通过 `bridge_session_index` 增量协调 transcript 的路径、mtime、size、标题、用户可见性、来源、权限、IM 镜像和最近打开时间。扫描先按 mtime 稳定选择最新记录，既有目录一次批量读取并在一个短事务内批量 upsert；mtime/size 未变化时不重新读取 transcript。visibility sidecar 缺失或损坏时可用 SQLite 中已确认的 `visible` 记录恢复，SQLite 不可用时继续使用原 JSON/JSONL 扫描和 sidecar 设置。
-- 微信、飞书、钉钉按平台惰性导入旧 JSON。重配或解绑会同时清理 SQLite 和兼容文件；适配器停止时通知统计仍读取 SQLite。
-- 任务状态通过 `bridge_task_state`/`bridge_task_events` 双写 SQLite 与旧 task-state/Event Journal；状态和事件在同一短事务内按 revision 接受或拒绝，迟到 revision 不再进入事件流。终态任务先保存平台通知意图，通知使用确定性 ID 进入 outbox；worker 的 sent/failed/dead 结果回写任务投影，重启时对账缺失 outbox 记录并重新入队。Workflow 通过 `bridge_workflow_state` 保存阶段、token、父 Session 和运行键；重启后存活态降为可恢复的 paused，并结合 journal 恢复阶段和 token。SQLite 不复制最终回复或事件正文。
+- PostgreSQL 17.11 的 `bridge` schema 是结构化运行态唯一事实源，承载 IM inbox/outbox、会话索引、Memory 正文/元数据/embedding、Task/Workflow、Pitfall、Execution Report、Verification Campaign 和 usage。Gateway 启动只创建 PostgreSQL StorageGateway，未配置或不可用时明确失败，不创建、不打开第二种结构化数据库。
+- 项目与会话列表通过 PostgreSQL `bridge.session_index` 增量协调 transcript 的路径、mtime、size、标题、用户可见性、来源、权限、IM 镜像和最近打开时间。扫描先按 mtime 稳定选择最新记录，既有目录一次批量读取并批量 upsert；mtime/size 未变化时不重新读取 transcript。visibility sidecar 缺失或损坏时使用 PostgreSQL 中已确认的 `visible` 记录恢复。
+- 微信、飞书、钉钉从 PostgreSQL 状态仓储恢复 inbox/outbox；空表不回读旧结构化状态文件，重配或解绑只清理 PostgreSQL 运行态。
+- `PostgresStateCompat` 在启动时加载 PostgreSQL 内存投影，保留旧同步业务 API，写入通过 FIFO 队列串行提交；任务状态按 revision 幂等，PostgreSQL 失败进入 degraded，不回退旧数据库。最终回复、transcript 正文和凭据不进入状态投影。
 - transcript 索引只保存路径和元数据，命中时走快速路径；文件删除或元数据失效后清理陈旧行并回退目录扫描，不复制会话正文。
 - `context/memory-service.mjs` 对动作任务做确定性关键词召回，最多注入 6 KB；简单问题、无匹配内容、停用/过期记录和明确“不要记住”均不注入。
-- 设置页可搜索、启停、删除和重建项目 Memory，展示来源、状态、作用域和最近验证时间。SQLite 只保存索引，`memory/*.md` 仍可直接编辑和恢复。
+- 设置页可搜索、启停、删除和重建项目 Memory，展示来源、状态、作用域和最近验证时间。正文由 StorageGateway 写入 PostgreSQL `content_documents`，`memory/*.md` 作为用户编辑/SDK 兼容副本。
 - 内置 `bridge-memory` Skill 只处理明确的记住、沉淀、忘记或项目约定操作；普通代码任务、探索和功能解释不加载该 Skill。
+
+## 独立本地 Workbench 面板补充（2026-08-23）
+
+- Desktop 新增 `/workbench` 独立路由和侧栏入口，面向本地单用户提供 MultiCA 风格的任务看板、运行概览、最近活动、Coordinator 详情、Agent/Workflow、验证证据、Execution Report 和 AI 层健康视图。
+- 面板只读消费 `GET /api/workbench/tasks`、既有 reports/pitfalls/ai-health 接口；PostgreSQL Workbench Repository 支持可选 `projectKey` 与 `activeOnly`，查询仍使用参数化 SQL，状态库降级通过 `stateStoreDegraded` 明示。
+- UI 通过 `workbench-view-model.ts` 聚合状态计数和展示数据，不创建第二套任务终态；5 秒轮询、手动刷新、加载/错误/空状态和窄屏布局均在页面内处理。任务带有 `encodedDir/sessionId` 时可从面板返回对应历史会话。
+- 该面板是本地观测与协作管理层，不提供云工作区、成员权限、远程 Runtime、跨设备同步、供应商账单核验或设备/MQTT 业务能力；设置页既有 Workbench 治理 Tab 保持不变。
+- Workbench 现支持 `任务 / Agent / 会话` 三种只读视图。Agent 投影显示 `name/agentType/role/purpose/goal/status/resultSummary`、文件/测试计数和所属任务；任务详情抽屉显示任务概述、原始请求、问题列表、Coordinator 步骤、Agent/Workflow、任务事件与 Agent 时间线、验证证据和 Execution Report，并可按问题的 `sessionId + turnId` 跳转回对应会话上下文。
+- `GET /api/workbench/tasks/:taskId` 的 `questions` 对齐任务看板的 conversation reference 思路：根 `task/created` 和每个 `task/input-appended` 形成稳定问题项，问题项保存 bounded 摘要和独立 Session Link，不复制 Transcript 正文。
+- Coordinator 内部仍保留结构化 Agent 结果用于完成门禁，但 PostgreSQL 只写白名单投影，不写 prompt、凭据、完整结果正文或绝对路径。
+
+## PostgreSQL-only 运行时边界（2026-08-23）
+
+- Gateway 运行态 Memory 统一调用 `StorageGateway`，业务层不直接依赖 PostgreSQL client 或 JSON 状态文件；未注入 StorageGateway 时以稳定错误码阻止运行。
+- PostgreSQL 目标承载所有结构化运行态：任务状态、会话索引、IM inbox/outbox、Workbench 投影、Memory 元数据/embedding、Pitfall、Execution Report、Verification Campaign 和 model usage。
+- Markdown 继续保存用户可编辑的 Rules、Skills 和 Memory 正文，JSONL 继续作为 Claude SDK transcript/审计归档；二者由 StorageGateway 负责访问和兼容，不作为散落的业务入口。
+- PostgreSQL-only 代码闭合已完成；旧迁移产物不再属于运行时入口。2026-08-23 已完成真实 pg_dump/临时库恢复、vector 类型、内容 hash 和 transcript 物化验收；真实 Claude SDK resume 重启 E2E 与外部 Provider/IM 送达仍是独立门禁。
+- 当前本机 PostgreSQL 17.11 与 `pgvector 0.8.6` 已运行，`pg` 驱动、统一 StorageGateway、结构化状态导入和 Markdown/JSONL 内容导入已有真实探针；运行时结构化调用方已切换。真实 embedding endpoint、SDK transcript 文件物化/恢复和真实 IM/Provider 送达仍属于外部验收门禁。
+
+### 增量运行时证据（2026-08-23）
+
+- Gateway 启动从 `storage-config.json` 读取 PostgreSQL，初始化 `bridge` schema，并将 StorageGateway 注入 Memory 服务；关闭流程会释放连接。
+- Memory 召回、管理 API 的列表/保存/启停/重建/删除操作已通过 PostgreSQL `content_documents` 统一入口；Markdown 文件仍保留为用户可编辑和 SDK 兼容的内容副本。
+- `/api/health` 会返回 StorageGateway 的 PostgreSQL 健康状态、数据库名和 server version；本机已验证 `vector 0.8.6` 和 `vector(1536)`，但没有 embedding endpoint 时仍使用关键词召回，不宣称语义质量已验收。
+- 任务、Session、IM、Workbench 和 Pitfall 已通过 PostgreSQL 同步兼容投影运行；JSONL transcript 仍保留真实路径以满足 Claude SDK resume 契约。
+- Provider usage、任务、Session、IM、Workbench 和 Pitfall 均通过 PostgreSQL 统一状态入口写入，重复 event 使用 PostgreSQL 唯一键或 revision 幂等。
+- Coordinator 每个 revision 串行写入 PostgreSQL `task_state`/`task_events`，事务锁拒绝迟到 revision；数据库只保存脱敏任务、Agent、Workflow、验证和 finding 投影，不保存完整 plan 或工作目录。
+
+## 组合根纯端口收敛（2026-08-24）
+
+- `gateway/index.mjs` 只负责启动失败边界；`gateway/gateway-runtime.mjs` 只暴露稳定的 `startGateway()` 契约。
+- `gateway/gateway-runtime-impl.mjs` 仅负责依赖工厂、生命周期接线、端口包装、HTTP/WebSocket 上下文组装和启动组合；不再实现上传路径校验、Session ID 校验、SDK 事件转换或 SDK 输入 async iterable。
+- Session 上传边界位于 `gateway/runtime/session-upload-runtime.mjs`；SDK 客户端事件适配位于 `gateway/sessions/sdk-stream-adapter.mjs`；SDK 输入队列位于 `gateway/runtime/push-stream.mjs`。这些模块均有独立契约测试。
+- `gateway/runtime/composition-root-wiring.test.mjs` 对组合根执行静态门禁：拒绝 HTTP pathname 分支、直接数据库执行、SDK async iterator、直接 Session Map 状态变更和旧 `convertSdkToWs` 实现。
+- 组合根仍允许保留顶层常量、依赖工厂、惰性生命周期监听器、稳定 wrapper 和 route context assembly；这些是启动组合职责，不代表业务实现迁回根文件。
+- 本轮 `node --test gateway` 为 `684/684`；真实 Provider/IM 账单、外部签名安装和供应商缓存计费仍属于环境门禁，不由静态代码门禁替代。
 
 ## 通用 Workbench 实现补充（2026-08-21）
 
@@ -115,7 +150,21 @@ Incomplete: None
 - `Project Context` 只按有限深度读取允许的 manifest、锁文件和规则元数据，跳过源码正文、构建目录与密钥文件。Light 任务不扫描目标项目；Windows 的 npm/pnpm/yarn 命令使用受限 `.cmd` shim，命令适配器仍拒绝 Project Context 白名单之外的字符串。
 - 阶段计划固定为 Prime、Plan、Implement、Validate、Review、Report 的按风险子集。Light 为 0 个子 Agent，Focused 最多 1 个，Balanced 最多 2 个，Power 通常 3–6 个且上限 8 个。
 - `Agent Registry` 将内置角色和用户 Agent 分开，并以统一输入、结构化结果、能力和文件边界调度。`Verification Campaign` 提供适配器生命周期、timeout/cancellation、基线/候选、失败指纹、回归检测和 L0–L6 证据等级。
-- `Repair Loop` 对同类失败最多自动尝试两种策略；重复策略进入 RCA，新回归冻结候选。`Pitfall Ledger` 使用 SQLite 按 global/project/bridge 隔离，正文只保存脱敏摘要和引用。
-- 完成门禁要求必需步骤结束、Agent/Workflow 无活动实例、阻断 finding 已关闭、实际测试和必要验证通过，并且确定性通知意图已持久化。成功及所有稳定非成功终态都生成状态一致的 Execution Report；`paused`、验证不足、环境阻塞、回归和 RCA 终态都不会显示为完成。Coordinator 与旧 task-state 使用独立 SQLite task key，避免两套 revision 互相覆盖；重启时活动 Coordinator 投影降级为 `inconclusive` 并要求显式继续和重新验证。
-- `gateway/smoke/general-workbench-smoke.mjs` 使用临时 Node 目标项目验证 Light、Focused、Balanced、Power、L2 Host Test、修复循环、Pitfall、桌面事件、IM 终态去重和 SQLite 投影。该 Smoke 不等于真实 Provider、真实 IM 或真实业务项目端到端验收。
+- `Repair Loop` 对同类失败最多自动尝试两种策略；重复策略进入 RCA，新回归冻结候选。`Pitfall Ledger` 使用 PostgreSQL 按 global/project/bridge 隔离，正文只保存脱敏摘要和引用。
+- 完成门禁要求必需步骤结束、Agent/Workflow 无活动实例、阻断 finding 已关闭、实际测试和必要验证通过，并且确定性通知意图已持久化。成功及所有稳定非成功终态都生成状态一致的 Execution Report；`paused`、验证不足、环境阻塞、回归和 RCA 终态都不会显示为完成。Coordinator 与旧 task-state 使用独立 PostgreSQL task key，避免两套 revision 互相覆盖；重启时活动 Coordinator 投影降级为 `inconclusive` 并要求显式继续和重新验证。
+- `gateway/smoke/general-workbench-smoke.mjs` 使用临时 Node 目标项目验证 Light、Focused、Balanced、Power、L2 Host Test、修复循环、Pitfall、桌面事件、IM 终态去重和结构化投影。该 Smoke 不等于真实 Provider、真实 IM 或真实业务项目端到端验收。
 - 2026-08-23 当前代码门禁为 Gateway 全量测试、62 项内置资源检查、桌面端 Vue 类型检查和 Vite 生产构建全部通过；Windows NSIS 生产打包成功。源码 Desktop 冷启动、普通消息、补充消息、停止、重连和崩溃恢复 L3 已通过；真实 Provider 普通回复、handoff、同模型重连、补充队列、停止和受控 idle timeout 均通过，usage ledger 保留 `provider_observed` 与未知字段 `null`；微信入站、会话执行和完成回复双向链路已有用户实测。Provider 账单/缓存读计费、无入站会话的 IM 主动推送、安装/升级签名与失败回滚仍分别属于供应商/发布外部门禁，不能由本地代码门禁替代；认证业务接口按当前范围不验收。
+
+## 组合根迁移增量（2026-08-24）
+
+- `gateway/runtime/session-context-runtime.mjs` 现在独立拥有项目 transcript 接力、用户偏好和 PostgreSQL Memory 注入；`gateway-runtime-impl.mjs` 只通过显式依赖和稳定 wrapper 接线。
+- `gateway/runtime/project-session-runtime.mjs` 独立拥有项目分组、可见性迁移、Session Catalog 协调、项目/Session 查询、删除标记和 Session 文件清理；transcript 正文仍由 Claude SDK 文件契约拥有，结构化索引仍进入 PostgreSQL。
+- 本增量的定向契约、语法检查、`git diff --check` 和 Gateway 全量测试均通过（`614/614`）。项目/Session legacy 实现已从组合根删除，当前仅保留稳定 wrapper；`gateway-runtime-impl.mjs` 仍包含其他生命周期与配置组合逻辑，尚未宣称整个实现文件已完全收敛。
+
+## 运行时兼容闭合增量（2026-08-24）
+
+- Memory、Pitfall、IM Inbox/Outbox 和通知状态路由均已改为显式领域 Repository；生产 Context、Runtime、HTTP、IM 和 Workflow 不再使用 `stateStore`、文件 outbox/inbox fallback 或 Workflow 全局依赖槽。
+- `NotificationOutbox` 的去重、延迟、失败重试、dead、恢复、容量上限和 Repository 写失败回滚均通过 Repository fixture 验证；三平台适配器只接收 Repository port。
+- `PitfallService` 不再自行创建兼容仓储，启动组合根只注入 `repositories.pitfall`；IM Runtime 通过 `getSessionRepository`、`getImRepository` 和 `getNotificationRepository` 取领域端口。
+- 2026-08-24 全量 Gateway 回归为 `674/674`，`vue-tsc` 和 Vite 生产构建通过，相关 Node 语法检查和 `git diff --check` 通过。代码层面的本轮闭合完成。
+- 真实 Gateway/Provider/IM/PostgreSQL 断线恢复、SDK resume 及 Electron 签名安装仍是外部运行时门禁，不能由本地单元或静态测试替代。

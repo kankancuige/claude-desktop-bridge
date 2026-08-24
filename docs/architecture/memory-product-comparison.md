@@ -26,7 +26,7 @@
 
 | 能力 | 当前实现 | 结论 |
 |---|---|---|
-| 正文与索引分离 | Markdown 保存正文，SQLite 只保存可重建元数据 | 保留 |
+| 正文与索引分离 | Markdown 保存用户可编辑副本，PostgreSQL 保存版本化正文、元数据和可选 embedding | 保留 |
 | 简单问题零注入 | 只有动作任务或明确 Memory 请求进入召回 | 保留 |
 | 有界召回 | 确定性关键词、单文件片段上限、总计 6 KB | 保留，后续用评测调整而非直接上向量库 |
 | 来源与新鲜度 | 索引记录 source、hash、lastVerifiedAt、lastUsedAt | 已实现 |
@@ -47,3 +47,9 @@
 - 不同 Agent 反复写入冲突约定，需要 Agent type 隔离。
 - 用户明确需要本机全局 Memory 正文，而结构化全局偏好无法覆盖。
 - 需要跨设备同步；届时必须先定义端到端加密、冲突合并、删除传播和恢复策略。
+
+## PostgreSQL/pgvector 边界（2026-08-23）
+
+pgvector 适合解决“Memory 数量大、关键词命中不足”的语义召回问题。当前 Bridge 的任务状态、会话索引、IM outbox、用量事件和 Memory 均由 PostgreSQL 统一承载；Markdown、transcript、规则和 Skill 仍保留用户可编辑或 SDK 兼容副本。
+
+Memory 使用 PostgreSQL 关键词索引，并在 embedding provider 和向量列可用时启用 pgvector 语义召回；连接或 provider 不可用时明确报告 degraded，不切换到第二种结构化数据库。

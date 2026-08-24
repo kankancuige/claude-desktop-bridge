@@ -4,16 +4,21 @@ import {tmpdir} from 'node:os'
 import {dirname, join} from 'node:path'
 import {fileURLToPath} from 'node:url'
 import test from 'node:test'
-import {BridgeStateDb} from '../storage/bridge-state-db.mjs'
-import {reconcileSessionCatalog} from './session-catalog.mjs'
+import {createPostgresStateFixture} from '../test-support/postgres-state-fixture.mjs'
+import {reconcileSessionCatalog as reconcileSessionCatalogImpl} from './session-catalog.mjs'
+import {createSessionRepository} from '../storage/repositories/session-repository.mjs'
 
-const gatewaySource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'index.mjs'), 'utf8')
+function reconcileSessionCatalog(options) {
+    return reconcileSessionCatalogImpl({...options, repository: options.repository || createSessionRepository({stateStore: options.stateStore})})
+}
+
+const gatewaySource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'runtime', 'project-session-runtime.mjs'), 'utf8')
 
 function fixture() {
     const home = mkdtempSync(join(tmpdir(), 'bridge-session-catalog-'))
     const projectDir = join(home, 'project')
-    const stateStore = new BridgeStateDb({bridgeHome: home})
-    return {home, projectDir, stateStore}
+    const {store: stateStore} = createPostgresStateFixture()
+    return {home, projectDir, stateStore, repository: createSessionRepository({stateStore})}
 }
 
 test('协调器只索引可见用户会话并保留 transcript 路径', t => {
@@ -62,8 +67,7 @@ test('首次协调导入权限和 IM 镜像设置，且不复制 transcript 正�
     const row = stateStore.getSessionCatalog('D--demo', 'sdk-user')
     assert.equal(row.permissionMode, 'acceptEdits')
     assert.equal(row.mirrors.wechat, true)
-    const columns = stateStore.db.prepare('PRAGMA table_info(bridge_session_index)').all().map(item => item.name)
-    assert.equal(columns.includes('content'), false)
+    assert.equal(Object.hasOwn(stateStore.getSessionCatalog('D--demo', 'sdk-user'), 'content'), false)
 })
 
 test('删除 transcript 只清理派生索引，不删除其他源文件', t => {
@@ -83,7 +87,7 @@ test('删除 transcript 只清理派生索引，不删除其他源文件', t => 
     assert.deepEqual(stateStore.listSessionIndex('D--demo'), [])
 })
 
-test('visibility sidecar 丢失时从 SQLite 恢复已确认可见的会话', t => {
+test('visibility sidecar 丢失时从 PostgreSQL 索引恢复已确认可见的会话', t => {
     const {projectDir, stateStore} = fixture()
     t.after(() => stateStore.close())
     mkdirSync(projectDir, {recursive: true})
@@ -141,7 +145,7 @@ test('旧 visibility 空迁移后可从主 transcript 修复目录并继续过�
     assert.equal(stateStore.getSessionCatalog('D--demo', 'sdk-agent'), null)
 })
 
-test('同一 cwd 的 canonical 与旧编码目录合并到一个 SQLite 项目键', t => {
+test('同一 cwd 的 canonical 与旧编码目录合并到一个 PostgreSQL 项目键', t => {
     const {home, stateStore} = fixture()
     t.after(() => stateStore.close())
     const canonicalDir = join(home, 'D--项目-测试')
@@ -167,6 +171,6 @@ test('同一 cwd 的 canonical 与旧编码目录合并到一个 SQLite 项目�
 })
 
 test('Gateway 项目扫描向协调器传入真实存在的 transcript 首部读取函数', () => {
-    assert.match(gatewaySource, /reconcileSessionCatalog\(\{[\s\S]*?readHeadLines:\s*readFileHeadLines,/)
-    assert.doesNotMatch(gatewaySource, /\n\s*readHeadLines,\s*\n/)
+    assert.match(gatewaySource, /readHeadLines\s*=\s*readFileHeadLines/)
+    assert.match(gatewaySource, /reconcileSessionCatalog\(\{[\s\S]*?readHeadLines,/)
 })

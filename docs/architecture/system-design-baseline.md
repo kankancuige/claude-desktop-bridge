@@ -54,4 +54,4 @@ Incomplete: None
 - 错误提示只能显示稳定错误码、HTTP 状态和脱敏说明，不显示 secret、请求 body 或堆栈。
 - 后台轮询采用去重/限频提示；用户触发的保存、恢复、发送、停止必须逐次给出结果。
 - 当前单机负载没有可信生产指标；设计按最多数十个打开 tab、数百个本地 transcript 工作，超过该量级后以扫描延迟和存储占用重新评估。
-- Rule、Skill、MCP、Agent 和 Hook 属于低频、可人工检查的配置资产，继续使用 Markdown、JSON 和脚本文件；SQLite 仅用于 IM 高频状态、会话索引和 Memory 文件索引，不保存配置或正文。
+- Rule、Skill、MCP、Agent 和 Hook 属于低频、可人工检查的配置资产，继续使用 Markdown、JSON 和脚本文件；PostgreSQL 统一保存 IM 高频状态、会话索引和 Memory 内容/索引，不保存凭据。

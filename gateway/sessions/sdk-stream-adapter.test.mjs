@@ -43,3 +43,32 @@ test('内部用户消息不会泄漏到界面，result 只使用会话连续性�
         result: 'done', usage: undefined, modelUsage: undefined, outcome: 'succeeded', resumable: true,
     })
 })
+
+test('SDK 工具、思考、错误和未知事件保持明确边界', () => {
+    const adapter = createAdapter()
+    assert.deepEqual(adapter.toClientEvent({
+        type: 'stream_event', event: {
+            type: 'content_block_start', index: 1,
+            content_block: {type: 'tool_use', id: 'tool-1', name: 'Bash', input: {}},
+        },
+    }, 'session-1'), {
+        type: 'tool_use_start', index: 1, tool_name: 'Bash', tool_use_id: 'tool-1', input: {},
+    })
+    assert.deepEqual(adapter.toClientEvent({
+        type: 'stream_event', event: {
+            type: 'content_block_delta', index: 2,
+            delta: {type: 'thinking_delta', thinking: '分析'},
+        },
+    }, 'session-1'), {type: 'thinking_delta', index: 2, thinking: '分析'})
+    assert.deepEqual(adapter.toClientEvent({
+        type: 'assistant', message: {role: 'assistant', content: []}, error: 'provider error',
+    }, 'session-1'), {
+        type: 'assistant_message', message: {role: 'assistant', content: []}, error: 'provider error',
+    })
+    assert.deepEqual(adapter.toClientEvent({
+        type: 'tool_progress', tool_use_id: 'tool-1', tool_name: 'Bash', elapsed_time_seconds: 2,
+    }, 'session-1'), {
+        type: 'tool_progress', tool_use_id: 'tool-1', tool_name: 'Bash', elapsed_time_seconds: 2,
+    })
+    assert.equal(adapter.toClientEvent({type: 'unknown_sdk_event'}, 'session-1'), null)
+})
