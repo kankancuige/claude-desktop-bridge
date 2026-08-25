@@ -5,6 +5,8 @@
 
 **核心亮点**：微信 / 飞书 / 钉钉消息**直接注入当前活跃 session**，桌面端实时同步显示 Claude 回复。
 
+当前稳定版本：**v1.7.0**。可直接从 [GitHub Releases](https://github.com/kankancuige/claude-desktop-bridge/releases/tag/v1.7.0) 下载 Windows、macOS 和 Linux 安装包。
+
 喜欢这个项目可以点个star哦~
 
 ---
@@ -31,6 +33,7 @@
   - [IM 集成（微信 / 飞书 / 钉钉）](#im-集成微信--飞书--钉钉)
   - [Workflow 多 Agent 编排](#workflow-多-agent-编排)
   - [配置管理（Settings）](#配置管理settings)
+  - [Memory（PostgreSQL 主存储）](#memorypostgresql-主存储)
   - [压缩模式（Caveman / RTK）](#压缩模式caveman--rtk)
   - [DeepSeek 兼容代理](#deepseek-兼容代理)
   - [定时任务（Scheduler）](#定时任务scheduler)
@@ -144,7 +147,7 @@ SDK 触发工具调用 → canUseTool 回调 → 广播确认请求
 | **DeepSeek 代理** | 内置兼容代理修复 `thinking` 与 `reasoning_content` 兼容性 Bug，自动路由 |
 | **OCR 图片理解** | Tesseract.js 对非多模态模型自动 OCR 识别图片文字，作为 Claude 上下文注入 |
 | **定时任务** | Cron 定时任务 CRUD，支持一次性/周期性调度，持久化到磁盘 |
-| **更新策略** | 仅代码签名且标记为可信的正式构建启用 electron-updater；未签名构建只提供官方 Release 手动更新入口 |
+| **发布与更新** | GitHub Actions 自动生成三平台 Release；当前本地使用不依赖代码签名，未签名构建通过官方 Release 手动更新 |
 | **主题与语言** | Dark / Light / 跟随系统 + 中文 / English |
 | **日志系统** | 结构化日志（pino），按天+按大小分包，自动过期清理，完整堆栈保留 |
 | **GitHub Actions** | push 自动三平台构建，产物可直接下载 |
@@ -267,7 +270,7 @@ claude-desktop-bridge/
 | 依赖 | 最低版本 | 说明 |
 |------|---------|------|
 | Node.js | 20+ | 推荐 20 LTS |
-| pnpm | 最新 | Desktop UI 包管理器（也可用 npm） |
+| pnpm | 10+ | Desktop UI 包管理器；仓库 CI 使用 pnpm 10 |
 | Git | 2.x | 版本管理 + CI（可选） |
 
 ### 可选依赖
@@ -358,6 +361,8 @@ Code → Actions → 最新一次 Workflow run → Artifacts
 ├── Claude-Desktop-Bridge-macOS/
 └── Claude-Desktop-Bridge-Linux/
 ```
+
+推送版本标签（例如 `v1.7.0`）会在质量门禁通过后自动构建并创建 GitHub Release。发布包名称包含版本号，当前 `v1.7.0` 已提供 Windows `.exe/.zip`、macOS `.dmg/.zip` 和 Linux `.AppImage/.zip`。
 
 也可手动触发：Actions → 三平台构建 → Run workflow。
 
@@ -549,12 +554,22 @@ Gateway 每次启动时为每个已连接的平台生成一个 6 位**配对码*
 | **命令** | 斜杠命令列表（只读），支持搜索，标注实时/缓存来源 |
 | **Hooks** | 事件钩子脚本（.sh/.js），按触发时机分组（PostToolUse / Stop / PreToolUse 等） |
 | **Rules** | 编码规则（.md），按语言分组，paths 属性按文件扩展名匹配 |
-| **Memory** | 跨项目记忆文件概览，展开/折叠，创建/删除/刷新，.md 后缀自动追加 |
+| **Memory** | PostgreSQL 中的项目 Memory 列表、正文、状态和索引管理；本地 `memory/*.md` 仅用于兼容迁移 |
 | **MCP** | MCP 协议服务器，内置插件列表 + 已安装列表 + 自定义服务器 CRUD（stdio/sse/http 传输） |
 | **IM 连接** | 微信扫码绑定 / 飞书凭据 / 钉钉凭据，连接状态、配对码、用户与 Session 绑定、通知队列管理、平台解绑 |
 | **Workflow** | DAG 设计器 + 脚本编辑器 + 全局开关，支持执行/暂停/恢复/状态监控 |
 | **定时任务** | Cron 定时任务 CRUD，可视化频率选择（每天/工作日/每周/每月/自定义），手动触发 |
 | **开源** | Caveman 压缩配置 / RTK 压缩配置 / 桌面宠物选择 |
+
+### Memory（PostgreSQL 主存储）
+
+- PostgreSQL 是 Memory 的唯一正常读写入口，设置页直接读取数据库内容，不扫描或生成本地 `memory/*.md` 副本。
+- `memory/*.md` 只在显式迁移旧项目数据时读取；迁移完成后不参与正常召回、编辑或删除。
+- 会话成功收口时，系统只根据原始任务和验证证据生成候选 Memory；候选需经过审批并保留证据后才会成为 active Memory。
+- Memory 支持项目隔离、候选去重、停用/删除、L0/L1/L2 摘要层和规模诊断。默认关键词召回不依赖 embedding。
+- 配置真实 embedding provider 和 pgvector 索引后，可额外启用语义召回与批量回填；没有 embedding provider 时，普通 Memory 功能仍可用。
+
+首次使用前，在 Bridge 私有配置中启用 PostgreSQL（默认仅允许本机地址），示例见 [`gateway/.env.example`](gateway/.env.example)。
 
 Bridge 只使用仓库内的 `gateway/context/BRIDGE_RULES.md` 作为跨项目长期规则来源，不读取或合并用户机器上的
 Claude/Codex 全局规则。操作 Bridge 仓库根目录或其子目录时，Gateway 额外注入
@@ -614,17 +629,9 @@ Claude/Codex 全局规则。操作 Bridge 仓库根目录或其子目录时，Ga
 - 设置页 **IM 连接** 可查看各平台待发送、重试中和永久失败数量，并可“立即重试”或“清除永久失败”
 - 平台解绑会清空该平台尚未发送的通知；这是不可恢复操作，设置页会二次确认
 
-### 自动更新
+### 发布与更新
 
-代码签名且 `bridgeUpdateTrust.signed=true` 的正式构建可自动检查 GitHub Release 更新：
-
-- **electron-updater**：启动 5 秒后自动检查新版本
-- **下载进度**：桌面端右下角显示下载进度条
-- **安装**：下载完成后提示用户，点击立即重启安装
-- **降级保护**：默认拒绝安装低于当前版本的发布包
-- 开发模式和未签名构建均禁用应用内下载，设置页只提供“打开官方 Release”
-
-> SHA-512 只校验下载完整性，不能证明发布者身份。发布前必须配置 Windows/macOS 代码签名，并用签名安装包完成真实升级验收。源码不提供绕过未签名更新限制的生产开关。
+项目面向本地使用，当前 GitHub Release 产物不依赖代码签名。建议从官方 Release 下载对应平台安装包并手动更新；开发模式和未签名构建不会执行静默自动安装。
 
 ---
 
@@ -858,9 +865,9 @@ cat gateway/bridge-logs/error.$(date +%Y-%m-%d).*.log
 2. 如在 Electron 内运行，检查 `gateway.log`（`userData` 目录下）
 3. 手动重启 Gateway：设置页 → 点按不会……目前需重启 Electron 应用
 
-### Mac 用户打开 DMG 提示"无法验证开发者"
+### Mac 用户首次打开 DMG
 
-这是未签名的正常行为：右键点击 App → 打开 → 确认一次即可。需要正式签名需配置 Apple Developer Program（见 [GitHub Actions](#4-github-actions-自动构建) 签名部分）。
+当前 Release 为本地使用构建，未配置代码签名。若系统阻止首次打开，请在 Finder 中右键点击 App → 打开，并确认一次。
 
 ### 日志占用磁盘过大
 
