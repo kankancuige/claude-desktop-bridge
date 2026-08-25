@@ -1,5 +1,6 @@
 /** 定时任务、IM Adapter、MCP 和余额/确认 HTTP 路由。 */
 export function createAdapterConfigRoutes(deps = {}) {
+    const getMemoryService = typeof deps.getMemoryService === 'function' ? deps.getMemoryService : () => deps.memoryService
     const getFocusedSessionId = deps.getFocusedSessionId
     const scheduledTaskStore = deps.scheduledTaskStore
     const getNotificationRepository = typeof deps.getNotificationRepository === 'function'
@@ -726,8 +727,8 @@ export function createAdapterConfigRoutes(deps = {}) {
     }
 
     // ── GET /api/config/memory-summary —— PostgreSQL 项目 Memory 摘要 ──
-    // 功能说明: 以 PostgreSQL content_documents 的 Memory 索引为主，兼容读取项目目录
-    //          仅用于发现项目和展示 workDir，不再以 memory/*.md 是否存在判断是否有 Memory。
+    // 功能说明: 以 PostgreSQL content_documents 的 Memory 索引为唯一数据源；
+    //          本地 memory/*.md 仅作为兼容迁移文件，不参与项目 Memory 发现。
     // 关键数据流: GET → 遍历项目 → memoryService.listAsync() → 200 {mode:'postgres', projects:[...]}
     if (req.method === 'GET' && url.pathname === '/api/config/memory-summary') {
         const bp = join(BRIDGE_HOME, 'projects');
@@ -736,8 +737,9 @@ export function createAdapterConfigRoutes(deps = {}) {
             for (const ed of readdirSync(bp)) {
                 let jls = readdirSync(join(bp, ed)).filter(f => f.endsWith('.jsonl') && !f.startsWith('.trash-') && !f.startsWith('agent-') && !f.startsWith('wf-agent-'));
                 jls = jls.filter(f => !isAgentTranscriptByContent(join(bp, ed, f)));
-                const rows = typeof memoryService?.listAsync === 'function'
-                    ? await memoryService.listAsync({encodedDir: ed, limit: 500})
+                const service = getMemoryService()
+                const rows = typeof service?.listAsync === 'function'
+                    ? await service.listAsync({encodedDir: ed, limit: 500})
                     : [];
                 if (!jls.length && !rows.length) continue;
                 let wd = decodeProjectName(ed) || ed;

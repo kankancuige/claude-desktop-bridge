@@ -24,8 +24,19 @@ function fixture() {
     writeFileSync(join(home, 'projects', encodedDir, 'memory', 'conventions.md'), '# 编码约定\n所有源文件使用 UTF-8，注释使用简体中文。\napi_key=should-not-leak\n', 'utf8')
     const {store} = createPostgresStateFixture()
     const service = createMemoryService({bridgeHome: home, memoryRepository: syncMemoryRepository(store)})
+    service.refreshProject({workDir: 'D:\\demo', encodedDir})
     return {home, db: store, service, encodedDir}
 }
+
+test('正常召回不把本地 md 作为活动入口', async t => {
+    const {home, db, encodedDir} = fixture()
+    t.after(() => db.close())
+    db.removeMemoryIndex(encodedDir, 'memory/conventions.md')
+    const service = createMemoryService({bridgeHome: home, memoryRepository: syncMemoryRepository(db)})
+    assert.equal(service.retrieve({workDir: 'D:\\demo', encodedDir, text: '修改代码并统一使用 UTF-8 编码'}).items.length, 0)
+    assert.equal((await service.retrieveAsync({workDir: 'D:\\demo', encodedDir, text: '修改代码并统一使用 UTF-8 编码'})).items.length, 0)
+    assert.equal(service.list({encodedDir, status: null}).length, 0)
+})
 
 test('普通问题不召回 Memory，动作任务只召回关键词匹配内容并脱敏', t => {
     const {db, service, encodedDir} = fixture()
@@ -168,6 +179,7 @@ test('PostgreSQL 内容入口可同步 Memory 正文并召回', async t => {
             markUsed: async () => true,
     }
     const service = createMemoryService({bridgeHome: home, memoryRepository})
+    await service.refreshProjectAsync({workDir: 'D:\\demo', encodedDir})
     const result = await service.retrieveAsync({workDir: 'D:\\demo', encodedDir, text: '修改代码并统一使用 UTF-8 编码'})
     assert.match(result.text, /编码约定/)
     assert.equal(result.backend, 'postgres')

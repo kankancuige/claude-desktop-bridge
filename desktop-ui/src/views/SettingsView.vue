@@ -1476,7 +1476,7 @@ async function deleteRule(filename: string) {
 // ═══════════════════════════════════════════════════════════════
 // Memory 管理 - 跨项目 PostgreSQL Memory 管理
 // 功能说明: 从 PostgreSQL Memory 索引读取各项目记录，
-//   本地 memory/*.md 仅作为兼容编辑副本展示和写回
+//   本地 memory/*.md 仅作为兼容迁移文件，不参与设置页读写
 // ═══════════════════════════════════════════════════════════════
 // ── 项目列表摘要，含 encodedDir/workDir/recordCount ──
 const memoryProjects = ref<any[]>([])

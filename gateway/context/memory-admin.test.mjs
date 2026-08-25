@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import {mkdtempSync, mkdirSync} from 'node:fs'
+import {existsSync, mkdtempSync, mkdirSync, writeFileSync} from 'node:fs'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import test from 'node:test'
@@ -79,4 +79,34 @@ test('PostgreSQL-only Memory 没有 md 副本时仍可在设置页读取', async
     assert.equal(listed.files.length, 1)
     assert.equal(listed.files[0].filename, 'database-only.md')
     assert.equal(listed.files[0].content, '正文只存在 PostgreSQL')
+})
+
+test('设置页列表只读取 PostgreSQL，不扫描本地 md 副本', async t => {
+    const ctx = fixture()
+    t.after(() => ctx.stateStore.close())
+    mkdirSync(join(ctx.bridgeHome, 'projects', ctx.encodedDir, 'memory'), {recursive: true})
+    writeFileSync(join(ctx.bridgeHome, 'projects', ctx.encodedDir, 'memory', 'legacy.md'), '本地兼容副本')
+    ctx.memoryService.memoryRepository.put({
+        projectKey: ctx.encodedDir,
+        sourceKey: 'memory/database.md',
+        title: '数据库记录',
+        body: '主存储正文',
+        bodyHash: 'hash-database',
+        scope: 'project',
+        status: 'active',
+        metadata: {keywords: '数据库', lifecycle: 'active', approvedBy: 'test'},
+    })
+    const listed = await listProjectMemoryAsync(ctx)
+    assert.deepEqual(listed.files.map(file => file.filename), ['database.md'])
+})
+
+test('设置页异步保存和删除只操作 PostgreSQL，不创建本地 md', async t => {
+    const ctx = fixture()
+    t.after(() => ctx.stateStore.close())
+    const {saveProjectMemoryAsync, deleteProjectMemoryAsync} = await import('./memory-admin.mjs')
+    await saveProjectMemoryAsync({...ctx, filename: 'database-only.md', content: '只保存到 PostgreSQL'})
+    assert.equal(existsSync(join(ctx.bridgeHome, 'projects', ctx.encodedDir, 'memory', 'database-only.md')), false)
+    assert.equal((await listProjectMemoryAsync(ctx)).files[0].content, '只保存到 PostgreSQL')
+    await deleteProjectMemoryAsync({...ctx, filename: 'database-only.md'})
+    assert.deepEqual((await listProjectMemoryAsync(ctx)).files, [])
 })

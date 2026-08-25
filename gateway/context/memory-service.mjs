@@ -64,6 +64,11 @@ function normalizeSourcePath(value) {
     return /^memory\/[A-Za-z0-9._-]{1,160}\.md$/i.test(sourcePath) ? sourcePath : null
 }
 
+function filenameToSource(filename) {
+    const source = `memory/${String(filename || '')}`
+    return normalizeSourcePath(source)
+}
+
 function memoryScopeMatches(row, {scope = 'project', agentType = '', taskId = ''} = {}) {
     const rowScope = String(row?.scope || 'project').toLowerCase()
     if (rowScope === 'global') return true
@@ -154,7 +159,6 @@ export class BridgeMemoryService {
         }
         const key = String(encodedDir)
         let rows = []
-        this.refreshProject({workDir, encodedDir: key})
         rows = (this.memoryRepository.list({projectKey: key, status: 'active', limit: 200}) || []).filter(row => memoryScopeMatches(row, {scope, agentType, taskId}))
         if (rows?.then) throw Object.assign(new Error('同步 Memory 读取需要同步 Repository port'), {code: 'MEMORY_SYNC_PORT_REQUIRED'})
         const conflicts = explicitConflictText(prompt)
@@ -249,7 +253,6 @@ export class BridgeMemoryService {
         const prompt = String(text || '').trim()
         if (!workDir || !prompt || (!ACTION_TASK.test(prompt) && !EXPLICIT_MEMORY.test(prompt)) || /(?:不要|禁止|别|不需要).{0,8}(?:记住|记忆|memory|记录)/i.test(prompt)) return {text: '', items: [], reason: 'not_relevant', backend: 'postgres'}
         const semantic = this.#semanticDecision(String(encodedDir))
-        await this.refreshProjectAsync({workDir, encodedDir})
         const conflicts = explicitConflictText(prompt)
         if (semantic.enabled) {
             try {
@@ -338,6 +341,7 @@ export class BridgeMemoryService {
                 l1: row.metadata?.l1 || '',
                 confidence: Number(row.metadata?.confidence ?? 1),
                 lastVerifiedAt: row.metadata?.lastVerifiedAt || null,
+                lastUsedAt: row.metadata?.lastUsedAt || row.lastUsedAt || null,
                 updatedAt: row.updatedAt || null,
             }))
             .filter(item => !needle || `${item.title}\n${item.sourcePath}\n${item.keywords}`.toLowerCase().includes(needle))
@@ -397,6 +401,18 @@ export class BridgeMemoryService {
             await this.memoryRepository.disable({projectKey: key, sourceKey: safeSource, updatedAt: this.now()})
         }
         return true
+    }
+
+    async saveAsync({encodedDir, filename, content} = {}) {
+        const key = String(encodedDir || '')
+        const sourceKey = filenameToSource(filename)
+        if (!key || !sourceKey) throw Object.assign(new Error('Memory 路径无效'), {code: 'MEMORY_PATH_INVALID'})
+        if (typeof content !== 'string') throw Object.assign(new TypeError('Memory 内容必须是字符串'), {code: 'MEMORY_CONTENT_INVALID'})
+        if (Buffer.byteLength(content, 'utf8') > MAX_FILE_BYTES) throw Object.assign(new Error('Memory 文件超过 512 KB 限制'), {code: 'MEMORY_FILE_TOO_LARGE', statusCode: 413})
+        const previous = await this.memoryRepository.get({projectKey: key, sourceKey})
+        const metadata = normalizeMemoryMetadata({keywords: '', size: Buffer.byteLength(content, 'utf8'), confidence: previous?.metadata?.confidence ?? 1, lastVerifiedAt: previous?.metadata?.lastVerifiedAt || null}, content)
+        await this.memoryRepository.put({projectKey: key, sourceKey, title: previous?.title || String(filename).replace(/\.md$/i, ''), body: content, scope: previous?.scope || 'project', status: previous?.status === 'disabled' ? 'disabled' : 'active', metadata, updatedAt: this.now()})
+        return {filename: String(filename), size: Buffer.byteLength(content, 'utf8'), mode: 'postgres'}
     }
 
     remove({encodedDir, sourcePath} = {}) {

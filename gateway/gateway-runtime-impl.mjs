@@ -147,6 +147,7 @@ import {
     rebuildProjectMemory,
     rebuildProjectMemoryAsync,
     saveProjectMemory,
+    saveProjectMemoryAsync,
     setProjectMemoryEnabled,
     setProjectMemoryEnabledAsync,
 } from './context/memory-admin.mjs'
@@ -1502,7 +1503,8 @@ gatewayRouteContext = {
     taskStateForClient, taskStateForError, taskStateForInconclusive, taskStateForStop,
     taskStateFromCompletion, taskStateWithNotificationIntents, taskCompletionEventForClient,
     updateTaskState, updateTaskCompletion, transitionTaskCompletion, taskStateStorePath,
-    memoryService, listProjectMemory, listProjectMemoryAsync, saveProjectMemory, rebuildProjectMemory, rebuildProjectMemoryAsync, deleteProjectMemory, deleteProjectMemoryAsync,
+    getMemoryService: () => memoryService,
+    memoryService, listProjectMemory, listProjectMemoryAsync, saveProjectMemory, saveProjectMemoryAsync, rebuildProjectMemory, rebuildProjectMemoryAsync, deleteProjectMemory, deleteProjectMemoryAsync,
     memoryCandidateStore,
     setProjectMemoryEnabled, setProjectMemoryEnabledAsync, checkAiLayerHealth, detectRuleDrift,
     resourceConfigRoutes,

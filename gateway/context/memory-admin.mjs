@@ -92,31 +92,15 @@ export function rebuildProjectMemory({workDir, encodedDir, memoryService} = {}) 
 }
 
 export async function listProjectMemoryAsync({bridgeHome, encodedDir, workDir, memoryService, query = ''} = {}) {
-    const {memoryDir} = resolveMemoryPath(bridgeHome, encodedDir)
-    // PostgreSQL 是主存储；读取列表不能因为缺少兼容 md 副本而删除数据库记录。
+    resolveMemoryPath(bridgeHome, encodedDir)
+    // PostgreSQL 是唯一活动读取入口；本地 md 只由显式迁移/兼容操作处理。
     const metadata = new Map((await memoryService?.listAsync?.({encodedDir, query: '', limit: 500}) || [])
         .map(item => [item.sourcePath, item]))
     const needle = String(query || '').trim().toLowerCase()
     const files = []
-    const seen = new Set()
-    const filenames = existsSync(memoryDir) ? readdirSync(memoryDir, {withFileTypes: true})
-        .filter(entry => entry.isFile() && entry.name.toLowerCase().endsWith('.md'))
-        .map(entry => entry.name) : []
-    for (const filename of filenames) {
-        const {filePath} = resolveMemoryPath(bridgeHome, encodedDir, filename)
-        if (!filePath || !existsSync(filePath)) continue
-        const stat = statSync(filePath)
-        if (!stat.isFile() || stat.size > MAX_MEMORY_FILE_BYTES) continue
-        const content = readFileSync(filePath, 'utf8')
-        const item = metadata.get(sourcePath(filename)) || {}
-        if (needle && !`${filename}\n${content}\n${item.title || ''}\n${item.keywords || ''}`.toLowerCase().includes(needle)) continue
-        seen.add(sourcePath(filename))
-        files.push({filename, content, size: Buffer.byteLength(content, 'utf8'), sourcePath: sourcePath(filename), title: item.title || filename.replace(/\.md$/i, ''), scope: item.scope || 'project', confidence: Number(item.confidence ?? 1), status: item.status || 'active', lastVerifiedAt: item.lastVerifiedAt || null, lastUsedAt: item.lastUsedAt || null})
-    }
-    // PostgreSQL 是主存储；没有本地 md 副本的记录也必须在设置页可见。
     for (const item of metadata.values()) {
         const source = String(item.sourcePath || '')
-        if (seen.has(source) || !source.startsWith('memory/') || !source.toLowerCase().endsWith('.md')) continue
+        if (!source.startsWith('memory/') || !source.toLowerCase().endsWith('.md')) continue
         const filename = basename(source)
         const loaded = await memoryService?.loadAsync?.({encodedDir, sourcePath: source})
         const content = String(loaded?.selectedBody || '')
@@ -132,14 +116,18 @@ export async function setProjectMemoryEnabledAsync({encodedDir, filename, enable
     return {filename, status: enabled === false ? 'disabled' : 'active'}
 }
 
+export async function saveProjectMemoryAsync({encodedDir, filename, content, memoryService} = {}) {
+    if (typeof memoryService?.saveAsync !== 'function') throw memoryError('Memory 主存储不可用', 'MEMORY_INDEX_UNAVAILABLE', 503)
+    return memoryService.saveAsync({encodedDir, filename, content})
+}
+
 export async function rebuildProjectMemoryAsync({workDir, encodedDir, memoryService} = {}) {
     return memoryService.rebuildAsync({workDir, encodedDir})
 }
 
 export async function deleteProjectMemoryAsync({bridgeHome, encodedDir, filename, memoryService} = {}) {
-    const {filePath} = resolveMemoryPath(bridgeHome, encodedDir, filename)
-    if (!existsSync(filePath)) throw memoryError('Memory 文件不存在', 'MEMORY_NOT_FOUND', 404)
-    unlinkSync(filePath)
-    await memoryService?.removeAsync?.({encodedDir, sourcePath: sourcePath(filename)})
-    return {filename}
+    if (typeof memoryService?.removeAsync !== 'function') throw memoryError('Memory 主存储不可用', 'MEMORY_INDEX_UNAVAILABLE', 503)
+    const changed = await memoryService.removeAsync({encodedDir, sourcePath: sourcePath(filename)})
+    if (!changed) throw memoryError('Memory 记录不存在', 'MEMORY_NOT_FOUND', 404)
+    return {filename, mode: 'postgres'}
 }
