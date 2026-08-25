@@ -8,8 +8,9 @@ import {createSdkStreamService} from './sdk-stream-service.mjs'
 import {createTaskRunBudget} from '../tasks/task-run-budget.mjs'
 
 export function createSdkStreamRuntime(deps = {}) {
-    const {sessions, sessionCoordinator, PushStream, loadCliSettings, makeQueryOptions, startClaudeAgent, log, updateTaskCompletion, applyTaskCompletionEffects, broadcastTurn, taskStateForClient, taskStateForError, updateTaskState, failPendingSessionInputs, appendSessionEvent, persistSessionMirrors, persistSdkSessionId, sessionVisibilitySource, getProjectVisibility, markVisibleSession, broadcastDesktop, dynamicCache, builtinCache, persistDynamicCache, taskWorkflowResultIdFromMessage, consumeTaskWorkflowResultTurn, taskInputQueue, IM_SOURCES, createTurnIdentity, loadWfConfig, getWorkflow, runWfScript, finishTaskWorkflowResultTurn, hasPendingTaskWorkflow, sdkStreamAdapter, broadcastTaskLifecycle, classifyTaskResult, resolveAutoContinuation, maybeUpdateProjectCache, finalizeCheckpoint, shouldCaptureTurnCheckpoint, beginTurn, resolveFinalReviewPlan, canResumeTask, deferPrimaryResultForTaskWorkflow, takeDeferredPrimaryResult, taskCompletionEventForClient, taskWorkbench, taskCoordinator, maybeInjectProjectCache, maybeInjectGitContext, clearTaskWorkflowGate, clearStreamWatchdog, markSessionDeleted, finishImProgressReporters, clearAdapterBindingsForSessions, invalidateProjectsCache, deleteSessionFiles, armStreamWatchdog, withTimeout, getStateStore, getSessionProjectKey, getFocusedSessionId, setFocusedSessionId} = deps
-    if (!sessions || !sessionCoordinator || typeof broadcastTurn !== 'function'
+    const {sessions, sessionCoordinator, PushStream, loadCliSettings, makeQueryOptions, startClaudeAgent, log, updateTaskCompletion, applyTaskCompletionEffects, broadcastTurn, taskStateForClient, taskStateForError, updateTaskState, failPendingSessionInputs, appendSessionEvent, persistSessionMirrors, persistSdkSessionId, sessionVisibilitySource, getProjectVisibility, markVisibleSession, broadcastDesktop, dynamicCache, builtinCache, persistDynamicCache, taskWorkflowResultIdFromMessage, consumeTaskWorkflowResultTurn, taskInputQueue, IM_SOURCES, createTurnIdentity, loadWfConfig, getWorkflow, runWfScript, finishTaskWorkflowResultTurn, hasPendingTaskWorkflow, consumePendingSessionInputOnResult, sdkStreamAdapter, broadcastTaskLifecycle, classifyTaskResult, resolveAutoContinuation, maybeUpdateProjectCache, finalizeCheckpoint, shouldCaptureTurnCheckpoint, beginTurn, resolveFinalReviewPlan, canResumeTask, deferPrimaryResultForTaskWorkflow, takeDeferredPrimaryResult, taskCompletionEventForClient, taskWorkbench, getTaskWorkbench, taskCoordinator, maybeInjectProjectCache, maybeInjectGitContext, clearTaskWorkflowGate, clearStreamWatchdog, markSessionDeleted, finishImProgressReporters, clearAdapterBindingsForSessions, invalidateProjectsCache, deleteSessionFiles, armStreamWatchdog, withTimeout, getStateStore, getSessionProjectKey, getFocusedSessionId, setFocusedSessionId} = deps
+    if (!sessions || !sessionCoordinator || typeof consumePendingSessionInputOnResult !== 'function'
+        || typeof broadcastTurn !== 'function'
         || !sdkStreamAdapter || typeof sdkStreamAdapter.toClientEvent !== 'function') {
         throw new TypeError('sdk stream runtime dependencies are required')
     }
@@ -425,18 +426,19 @@ async function startStreamPump(sessionId) {
                 s.taskCompletionDecision = completionDecision
                 s.taskCompletionIdentity = s.activeTurnIdentity ? {...s.activeTurnIdentity} : s.taskCompletionIdentity || null
                 s.taskFinalReplyText = String(s.turnText || s.lastTaskResult.result || '').trim().slice(-100000)
-                if (s.coordinatorTaskId && taskWorkbench) {
+                const currentTaskWorkbench = typeof getTaskWorkbench === 'function' ? getTaskWorkbench() : taskWorkbench
+                if (s.coordinatorTaskId && currentTaskWorkbench) {
                     const primaryStatus = taskResult.outcome === 'succeeded'
                         ? 'completed'
                         : taskResult.outcome === 'incomplete' ? 'inconclusive' : 'failed'
-                    taskWorkbench.recordPrimaryResult(s.coordinatorTaskId, {
+                    currentTaskWorkbench.recordPrimaryResult(s.coordinatorTaskId, {
                         status: primaryStatus,
                         summary: s.lastTaskResult.result || taskResult.outcome,
                         changedFiles: (checkpoint?.files || []).map(file => file.path).filter(Boolean),
                         blockers: primaryStatus === 'completed' ? [] : [taskResult.continuationReason || sdkMsg.subtype || 'primary_execution_failed'],
                         nextAction: taskResult.continuationReason || '',
                     })
-                    if (primaryStatus !== 'completed') taskWorkbench.recordFailure(s.coordinatorTaskId, {
+                    if (primaryStatus !== 'completed') currentTaskWorkbench.recordFailure(s.coordinatorTaskId, {
                         module: 'primary-session', phase: taskCoordinator.getTaskSnapshot(s.coordinatorTaskId)?.phase || 'implement',
                         errorCode: taskResult.continuationReason || sdkMsg.subtype || 'PRIMARY_EXECUTION_FAILED',
                         message: s.lastTaskResult.result || taskResult.outcome,

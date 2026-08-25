@@ -40,3 +40,21 @@ test('task event append 使用参数化 SQL 并保持重复 revision 幂等', as
     assert.doesNotMatch(event.text, /task\/created|摘要/)
     assert.deepEqual(event.values.slice(0, 5), ['p', 't', 7, 'task/created', JSON.stringify({summary: '摘要'})])
 })
+
+test('task state 持久化顶层终态和恢复字段', async () => {
+    const gateway = fakeGateway()
+    const store = createPostgresStateStore({gateway})
+    await store.recordTaskTransition({
+        projectKey: 'p', taskKey: 't', taskId: 't', revision: 9,
+        status: 'succeeded', outcome: 'succeeded', continuationReason: null,
+        phase: 'succeeded', reviewState: 'passed', errorCode: null,
+        state: {status: 'succeeded', outcome: 'succeeded', resumable: false},
+    })
+    const task = gateway.calls.find(call => call.text.includes('task_state') && call.text.startsWith('INSERT'))
+    assert.ok(task)
+    assert.match(task.text, /status, outcome, continuation_reason, phase, review_state, model_tier, error_code/)
+    assert.deepEqual(task.values.slice(0, 13), [
+        'p', 't', null, 't', null, 'succeeded', 'succeeded', null,
+        'succeeded', 'passed', null, null, 0,
+    ])
+})

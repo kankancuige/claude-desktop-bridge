@@ -4,19 +4,20 @@
  */
 export function createTaskCompletionEffectsRuntime(deps = {}) {
     const {
-        sessions, runCoordinatorValidation, taskWorkbench, taskCompletionEventForClient,
+        sessions, runCoordinatorValidation, taskWorkbench, getTaskWorkbench, taskCompletionEventForClient,
         publishVerificationInconclusive, autoTriggerFinalReview, runCoordinatorRootCauseAnalysis,
         updateTaskCompletion, beginTurn, markInternalInput, hasPersistedNotificationIntents,
         requiredTaskNotificationPlatforms, requestCoordinatorCompletion, updateTaskState,
-        taskStateFromCompletion, maybeMirror, taskCoordinator, log,
+        taskStateFromCompletion, maybeMirror, taskCoordinator, broadcastTaskLifecycle, log,
     } = deps
     if (!sessions || typeof updateTaskCompletion !== 'function') {
         throw new TypeError('task completion effects dependencies are required')
     }
 
-async function applyTaskCompletionEffects(sessionId, effects = []) {
+async function applyTaskCompletionEffectsUnsafe(sessionId, effects = []) {
     const s = sessions.get(sessionId)
     if (!s) return
+    const currentTaskWorkbench = () => typeof getTaskWorkbench === 'function' ? getTaskWorkbench() : taskWorkbench
     for (const effect of effects) {
         if (effect.type === 'start_review') {
             // 验证是完成门禁的一部分。先等待受信项目命令的真实结果，再启动最终审查，
@@ -24,7 +25,7 @@ async function applyTaskCompletionEffects(sessionId, effects = []) {
             const validation = await runCoordinatorValidation(sessionId, s, {reason: 'before_review'})
             if (['blocked', 'inconclusive', 'regression_detected'].includes(validation?.status)) {
                 const detail = validation.blockers?.at(-1)?.detail || validation.verification?.summary || '验证不足，任务尚未完成'
-                taskWorkbench?.finalizeReport(s.coordinatorTaskId, {
+                currentTaskWorkbench()?.finalizeReport(s.coordinatorTaskId, {
                     unresolvedRisks: [detail],
                 })
                 await publishVerificationInconclusive(sessionId, s, detail, {
@@ -58,7 +59,7 @@ async function applyTaskCompletionEffects(sessionId, effects = []) {
             const repairAction = s._repairDecision?.repair?.action || s._repairDecision?.action
             if (repairAction && repairAction !== 'retry') {
                 const detail = `自动修复已停止：${s._repairDecision?.repair?.status || s._repairDecision?.status || s._repairDecision?.repair?.reason || 'diagnosis_required'}`
-                taskWorkbench?.finalizeReport(s.coordinatorTaskId, {unresolvedRisks: [detail]})
+                currentTaskWorkbench()?.finalizeReport(s.coordinatorTaskId, {unresolvedRisks: [detail]})
                 await publishVerificationInconclusive(sessionId, s, detail)
                 continue
             }
@@ -119,15 +120,16 @@ async function applyTaskCompletionEffects(sessionId, effects = []) {
                 log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '最终完成镜像失败')
             }
         } else if (effect.type === 'fail' || effect.type === 'pause') {
-            if (s.coordinatorTaskId && taskWorkbench) {
+            const workbench = currentTaskWorkbench()
+            if (s.coordinatorTaskId && workbench) {
                 const snapshot = taskCoordinator.getTaskSnapshot(s.coordinatorTaskId)
                 const step = snapshot?.plan?.steps?.find(item => item.status === 'running')
-                taskWorkbench.recordTaskEvent(s.coordinatorTaskId, effect.type === 'pause'
+                workbench.recordTaskEvent(s.coordinatorTaskId, effect.type === 'pause'
                     ? {type: 'task/paused', detail: effect.detail || '任务已暂停'}
                     : step
                         ? {type: 'phase/failed', phase: step.phase, stepId: step.stepId, code: 'task_execution_failed', detail: effect.detail || '任务未完成'}
                         : {type: 'task/status', status: 'failed'})
-                taskWorkbench.finalizeReport(s.coordinatorTaskId, {unresolvedRisks: [effect.detail || '任务未完成']})
+                workbench.finalizeReport(s.coordinatorTaskId, {unresolvedRisks: [effect.detail || '任务未完成']})
             }
             updateTaskState(s, sessionId, taskStateFromCompletion(s, effect.detail))
             taskCompletionEventForClient(s, sessionId, effect.type === 'pause' ? 'task_review_paused' : 'task_failed', {
@@ -140,6 +142,32 @@ async function applyTaskCompletionEffects(sessionId, effects = []) {
             } catch (error) {
                 log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '任务失败镜像失败')
             }
+        }
+    }
+}
+
+async function applyTaskCompletionEffects(sessionId, effects = []) {
+    try {
+        await applyTaskCompletionEffectsUnsafe(sessionId, effects)
+    } catch (error) {
+        const s = sessions.get(sessionId)
+        if (!s) throw error
+        const detail = `任务完成收口异常：${String(error?.message || error || '未知错误')}`.slice(0, 2000)
+        log?.error?.({err: error, sessionId: sessionId?.slice(0, 8)}, detail)
+        try { updateTaskCompletion(s, sessionId, {type: 'runtime_failed', detail}) }
+        catch (transitionError) { log?.error?.({err: transitionError, sessionId: sessionId?.slice(0, 8)}, '完成异常状态转换失败') }
+        try { updateTaskState?.(s, sessionId, taskStateFromCompletion?.(s, detail)) }
+        catch (stateError) { log?.error?.({err: stateError, sessionId: sessionId?.slice(0, 8)}, '完成异常任务状态持久化失败') }
+        try {
+            taskCompletionEventForClient?.(s, sessionId, 'task_failed', {detail})
+            broadcastTaskLifecycle?.(sessionId)
+        } catch (broadcastError) {
+            log?.warn?.({err: broadcastError, sessionId: sessionId?.slice(0, 8)}, '完成异常终态广播失败')
+        }
+        try {
+            await maybeMirror?.(sessionId, {outcome: 'failed', continuationReason: 'completion_effect_error'}, `${s.taskCompletionTaskId || sessionId}:task_failed`)
+        } catch (mirrorError) {
+            log?.warn?.({err: mirrorError, sessionId: sessionId?.slice(0, 8)}, '完成异常失败镜像失败')
         }
     }
 }

@@ -57,3 +57,17 @@ test('Session Runtime 为 query、stream 和 watchdog 建立统一 Cleanup Regis
     await replacement.abort('test')
     assert.equal(replacement.snapshot().state, 'aborted')
 })
+
+test('Session Runtime 清理优先关闭 SDK Query，并取消本次 Query 的 AbortController', async () => {
+    const controller = new AbortController()
+    let closed = 0
+    const runtime = createSessionRuntime({
+        workDir: 'D:/project',
+        opts: {abortController: controller},
+        query: {close() { closed += 1 }},
+    })
+    await runtime.cleanupRegistry.abort('stop_generation')
+    assert.equal(closed, 1)
+    assert.equal(controller.signal.aborted, true)
+    assert.equal(controller.signal.reason, 'stop_generation')
+})

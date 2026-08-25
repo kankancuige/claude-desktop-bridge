@@ -572,7 +572,7 @@ export function createSessionMutationRoutes(deps = {}) {
     // 实现方式:
     //   1. ?deleteFiles=1 时删除对应的 .jsonl 文件（清理持久化对话记录）
     //   2. settlePending 所有挂起的确认请求（拒绝 + 标记为 'deleted'）
-    //   3. pushStream.close() + query.return() 关闭 SDK query
+    //   3. pushStream.close() + Query.close() 关闭 SDK query（旧 SDK 才回退 return）
     //   4. 从 sessions Map 删除 + 如为 focusedSessionId 则置空
     // 关键数据流: DELETE /api/sessions/:id → settlePending(all) → close query → delete session → 200 {ok:true}
     if (req.method === 'DELETE' && delM) {

@@ -14,6 +14,7 @@ export function createShutdownRuntime({
     destroyScheduledJob = () => {},
     scheduledRuns = new Map(),
     finishScheduledRun = () => {},
+    stopSessionGeneration = null,
     wsPingTimer = null,
     wss = {clients: new Set()},
     sessions = new Map(),
@@ -53,14 +54,24 @@ export function createShutdownRuntime({
         for (const ws of wss.clients || []) closeResource('WebSocket', () => ws.close(1001, 'gateway shutting down'))
         for (const [sessionId, session] of sessions) {
             finishImProgressReporters(sessionId)
+            if (typeof stopSessionGeneration === 'function') {
+                closers.push(Promise.resolve(stopSessionGeneration(sessionId, session)).catch(error => {
+                    logger.warn({err: error, sessionId: sessionId?.slice?.(0, 8)}, 'Session 终止状态收口失败')
+                }))
+            }
             for (const requestId of [...(session.pending?.keys?.() || [])]) {
                 closeResource('Session pending request', () => settlePending(sessionId, requestId,
                     {behavior: 'deny', message: 'Gateway 正在关闭', interrupt: true}, 'shutdown'))
             }
             closeResource('Session input stream', () => session.pushStream?.close())
             try {
-                const closing = session.query?.return?.()
-                if (closing && typeof closing.then === 'function') closers.push(closing)
+                if (typeof session.query?.close === 'function') session.query.close()
+                else {
+                    const closing = session.query?.return?.()
+                    if (closing && typeof closing.then === 'function') closers.push(closing)
+                }
+                const controller = session.queryOpts?.abortController
+                if (controller && !controller.signal.aborted) controller.abort('shutdown')
             } catch (error) {
                 logger.debug({err: error, sessionId: sessionId?.slice?.(0, 8)}, '关闭 Session query 失败')
             }

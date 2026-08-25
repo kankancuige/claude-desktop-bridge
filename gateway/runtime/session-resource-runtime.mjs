@@ -28,9 +28,17 @@ export function createSessionResourceRuntime({
         try { session.pushStream?.close() }
         catch (error) { pushStreamClosed = false; logger.warn({err: error, sessionId: sessionId?.slice(0, 8), reason}, '关闭 Session 输入流失败') }
         try {
-            const closing = session.query?.return?.()
-            if (closing && typeof closing.then === 'function') await withTimeout(Promise.resolve(closing), timeoutMs)
+            if (typeof session.query?.close === 'function') {
+                session.query.close()
+            } else {
+                const closing = session.query?.return?.()
+                if (closing && typeof closing.then === 'function') await withTimeout(Promise.resolve(closing), timeoutMs)
+            }
         } catch (error) { queryClosed = false; logger.warn({err: error, sessionId: sessionId?.slice(0, 8), reason}, '关闭 Session query 失败') }
+        try {
+            const controller = session.queryOpts?.abortController
+            if (controller && !controller.signal.aborted) controller.abort(reason)
+        } catch (error) { queryClosed = false; logger.warn({err: error, sessionId: sessionId?.slice(0, 8), reason}, '取消 Session query 失败') }
         return {pushStreamClosed, queryClosed}
     }
 

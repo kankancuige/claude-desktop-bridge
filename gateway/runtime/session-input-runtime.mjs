@@ -96,7 +96,15 @@ export function createSessionInputRuntime({
             if (session.query === query) session.query = null
             try { session.pushStream?.close() } catch (error) { logger.debug({err: error, sessionId: sessionId?.slice(0, 8)}, 'SDK 流超时输入流关闭失败') }
             session.pushStream = null
-            Promise.resolve(query.return?.()).catch(error => logger.warn({err: error, sessionId: sessionId?.slice(0, 8)}, 'SDK 流超时关闭失败'))
+            try {
+                if (typeof query.close === 'function') query.close()
+                else Promise.resolve(query.return?.()).catch(error => logger.warn({err: error, sessionId: sessionId?.slice(0, 8)}, 'SDK 流超时关闭失败'))
+            } catch (error) {
+                logger.warn({err: error, sessionId: sessionId?.slice(0, 8)}, 'SDK 流超时关闭失败')
+            } finally {
+                const controller = session.queryOpts?.abortController
+                if (controller && !controller.signal.aborted) controller.abort('stream_idle_timeout')
+            }
         }, streamIdleTimeoutMs)
         session._streamWatchdogCleanup = session.cleanupRegistry?.register?.('timer', () => {
             if (session._streamWatchdogTimer) clearTimeout(session._streamWatchdogTimer)

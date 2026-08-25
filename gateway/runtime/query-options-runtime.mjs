@@ -101,6 +101,7 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
     const configuredMcpServers = Object.fromEntries(Object.entries(cliS.mcpServers || {})
         .filter(([name]) => !builtinMcpIds.has(name) || enabledBuiltinMcp.has(name)))
     let opts = {
+        abortController: new AbortController(),
         model: resolvedModel,
         executable: 'node',
         cwd: workDir,

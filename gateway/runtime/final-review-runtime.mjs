@@ -6,7 +6,7 @@ export function createFinalReviewRuntime(deps = {}) {
     const {
         sessions, loadWfConfig, updateTaskCompletion, applyTaskCompletionEffects,
         resolveFinalReviewPlan, listWorkflows, presetRunState, broadcastTaskLifecycle,
-        broadcast, runWfScript, normalizeReviewOutcome, taskCoordinator, taskWorkbench,
+        broadcast, runWfScript, normalizeReviewOutcome, taskCoordinator, taskWorkbench, getTaskWorkbench,
         logger = {warn() {}, error() {}},
     } = deps
     if (!sessions || typeof updateTaskCompletion !== 'function' || typeof runWfScript !== 'function') {
@@ -76,13 +76,14 @@ async function autoTriggerFinalReview(sessionId, taskDecision, checkpoint, revie
             return
         }
         const outcome = normalizeReviewOutcome(result, plan, {files: checkpoint.files})
-        if (s.coordinatorTaskId && taskWorkbench) {
-            taskWorkbench.recordReviewResult(s.coordinatorTaskId, {
+        const currentTaskWorkbench = typeof getTaskWorkbench === 'function' ? getTaskWorkbench() : taskWorkbench
+        if (s.coordinatorTaskId && currentTaskWorkbench) {
+            currentTaskWorkbench.recordReviewResult(s.coordinatorTaskId, {
                 passed: outcome.passed,
                 summary: outcome.summary,
                 findings: [...outcome.blockingFindings, ...outcome.advisoryFindings],
             })
-            s._repairDecision = outcome.passed ? null : taskWorkbench.recordFailure(s.coordinatorTaskId, {
+            s._repairDecision = outcome.passed ? null : currentTaskWorkbench.recordFailure(s.coordinatorTaskId, {
                 module: 'final-review', phase: 'review', errorCode: 'REVIEW_BLOCKING_FINDINGS',
                 message: outcome.blockingFindings.map(item => `${item.file}:${item.line || ''}:${item.title}`).join('|') || outcome.summary,
                 strategy: 'apply-review-findings',

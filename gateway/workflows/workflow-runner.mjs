@@ -1561,6 +1561,9 @@ function stopWorkflow(nameOrRunKey) {
     if (state.status === 'starting') {
         state.status = 'stopped'
         state._aborted = true
+        state.endedAt = Date.now()
+        persistWorkflowProjection(wfId, state)
+        scheduleRunStateCleanup(wfId)
         return true
     }
     // 保存快照供 resume

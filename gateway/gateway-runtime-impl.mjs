@@ -872,6 +872,7 @@ finalReviewRuntime = createFinalReviewRuntime({
     normalizeReviewOutcome,
     taskCoordinator,
     taskWorkbench,
+    getTaskWorkbench: () => taskWorkbench,
     logger: log,
 })
 workflowAutoTriggerRuntime = createWorkflowAutoTriggerRuntime({
@@ -893,6 +894,7 @@ taskCompletionEffectsRuntime = createTaskCompletionEffectsRuntime({
     sessions,
     runCoordinatorValidation,
     taskWorkbench,
+    getTaskWorkbench: () => taskWorkbench,
     taskCompletionEventForClient,
     publishVerificationInconclusive,
     autoTriggerFinalReview,
@@ -1212,6 +1214,7 @@ const sdkStreamRuntimeDependencies = {
     takeDeferredPrimaryResult,
     taskCompletionEventForClient,
     taskWorkbench,
+    getTaskWorkbench: () => taskWorkbench,
     taskCoordinator,
     maybeInjectProjectCache,
     maybeInjectGitContext,
@@ -1300,7 +1303,7 @@ const scheduledRuntime = createScheduledRuntime({
     openSessionEventJournal, startClaudeAgent, createSessionRuntime,
     createTaskCompletionState, appendSessionEvent, initializeTaskWorkbenchSession,
     updateTaskState, taskStateFromCompletion, markInternalInput,
-    buildTaskPitfallReminder, startStreamPump,
+    buildTaskPitfallReminder, startStreamPump, stopSessionGeneration,
 })
 const destroyScheduledJob = scheduledRuntime.destroyScheduledJob
 const registerScheduledJob = scheduledRuntime.registerScheduledJob
@@ -1318,6 +1321,7 @@ const shutdownRuntime = createShutdownRuntime({
     destroyScheduledJob,
     scheduledRuns,
     finishScheduledRun,
+    stopSessionGeneration,
     wsPingTimer,
     wss,
     sessions,

@@ -20,6 +20,20 @@ async function closeWithTimeout(value, timeoutMs = 5000) {
     }
 }
 
+async function closeQueryRuntime(runtime, reason = 'session_closed') {
+    const query = runtime?.query
+    const controller = runtime?.queryOpts?.abortController
+    try {
+        if (typeof query?.close === 'function') {
+            query.close()
+        } else {
+            await closeWithTimeout(query?.return?.())
+        }
+    } finally {
+        if (controller && !controller.signal.aborted) controller.abort(reason)
+    }
+}
+
 /**
  * 只把匿名、稳定的运行配置投影给上下文策略；Prompt、凭据和工作目录不进入 envelope。
  */
@@ -52,6 +66,7 @@ export function createSessionRuntime({
     depth = 0,
     extra = {},
 } = {}) {
+    if (!opts.abortController) opts.abortController = new AbortController()
     const runtime = {
         query,
         pushStream,
@@ -103,9 +118,8 @@ export function createSessionRuntime({
     }
     runtime.cleanupRegistry = extra.cleanupRegistry || createCleanupRegistry({parentSignal: extra.parentSignal || null})
     runtime.diagnostics = extra.diagnostics || createRuntimeDiagnostics()
-    runtime.cleanupRegistry.register('query', async () => {
-        const closing = runtime.query?.return?.()
-        await closeWithTimeout(closing)
+    runtime.cleanupRegistry.register('query', async reason => {
+        await closeQueryRuntime(runtime, reason)
     }, 'session-query')
     runtime.cleanupRegistry.register('stream', () => runtime.pushStream?.close(), 'session-push-stream')
     runtime.cleanupRegistry.register('watchdog', () => {
@@ -115,9 +129,8 @@ export function createSessionRuntime({
     }, 'session-watchdog')
     runtime.newCleanupRegistry = () => {
         runtime.cleanupRegistry = createCleanupRegistry({parentSignal: extra.parentSignal || null})
-        runtime.cleanupRegistry.register('query', async () => {
-            const closing = runtime.query?.return?.()
-            await closeWithTimeout(closing)
+        runtime.cleanupRegistry.register('query', async reason => {
+            await closeQueryRuntime(runtime, reason)
         }, 'session-query')
         runtime.cleanupRegistry.register('stream', () => runtime.pushStream?.close(), 'session-push-stream')
         runtime.cleanupRegistry.register('watchdog', () => {

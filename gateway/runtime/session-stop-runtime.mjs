@@ -55,8 +55,28 @@ export function createSessionStopRuntime({
                 if (workflow.wfId || workflow.name) stopWorkflow(workflow.wfId || workflow.name)
             }
             if (!stopScope.primaryActive) {
+                // Workflow-only 停止也必须收口本地 Gate、输入队列和运行时资源；
+                // 否则 taskWorkflowPending 会继续把已经停止的会话判定为 active。
+                clearTaskWorkflowGate(session._taskWorkflowGate)
+                session._internalWorkflowResultTurnId = null
+                session._autoContinuationRequest = null
+                session.autoContinuationCount = 0
+                session.autoContinuationTurns = 0
+                sessionCoordinator.cancel(session, 'stop_generation')
+                for (const id of [...(session.pending?.keys() || [])]) {
+                    settlePending(sessionId, id, {behavior: 'deny', message: '已取消', interrupt: true}, 'stopped')
+                }
+                await closeSessionRuntime(session, {sessionId, reason: 'stop_workflow'})
+                session.query = null
+                session.pushStream = null
+                session.pendingTurn = null
+                const cancelledInputs = cancelPendingSessionInputs(sessionId, session, null)
+                session._pendingTurns = []
+                session._generating = false
+                session.activeTurnId = null
+                session.activeTurnIdentity = null
                 broadcastTaskLifecycle(sessionId)
-                return {stopped: true, scope: 'workflow', cancelledInputs: 0, turnId: null}
+                return {stopped: true, scope: 'workflow', cancelledInputs, turnId: null}
             }
             const stoppedTurnId = resolvePrimaryStopTurnId(session)
             const stoppedTurnIdentity = session.activeTurnIdentity ? {...session.activeTurnIdentity} : null

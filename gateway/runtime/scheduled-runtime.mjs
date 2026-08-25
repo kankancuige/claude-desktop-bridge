@@ -6,7 +6,7 @@ export function createScheduledRuntime(deps = {}) {
         loadCliSettings, makeQueryOptions, openSessionEventJournal, startClaudeAgent,
         createSessionRuntime, createTaskCompletionState, appendSessionEvent,
         initializeTaskWorkbenchSession, updateTaskState, taskStateFromCompletion,
-        markInternalInput, buildTaskPitfallReminder, startStreamPump,
+        markInternalInput, buildTaskPitfallReminder, startStreamPump, stopSessionGeneration,
     } = deps
     if (!cron || !scheduledTaskStore || !sessions || !cronJobs || !scheduledRuns) throw new TypeError('scheduled runtime dependencies are required')
 
@@ -103,7 +103,10 @@ async function executeScheduledTask(id) {
             log.warn({err: error, taskId: id}, '关闭旧定时任务输入流失败')
         }
         try {
-            await old.query?.return?.()
+            if (typeof old.query?.close === 'function') old.query.close()
+            else await old.query?.return?.()
+            const controller = old.queryOpts?.abortController
+            if (controller && !controller.signal.aborted) controller.abort('scheduled_replaced')
         } catch (error) {
             log.warn({err: error, taskId: id}, '关闭旧定时任务 query 失败')
         }
@@ -156,7 +159,7 @@ async function executeScheduledTask(id) {
     startStreamPump(sessionId)
     const run = scheduledRuns.get(id)
     if (run) {
-        run.timer = setTimeout(() => {
+        run.timer = setTimeout(async () => {
             const current = sessions.get(sessionId)
             if (current !== scheduledSession) {
                 finishScheduledRun(id)
@@ -164,19 +167,36 @@ async function executeScheduledTask(id) {
             }
             log.warn({taskId: id, sessionId: sessionId.slice(0, 8)}, '定时任务运行超时，正在停止')
             try {
-                current.pushStream?.close()
+                if (typeof stopSessionGeneration === 'function') {
+                    const stopped = await stopSessionGeneration(sessionId, current)
+                    if (stopped?.stopped === true) return
+                }
+                {
+                    current.pushStream?.close()
+                    if (typeof current.query?.close === 'function') current.query.close()
+                    else await current.query?.return?.()
+                    const controller = current.queryOpts?.abortController
+                    if (controller && !controller.signal.aborted) controller.abort('scheduled_timeout')
+                    current.query = null
+                    current.pushStream = null
+                }
             } catch (error) {
-                log.warn({err: error, taskId: id}, '关闭超时定时任务输入流失败')
+                log.warn({err: error, taskId: id}, '关闭超时定时任务失败')
+                try {
+                    current.pushStream?.close()
+                    if (typeof current.query?.close === 'function') current.query.close()
+                    else await current.query?.return?.()
+                    const controller = current.queryOpts?.abortController
+                    if (controller && !controller.signal.aborted) controller.abort('scheduled_timeout')
+                    current.query = null
+                    current.pushStream = null
+                } catch (fallbackError) {
+                    log.warn({err: fallbackError, taskId: id}, '定时任务超时兜底关闭失败')
+                }
+            } finally {
+                if (current._autoDelete && sessions.get(sessionId) === current) sessions.delete(sessionId)
+                finishScheduledRun(id)
             }
-            try {
-                const closing = current.query?.return?.()
-                Promise.resolve(closing).catch(error => {
-                    log.warn({err: error, taskId: id}, '关闭超时定时任务 query 失败')
-                })
-            } catch (error) {
-                log.warn({err: error, taskId: id}, '关闭超时定时任务 query 异常')
-            }
-            finishScheduledRun(id)
         }, MAX_SCHEDULED_DURATION_MS)
         run.timer.unref?.()
     }

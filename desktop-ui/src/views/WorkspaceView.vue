@@ -465,12 +465,50 @@ async function confirmCloseTab() {
   const tab = tabSessions.value.find(item => item.id === tabId)
   const tabStatus = tab?.id === activeTabId.value ? status.value : tab?.state.status
   const tabSessionId = tab?.id === activeTabId.value ? sessionId.value : tab?.state.sessionId
-  if (tabSessionId && tabStatus === 'thinking') {
+  const lifecycle = tab?.id === activeTabId.value ? sessionLifecycle.value : tab?.state.sessionLifecycle
+  const workflowStatus = tab?.id === activeTabId.value ? wfRunState.value?.status : tab?.state.workflowRunState?.status
+  const hasActiveWork = tabStatus === 'thinking'
+    || lifecycle?.active === true
+    || ['starting', 'running'].includes(String(workflowStatus || ''))
+  if (tabSessionId && hasActiveWork) {
     const stopped = await requestStopSession(tabSessionId)
     if (!stopped.ok) return
+    if (stopped.scope === 'workflow') {
+      // Workflow-only stop 也要等 Gateway 生命周期快照确认 active=false，再移除标签页。
+      if (!await waitForSessionStop(tabSessionId)) return
+    }
   }
   doCloseTab(tabId)
   pendingCloseTabId.value = null
+}
+
+async function waitForSessionStop(sid: string, timeoutMs = 3000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const current = sid === sessionId.value ? sessionLifecycle.value : tabSessions.value.find(item => item.state.sessionId === sid)?.state.sessionLifecycle
+    if (current?.active !== true) return true
+    await new Promise(resolve => setTimeout(resolve, 100))
+  }
+  showToast('Gateway 尚未确认任务停止，请稍后重试', 5000)
+  return false
+}
+
+async function stopActiveSessionsOnUnmount() {
+  const pending = new Set<string>()
+  const addIfActive = (sid: string | null | undefined, state: TabState | null | undefined) => {
+    if (!sid) return
+    const workflowStatus = state?.workflowRunState?.status
+    if (state?.status === 'thinking' || state?.sessionLifecycle.active === true
+      || ['starting', 'running'].includes(String(workflowStatus || ''))) pending.add(sid)
+  }
+  addIfActive(sessionId.value, {
+    ...snapshotTabState(),
+    status: status.value,
+    sessionLifecycle: sessionLifecycle.value,
+    workflowRunState: wfRunState.value,
+  })
+  for (const tab of tabSessions.value) addIfActive(tab.state.sessionId, tab.state)
+  await Promise.allSettled([...pending].map(sid => requestStopSession(sid)))
 }
 
 interface StopSessionResult {
@@ -3872,6 +3910,17 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         // Gateway 可能为同一停止操作逐条取消排队输入；只有携带主任务状态的终止事件生成结果气泡。
         if (!msg.taskState && !msg.durationMs) break
         if (msg.taskState && typeof msg.taskState === 'object') tabTaskState.value = msg.taskState as PersistedTaskState
+        // 主任务停止会先于 Workflow 子 Agent 的异步终止事件到达；
+        // 先收口本地镜像，避免 Query 已关闭但界面仍把 Agent 判为运行中。
+        if (wfRunState.value && (wfRunState.value.status === 'running' || wfRunState.value.status === 'starting')) {
+          wfRunState.value.status = 'paused'
+        }
+        for (const ag of agentRuns.value) {
+          if (ag.status === 'running' || ag.status === 'spawning') {
+            ag.status = ag.source === 'workflow' ? 'paused' : 'done'
+            if (ag.status !== 'paused') ag.doneTime = Date.now()
+          }
+        }
         messages.value.push({
           role: 'system',
           text: '任务已停止',
@@ -5891,6 +5940,8 @@ document.addEventListener('visibilitychange', onPageVisibility)
 
 // 组件卸载时清理 Monaco 实例及外部 model
 onBeforeUnmount(() => {
+  // 路由离开或窗口页面卸载时，先通知 Gateway 停止活动 Session；关闭 WebSocket 不能代替后台任务收口。
+  void stopActiveSessionsOnUnmount()
   stopActivityClock()
   clearProjectLoadRetry()
   if (draftPersistTimer) { clearTimeout(draftPersistTimer); draftPersistTimer = null }
