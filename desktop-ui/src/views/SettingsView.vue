@@ -1553,11 +1553,13 @@ async function loadMemorySummary() {
   memoryLoading.value = true
   try {
     const res = await fetch(`${GW}/api/config/memory-summary`)
-    if (res.ok) {
-      const data = await res.json()
-      memoryProjects.value = data.projects || []
-    }
-  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const data = await res.json()
+    memoryProjects.value = data.projects || []
+  } catch (error: any) {
+    memoryProjects.value = []
+    showAlert(`${t('mem.loadFailed')}: ${error?.message || ''}`)
+  }
   memoryLoading.value = false
 }
 

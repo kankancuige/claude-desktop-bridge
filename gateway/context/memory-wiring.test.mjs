@@ -18,7 +18,11 @@ test('Gateway 将 Memory 管理 API 接入统一服务', () => {
     assert.match(adapterRoutes, /service\.listAsync\(\{encodedDir: ed, limit: 500\}\)/)
     assert.match(adapterRoutes, /mode: 'postgres', projects: rs/)
     assert.match(source, /getMemoryService: \(\) => memoryService/)
+    assert.match(source, /encodeProjectName, decodeProjectName, openSessionEventJournal/)
     assert.match(memoryRoutes, /const getMemoryService = typeof deps\.getMemoryService === 'function'/)
+    assert.match(memoryRoutes, /const listProjectMemoryAsync = deps\.listProjectMemoryAsync/)
+    assert.match(memoryRoutes, /const deleteProjectMemoryAsync = deps\.deleteProjectMemoryAsync/)
+    assert.match(adapterRoutes, /classifyTranscript\(join\(bp, ed, f\)\) !== 'agent'/)
 })
 
 test('Gateway 停止适配器后仍从 PostgreSQL 汇总通知并清理平台状态', () => {

@@ -1442,7 +1442,7 @@ gatewayRouteContext = {
     isValidSessionId, isDirectoryPath, crypto, resolve,
     resolveSessionCreateMode, resolveSessionResume, resolveResumeModel,
     buildSessionStopResponse, shouldDeferAutomaticQuery,
-    encodeProjectName, openSessionEventJournal, restoreSessionMirrors,
+    encodeProjectName, decodeProjectName, openSessionEventJournal, restoreSessionMirrors,
     persistSessionMirrors,
     normalizeWorkDir,
     persistSessionCatalogSettings, reconcileTaskNotificationIntents,

@@ -1,6 +1,7 @@
 /** 定时任务、IM Adapter、MCP 和余额/确认 HTTP 路由。 */
 export function createAdapterConfigRoutes(deps = {}) {
     const getMemoryService = typeof deps.getMemoryService === 'function' ? deps.getMemoryService : () => deps.memoryService
+    const classifyTranscript = deps.classifyTranscriptFile
     const getFocusedSessionId = deps.getFocusedSessionId
     const scheduledTaskStore = deps.scheduledTaskStore
     const getNotificationRepository = typeof deps.getNotificationRepository === 'function'
@@ -736,7 +737,7 @@ export function createAdapterConfigRoutes(deps = {}) {
         try {
             for (const ed of readdirSync(bp)) {
                 let jls = readdirSync(join(bp, ed)).filter(f => f.endsWith('.jsonl') && !f.startsWith('.trash-') && !f.startsWith('agent-') && !f.startsWith('wf-agent-'));
-                jls = jls.filter(f => !isAgentTranscriptByContent(join(bp, ed, f)));
+                jls = jls.filter(f => typeof classifyTranscript !== 'function' || classifyTranscript(join(bp, ed, f)) !== 'agent');
                 const service = getMemoryService()
                 const rows = typeof service?.listAsync === 'function'
                     ? await service.listAsync({encodedDir: ed, limit: 500})
