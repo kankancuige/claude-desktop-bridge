@@ -2,7 +2,7 @@
 
 **目的：** 将 Bridge 的本地 Host Test 与真实运行、外部平台和代表性目标项目验收分开记录。没有对应证据时只能是 `not_verified`、`blocked_environment` 或 `blocked_external`，不得由构建或 Smoke 推导为通过。
 
-**当前基线（2026-08-23）：** `node gateway/smoke/general-workbench-smoke.mjs` 已在临时 Node 目标项目执行并返回 `L2`；Gateway 代码范围的 L3/L5 受控 Provider/Desktop 验收已记录。Provider 账单、缓存读计费和签名需要供应商/发布环境证据，本轮标记为外部非阻塞项；登录业务接口按用户要求不纳入本轮。文件不保存 Provider 凭据、Prompt、IM 收件人、绝对工作目录或 transcript 正文。
+**当前基线（2026-08-25）：** `node gateway/smoke/general-workbench-smoke.mjs` 已在临时 Node 目标项目执行并返回 `L2`；本轮修复了 Pitfall Repository 接线，当前 Smoke 退出码为 0。Gateway 全量测试为 `742/742`，Desktop/Electron 为 `141/141`，内置资源为 `64` 项。Provider 账单、缓存读计费和签名不作为本地使用完成条件；登录业务接口按用户要求不纳入本轮。文件不保存 Provider 凭据、Prompt、IM 收件人、绝对工作目录或 transcript 正文。
 
 | 场景 | 触发与前置条件 | 预期结果 | 最低证据级别 | 证据记录 | 失败判据 | 当前状态 |
 |---|---|---|---|---|---|---|
@@ -32,7 +32,7 @@
 
 | 日期 | 场景 | 结果 | 证据 | Blocker/下一步 |
 |---|---|---|---|---|
-| 2026-08-21 | 本地 Host Smoke | L2 passed | `node gateway/smoke/general-workbench-smoke.mjs` | L3-L6 需要操作者授权重启运行实例及提供测试 Provider/IM/目标项目环境 |
+| 2026-08-25 | 本地 Host Smoke | L2 passed | `node gateway/smoke/general-workbench-smoke.mjs`：`ok=true`、`task.status=succeeded`、`evidence.level=L2` | L3-L6 需要真实 Gateway/Electron、测试 Provider/IM 和目标项目环境 |
 | 2026-08-21 | 会话停止与恢复 L2 | passed | `node --test gateway/sessions/session-lifecycle-l2.test.mjs gateway/sessions/session-stop.test.mjs gateway/sessions/session-resume.test.mjs gateway/sessions/session-runtime-state.test.mjs gateway/sessions/session-coordinator.test.mjs gateway/sessions/task-input-queue.test.mjs gateway/tasks/task-completion.test.mjs gateway/tasks/task-lifecycle.test.mjs`，49 项通过 | 只验证纯状态、队列和恢复契约；真实 Gateway/网络中断仍需 L3 |
 | 2026-08-21 | Electron Gateway 崩溃退避 L2 | passed | `node --test desktop-ui/electron/gateway-restart-policy.test.cjs`，3 项通过 | 只验证重启决策；真实 child process 崩溃、窗口重连和侧栏恢复仍需 L3 |
 | 2026-08-21 | Electron 源码冷启动与项目加载 | partially verified | 新增路径回归测试覆盖源码/打包分支；实际冷启动日志确认 Gateway 从源码目录启动，桌面请求项目接口并得到 `200` | 尚缺桌面截图和安装包冷启动；不以接口 `200` 代替左栏视觉验收 |
@@ -62,4 +62,9 @@
 | 2026-08-24 | Workbench 任务概述、问题列表与问题会话关联 | passed（代码门禁） | `task-questions.test.mjs`、Workbench Repository/HTTP route 定向测试；根问题与补充问题保留 `taskId/sessionId/turnId`，详情 API 返回每项 `sessionLink`，Vue 提供逐问题打开对应对话 | 尚未启动真实 Gateway/PostgreSQL 做 API、重启和多任务人工验收 |
 | 2026-08-23 | PostgreSQL 统一存储入口与代码闭合 | passed（代码门禁） | PostgreSQL schema、事务回滚、内容/向量契约、配置失败传播和状态投影测试通过；SQLite 运行时模块、导出/导入器、专用测试和 `better-sqlite3` 依赖已删除；定向测试 49/49 | 真实 embedding provider、Provider/IM 送达、pg_dump 恢复和安装包视觉回归仍属于外部验收，不影响本代码门禁 |
 | 2026-08-23 | PostgreSQL 备份恢复与 transcript 物化 | passed（真实临时库） | `postgres-backup-restore-real.mjs`：pg_dump/pg_restore 到隔离临时库；schema 存在、Memory 36、transcript 79、内容 hash 一致，源/恢复均为 `vector(1536)`；恢复库 transcript 物化 `status=materialized`、`source=postgres`、hash/bytes 校验通过；临时库已清理 | 不等同真实 Claude SDK `resume` 重启 E2E；恢复前需先创建 `vector` 扩展 |
+| 2026-08-25 | Memory 分层扩展预留与规模策略 | passed（代码门禁） | 37/37 定向测试：metadata 分层契约、Repository `count/listChildren/load`、摘要回填 dry-run/取消/checkpoint、规模策略和 policy route；Node 语法检查通过 | 未启用自动层级召回；真实 summarizer/embedding 质量评测仍按项目规模和质量门禁触发 |
+| 2026-08-25 | Memory 成功会话自动沉淀与跨会话成长 | passed（代码门禁） | 自动捕获只接受用户原始请求的明确长期约定；成功收口生成 PostgreSQL candidate，失败/暂停不生成；项目+内容稳定去重；11 项定向测试通过 | candidate 仍需用户显式审批；不从普通最终回复推断事实 |
 | 2026-08-23 | 真实 Provider timeout 复验 | inconclusive（不判通过） | 以 `BRIDGE_STREAM_IDLE_TIMEOUT_MS=30000` 启动并打开测试 relay 延迟后，watchdog 日志显示已 arm、连续 SDK 事件后正常 `result`，随后因 `hasActiveWork=false` 忽略 idle 收口；当前 Provider 路由未产生 `stream_idle_timeout` | 说明 Bridge watchdog 的“正常 result 后不误报”路径成立，但未重新取得无事件上游下的 timeout 证据；不修改生产 watchdog，不把该项标为 passed |
+| 2026-08-25 | 1.6.1 本地 NSIS 构建 | passed（未签名本地包） | `pnpm build`；生成 `desktop-ui/dist-electron/Claude Desktop Bridge Setup 1.6.1.exe` | 本地使用不要求代码签名；覆盖升级、卸载和异常回滚需在目标机器执行后再记录 |
+| 2026-08-25 | 1.6.1 隔离安装、冷启动与卸载烟测 | passed（本地未签名包） | 安装到临时目录成功；启动后短窗口观察到 `127.0.0.1:3456`、`8787`、`8788`、`8789` 监听，Gateway 日志包含 PostgreSQL 初始化、`Gateway 已启动` 和 WebSocket 连接；停止后静默卸载退出码为 0 且应用文件已移除 | 未执行覆盖升级与异常回滚；签名按本地使用范围排除 |
+| 2026-08-25 | 1.5.0→1.6.1 临时覆盖安装探针 | passed（本地包文件证据） | 同一临时安装目录覆盖后，`resources/gateway/package.json` 版本为 `1.6.1`，应用可执行文件存在，测试结束无 Bridge 端口残留 | 未验证中断安装时的原子回滚；不影响本地正常升级路径 |

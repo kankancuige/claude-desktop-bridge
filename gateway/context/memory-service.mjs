@@ -1,5 +1,7 @@
 import {readFileSync} from 'node:fs'
 import {listMemoryFiles, memoryFileMetadata, memoryProjectKey, memorySearchTokens} from '../storage/memory-index.mjs'
+import {normalizeMemoryMetadata, selectMemoryContent} from './memory-layer.mjs'
+import {decideMemoryScalePolicy} from './memory-scale-policy.mjs'
 
 const ACTION_TASK = /修改|实现|修复|新增|创建|生成|写入|保存|重构|提交|发布|部署|测试|验证|检查并修复|edit|write|patch|implement|fix|create|commit|push|deploy/i
 const EXPLICIT_MEMORY = /记住|记忆|memory|项目约定|长期保存|记录下来|沉淀|不要记|忘记|删除记忆/i
@@ -121,7 +123,7 @@ export class BridgeMemoryService {
                 const result = this.memoryRepository.put({
                     projectKey: key, sourceKey: metadata.sourcePath, title: metadata.title, body,
                     bodyHash: metadata.contentHash, scope: metadata.scope || 'project', status,
-                    metadata: {keywords: metadata.keywords, mtime: metadata.mtime, size: metadata.size, confidence: metadata.confidence ?? 1, lastVerifiedAt: metadata.lastVerifiedAt || null},
+                    metadata: normalizeMemoryMetadata({keywords: metadata.keywords, mtime: metadata.mtime, size: metadata.size, confidence: metadata.confidence ?? 1, lastVerifiedAt: metadata.lastVerifiedAt || null}, body),
                     updatedAt: this.now(),
                 })
                 if (result?.then) throw Object.assign(new Error('同步 Memory 写入需要同步 Repository port'), {code: 'MEMORY_SYNC_PORT_REQUIRED'})
@@ -221,7 +223,7 @@ export class BridgeMemoryService {
                     projectKey: key, sourceKey: metadata.sourcePath,
                     title: metadata.title, body: content, bodyHash: metadata.contentHash,
                     scope: metadata.scope || 'project', status,
-                    metadata: {keywords: metadata.keywords, mtime: metadata.mtime, size: metadata.size, confidence: metadata.confidence ?? 1, lastVerifiedAt: metadata.lastVerifiedAt || null},
+                    metadata: normalizeMemoryMetadata({keywords: metadata.keywords, mtime: metadata.mtime, size: metadata.size, confidence: metadata.confidence ?? 1, lastVerifiedAt: metadata.lastVerifiedAt || null}, content),
                     updatedAt: metadata.lastVerifiedAt || this.now(),
                 })
                 if (semantic.enabled) {
@@ -324,17 +326,44 @@ export class BridgeMemoryService {
         const needle = String(query || '').trim().toLowerCase()
         return rows
             .map(row => ({
-                sourcePath: row.sourceKey,
+                sourcePath: row.sourceKey || row.sourcePath,
                 title: row.title || row.sourceKey,
                 scope: row.scope || 'project',
                 status: row.status || 'active',
                 keywords: row.metadata?.keywords || '',
+                schemaVersion: Number(row.metadata?.schemaVersion || 1),
+                memoryType: row.metadata?.memoryType || 'fact',
+                parentKey: row.metadata?.parentKey || null,
+                l0: row.metadata?.l0 || '',
+                l1: row.metadata?.l1 || '',
                 confidence: Number(row.metadata?.confidence ?? 1),
                 lastVerifiedAt: row.metadata?.lastVerifiedAt || null,
                 updatedAt: row.updatedAt || null,
             }))
             .filter(item => !needle || `${item.title}\n${item.sourcePath}\n${item.keywords}`.toLowerCase().includes(needle))
             .slice(0, Math.max(1, Math.min(500, Number(limit) || 200)))
+    }
+
+    async loadAsync({encodedDir, sourcePath, tier = 'l2'} = {}) {
+        const key = String(encodedDir || '')
+        const source = String(sourcePath || '')
+        if (!key || !source) return null
+        const row = typeof this.memoryRepository.load === 'function'
+            ? await this.memoryRepository.load({projectKey: key, sourceKey: source, tier})
+            : await this.memoryRepository.get({projectKey: key, sourceKey: source})
+        if (!row) return null
+        if (Object.hasOwn(row, 'selectedBody')) return row
+        const selected = selectMemoryContent(row, tier)
+        return {...row, selectedTier: selected.tier, selectedBody: selected.content}
+    }
+
+    async scalePolicyAsync({encodedDir, keywordRecall = null, injectionBytes = 0, thresholds = {}} = {}) {
+        const key = String(encodedDir || '')
+        if (!key) return decideMemoryScalePolicy({count: 0, keywordRecall, injectionBytes, thresholds})
+        const count = typeof this.memoryRepository.count === 'function'
+            ? await this.memoryRepository.count({projectKey: key, status: 'active'})
+            : (await this.memoryRepository.list({projectKey: key, status: 'active', limit: 500})).length
+        return decideMemoryScalePolicy({count, keywordRecall, injectionBytes, thresholds})
     }
 
     disable({encodedDir, sourcePath} = {}) {

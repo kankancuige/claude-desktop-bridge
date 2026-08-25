@@ -178,6 +178,8 @@ export function createTaskCommandRuntime(deps = {}) {
             s.taskCompletedAt = 0
             s.taskCompletion = createTaskCompletionState({phase: 'running'})
             s.taskCompletionDecision = taskDecision
+            // 自动 Memory 只读取本轮原始用户请求，避免把模型最终回复误当成事实来源。
+            s.taskRequestText = String(desktopInput && command.taskText?.trim() ? command.taskText : command.content || '').slice(0, 12000)
             s.taskCompletionIdentity = createTurnIdentity(source, userId, IM_SOURCES)
             s.taskFinalReplyText = ''
             s.taskReviewFiles = []

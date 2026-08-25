@@ -85,6 +85,47 @@ export class PostgresContentStore {
         return result.rows || []
     }
 
+    async count({projectKey, kind = 'memory', status = 'active', scope = null} = {}) {
+        const project = required(projectKey, 'projectKey')
+        const values = [project, String(kind)]
+        const clauses = ['project_key = $1', 'content_kind = $2']
+        if (status !== null) { values.push(String(status)); clauses.push(`status = $${values.length}`) }
+        if (scope != null) { values.push(String(scope)); clauses.push(`scope = $${values.length}`) }
+        const result = await this.gateway.query(`SELECT COUNT(*)::int AS count FROM ${this.table} WHERE ${clauses.join(' AND ')}`, values)
+        return Number(result.rows?.[0]?.count || 0)
+    }
+
+    async listChildren({projectKey, parentKey, kind = 'memory', status = 'active', limit = 100, after = null, scope = null} = {}) {
+        const project = required(projectKey, 'projectKey')
+        const parent = required(parentKey, 'parentKey')
+        const values = [project, String(kind), parent]
+        const clauses = ['project_key = $1', 'content_kind = $2', `metadata->>'parentKey' = $3`]
+        if (status !== null) { values.push(String(status)); clauses.push(`status = $${values.length}`) }
+        if (scope != null) { values.push(String(scope)); clauses.push(`scope = $${values.length}`) }
+        if (after != null) {
+            const updatedAt = Number(after.updatedAt)
+            const sourceKey = required(after.sourceKey, 'after.sourceKey')
+            if (!Number.isFinite(updatedAt)) throw Object.assign(new TypeError('after.updatedAt is invalid'), {code: 'STORAGE_CONTENT_CURSOR_INVALID'})
+            values.push(updatedAt, sourceKey)
+            clauses.push(`(updated_at, source_key) < ($${values.length - 1}, $${values.length})`)
+        }
+        values.push(Math.max(1, Math.min(500, Number(limit) || 100)))
+        const result = await this.gateway.query(`
+            SELECT project_key AS "projectKey", content_kind AS kind, source_key AS "sourceKey", title, body, body_hash AS "bodyHash", version, scope, status, metadata, created_at AS "createdAt", updated_at AS "updatedAt"
+            FROM ${this.table} WHERE ${clauses.join(' AND ')} ORDER BY updated_at DESC, source_key DESC LIMIT $${values.length}
+        `, values)
+        return result.rows || []
+    }
+
+    async load({projectKey, kind = 'memory', sourceKey, tier = 'l2'} = {}) {
+        const row = await this.get({projectKey, kind, sourceKey})
+        if (!row) return null
+        const requested = String(tier || 'l2').toLowerCase()
+        const selectedTier = ['l0', 'l1', 'l2'].includes(requested) ? requested : 'l2'
+        const selectedBody = selectedTier === 'l0' ? row.metadata?.l0 || row.body : selectedTier === 'l1' ? row.metadata?.l1 || row.body : row.body
+        return {...row, selectedTier, selectedBody: String(selectedBody || '')}
+    }
+
     async getEmbedding({projectKey, sourceKey, bodyHash, embeddingModel} = {}) {
         const result = await this.gateway.query(`
             SELECT project_key AS "projectKey", source_key AS "sourceKey", body_hash AS "bodyHash", embedding_model AS "embeddingModel", dimensions, status, updated_at AS "updatedAt"

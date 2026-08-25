@@ -179,6 +179,8 @@ import {createSessionContextRuntime} from './runtime/session-context-runtime.mjs
 import {createContextPlanner} from './context/context-planner.mjs'
 import {createAgentMailbox} from './agents/agent-message.mjs'
 import {createMemoryCandidateStore} from './context/memory-candidate.mjs'
+import {extractAutomaticMemoryFactsFromSession} from './context/memory-auto-capture.mjs'
+import {createMemoryAutoCaptureRuntime} from './runtime/memory-auto-capture-runtime.mjs'
 import {createProjectSessionRuntime} from './runtime/project-session-runtime.mjs'
 import {createProviderRuntime} from './runtime/provider-runtime.mjs'
 import {createProjectGitRuntime} from './runtime/project-git-runtime.mjs'
@@ -364,6 +366,11 @@ let pitfallAdmin = null
 let memoryService = null
 let agentMailbox = null
 let memoryCandidateStore = null
+const memoryAutoCaptureRuntime = createMemoryAutoCaptureRuntime({
+    getCandidateStore: () => memoryCandidateStore,
+    extractFacts: extractAutomaticMemoryFactsFromSession,
+    encodeProjectName,
+})
 let stateRepositories = () => storageGateway?.repositories || {}
 // Health contract keeps stateStoreDegradedReason: for desktop compatibility.
 // stateStoreDegradedReason:
@@ -910,6 +917,7 @@ taskCompletionEffectsRuntime = createTaskCompletionEffectsRuntime({
     maybeMirror,
     taskCoordinator,
     log,
+    captureAutomaticMemory: memoryAutoCaptureRuntime.captureAutomaticMemory,
 })
 sessionArtifactRuntime = createSessionArtifactRuntime({
     BRIDGE_HOME,

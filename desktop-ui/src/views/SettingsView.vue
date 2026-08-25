@@ -21,6 +21,7 @@
 import {ref, onMounted, onUnmounted, computed} from 'vue'
 import {useRouter} from 'vue-router'
 import {t, setLocale} from '../i18n'
+import {isMemoryIndexReady, memoryModeLabelKey} from '../memory-mode.mjs'
 import WorkflowTab from './WorkflowTab.vue'
 
 // ── Vue Router 实例 ──
@@ -1473,11 +1474,11 @@ async function deleteRule(filename: string) {
 
 // ── Memory (all projects summary view) ──
 // ═══════════════════════════════════════════════════════════════
-// Memory 管理 - 跨项目 memory 文件管理
-// 功能说明: 扫描各项目的 memory 文件（~/.claude-desktop-bridge/projects/*/memory/），
-//   按项目分组，点击展开加载项目下所有 memory 文件，支持编辑/新建/删除
+// Memory 管理 - 跨项目 PostgreSQL Memory 管理
+// 功能说明: 从 PostgreSQL Memory 索引读取各项目记录，
+//   本地 memory/*.md 仅作为兼容编辑副本展示和写回
 // ═══════════════════════════════════════════════════════════════
-// ── 项目列表摘要，含 encodedDir/workDir/fileCount ──
+// ── 项目列表摘要，含 encodedDir/workDir/recordCount ──
 const memoryProjects = ref<any[]>([])
 const memoryLoading = ref(false)
 // ── 当前展开的项目 encodedDir（'' 表示无展开）──
@@ -1547,7 +1548,7 @@ async function deletePreference(item: any, scope: 'global' | 'project', encodedD
 }
 
 // ── 加载 Memory 项目摘要 ──
-// 功能说明: GET /api/config/memory-summary，返回 { projects: [{encodedDir, workDir, fileCount}] }
+// 功能说明: GET /api/config/memory-summary，返回 { mode: 'postgres', projects: [{encodedDir, workDir, fileCount}] }
 async function loadMemorySummary() {
   memoryLoading.value = true
   try {
@@ -3464,8 +3465,8 @@ onUnmounted(() => {
                             @click="rebuildMemoryIndex(proj)">
                       {{ memoryAction === `${proj.encodedDir}:rebuild` ? t('mem.rebuilding') : t('mem.rebuild') }}
                     </button>
-                    <span class="memory-mode" :class="{degraded: proj._memoryMode !== 'sqlite'}">
-                      {{ proj._memoryMode === 'sqlite' ? t('mem.indexReady') : t('mem.fileMode') }}
+                    <span class="memory-mode" :class="{degraded: !isMemoryIndexReady(proj._memoryMode)}">
+                      {{ t(memoryModeLabelKey(proj._memoryMode)) }}
                     </span>
                   </div>
                   <div class="memory-create">

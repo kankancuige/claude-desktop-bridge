@@ -31,3 +31,12 @@ test('审批缺少证据时拒绝激活', async () => {
     const [candidate] = await store.extractMemoryCandidates({taskId: 't1', projectKey: 'p1', verifiedFacts: [{summary: '规则', verified: true, evidence: ['test']} ]})
     await assert.rejects(() => store.approveMemoryCandidate({candidateId: candidate.candidateId, projectKey: 'p1', actor: 'user'}), error => error.code === 'MEMORY_CANDIDATE_APPROVAL_REQUIRED')
 })
+
+test('同一项目的重复事实跨会话复用 candidate，不持续膨胀', async () => {
+    const store = createMemoryCandidateStore({memoryRepository: repository()})
+    const first = await store.extractMemoryCandidates({taskId: 't1', projectKey: 'p1', verifiedFacts: [{summary: '统一使用 UTF-8', verified: true, evidence: ['request:t1']}]})
+    const second = await store.extractMemoryCandidates({taskId: 't2', projectKey: 'p1', verifiedFacts: [{summary: '统一使用 UTF-8', verified: true, evidence: ['request:t2']}]})
+    assert.equal(first[0].candidateId, second[0].candidateId)
+    assert.equal((await store.listCandidates({projectKey: 'p1'})).length, 1)
+    assert.equal((await store.listCandidates({projectKey: 'p1'}))[0].metadata.taskId, 't2')
+})

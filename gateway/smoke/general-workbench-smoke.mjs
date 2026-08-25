@@ -8,6 +8,7 @@ import {createPitfallService} from '../context/pitfall-service.mjs'
 import {createImProgressPolicy} from '../im/im-progress-policy.mjs'
 import {buildProjectContext} from '../projects/project-context.mjs'
 import {createPostgresStateFixture} from '../test-support/postgres-state-fixture.mjs'
+import {createPitfallRepository} from '../storage/repositories/pitfall-repository.mjs'
 import {mapVerificationToCoordinator} from '../tasks/coordinator-compatibility.mjs'
 import {createRepairLoop} from '../tasks/repair-loop.mjs'
 import {createTaskCoordinator} from '../tasks/task-coordinator.mjs'
@@ -202,7 +203,7 @@ async function run() {
         assert.equal(repair.recordFailure({fingerprint: 'same-failure', strategy: 'first-fix'}).action, 'retry')
         assert.equal(repair.recordFailure({fingerprint: 'same-failure', strategy: 'first-fix'}).status, 'diagnosis_required')
 
-        const pitfalls = createPitfallService({stateStore, cooldownMs: 0})
+        const pitfalls = createPitfallService({repository: createPitfallRepository({stateStore}), cooldownMs: 0})
         const firstPitfall = pitfalls.recordPitfallOccurrence({projectKey: projectContext.projectKey, taskId: 'p1', fingerprint: 'smoke-pitfall', title: 'Smoke failure', tags: ['node']})
         pitfalls.recordPitfallOccurrence({projectKey: projectContext.projectKey, taskId: 'p2', fingerprint: 'smoke-pitfall', title: 'Smoke failure', tags: ['node']})
         assert.equal(firstPitfall.status, 'observed')

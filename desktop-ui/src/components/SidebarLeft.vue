@@ -121,9 +121,11 @@ function visibleSessions(p: Project, showAllSessions: Set<string>, pageSize: num
     <div class="sidebar-top">
       <div class="app-brand">
         <span class="brand-mark">
-          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round">
-            <polygon points="12,2 22,12 12,22 2,12"/>
-            <circle cx="12" cy="12" r="4" fill="currentColor" opacity="0.3"/>
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M3.5 17.5V14a8.5 8.5 0 0 1 17 0v3.5"/>
+            <path d="M2.5 17.5h19"/>
+            <path d="M5.5 17.5V21m13-3.5V21"/>
+            <circle cx="12" cy="12.5" r="1.8" fill="currentColor" stroke="none"/>
           </svg>
         </span>
         <div>

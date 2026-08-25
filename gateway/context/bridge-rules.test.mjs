@@ -18,9 +18,16 @@ test('Bridge 规则来自仓库内固定文件并包含核心纪律', () => {
     assert.match(BRIDGE_RULES, /不得写死或记录到日志/)
     assert.match(BRIDGE_RULES, /digital-twin-cad/)
     assert.match(BRIDGE_RULES, /twin\.config\.yaml/)
+    assert.match(BRIDGE_RULES, /Low Coupling And Dependency Direction/)
+    assert.match(BRIDGE_RULES, /外部能力通过明确的 `port` 注入/)
+    assert.match(BRIDGE_RULES, /由组合根统一接线/)
     assert.match(BRIDGE_PROJECT_RULES, /Gateway 结构化事件或权威快照/)
     assert.match(BRIDGE_PROJECT_RULES, /1200x700/)
     assert.match(BRIDGE_PROJECT_RULES, /WorkspaceView.*keep-alive/)
+    assert.match(BRIDGE_PROJECT_RULES, /Low Coupling And Module Boundaries/)
+    assert.match(BRIDGE_PROJECT_RULES, /gateway\/gateway-runtime-impl\.mjs/)
+    assert.match(BRIDGE_PROJECT_RULES, /PostgreSQL 是结构化 Memory 的唯一主存储入口/)
+    assert.match(BRIDGE_PROJECT_RULES, /Memory context（提取、候选、分层和规模策略）保持纯规则/)
 })
 
 test('Bridge 规则追加到 Claude Code preset，不读取外部规则文件', () => {

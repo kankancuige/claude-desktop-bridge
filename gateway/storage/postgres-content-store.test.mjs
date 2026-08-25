@@ -81,6 +81,23 @@ test('内容列表支持 updated_at/source_key keyset 游标', async () => {
     assert.deepEqual(call.values.slice(-3), [123, 'memory/old.md', 10])
 })
 
+test('Memory 子节点查询使用 JSONB parentKey 和参数化 keyset', async () => {
+    const gateway = fakeGateway()
+    const store = createPostgresContentStore({gateway})
+    await store.listChildren({projectKey: 'p', parentKey: 'memory/root.md', limit: 5, after: {updatedAt: 123, sourceKey: 'memory/old.md'}})
+    const call = gateway.calls.at(-1)
+    assert.match(call.text, /metadata->>'parentKey' = \$3/)
+    assert.match(call.text, /\(updated_at, source_key\) < \(\$5, \$6\)/)
+    assert.deepEqual(call.values.slice(-3), [123, 'memory/old.md', 5])
+})
+
+test('Memory load 按层返回摘要并兼容旧正文', async () => {
+    const store = createPostgresContentStore({gateway: {query: async (text) => text.includes('ORDER BY version') ? {rows: [{body: '正文', metadata: {l0: '摘要', l1: '概览'}}]} : {rows: []}}})
+    const result = await store.load({projectKey: 'p', sourceKey: 'memory/a.md', tier: 'l0'})
+    assert.equal(result.selectedTier, 'l0')
+    assert.equal(result.selectedBody, '摘要')
+})
+
 test('按正文 hash 和 embedding model 查询现有向量', async () => {
     const gateway = {calls: [], query: async (text, values) => { gateway.calls.push({text, values}); return {rows: [{status: 'ready', embeddingModel: values[3]}]} }}
     const store = createPostgresContentStore({gateway})

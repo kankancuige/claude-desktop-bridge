@@ -725,41 +725,38 @@ export function createAdapterConfigRoutes(deps = {}) {
         return
     }
 
-    // ── GET /api/config/memory-summary —— 项目记忆摘要 ──
-    // 功能说明: 扫描所有项目的 memory/ 目录，返回每个项目的工作目录路径和记忆文件列表
-    //   前端设置页 Memory 面板依赖此接口展示各项目的记忆文件
-    // 实现方式: 遍历 ~/.claude-desktop-bridge/projects/ → 读 memory/ 目录 → 从 .jsonl 解析真实 cwd
-    // 关键数据流: GET → 遍历 projects/ → 200 {projects: [{workDir, fileCount, files}]}
+    // ── GET /api/config/memory-summary —— PostgreSQL 项目 Memory 摘要 ──
+    // 功能说明: 以 PostgreSQL content_documents 的 Memory 索引为主，兼容读取项目目录
+    //          仅用于发现项目和展示 workDir，不再以 memory/*.md 是否存在判断是否有 Memory。
+    // 关键数据流: GET → 遍历项目 → memoryService.listAsync() → 200 {mode:'postgres', projects:[...]}
     if (req.method === 'GET' && url.pathname === '/api/config/memory-summary') {
         const bp = join(BRIDGE_HOME, 'projects');
         const rs = [];
         try {
             for (const ed of readdirSync(bp)) {
-                // 跳过非项目目录（无 jsonl session 记录）
-                // 过滤子 agent 转录文件，仅以主 session .jsonl 判断项目存在性
                 let jls = readdirSync(join(bp, ed)).filter(f => f.endsWith('.jsonl') && !f.startsWith('.trash-') && !f.startsWith('agent-') && !f.startsWith('wf-agent-'));
-                // 白名单二次过滤: 排除 UUID 命名的 agent transcript
                 jls = jls.filter(f => !isAgentTranscriptByContent(join(bp, ed, f)));
-                if (!jls.length) continue;
-                const md = join(bp, ed, 'memory');
-                const fl = existsSync(md) ? readdirSync(md).filter(f => f.endsWith('.md')) : [];
+                const rows = typeof memoryService?.listAsync === 'function'
+                    ? await memoryService.listAsync({encodedDir: ed, limit: 500})
+                    : [];
+                if (!jls.length && !rows.length) continue;
                 let wd = decodeProjectName(ed) || ed;
                 try {
-                    const c = readFileSync(join(bp, ed, jls[0]), 'utf8');
+                    const c = jls.length ? readFileSync(join(bp, ed, jls[0]), 'utf8') : '';
                     const cm = c.match(/"cwd":\s*"([^"]+)"/);
                     if (cm) wd = cm[1].replace(/\\/g, '/')
                 } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
-                ;rs.push({
+                rs.push({
                     workDir: wd,
                     encodedDir: ed,
-                    fileCount: fl.length,
-                    files: fl.map(f => ({filename: f, size: statSync(join(md, f)).size}))
+                    fileCount: rows.length,
+                    mode: 'postgres',
                 })
             }
         } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
         ;rs.sort((a, b) => b.fileCount - a.fileCount);
         res.writeHead(200);
-        res.end(JSON.stringify({projects: rs}));
+        res.end(JSON.stringify({mode: 'postgres', projects: rs}));
         return
     }
     // ── GET /api/balance —— 可选余额查询 ──

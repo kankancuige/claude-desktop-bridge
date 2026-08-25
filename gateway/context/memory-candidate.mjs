@@ -1,8 +1,10 @@
 import {createHash} from 'node:crypto'
+import {normalizeMemoryMetadata} from './memory-layer.mjs'
 
 function text(value, max = 1000) { return typeof value === 'string' ? value.replace(/[\0\r\n]+/g, ' ').trim().slice(0, max) : '' }
-function candidateId(taskId, fact, index) {
-    return createHash('sha256').update(`${taskId}|${index}|${text(fact?.summary || fact?.text)}`).digest('hex').slice(0, 32)
+function candidateId(projectKey, fact) {
+    const summary = text(fact?.summary || fact?.text).toLowerCase().replace(/\s+/g, ' ')
+    return createHash('sha256').update(`${projectKey}|${summary}`).digest('hex').slice(0, 32)
 }
 function normalizeFact(fact) {
     const summary = text(fact?.summary || fact?.text, 2000)
@@ -19,14 +21,14 @@ export function createMemoryCandidateStore({memoryRepository, now = () => Date.n
         const project = text(projectKey, 240)
         if (!task || !project) throw Object.assign(new TypeError('candidate taskId/projectKey 无效'), {code: 'MEMORY_CANDIDATE_ARGUMENT_INVALID'})
         const candidates = []
-        for (const [index, raw] of (Array.isArray(verifiedFacts) ? verifiedFacts : []).entries()) {
+        for (const raw of (Array.isArray(verifiedFacts) ? verifiedFacts : [])) {
             const fact = normalizeFact(raw)
             if (!fact.summary || !fact.verified || !fact.evidence.length) continue
-            const id = candidateId(task, fact, index)
+            const id = candidateId(project, fact)
             const sourceKey = `candidate/${id}`
             const row = await memoryRepository.put({
                 projectKey: project, sourceKey, title: fact.summary.slice(0, 120), body: fact.summary,
-                scope, status: 'candidate', metadata: {lifecycle: 'candidate', candidateId: id, taskId: task, evidence: fact.evidence, createdAt: now()}, updatedAt: now(),
+                scope, status: 'candidate', metadata: normalizeMemoryMetadata({lifecycle: 'candidate', candidateId: id, taskId: task, evidence: fact.evidence, capture: fact.capture || 'explicit', createdAt: now(), memoryType: 'fact'}, fact.summary), updatedAt: now(),
             })
             candidates.push({candidateId: id, projectKey: project, taskId: task, sourceKey, scope, status: 'candidate', evidence: fact.evidence, summary: fact.summary, row})
         }
@@ -46,7 +48,7 @@ export function createMemoryCandidateStore({memoryRepository, now = () => Date.n
         const activeKey = text(sourceKey, 240) || `memory/approved-${candidateIdValue}.md`
         const active = await memoryRepository.put({
             projectKey: candidate.projectKey || projectKey, sourceKey: activeKey, title: candidate.title, body: candidate.body || '',
-            scope: candidate.scope || 'project', status: 'active', metadata: {...(candidate.metadata || {}), lifecycle: 'active', approvedBy: actorValue, approvedAt: now(), approvalEvidence: evidence}, updatedAt: now(),
+            scope: candidate.scope || 'project', status: 'active', metadata: normalizeMemoryMetadata({... (candidate.metadata || {}), lifecycle: 'active', approvedBy: actorValue, approvedAt: now(), approvalEvidence: evidence}, candidate.body || ''), updatedAt: now(),
         })
         await memoryRepository.disable({projectKey: candidate.projectKey || projectKey, sourceKey: candidate.sourceKey, updatedAt: now()})
         return {...active, candidateId: candidateIdValue, status: 'active'}

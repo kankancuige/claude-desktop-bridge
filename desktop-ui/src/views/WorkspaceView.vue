@@ -1784,11 +1784,12 @@ const showSidebar = ref(true)
 function toggleSidebar() { showSidebar.value = !showSidebar.value }
 
 // ── 面板拖拽缩放 ──
-const sidebarWidth = ref(380)
+// Apple 风格桌面布局使用更紧凑的导航栏，仍允许用户拖拽扩大。
+const sidebarWidth = ref(300)
 const rightPanelWidth = ref(360)
 
 const {dragging: leftDragging, onMouseDown: onLeftHandleDown} = useResizeHandle({
-  targetWidth: sidebarWidth, minWidth: 200, maxWidth: 600,
+  targetWidth: sidebarWidth, minWidth: 248, maxWidth: 600,
 })
 const {dragging: rightDragging, onMouseDown: onRightHandleDown} = useResizeHandle({
   targetWidth: rightPanelWidth, minWidth: 250, maxWidth: 600, reverse: true,
@@ -6748,10 +6749,12 @@ const tokenTooltip = computed(() => {
       <div v-if="!connected && messages.length === 0" class="welcome">
         <div class="welcome-glow"></div>
         <div class="welcome-icon">
-          <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1"
-               stroke-linejoin="round">
-            <polygon points="12,2 22,12 12,22 2,12"/>
-            <circle cx="12" cy="12" r="4" fill="currentColor" opacity="0.25"/>
+          <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.35"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M3.5 17.5V14a8.5 8.5 0 0 1 17 0v3.5"/>
+            <path d="M2.5 17.5h19"/>
+            <path d="M5.5 17.5V21m13-3.5V21"/>
+            <circle cx="12" cy="12.5" r="1.8" fill="currentColor" stroke="none"/>
           </svg>
         </div>
         <h1>Claude Desktop Bridge</h1>

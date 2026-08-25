@@ -9,6 +9,7 @@ export function createTaskCompletionEffectsRuntime(deps = {}) {
         updateTaskCompletion, beginTurn, markInternalInput, hasPersistedNotificationIntents,
         requiredTaskNotificationPlatforms, requestCoordinatorCompletion, updateTaskState,
         taskStateFromCompletion, maybeMirror, taskCoordinator, broadcastTaskLifecycle, log,
+        captureAutomaticMemory = null,
     } = deps
     if (!sessions || typeof updateTaskCompletion !== 'function') {
         throw new TypeError('task completion effects dependencies are required')
@@ -107,9 +108,18 @@ async function applyTaskCompletionEffectsUnsafe(sessionId, effects = []) {
                 continue
             }
             updateTaskState(s, sessionId, taskStateFromCompletion(s, effect.detail))
+            let capturedMemoryCandidates = []
+            if (typeof captureAutomaticMemory === 'function') {
+                try {
+                    capturedMemoryCandidates = await captureAutomaticMemory({session: s, sessionId}) || []
+                } catch (error) {
+                    log?.warn?.({err: error, sessionId: sessionId?.slice(0, 8)}, '自动 Memory candidate 沉淀失败，任务终态不变')
+                }
+            }
             taskCompletionEventForClient(s, sessionId, 'task_completed', {
                 reply: s.taskFinalReplyText || s.taskState?.finalReplyText || '',
                 review: s.taskCompletion?.reviewOutcome || null,
+                memoryCandidatesCreated: capturedMemoryCandidates.length,
             })
             try {
                 const notification = await maybeMirror(sessionId, {outcome: 'succeeded'}, notificationId)

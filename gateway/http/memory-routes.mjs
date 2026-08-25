@@ -138,6 +138,29 @@ export function createMemoryRoutes(deps = {}) {
         return true
     }
 
+    const policyM = url.pathname.match(/^\/api\/projects\/([^/]+)\/memory\/policy$/)
+    if (req.method === 'GET' && policyM) {
+        const ed = safeDecodeURIComponent(policyM[1])
+        if (!ed || basename(ed) !== ed) { writeJson(res, 400, {error: 'invalid project', code: 'MEMORY_PROJECT_INVALID'}); return true }
+        const identity = getAdapterIdentity(req)
+        if (identity && !adapterOwnsProject(identity, ed)) { writeJson(res, 403, {error: 'project ownership mismatch'}); return true }
+        if (!memoryService?.scalePolicyAsync) { writeJson(res, 503, {error: 'memory scale policy unavailable', code: 'MEMORY_SCALE_POLICY_UNAVAILABLE'}); return true }
+        try {
+            const recall = Number(url.searchParams.get('keywordRecall'))
+            const injectionBytes = Number(url.searchParams.get('injectionBytes'))
+            const policy = await memoryService.scalePolicyAsync({
+                encodedDir: ed,
+                keywordRecall: Number.isFinite(recall) ? recall : null,
+                injectionBytes: Number.isFinite(injectionBytes) ? injectionBytes : 0,
+            })
+            writeJson(res, 200, {policy})
+        } catch (error) {
+            log.warn({err: error, encodedDir: ed}, '读取 Memory 规模策略失败')
+            writeJson(res, 500, {error: error?.message || '读取 Memory 规模策略失败', code: 'MEMORY_SCALE_POLICY_FAILED'})
+        }
+        return true
+    }
+
     // ── GET /api/projects/:encodedDir/memory —— 读取项目所有 memory 文件 ──
     const projMemM = url.pathname.match(/^\/api\/projects\/([^/]+)\/memory$/);
     if (req.method === 'GET' && projMemM) {

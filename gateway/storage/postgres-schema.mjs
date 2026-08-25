@@ -310,6 +310,7 @@ CREATE TABLE IF NOT EXISTS ${schema}.content_documents (
     PRIMARY KEY (project_key, content_kind, source_key, version)
 );
 CREATE INDEX IF NOT EXISTS idx_content_lookup ON ${schema}.content_documents (project_key, content_kind, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memory_parent_lookup ON ${schema}.content_documents (project_key, (metadata->>'parentKey'), status, updated_at DESC, source_key DESC) WHERE content_kind = 'memory';
 CREATE TABLE IF NOT EXISTS ${schema}.memory_embeddings (
     project_key TEXT NOT NULL,
     source_key TEXT NOT NULL,

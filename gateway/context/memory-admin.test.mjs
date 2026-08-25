@@ -8,6 +8,7 @@ import {createMemoryService} from './memory-service.mjs'
 import {
     deleteProjectMemory,
     listProjectMemory,
+    listProjectMemoryAsync,
     rebuildProjectMemory,
     saveProjectMemory,
     setProjectMemoryEnabled,
@@ -17,7 +18,7 @@ function syncMemoryRepository(store) {
     return {
         list: ({projectKey, status = 'active', limit = 100} = {}) => store.listMemoryIndex(projectKey, {status, limit}),
         get: ({projectKey, sourceKey} = {}) => store.listMemoryIndex(projectKey, {status: null, limit: 500}).find(row => row.sourcePath === sourceKey) || null,
-        put: ({projectKey, sourceKey, title, body, bodyHash, scope, status, metadata, updatedAt} = {}) => store.upsertMemoryIndex({projectKey, sourcePath: sourceKey, title, body, contentHash: bodyHash, scope, status, keywords: metadata?.keywords || '', mtime: metadata?.mtime || 0, size: metadata?.size || Buffer.byteLength(body || ''), confidence: metadata?.confidence ?? 1, lastVerifiedAt: metadata?.lastVerifiedAt || null, updatedAt}),
+        put: ({projectKey, sourceKey, title, body, bodyHash, scope, status, metadata, updatedAt} = {}) => store.upsertMemoryIndex({projectKey, sourcePath: sourceKey, title, body, contentHash: bodyHash, scope, status, metadata, keywords: metadata?.keywords || '', mtime: metadata?.mtime || 0, size: metadata?.size || Buffer.byteLength(body || ''), confidence: metadata?.confidence ?? 1, lastVerifiedAt: metadata?.lastVerifiedAt || null, updatedAt}),
         disable: ({projectKey, sourceKey, updatedAt} = {}) => store.upsertMemoryIndex({...syncMemoryRepository(store).get({projectKey, sourceKey}), projectKey, sourcePath: sourceKey, status: 'disabled', updatedAt}),
         remove: ({projectKey, sourceKey} = {}) => store.removeMemoryIndex(projectKey, sourceKey),
         markUsed: ({projectKey, sourceKey, usedAt} = {}) => store.markMemoryUsed(projectKey, sourceKey, usedAt),
@@ -58,4 +59,24 @@ test('Memory 管理拒绝越界文件名、非字符串和超限内容', t => {
     assert.throws(() => saveProjectMemory({...ctx, filename: '../bad.md', content: 'x'}), {code: 'MEMORY_PATH_INVALID'})
     assert.throws(() => saveProjectMemory({...ctx, filename: 'bad.md', content: null}), {code: 'MEMORY_CONTENT_INVALID'})
     assert.throws(() => saveProjectMemory({...ctx, filename: 'large.md', content: 'x'.repeat(512 * 1024 + 1)}), {code: 'MEMORY_FILE_TOO_LARGE'})
+})
+
+test('PostgreSQL-only Memory 没有 md 副本时仍可在设置页读取', async t => {
+    const ctx = fixture()
+    t.after(() => ctx.stateStore.close())
+    ctx.memoryService.memoryRepository.put({
+        projectKey: ctx.encodedDir,
+        sourceKey: 'memory/database-only.md',
+        title: '数据库主存储',
+        body: '正文只存在 PostgreSQL',
+        bodyHash: 'hash-database-only',
+        scope: 'project',
+        status: 'active',
+        metadata: {keywords: '数据库', lifecycle: 'active', approvedBy: 'test'},
+    })
+    const listed = await listProjectMemoryAsync(ctx)
+    assert.equal(listed.mode, 'postgres')
+    assert.equal(listed.files.length, 1)
+    assert.equal(listed.files[0].filename, 'database-only.md')
+    assert.equal(listed.files[0].content, '正文只存在 PostgreSQL')
 })

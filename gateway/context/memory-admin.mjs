@@ -1,5 +1,5 @@
 import {existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync} from 'node:fs'
-import {join} from 'node:path'
+import {basename, join} from 'node:path'
 import {safeBasename, safeChildPath} from '../security/path-security.mjs'
 
 export const MAX_MEMORY_FILE_BYTES = 512 * 1024
@@ -93,15 +93,15 @@ export function rebuildProjectMemory({workDir, encodedDir, memoryService} = {}) 
 
 export async function listProjectMemoryAsync({bridgeHome, encodedDir, workDir, memoryService, query = ''} = {}) {
     const {memoryDir} = resolveMemoryPath(bridgeHome, encodedDir)
-    await memoryService?.refreshProjectAsync?.({workDir, encodedDir})
+    // PostgreSQL 是主存储；读取列表不能因为缺少兼容 md 副本而删除数据库记录。
     const metadata = new Map((await memoryService?.listAsync?.({encodedDir, query: '', limit: 500}) || [])
         .map(item => [item.sourcePath, item]))
     const needle = String(query || '').trim().toLowerCase()
     const files = []
-    if (!existsSync(memoryDir)) return {files, mode: 'postgres'}
-    const filenames = readdirSync(memoryDir, {withFileTypes: true})
+    const seen = new Set()
+    const filenames = existsSync(memoryDir) ? readdirSync(memoryDir, {withFileTypes: true})
         .filter(entry => entry.isFile() && entry.name.toLowerCase().endsWith('.md'))
-        .map(entry => entry.name)
+        .map(entry => entry.name) : []
     for (const filename of filenames) {
         const {filePath} = resolveMemoryPath(bridgeHome, encodedDir, filename)
         if (!filePath || !existsSync(filePath)) continue
@@ -110,7 +110,18 @@ export async function listProjectMemoryAsync({bridgeHome, encodedDir, workDir, m
         const content = readFileSync(filePath, 'utf8')
         const item = metadata.get(sourcePath(filename)) || {}
         if (needle && !`${filename}\n${content}\n${item.title || ''}\n${item.keywords || ''}`.toLowerCase().includes(needle)) continue
+        seen.add(sourcePath(filename))
         files.push({filename, content, size: Buffer.byteLength(content, 'utf8'), sourcePath: sourcePath(filename), title: item.title || filename.replace(/\.md$/i, ''), scope: item.scope || 'project', confidence: Number(item.confidence ?? 1), status: item.status || 'active', lastVerifiedAt: item.lastVerifiedAt || null, lastUsedAt: item.lastUsedAt || null})
+    }
+    // PostgreSQL 是主存储；没有本地 md 副本的记录也必须在设置页可见。
+    for (const item of metadata.values()) {
+        const source = String(item.sourcePath || '')
+        if (seen.has(source) || !source.startsWith('memory/') || !source.toLowerCase().endsWith('.md')) continue
+        const filename = basename(source)
+        const loaded = await memoryService?.loadAsync?.({encodedDir, sourcePath: source})
+        const content = String(loaded?.selectedBody || '')
+        if (needle && !`${filename}\n${content}\n${item.title || ''}\n${item.keywords || ''}`.toLowerCase().includes(needle)) continue
+        files.push({filename, content, size: Buffer.byteLength(content, 'utf8'), sourcePath: source, title: item.title || filename.replace(/\.md$/i, ''), scope: item.scope || 'project', confidence: Number(item.confidence ?? 1), status: item.status || 'active', lastVerifiedAt: item.lastVerifiedAt || null, lastUsedAt: item.lastUsedAt || null})
     }
     return {files, mode: 'postgres'}
 }

@@ -24,6 +24,17 @@ const {resolveGatewayRuntimePath} = require('./gateway-runtime-path.cjs')
 
 const BRIDGE_HOME = resolveBridgeHome()
 
+// Windows 任务栏图标来自窗口图标，而不是托盘实例；开发和打包模式都指向同一份品牌资源。
+function resolveLogoPath() {
+  return process.env.VITE_DEV_SERVER_URL
+    ? path.join(__dirname, '..', 'public', 'logo.png')
+    : path.join(__dirname, '..', 'dist', 'logo.png')
+}
+
+if (process.platform === 'win32') {
+  app.setAppUserModelId('com.claude.desktop.bridge')
+}
+
 // ── 全局状态 ──
 let mainWindow = null           // 主窗口实例，全局唯一
 let tray = null                 // 系统托盘图标实例
@@ -335,12 +346,14 @@ function stopGateway() {
  */
 function createWindow() {
   if (isQuitting) return
+  const logoPath = resolveLogoPath()
   mainWindow = new BrowserWindow({
     width: 1800,
     height: 960,
     minWidth: 1200,                               // 最小宽度限制，防止布局崩溃
     minHeight: 700,                               // 最小高度限制
     title: 'Claude Desktop Bridge',
+    icon: logoPath,
     frame: false,                                 // 无系统边框，使用自定义标题栏
     titleBarStyle: 'hidden',                      // macOS 下隐藏原生标题栏
     backgroundColor: '#1A1D28',                   // 窗口加载前背景色，与暗色主题一致
@@ -562,10 +575,7 @@ function createWindow() {
  */
 function createTray() {
   // 托盘图标使用 logo.png
-  const isDev = !!process.env.VITE_DEV_SERVER_URL
-  const logoPath = isDev
-    ? path.join(__dirname, '..', 'public', 'logo.png')
-    : path.join(__dirname, '..', 'dist', 'logo.png')
+  const logoPath = resolveLogoPath()
   const icon = nativeImage.createFromPath(logoPath)
   tray = new Tray(icon.resize({ width: 16, height: 16 }))
   tray.setToolTip('Claude Desktop Bridge')

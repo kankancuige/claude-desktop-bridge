@@ -34,3 +34,41 @@ test('完成副作用异常会收口为 task_failed', async () => {
     await runtime.applyTaskCompletionEffects('s1', [{type: 'start_review'}])
     assert.deepEqual(events, [['state', 'failed'], ['event', 'task_failed'], ['lifecycle']])
 })
+
+test('成功任务收口自动生成 PostgreSQL-backed Memory candidate，但不改变任务终态', async () => {
+    const captured = []
+    const session = {
+        workDir: 'D:/work', taskCompletionTaskId: 'task-1', taskRequestText: '请记住：本项目统一使用 UTF-8',
+        taskCompletion: {phase: 'running'}, taskState: {status: 'running'}, taskFinalReplyText: '完成',
+    }
+    const runtime = createTaskCompletionEffectsRuntime({
+        sessions: new Map([['s1', session]]),
+        runCoordinatorValidation: async () => ({status: 'passed', verification: {status: 'passed'}}),
+        requestCoordinatorCompletion: () => ({status: 'completed'}),
+        hasPersistedNotificationIntents: () => true,
+        requiredTaskNotificationPlatforms: () => [],
+        taskStateFromCompletion: () => ({status: 'succeeded'}),
+        updateTaskState() {},
+        taskCompletionEventForClient(_session, _id, _type, extra) { assert.equal(extra.memoryCandidatesCreated, 1) },
+        maybeMirror: async () => ({failed: 0, pending: 0}),
+        updateTaskCompletion() {},
+        captureAutomaticMemory: async () => { captured.push({projectKey: 'encoded:D:/work', verifiedFacts: [{summary: '本项目统一使用 UTF-8'}]}); return [{candidateId: 'c1'}] },
+        log: {warn() {}, error() {}},
+    })
+    await runtime.applyTaskCompletionEffects('s1', [{type: 'complete'}])
+    assert.equal(captured.length, 1)
+    assert.equal(captured[0].projectKey, 'encoded:D:/work')
+    assert.equal(captured[0].verifiedFacts[0].summary, '本项目统一使用 UTF-8')
+})
+
+test('失败或验证不足任务不自动沉淀 Memory', async () => {
+    let calls = 0
+    const session = {workDir: 'D:/work', taskCompletionTaskId: 'task-1', taskRequestText: '请记住：临时约定', taskCompletion: {phase: 'running'}}
+    const runtime = createTaskCompletionEffectsRuntime({
+        sessions: new Map([['s1', session]]),
+        updateTaskCompletion() {},
+        captureAutomaticMemory: async () => { calls++ },
+    })
+    await runtime.applyTaskCompletionEffects('s1', [{type: 'pause'}])
+    assert.equal(calls, 0)
+})

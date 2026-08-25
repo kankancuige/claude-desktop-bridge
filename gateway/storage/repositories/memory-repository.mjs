@@ -16,6 +16,27 @@ export class MemoryRepository {
         if (scope != null) args.scope = String(scope)
         return this.contentStore.list(args)
     }
+    count({projectKey, status = 'active', scope} = {}) {
+        if (typeof this.contentStore.count === 'function') return this.contentStore.count({projectKey: required(projectKey, 'projectKey'), kind: 'memory', status, scope})
+        return this.list({projectKey, status, scope, limit: 500}).then(rows => rows.length)
+    }
+    listChildren({projectKey, parentKey, status = 'active', limit = 100, after = null, scope} = {}) {
+        const args = {projectKey: required(projectKey, 'projectKey'), parentKey: required(parentKey, 'parentKey'), kind: 'memory', status, limit, after}
+        if (scope != null) args.scope = String(scope)
+        if (typeof this.contentStore.listChildren === 'function') return this.contentStore.listChildren(args)
+        return Promise.resolve(this.list({projectKey: args.projectKey, status, limit: 500, scope})).then(rows => rows.filter(row => row.metadata?.parentKey === args.parentKey).slice(0, Math.max(1, Math.min(500, Number(limit) || 100))))
+    }
+    load({projectKey, sourceKey, tier = 'l2'} = {}) {
+        const project = required(projectKey, 'projectKey')
+        const source = required(sourceKey, 'sourceKey')
+        if (typeof this.contentStore.load === 'function') return this.contentStore.load({projectKey: project, kind: 'memory', sourceKey: source, tier})
+        return Promise.resolve(this.get({projectKey: project, sourceKey: source})).then(row => {
+            if (!row) return null
+            const selectedTier = ['l0', 'l1', 'l2'].includes(String(tier).toLowerCase()) ? String(tier).toLowerCase() : 'l2'
+            const selectedBody = selectedTier === 'l0' ? row.metadata?.l0 || row.body : selectedTier === 'l1' ? row.metadata?.l1 || row.body : row.body
+            return {...row, selectedTier, selectedBody: String(selectedBody || '')}
+        })
+    }
     get({projectKey, sourceKey} = {}) { return this.contentStore.get({projectKey: required(projectKey, 'projectKey'), kind: 'memory', sourceKey: required(sourceKey, 'sourceKey')}) }
     put(args = {}) { return this.contentStore.put({...args, projectKey: required(args.projectKey, 'projectKey'), kind: 'memory', sourceKey: required(args.sourceKey, 'sourceKey')}) }
     disable({projectKey, sourceKey, updatedAt} = {}) { return this.contentStore.disable({projectKey: required(projectKey, 'projectKey'), kind: 'memory', sourceKey: required(sourceKey, 'sourceKey'), updatedAt}) }

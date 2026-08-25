@@ -211,6 +211,18 @@ test('PostgreSQL Memory 管理操作更新统一内容入口', async t => {
     assert.deepEqual(await service.listAsync({encodedDir}), [])
 })
 
+test('Memory 规模策略提供诊断且不改变默认召回路径', async t => {
+    const {db, service, encodedDir} = fixture()
+    t.after(() => db.close())
+    const policy = await service.scalePolicyAsync({encodedDir})
+    assert.equal(policy.mode, 'flat')
+    assert.equal(policy.shouldUseHierarchy, false)
+    await service.refreshProjectAsync({workDir: 'D:\\demo', encodedDir})
+    const loaded = await service.loadAsync({encodedDir, sourcePath: 'memory/conventions.md', tier: 'l0'})
+    assert.equal(loaded.selectedTier, 'l0')
+    assert.equal(typeof loaded.selectedBody, 'string')
+})
+
 test('pgvector 语义召回在 embedding provider 和向量索引可用时启用', async t => {
     const {home, db, encodedDir} = fixture()
     t.after(() => db.close())

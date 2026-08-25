@@ -1,40 +1,41 @@
 /* ═══════════════ Claude Desktop Bridge — Design System ═══════════════
- * source: github.com/kankancuige/claude-desktop-bridge
- * Dashboard Dark + Glassmorphism + Bento Grid
- * Ref: EasyVibe design principles
+ * macOS-inspired flat desktop surfaces: neutral layers, warm graphite accent and
+ * restrained depth. Interaction and status colors remain semantic.
  */
 
 /* ── CSS Variables ── */
 :root {
-  --bg-deep:       #1A1D28;
-  --bg-base:       #212430;
-  --bg-raised:     #282C38;
-  --bg-glass:      rgba(33, 36, 48, 0.88);
-  --border:        #323642;
-  --border-hover:  #434958;
-  --accent:        #E94560;
-  --accent-gold:   #D4A853;
-  --accent-blue:   #6BAEE0;
-  --bubble-user-bg:#3B5998;
-  --text-primary:  #D8DCE3;
-  --text-secondary:#8E929B;
-  --text-muted:    #5E6370;
-  --success:       #3FB950;
-  --warning:       #D29922;
-  --error:         #F85149;
+  --bg-deep:       #1c1c1e;
+  --bg-base:       #2c2c2e;
+  --bg-raised:     #3a3a3c;
+  --bg-sidebar:    #252527;
+  --bg-panel:      #303033;
+  --bg-glass:      #2c2c2e;
+  --border:        #48484a;
+  --border-hover:  #636366;
+  --accent:        #c9947e;
+  --accent-gold:   #d8a06f;
+  --accent-blue:   #a7bbb5;
+  --bubble-user-bg:#8f6d5e;
+  --text-primary:  #f5f5f7;
+  --text-secondary:#aeaeb2;
+  --text-muted:    #8e8e93;
+  --success:       #30d158;
+  --warning:       #ff9f0a;
+  --error:         #ff453a;
 
   /* Shadows */
-  --shadow-sm:     0 1px 3px rgba(0,0,0,0.2);
-  --shadow-md:     0 4px 16px rgba(0,0,0,0.25);
-  --shadow-lg:     0 8px 32px rgba(0,0,0,0.35);
-  --shadow-glow:   0 0 20px rgba(233,69,96,0.15);
-  --shadow-gold:   0 4px 20px rgba(212,168,83,0.15);
+  --shadow-sm:     0 1px 2px rgba(0,0,0,0.18);
+  --shadow-md:     0 4px 14px rgba(0,0,0,0.24);
+  --shadow-lg:     0 12px 32px rgba(0,0,0,0.32);
+  --shadow-glow:   0 0 0 3px color-mix(in srgb, var(--accent) 24%, transparent);
+  --shadow-gold:   0 0 0 3px rgba(255,159,10,0.16);
 
   /* Radius */
   --radius-btn:    8px;
   --radius-input:  8px;
-  --radius-card:   12px;
-  --radius-modal:  16px;
+  --radius-card:   10px;
+  --radius-modal:  14px;
   --radius-bubble: 12px;
 
   /* Transitions */
@@ -44,35 +45,37 @@
   --transition-slow: 300ms var(--ease-out);
 
   /* Fonts */
-  --font-heading:  'Segoe UI Variable Display', 'Segoe UI', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
-  --font-body:     'Segoe UI Variable Text', 'Segoe UI', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
-  --font-mono:     'Cascadia Mono', 'Cascadia Code', Consolas, 'SFMono-Regular', monospace;
+  --font-heading:  -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', sans-serif;
+  --font-body:     -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', sans-serif;
+  --font-mono:     'SF Mono', 'Cascadia Mono', 'Cascadia Code', Consolas, monospace;
 }
 
 /* ── Light Theme (柔和暖白) ── */
 :root[data-theme="light"] {
-  --bg-deep:       #F7F4EF;
-  --bg-base:       #EDE9E3;
-  --bg-raised:     #E5E0D9;
-  --bg-glass:      rgba(237, 233, 227, 0.92);
-  --border:        #D6D0C8;
-  --border-hover:  #B8B0A6;
-  --accent:        #D94050;
-  --accent-gold:   #B8903A;
-  --accent-blue:   #4A8BC2;
-  --bubble-user-bg:#3B5998;
-  --text-primary:  #2D2A26;
-  --text-secondary:#635F5A;
-  --text-muted:    #928D87;
-  --success:       #2E8B57;
-  --warning:       #B8860B;
-  --error:         #D94050;
+  --bg-deep:       #f2f2f7;
+  --bg-base:       #fbfbfd;
+  --bg-raised:     #e8e8ed;
+  --bg-sidebar:    #e9e9ee;
+  --bg-panel:      #ffffff;
+  --bg-glass:      #fbfbfd;
+  --border:        #d8d8dc;
+  --border-hover:  #b8b8bd;
+  --accent:        #8b5e4c;
+  --accent-gold:   #b97945;
+  --accent-blue:   #5f817b;
+  --bubble-user-bg:#8b5e4c;
+  --text-primary:  #1c1c1e;
+  --text-secondary:#636366;
+  --text-muted:    #8e8e93;
+  --success:       #34c759;
+  --warning:       #ff9500;
+  --error:         #ff3b30;
 
-  --shadow-sm:     0 1px 3px rgba(0,0,0,0.06);
-  --shadow-md:     0 4px 12px rgba(0,0,0,0.08);
-  --shadow-lg:     0 8px 24px rgba(0,0,0,0.10);
-  --shadow-glow:   0 0 18px rgba(217,64,80,0.12);
-  --shadow-gold:   0 4px 16px rgba(184,144,58,0.12);
+  --shadow-sm:     0 1px 2px rgba(0,0,0,0.06);
+  --shadow-md:     0 4px 14px rgba(0,0,0,0.10);
+  --shadow-lg:     0 12px 32px rgba(0,0,0,0.14);
+  --shadow-glow:   0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
+  --shadow-gold:   0 0 0 3px rgba(255,149,0,0.14);
 }
 
 /* ── Reset ── */
@@ -110,12 +113,11 @@ body {
 ::-webkit-scrollbar-thumb:hover { background: var(--border-hover); }
 * { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
 
-/* ── Global Glassmorphism utility ── */
+/* ── Shared surface utility: opaque by design ── */
 .glass {
   background: var(--bg-glass);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-md);
 }
 
 /* ── Focus ring ── */
@@ -126,8 +128,22 @@ input:focus-visible, textarea:focus-visible, select:focus-visible, button:focus-
 
 /* ── Selection ── */
 ::selection {
-  background: rgba(233, 69, 96, 0.25);
+  background: color-mix(in srgb, var(--accent) 25%, transparent);
   color: var(--text-primary);
+}
+
+/* Shared controls keep the visual language consistent across scoped views. */
+button, input, textarea, select { font-family: var(--font-body); }
+button { -webkit-tap-highlight-color: transparent; }
+button:disabled { filter: saturate(.55); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 
 /* ── Keyframe animations ── */
@@ -159,3 +175,219 @@ input:focus-visible, textarea:focus-visible, select:focus-visible, button:focus-
   0%   { background-position: -200% 0; }
   100% { background-position: 200% 0; }
 }
+
+/* ═══════════════ Apple-like application surfaces ═══════════════ */
+body .app,
+body .app-shell,
+body .main-area {
+  background: var(--bg-deep) !important;
+}
+
+body .title-bar,
+body .sidebar,
+body .tab-bar,
+body .chat-header,
+body .input-area,
+body .sidebar-bottom,
+body .wf-toolbox,
+body .wf-props,
+body .wf-script-sidebar,
+body .wf-editor-hdr,
+body .wf-editor-ftr {
+  background: var(--bg-base) !important;
+  border-color: var(--border) !important;
+}
+
+body .title-bar { height: 44px; }
+body .title-bar-brand { color: var(--text-primary); font-weight: 600; letter-spacing: 0; }
+body .title-bar-github { color: var(--text-muted); font-size: 12px; }
+body .win-btn { color: var(--text-secondary); }
+body .win-btn:hover { background: var(--bg-raised); color: var(--text-primary); }
+body .win-close:hover { background: var(--error); color: #fff; }
+
+body .sidebar-wrapper,
+body .sidebar-collapsed-strip { background: var(--bg-sidebar); border-color: var(--border); }
+body .sidebar-wrapper .sidebar { background: var(--bg-sidebar) !important; }
+body .sidebar-collapsed-strip { width: 32px; }
+body .brand-mark { width: 32px; height: 32px; border-radius: 9px; background: var(--bg-panel); color: var(--accent); }
+body .brand-name { font-size: 16px; letter-spacing: 0; }
+body .brand-sub { color: var(--text-muted); }
+body .sidebar-top { padding: 15px 14px 12px; }
+body .sidebar-top-actions { gap: 1px; }
+body .sidebar-top .icon-btn { padding: 7px; border-radius: 7px; }
+body .sidebar-top .icon-btn svg { width: 17px; height: 17px; }
+body .search-box { padding: 0 14px 12px; gap: 7px; }
+body .search-input,
+body .field-input,
+body .text-input,
+body .code-editor,
+body .input-wrapper {
+  background: var(--bg-deep) !important;
+  border-color: var(--border) !important;
+  color: var(--text-primary) !important;
+}
+body .search-input { height: 32px; padding: 6px 10px; font-size: 13px; border-radius: 8px; }
+body .add-project-btn { width: 32px; height: 32px; border-radius: 8px; }
+body .project-list { padding: 0 8px; }
+body .list-header { padding: 5px 8px 7px; font-size: 11px; letter-spacing: .6px; }
+body .project-card { gap: 8px; padding: 8px 9px; border-radius: 8px; }
+body .project-name { font-size: 13px; font-weight: 600; }
+body .project-path { font-size: 11px; }
+body .project-meta { font-size: 11px; }
+body .session-sublist { padding-left: 22px; padding-right: 2px; }
+body .session-item { padding: 6px 7px; border-radius: 7px; font-size: 12px; }
+body .session-title { font-size: 12px; }
+body .session-id-text { font-size: 10px; }
+body .sidebar-bottom { padding: 9px 13px; }
+body .gateway-status { font-size: 11px; }
+body .search-input:focus,
+body .field-input:focus,
+body .text-input:focus,
+body .code-editor:focus,
+body .input-wrapper:focus-within { border-color: var(--accent) !important; box-shadow: var(--shadow-glow); }
+body .add-project-btn,
+body .icon-btn:hover,
+body .icon-btn-sm:hover,
+body .project-card:hover,
+body .project-card.active,
+body .session-item:hover,
+body .hidden-section-header:hover,
+body .wf-script-row:hover,
+body .list-item:hover { background: var(--bg-raised) !important; }
+body .project-card.active,
+body .session-item.selected,
+body .wf-script-row.active { border-color: var(--accent) !important; background: color-mix(in srgb, var(--accent) 12%, var(--bg-base)) !important; }
+
+body .btn-primary,
+body .claude-retry-btn,
+body .add-project-btn { background: var(--accent) !important; color: #fff !important; box-shadow: none; }
+body .btn-primary:hover:not(:disabled),
+body .claude-retry-btn:hover:not(:disabled),
+body .add-project-btn:hover { background: color-mix(in srgb, var(--accent) 86%, #000) !important; box-shadow: var(--shadow-glow); }
+body .btn-primary.danger { background: var(--error) !important; }
+body .btn-secondary,
+body .btn-text,
+body .btn-add,
+body .refresh-btn { border-color: var(--border); }
+body .btn-secondary:hover:not(:disabled),
+body .btn-text:hover,
+body .btn-add:hover,
+body .refresh-btn:hover:not(:disabled) { background: var(--bg-raised) !important; border-color: var(--border-hover); color: var(--text-primary); }
+
+body .tab-chip { border-radius: 8px 8px 0 0; }
+body .tab-chip.active { background: var(--bg-base) !important; border-color: var(--border) !important; }
+body .quick-project { background: var(--bg-base) !important; border-color: var(--border) !important; }
+body .quick-project:hover { transform: none; border-color: var(--accent) !important; box-shadow: var(--shadow-glow); }
+body .welcome-glow { display: none; }
+body .welcome { gap: 10px; padding: 32px 24px; }
+body .welcome-icon { width: 60px; height: 60px; margin-bottom: 10px; border-radius: 16px; background: var(--bg-panel); border: 1px solid var(--border); color: var(--accent); }
+body .welcome-icon svg { width: 42px; height: 42px; }
+body .welcome h1 { font-size: 28px; font-weight: 650; letter-spacing: 0; }
+body .welcome p { max-width: 420px; font-size: 14px; }
+body .quick-actions { gap: 8px; margin-top: 10px; }
+body .quick-project { padding: 8px 14px; border-radius: 8px; font-size: 13px; }
+
+/* Chat chrome: one compact toolbar, a calm canvas, and a distinct composer rail. */
+body .tab-bar { padding: 5px 16px 0; gap: 3px; }
+body .tab-chip { padding: 5px 9px; font-size: 11px; }
+body .chat-header { padding: 10px 18px; min-height: 48px; }
+body .chat-header-left { gap: 7px; font-size: 13px; }
+body .header-session { font-size: 11px; }
+body .chat-header-right { gap: 7px; font-size: 11px; }
+body .messages { padding: 22px clamp(18px, 4vw, 48px); gap: 14px; }
+body .input-area { padding: 10px clamp(16px, 3vw, 32px) 14px; }
+body .input-wrapper { border-radius: 13px; padding: 7px 8px 7px 13px; }
+body .input-wrapper textarea { font-size: 14px; padding: 5px 0; }
+body .send-btn { width: 34px; height: 34px; border-radius: 9px; }
+
+/* Settings follows the same sidebar/content split as the workspace. */
+body .settings-header { min-height: 58px; padding: 10px 18px; display: grid; grid-template-columns: 1fr auto 1fr; }
+body .header-center h1 { font-size: 18px; letter-spacing: 0; }
+body .header-sub { font-size: 11px; }
+body .header-right { width: auto; }
+body .back-btn { padding: 6px 10px; border-radius: 8px; font-size: 12px; }
+body .tab-nav { width: 214px; padding: 12px 9px; gap: 2px; background: var(--bg-sidebar) !important; }
+body .tab-btn { gap: 8px; padding: 9px 10px; border-radius: 8px; }
+body .tab-btn.active { background: var(--bg-panel); border-color: var(--border); box-shadow: inset 3px 0 0 var(--accent); }
+body .tab-icon { width: 22px; }
+body .tab-icon svg { width: 15px; height: 15px; }
+body .tab-label { font-size: 13px; font-weight: 600; }
+body .tab-desc { font-size: 10px; }
+body .tab-content { padding: 24px clamp(20px, 4vw, 44px); background: var(--bg-deep); }
+body .section-block { margin-bottom: 22px; }
+body .section-title { font-size: 16px; letter-spacing: 0; margin-bottom: 11px; padding-bottom: 7px; }
+body .provider-cards { gap: 8px; }
+body .provider-card { border-radius: 9px; padding: 12px; }
+body .api-config-card,
+body .settings-grid,
+body .list-panel { border-radius: 10px; }
+
+@media (max-width: 760px) {
+  body .sidebar-wrapper { width: 248px !important; }
+  body .settings-header { grid-template-columns: auto 1fr auto; }
+  body .header-center { text-align: right; }
+  body .header-sub { display: none; }
+  body .tab-nav { width: 188px; }
+  body .tab-content { padding: 18px 16px; }
+  body .messages { padding: 18px 14px; }
+}
+
+/* Scoped view styles intentionally sit next to their templates. These selectors
+   carry the view root to make the shared design contract win without editing
+   each component's business-specific style block. */
+.app .welcome { gap: 10px; padding: 32px 24px; }
+.app .welcome-icon { width: 60px; height: 60px; margin-bottom: 10px; border-radius: 16px; background: var(--bg-panel); border: 1px solid var(--border); }
+.app .welcome-icon svg { width: 42px; height: 42px; }
+.app .welcome h1 { font-size: 28px !important; font-weight: 650; letter-spacing: 0; }
+.app .welcome p { max-width: 420px; font-size: 14px; }
+.app .quick-actions { gap: 8px; margin-top: 10px; }
+.app .quick-project { padding: 8px 14px; border-radius: 8px; font-size: 13px; }
+.app .chat-header { padding: 10px 18px; min-height: 48px; }
+.app .messages { padding: 22px clamp(18px, 4vw, 48px); gap: 14px; }
+.app .input-area { padding: 10px clamp(16px, 3vw, 32px) 14px; }
+.app .input-wrapper { border-radius: 13px; padding: 7px 8px 7px 13px; }
+.app .input-wrapper textarea { font-size: 14px; padding: 5px 0; }
+.app .send-btn { width: 34px; height: 34px; border-radius: 9px; }
+.settings-app .settings-header { min-height: 58px; padding: 10px 18px !important; }
+.settings-app .header-center h1 { font-size: 18px !important; line-height: 1.25; letter-spacing: 0; }
+.settings-app .header-sub { font-size: 11px !important; line-height: 1.3; }
+.settings-app .tab-nav { width: 214px !important; padding: 12px 9px; gap: 2px; background: var(--bg-sidebar) !important; }
+.settings-app .tab-btn { gap: 9px; padding: 10px 10px; border-radius: 8px; }
+.settings-app .tab-btn.active { background: var(--bg-panel); border-color: var(--border); box-shadow: inset 3px 0 0 var(--accent); }
+.settings-app .tab-icon { width: 22px; }
+.settings-app .tab-label { font-size: 15px !important; line-height: 1.25; font-weight: 600; }
+.settings-app .tab-desc { font-size: 11.5px !important; line-height: 1.35; }
+.settings-app .tab-content { padding: 24px clamp(20px, 4vw, 44px); background: var(--bg-deep); }
+.settings-app .section-block { margin-bottom: 22px; }
+.settings-app .section-title { font-size: 16px; letter-spacing: 0; margin-bottom: 11px; padding-bottom: 7px; }
+.settings-app .provider-cards { gap: 8px; }
+.settings-app .provider-card { border-radius: 9px; padding: 12px; }
+
+/* Dialogs retain a dimmed backdrop, while their content remains opaque. */
+body .claude-overlay,
+body .wf-overlay,
+body .confirm-overlay,
+body .diff-overlay,
+body .qr-overlay,
+body .ring-tooltip,
+body .toast,
+body .cp-dropdown,
+body .fp-diff-btn,
+body .update-banner { backdrop-filter: none !important; -webkit-backdrop-filter: none !important; }
+body .claude-modal,
+body .wf-modal,
+body .confirm-dialog,
+body .diff-modal,
+body .cp-dropdown,
+body .ring-tooltip,
+body .toast,
+body .update-banner { background: var(--bg-base) !important; border-color: var(--border) !important; }
+body .claude-modal.glass,
+body .wf-modal.glass,
+body .confirm-dialog.glass { backdrop-filter: none !important; -webkit-backdrop-filter: none !important; }
+
+/* Apple surfaces use a solid status rail instead of decorative gradients. */
+body .agent-run-bar.running { background: var(--accent) !important; animation: none; }
+body .cp-tab { background: var(--accent) !important; box-shadow: none; }
+body .cp-tab:hover { transform: none; box-shadow: var(--shadow-glow); }
+body .welcome h1, body .chat-header .header-project { color: var(--accent); }

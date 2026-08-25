@@ -28,7 +28,7 @@ Incomplete: None
 4. 关闭 tab：只关闭 WebSocket并移除 tab shell，不调用 DELETE，所以 transcript 仍在侧栏项目扫描中；当前确认文案声称会中断任务，但实现不会确定性停止后台 query。
 5. 历史展示：`loadMessages`/`loadHistory`恢复用户和 assistant 文本；UI-only system 消息、实时工具进度、权限弹窗和宠物状态不是 transcript 正文。
 6. 新建会话：仍建立全新 SDK conversation；仅当首条消息是引用性短句时，从最近有效主会话注入有界只读接力上下文，普通独立问题不注入。
-7. 项目 Memory：设置页可以管理 `~/.claude-desktop-bridge/projects/<project>/memory/*.md`，但 Gateway 不会自动把上一会话整理为 Memory；引用性短句接力仍从有界 transcript 摘要派生。
+7. 项目 Memory：设置页从 PostgreSQL 主存储读取和管理项目 Memory 记录；`~/.claude-desktop-bridge/projects/<project>/memory/*.md` 仅作为兼容编辑副本。成功任务收口时，仅从用户原始请求中的明确“记住/项目约定/以后固定”表达自动生成 PostgreSQL `candidate`，普通回复和失败任务不自动沉淀，候选仍需显式审批后才进入 `active`。引用性短句接力仍从有界 transcript 摘要派生。
 8. 任务提交：desktop WebSocket 将旧消息协议适配为 `TaskCommand`；微信、飞书、钉钉直接调用同一进程内服务，不再创建到 Gateway 的任务注入 WebSocket。
 9. 任务接收：`task/accepted` 先同步写入并 `fsync`；写入失败返回 `session_event_persist_failed` 且回滚输入。后续状态、Workflow/Agent、停止和 runtime 失败写入安全事件投影。
 10. Agent 启动：主 Session、定时 Session、query 重建和 Workflow Agent 都通过 `agent/claude-sdk` Provider；只有 Provider 注册适配器可以直接调用 SDK `query()`。
@@ -108,6 +108,15 @@ Incomplete: None
 - 设置页可搜索、启停、删除和重建项目 Memory，展示来源、状态、作用域和最近验证时间。正文由 StorageGateway 写入 PostgreSQL `content_documents`，`memory/*.md` 作为用户编辑/SDK 兼容副本。
 - 内置 `bridge-memory` Skill 只处理明确的记住、沉淀、忘记或项目约定操作；普通代码任务、探索和功能解释不加载该 Skill。
 
+### Memory 扩展预留（2026-08-25）
+
+- 每条 Memory 可在 `content_documents.metadata` 中携带 `schemaVersion`、`memoryType`、`parentKey`、`l0`、`l1`、`summaryBodyHash` 和 `summaryGenerator`；旧记录没有这些字段时按 L2 正文兼容读取。
+- `MemoryRepository` 提供 `count`、`listChildren` 和 `load(tier)`，SQL 仍由 StorageGateway 参数化执行；业务层不直接拼接 JSONB 查询。
+- `runMemoryLayerBackfill()` 提供有界批次、keyset checkpoint、dry-run、取消和失败重试边界。默认使用确定性摘要，可注入受控 summarizer 生成更高质量 L0/L1；它是离线能力，不会阻塞 Gateway 启动。
+- `decideMemoryScalePolicy()` 按默认阈值建议 `flat (<100)`、`summary (100-499)`、`hierarchical (>=500)`；关键词召回质量或 6 KB 注入预算恶化时可提前建议升级。当前策略只提供诊断，不改变默认关键词召回。
+- `GET /api/projects/:encodedDir/memory/policy` 返回项目级规模诊断；embedding、L0/L1/L2 和层级召回均不是当前本地使用的强制门禁。
+- 自动沉淀通过 `memory-auto-capture-runtime` 适配器接入任务完成端口；完成运行时只依赖 `captureAutomaticMemory`，不直接依赖 Memory 解析器、项目编码或 PostgreSQL Repository。组合根负责组装纯捕获器与 `repositories.memory`。
+
 ## 独立本地 Workbench 面板补充（2026-08-23）
 
 - Desktop 新增 `/workbench` 独立路由和侧栏入口，面向本地单用户提供 MultiCA 风格的任务看板、运行概览、最近活动、Coordinator 详情、Agent/Workflow、验证证据、Execution Report 和 AI 层健康视图。
@@ -168,3 +177,13 @@ Incomplete: None
 - `PitfallService` 不再自行创建兼容仓储，启动组合根只注入 `repositories.pitfall`；IM Runtime 通过 `getSessionRepository`、`getImRepository` 和 `getNotificationRepository` 取领域端口。
 - 2026-08-24 全量 Gateway 回归为 `674/674`，`vue-tsc` 和 Vite 生产构建通过，相关 Node 语法检查和 `git diff --check` 通过。代码层面的本轮闭合完成。
 - 真实 Gateway/Provider/IM/PostgreSQL 断线恢复、SDK resume 及 Electron 签名安装仍是外部运行时门禁，不能由本地单元或静态测试替代。
+
+## 1.6.1 本轮质量闭合（2026-08-25）
+
+- Host Smoke 已按当前 Repository-only 架构接线 `PitfallRepository`；`node gateway/smoke/general-workbench-smoke.mjs` 当前退出码为 0，输出 `ok=true`、任务 `succeeded`、证据级别 `L2`。
+- 当前源码门禁为 Gateway `742/742`、Desktop/Electron `141/141`、内置资源 `64` 项、Vue 类型检查、Vite 生产构建和 487 个 Gateway 源文件语法检查全部通过。
+- Memory 管理 API 返回 `mode=postgres`；设置页只将 PostgreSQL 视为正常索引，旧 SQLite/缺失/未知模式显示为降级，避免误报存储状态。
+- 当前版本 `1.6.1` 已生成本地未签名 NSIS 包；签名不属于本地使用验收。覆盖升级、卸载、异常回滚和真实 Provider/IM 仍需目标环境运行证据。
+- 1.6.1 隔离安装/冷启动烟测已通过：临时安装包启动后短窗口观察到 Gateway `3456`、DeepSeek/OpenCode/Codex Relay 代理 `8787/8788/8789` 监听，日志包含 PostgreSQL 初始化、Gateway 启动和 WebSocket 连接；签名仍不纳入本地使用验收。
+- 同一临时安装目录的静默卸载退出码为 0，应用文件已移除；覆盖升级和异常回滚仍未在本轮执行。
+- 1.5.0→1.6.1 临时覆盖安装后，安装目录中的 Gateway `package.json` 版本为 `1.6.1`，应用文件存在且测试结束无 Bridge 端口残留；中断安装原子回滚未验证。

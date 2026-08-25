@@ -35,9 +35,10 @@ function repository() {
     }
 }
 
-function routeWith(store, {identity = null, owns = true} = {}) {
+function routeWith(store, {identity = null, owns = true, memoryService = null} = {}) {
     return createMemoryRoutes({
         memoryCandidateStore: store,
+        memoryService,
         getAdapterIdentity: () => identity,
         adapterOwnsProject: () => owns,
         safeDecodeURIComponent: value => decodeURIComponent(value),
@@ -96,4 +97,12 @@ test('Memory candidate 存储不可用时返回 503', async () => {
     await route({req: {method: 'GET'}, res, url: new URL('http://localhost/api/projects/P/memory-candidates')})
     assert.equal(res.status, 503)
     assert.equal(JSON.parse(res.body).code, 'MEMORY_CANDIDATE_STORE_UNAVAILABLE')
+})
+
+test('Memory 规模策略路由返回诊断结果', async () => {
+    const route = routeWith(null, {memoryService: {scalePolicyAsync: async input => ({mode: 'flat', count: 2, keywordRecall: input.keywordRecall})}})
+    const res = response()
+    await route({req: {method: 'GET'}, res, url: new URL('http://localhost/api/projects/P/memory/policy?keywordRecall=0.9')})
+    assert.equal(res.status, 200)
+    assert.deepEqual(JSON.parse(res.body).policy, {mode: 'flat', count: 2, keywordRecall: 0.9})
 })
