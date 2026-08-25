@@ -33,34 +33,8 @@ jobs:
 
       - name: Gateway 单元与契约测试
         shell: bash
-        id: gateway-tests
-        continue-on-error: true
-        # 每个文件使用独立 Node 进程，隔离模块级状态、临时环境和测试端口。
-        run: |
-          : > gateway-test.log
-          failures=0
-          while IFS= read -r -d '' test_file; do
-            printf '\n=== %s ===\n' "$test_file" | tee -a gateway-test.log
-            node --test "$test_file" 2>&1 | tee -a gateway-test.log
-            test_status=${PIPESTATUS[0]}
-            if [ "$test_status" -ne 0 ]; then
-              failures=$((failures + 1))
-            fi
-          done < <(find gateway -path 'gateway/node_modules' -prune -o -name '*.test.mjs' -print0)
-          printf '\nFAILURE_COUNT=%s\n' "$failures" | tee -a gateway-test.log
-          exit "$failures"
-
-      - name: 上传 Gateway 测试诊断
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: gateway-test-diagnostics
-          path: gateway-test.log
-          if-no-files-found: error
-
-      - name: Gateway 测试失败门禁
-        if: steps.gateway-tests.outcome == 'failure'
-        run: exit 1
+        # 测试共享端口、环境变量和临时状态；串行执行避免跨文件竞态。
+        run: node --test --test-concurrency=1 $(find gateway -path 'gateway/node_modules' -prune -o -name '*.test.mjs' -print)
 
       - name: Gateway Host Smoke
         run: node gateway/smoke/general-workbench-smoke.mjs

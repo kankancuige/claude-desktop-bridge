@@ -1,5 +1,5 @@
 import {existsSync, readdirSync, readFileSync, statSync} from 'node:fs'
-import {join, relative} from 'node:path'
+import {basename, join} from 'node:path'
 import {contentHash} from './postgres-content-store.mjs'
 
 const MAX_MEMORY_BYTES = 512 * 1024
@@ -48,7 +48,7 @@ export async function migrateContentFiles({bridgeHome, gateway, projectKeys = nu
         for (const filePath of memoryFiles(project.path)) {
             if (signal?.aborted) throw Object.assign(new Error('内容迁移已取消'), {code: 'CONTENT_MIGRATION_ABORTED'})
             if (!shouldRead(filePath, MAX_MEMORY_BYTES)) { result.skipped++; continue }
-            const sourceKey = `memory/${filePath.slice(filePath.lastIndexOf('\\') + 1).replace(/\\/g, '/')}`
+            const sourceKey = `memory/${basename(filePath).replace(/\\/g, '/')}`
             const body = readFileSync(filePath, 'utf8')
             result.bytes += Buffer.byteLength(body, 'utf8')
             if (!dryRun) await gateway.content.put({projectKey: project.key, kind: 'memory', sourceKey, title: sourceKey.slice(7, -3), body, bodyHash: contentHash(body)})
@@ -59,7 +59,7 @@ export async function migrateContentFiles({bridgeHome, gateway, projectKeys = nu
             if (signal?.aborted) throw Object.assign(new Error('内容迁移已取消'), {code: 'CONTENT_MIGRATION_ABORTED'})
             if (!shouldRead(filePath, MAX_TRANSCRIPT_BYTES)) { result.skipped++; continue }
             const body = readFileSync(filePath, 'utf8')
-            const sourceKey = `session/${filePath.slice(filePath.lastIndexOf('\\') + 1).replace(/\\/g, '/').replace(/\.jsonl$/i, '')}`
+            const sourceKey = `session/${basename(filePath).replace(/\\/g, '/').replace(/\.jsonl$/i, '')}`
             result.bytes += Buffer.byteLength(body, 'utf8')
             if (!dryRun) await gateway.content.put({projectKey: project.key, kind: 'transcript', sourceKey, title: sourceKey.slice(8), body, bodyHash: contentHash(body), metadata: {format: 'jsonl', transcriptPath: filePath}})
             result.transcripts++
