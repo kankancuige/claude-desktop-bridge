@@ -52,7 +52,6 @@
   "build": {
     "appId": "com.ckd.claude-desktop-bridge",
     "productName": "Claude Desktop Bridge",
-    "electronDist": "node_modules/electron/dist",
     "copyright": "kankancuige/claude-desktop-bridge",
     "directories": {
       "output": "dist-electron"
