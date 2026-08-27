@@ -20,6 +20,11 @@ export interface DraftIdentity {
   gatewaySessionId?: string | null
 }
 
+export interface SessionDraftTaskState {
+  status?: unknown
+  resumable?: unknown
+}
+
 const VERSION = 1 as const
 export const SESSION_DRAFTS_STORAGE_KEY = 'bridge-session-drafts-v1'
 export const DEFAULT_DRAFT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000
@@ -96,12 +101,34 @@ export function getSessionDraft(store: SessionDraftStore, rawKey: string): Sessi
   return key && store.drafts[key] ? {...store.drafts[key]} : null
 }
 
+export function shouldRestoreSessionDraft(
+  draft: SessionDraft,
+  taskState: SessionDraftTaskState | null | undefined,
+): boolean {
+  if (!draft.interrupted) return true
+  const status = String(taskState?.status || '')
+  return taskState?.resumable === true
+    && ['failed', 'incomplete', 'interrupted', 'stopped', 'review_paused'].includes(status)
+}
+
 export function removeSessionDraft(store: SessionDraftStore, rawKey: string): SessionDraftStore {
   const key = cleanKey(rawKey)
   if (!key || !store.drafts[key]) return store
   const drafts = {...store.drafts}
   delete drafts[key]
   return {version: VERSION, drafts}
+}
+
+export function removeMatchingInterruptedSessionDraft(
+  store: SessionDraftStore,
+  rawKey: string,
+  taskText: string,
+): SessionDraftStore {
+  const key = cleanKey(rawKey)
+  const draft = key ? store.drafts[key] : null
+  const expectedText = String(taskText || '').trim()
+  if (!draft?.interrupted || !expectedText || draft.text.trim() !== expectedText) return store
+  return removeSessionDraft(store, key)
 }
 
 export function readSessionDraftStore(storage: Pick<Storage, 'getItem'>): SessionDraftStore {

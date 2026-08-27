@@ -36,13 +36,16 @@ import {findSessionTab, sessionRequestStillOwned, sessionTabIdentityKey} from '.
 import {
   classifyBridgeFailure,
   dispatchBridgeNotice,
+  sanitizeErrorMessage,
 } from '../bridge-errors'
 import {
   getSessionDraft,
   readSessionDraftStore,
+  removeMatchingInterruptedSessionDraft,
   removeSessionDraft,
   SESSION_DRAFTS_STORAGE_KEY,
   sessionDraftKey,
+  shouldRestoreSessionDraft,
   upsertSessionDraft,
   writeSessionDraftStore,
 } from '../session-drafts'
@@ -63,24 +66,27 @@ import {mergeWorkflowAgentLogState, normalizeWorkflowLogAgentStatus} from '../ag
 import {formatCompactSummary, isSyntheticCompactUiMessage, normalizeContextUiState} from '../context-usage'
 import {
   createParentTaskUiState,
+  isLateFailureAfterSuccess,
   mergeParentTaskSnapshot,
   normalizeAssistantText,
   removeSupersededAssistantMessages,
   reduceParentTaskUi,
   selectSucceededTaskSummary,
+  shouldIgnorePostCompletionEvent,
   shouldShowPendingResultForTerminal,
   type ParentTaskUiState,
 } from '../task-completion'
 import {
   createTaskActivityState,
   isReviewLifecycleEvent,
+  reconcileTaskActivitySnapshot,
   reduceTaskActivity,
   taskActivityFreshness,
   type TaskActivityEntry,
   type TaskActivityState,
 } from '../task-activity'
 import {isTaskBusy} from '../task-busy'
-import {createSessionLifecycleState, reduceSessionLifecycle, type SessionLifecycleState} from '../task-lifecycle'
+import {createSessionLifecycleState, reduceSessionLifecycle, wasSessionGeneratingAtSocketClose, type SessionLifecycleState} from '../task-lifecycle'
 import {
   buildContinuationPrompt,
   normalizeTaskResult,
@@ -163,6 +169,10 @@ interface Message {
   activityStepKey?: string
   /** activity 是否已放到对应用户消息之后，用于区分 IM 首条任务和后续补充指令。 */
   activityUserLinked?: boolean
+  /** 会话错误事件的稳定去重键，避免 error/终态快照重复生成气泡。 */
+  errorKey?: string
+  /** 主回合先到的 assistant 文本；父任务终态前允许后续步骤插入其前方。 */
+  provisionalTaskReply?: boolean
 }
 
 interface PersistedTaskState {
@@ -493,24 +503,6 @@ async function waitForSessionStop(sid: string, timeoutMs = 3000): Promise<boolea
   return false
 }
 
-async function stopActiveSessionsOnUnmount() {
-  const pending = new Set<string>()
-  const addIfActive = (sid: string | null | undefined, state: TabState | null | undefined) => {
-    if (!sid) return
-    const workflowStatus = state?.workflowRunState?.status
-    if (state?.status === 'thinking' || state?.sessionLifecycle.active === true
-      || ['starting', 'running'].includes(String(workflowStatus || ''))) pending.add(sid)
-  }
-  addIfActive(sessionId.value, {
-    ...snapshotTabState(),
-    status: status.value,
-    sessionLifecycle: sessionLifecycle.value,
-    workflowRunState: wfRunState.value,
-  })
-  for (const tab of tabSessions.value) addIfActive(tab.state.sessionId, tab.state)
-  await Promise.allSettled([...pending].map(sid => requestStopSession(sid)))
-}
-
 interface StopSessionResult {
   ok: boolean
   scope: 'primary' | 'workflow' | 'none'
@@ -530,9 +522,11 @@ async function requestStopSession(sid: string): Promise<StopSessionResult> {
       const body = await response.json()
       if (body?.error) message = String(body.error)
     } catch (error) { console.debug('读取停止会话错误响应失败', error) }
+    appendSessionError(message, {key: `stop-session-http:${sid}:${response.status}`, prefix: '停止会话失败'})
     showToast(message, 6000)
     return {ok: false, scope: 'none'}
   } catch (error: any) {
+    appendSessionError(error, {key: `stop-session-network:${sid}`, prefix: '停止会话失败'})
     showToast(`停止会话失败：${error?.message || 'Gateway 不可用'}`, 6000)
     return {ok: false, scope: 'none'}
   }
@@ -686,6 +680,17 @@ const renderedMessages = computed(() => removeSupersededAssistantMessages(messag
   // 历史记录或迟到事件也可能携带空 assistant 内容；渲染层再次兜底，防止出现空白 AI 气泡。
   && (message.role !== 'assistant' || Boolean(normalizeAssistantText(message.text)))
 )))
+const messageRenderKeys = new WeakMap<Message, string>()
+let nextMessageRenderKey = 0
+
+/** 过滤可见消息时索引会变化，使用对象身份生成稳定 key，避免已有气泡被重挂载。 */
+function messageRenderKey(message: Message): string {
+  const existing = messageRenderKeys.get(message)
+  if (existing) return existing
+  const key = `message-${++nextMessageRenderKey}`
+  messageRenderKeys.set(message, key)
+  return key
+}
 
 function clearStaleContinuationActions() {
   for (const item of messages.value) {
@@ -697,6 +702,22 @@ function currentActivityMessage(): Message | null {
   return [...messages.value].reverse().find(message => message.role === 'activity' && message.activity) || null
 }
 
+function insertTaskProgressMessage(message: Message) {
+  const provisionalIndex = messages.value.findIndex(item => item.provisionalTaskReply === true)
+  if (provisionalIndex >= 0) messages.value.splice(provisionalIndex, 0, message)
+  else messages.value.push(message)
+}
+
+function provisionalTaskReplies(): Message[] {
+  return messages.value.filter(item => item.provisionalTaskReply === true && item.role === 'assistant')
+}
+
+function removeProvisionalTaskReplies(): Message[] {
+  const replies = provisionalTaskReplies()
+  if (replies.length) messages.value = messages.value.filter(item => !item.provisionalTaskReply)
+  return replies
+}
+
 function findLastMessageIndex(predicate: (message: Message) => boolean): number {
   for (let index = messages.value.length - 1; index >= 0; index--) {
     if (predicate(messages.value[index])) return index
@@ -704,12 +725,90 @@ function findLastMessageIndex(predicate: (message: Message) => boolean): number 
   return -1
 }
 
+function sessionErrorText(value: unknown, fallback = '任务执行失败'): string {
+  let candidate = value
+  if (candidate && typeof candidate === 'object') {
+    const record = candidate as Record<string, unknown>
+    candidate = record.message || record.error || record.detail || record.reason || record.code || ''
+  }
+  return sanitizeErrorMessage(candidate, 1000) || fallback
+}
+
+/** 将 Gateway 的上下文快照统一写入当前标签页状态，避免重连时回到未知态。 */
+function applyContextUsageEvent(raw: any) {
+  const normalized = normalizeContextUiState({...raw, configuredSafetyCap: contextSafetyCap.value})
+  usage.value.total = normalized.totalTokens
+  maxTokens.value = normalized.maxTokens || 0
+  rawMaxTokens.value = normalized.rawMaxTokens || normalized.maxTokens || 0
+  contextPercent.value = normalized.percentage || 0
+  contextPercentKnown.value = normalized.percentage !== null
+  if (normalized.percentage !== null && normalized.percentage >= 80 && normalized.percentage < 90 && contextWarningLevel < 80) {
+    contextWarningLevel = 80
+    messages.value.push({role: 'system', text: `上下文已使用 ${normalized.percentage}%，接近自动压缩阈值。`, time: Date.now()})
+  }
+  saveUsage()
+}
+
+/**
+ * SDK 未提供 get_context_usage 时，使用模型目录/初始化事件里的窗口先显示可用状态。
+ * 后续收到真实 context_usage 会覆盖这个估算值，不把未知状态伪装成精确用量。
+ */
+function applyKnownContextWindow(windowValue: unknown) {
+  const normalized = normalizeContextUiState({
+    totalTokens: usage.value.total,
+    maxTokens: windowValue,
+    rawMaxTokens: windowValue,
+    configuredSafetyCap: contextSafetyCap.value,
+  })
+  if (normalized.maxTokens === null) return
+  maxTokens.value = normalized.maxTokens
+  rawMaxTokens.value = normalized.rawMaxTokens || normalized.maxTokens
+  if (!contextPercentKnown.value && normalized.percentage !== null) {
+    contextPercent.value = normalized.percentage
+    contextPercentKnown.value = true
+  }
+  saveUsage()
+}
+
+/**
+ * 所有会话级异常都经过这里写入聊天窗口；Toast 只作为即时提醒，不能替代会话记录。
+ * errorKey 由事件类型和业务标识组成，防止同一故障同时由 error、task_failed、snapshot 重复显示。
+ */
+function appendSessionError(text: unknown, options: {key?: string; scroll?: boolean; prefix?: string} = {}) {
+  const detail = sessionErrorText(text)
+  const display = options.prefix ? `${options.prefix}：${detail}` : detail
+  const key = options.key ? String(options.key) : display
+  if (messages.value.some(message => message.role === 'error' && (message.errorKey === key || message.text === display))) return
+  const errorMessage: Message = {role: 'error', text: display, time: Date.now(), errorKey: key}
+  // 主回合文本只是临时回复时，错误也属于执行过程，必须排在临时回复之前。
+  if (provisionalTaskReplies().length && !parentTaskUi.value.completionShown) insertTaskProgressMessage(errorMessage)
+  else messages.value.push(errorMessage)
+  if (options.scroll !== false) nextTick(() => scrollDown())
+}
+
+/** 后台标签页的 WebSocket 生命周期没有切换全局 refs，直接写入对应快照。 */
+function appendSessionErrorToTab(tabId: string | null | undefined, text: unknown, key: string) {
+  const tab = tabId ? tabSessions.value.find(item => item.id === tabId) : null
+  if (!tab || tab.id === activeTabId.value) {
+    appendSessionError(text, {key})
+    return
+  }
+  const detail = sessionErrorText(text)
+  if (tab.state.messages.some(message => message.role === 'error' && (message.errorKey === key || message.text === detail))) return
+  tab.state.messages.push({role: 'error', text: detail, time: Date.now(), errorKey: key})
+}
+
 function syncTaskActivityMessage({forceNew = false, placeAfterLatestUser = false} = {}) {
-  if (!taskActivity.value.entries.length) return
+  if (!taskActivity.value.entries.length) {
+    // 服务端 idle/终态快照可能只负责收口本地状态；同步移除旧的运行中气泡，
+    // 否则消息列表中的旧对象仍会把“等待 Provider”渲染出来。
+    messages.value = messages.value.filter(message => !(message.role === 'activity' && message.activity?.running))
+    return
+  }
   let message = forceNew ? null : currentActivityMessage()
   if (!message || (!message.activity?.running && taskActivity.value.running && message.activity?.startedAt !== taskActivity.value.startedAt)) {
     message = {role: 'activity', text: '', time: taskActivity.value.startedAt || Date.now(), activity: taskActivity.value}
-    messages.value.push(message)
+    insertTaskProgressMessage(message)
   } else {
     message.activity = taskActivity.value
   }
@@ -779,6 +878,9 @@ function taskStepForEvent(event: any, state: TaskActivityState): {key: string; e
   } else if (type === 'task_auto_continuing') {
     key = `task:auto-continue:${activityEventIdentity(event, String(event?.attempt || state.updatedAt))}`
     entry = latest(item => item.id.startsWith('task:auto-continue:')); title = '正在自动续跑'
+  } else if (type === 'workflow_auto_started') {
+    const id = activityEventIdentity(event)
+    key = `workflow:auto:${id}`; entry = entryById(`workflow:auto:${id}`); title = entry?.title || '已自动启动工作流'
   } else if (type === 'thinking_start') {
     const id = activityEventIdentity(event)
     key = `thinking:start:${id}`; entry = entryById(`thinking:${id}`); title = '开始分析与推理'
@@ -856,7 +958,7 @@ function taskStepForEvent(event: any, state: TaskActivityState): {key: string; e
 function appendTaskActivityStep(event: any) {
   const step = taskStepForEvent(event, taskActivity.value)
   if (!step || messages.value.some(message => message.role === 'task_step' && message.activityStepKey === step.key)) return
-  messages.value.push({
+  insertTaskProgressMessage({
     role: 'task_step',
     text: step.entry.detail || '',
     time: step.entry.completedAt || step.entry.updatedAt || Date.now(),
@@ -866,6 +968,8 @@ function appendTaskActivityStep(event: any) {
 }
 
 function applyTaskActivityEvent(event: any, options: {forceNew?: boolean; placeAfterLatestUser?: boolean} = {}) {
+  // 成功总结已落到聊天底部后，丢弃旧回合迟到的进度事件。
+  if (shouldIgnorePostCompletionEvent(parentTaskUi.value, event)) return
   const wasRunning = taskActivity.value.running
   taskActivity.value = reduceTaskActivity(taskActivity.value, event)
   syncTaskActivityMessage({
@@ -882,6 +986,7 @@ interface TabState {
   connected: boolean
   status: string
   messages: Message[]
+  loadedHistoryTexts: Set<string> | null
   inputText: string
   usage: { input: number; output: number; thinking: number; total: number }
   costTotal: number
@@ -895,6 +1000,7 @@ interface TabState {
   pendingTools: any[]
   pendingPermission: any
   pendingChoice: any
+  resolvedConfirmationIds: Set<string>
   preferenceSuggestions: any[]
   thinkingLevel: string
   permissionMode: string
@@ -924,6 +1030,7 @@ function initialTabState(): TabState {
     connected: false,
     status: 'idle',
     messages: [],
+    loadedHistoryTexts: null,
     inputText: '',
     usage: { input: 0, output: 0, thinking: 0, total: 0 },
     costTotal: 0,
@@ -937,6 +1044,7 @@ function initialTabState(): TabState {
     pendingTools: [],
     pendingPermission: null,
     pendingChoice: null,
+    resolvedConfirmationIds: new Set(),
     preferenceSuggestions: [],
     thinkingLevel: 'auto',
     permissionMode: 'default',
@@ -967,6 +1075,7 @@ function snapshotTabState(): TabState {
     connected: connected.value,
     status: status.value,
     messages: [...messages.value],
+    loadedHistoryTexts: _loadedHistoryTexts ? new Set(_loadedHistoryTexts) : null,
     inputText: inputText.value,
     usage: { ...usage.value },
     costTotal: costTotal.value,
@@ -980,6 +1089,7 @@ function snapshotTabState(): TabState {
     pendingTools: [...pendingTools.value],
     pendingPermission: pendingPermission.value,
     pendingChoice: pendingChoice.value,
+    resolvedConfirmationIds: new Set(resolvedConfirmationIds.value),
     preferenceSuggestions: [...preferenceSuggestions.value],
     thinkingLevel: thinkingLevel.value,
     permissionMode: permissionMode.value,
@@ -1014,6 +1124,7 @@ function restoreTabState(s: TabState) {
   connected.value = s.connected
   status.value = s.status
   messages.value = s.messages.filter(message => !isSyntheticCompactUiMessage(message))
+  _loadedHistoryTexts = s.loadedHistoryTexts ? new Set(s.loadedHistoryTexts) : null
   inputText.value = s.inputText
   usage.value = { ...s.usage }
   costTotal.value = s.costTotal
@@ -1027,6 +1138,7 @@ function restoreTabState(s: TabState) {
   pendingTools.value = s.pendingTools
   pendingPermission.value = s.pendingPermission
   pendingChoice.value = s.pendingChoice
+  resolvedConfirmationIds.value = new Set(s.resolvedConfirmationIds || [])
   preferenceSuggestions.value = Array.isArray(s.preferenceSuggestions) ? s.preferenceSuggestions : []
   thinkingLevel.value = s.thinkingLevel
   suppressPermissionSync = true
@@ -1121,11 +1233,23 @@ function restoreDraftForTab(tab: TabSession): boolean {
   const key = sessionDraftKey(draftIdentity(tab))
   const draft = key ? getSessionDraft(sessionDraftStore, key) : null
   if (!draft || !draft.text.trim() || inputText.value.trim()) return false
+  const taskState = tabTaskState.value || tab.state.taskState
+  if (!shouldRestoreSessionDraft(draft, taskState)) return false
   inputText.value = draft.text
   if (draft.interrupted) {
     messages.value.push({role: 'system', text: '上次任务在这里中断，已恢复未发送内容。请确认后继续发送。', time: Date.now()})
   }
   return true
+}
+
+function clearCompletedTaskDraftForTab(tab: TabSession, taskText: string) {
+  const key = sessionDraftKey(draftIdentity(tab))
+  if (!key) return
+  const draft = getSessionDraft(sessionDraftStore, key)
+  const next = removeMatchingInterruptedSessionDraft(sessionDraftStore, key, taskText)
+  if (next === sessionDraftStore) return
+  if (draft?.text.trim() && inputText.value.trim() === draft.text.trim()) inputText.value = ''
+  persistDraftStore(next)
 }
 
 
@@ -1231,6 +1355,7 @@ async function switchToTab(tabId: string, validateCurrentRuntime = false) {
   const tabSocketActive = !!tab.websocket && (tab.websocket.readyState === WebSocket.OPEN || tab.websocket.readyState === WebSocket.CONNECTING)
   if (tab.state.sessionId && !tabSocketActive) {
     restoreTabState(tab.state)
+    hydrateKnownContextWindowForTab(tab)
     activeProject.value = tab.projectPath
     ws = null  // 切断旧 tab 的 ws 引用，防止 connectWS 误关
     // 校验 session 是否仍存在，避免用已删除的 gatewayUUID resume 导致"一变二"
@@ -1343,6 +1468,7 @@ async function switchToTab(tabId: string, validateCurrentRuntime = false) {
 
   // 恢复保存的状态快照到全局
   restoreTabState(tab.state)
+  hydrateKnownContextWindowForTab(tab)
   activeProject.value = tab.projectPath
   activeSessionId.value = tab.historySessionId
   ws = tab.websocket
@@ -1375,6 +1501,13 @@ function syncCurrentTabState() {
   tab.state = snapshotTabState()
   tab.websocket = ws
   persistWorkspaceShell()
+}
+
+/** 切回旧会话时补齐本地已知的模型窗口，避免历史快照永久停留在未知态。 */
+function hydrateKnownContextWindowForTab(tab: TabSession) {
+  const modelId = tab.state.model || model.value
+  const modelInfo = models.value.find(item => item.id === modelId)
+  if (modelInfo?.contextWindow) applyKnownContextWindow(modelInfo.contextWindow)
 }
 
 function closeTab(tabId: string) {
@@ -1885,16 +2018,19 @@ interface PendingPermission {
 /** 待处理的多选项选择请求 */
 interface PendingChoice {
   requestId: string;
-  question: string;
-  options: { label: string }[];
+  questions: { question: string; answerKey: string; options: { label: string }[] }[];
+  answers: Record<string, string>;
   /** "其他"自定义输入是否激活 */
-  customInputActive: boolean;
+  customInputActive: number | null;
   /** "其他"自定义输入文本 */
   customInputText: string
 }
 
 const pendingPermission = ref<PendingPermission | null>(null)
 const pendingChoice = ref<PendingChoice | null>(null)
+// 已结算请求在当前标签页内保留幂等记录，迟到/重放的 request 不得再次弹窗。
+const resolvedConfirmationIds = ref<Set<string>>(new Set())
+const confirmationSubmitting = ref<string | null>(null)
 const preferenceSuggestions = ref<any[]>([])
 
 // ── Agent 运行记录（内联卡片用，统一 native Task agent 和 workflow agent）──
@@ -1927,6 +2063,8 @@ interface AgentRun {
   fallbackReason?: string | null
   required?: boolean
   eventSource?: 'structured' | 'log'
+  workflowId?: string
+  workflowName?: string
 }
 
 /** 本轮对话中产生的所有 agent 运行记录（内联卡片数据源） */
@@ -1949,6 +2087,24 @@ const hasAgentRuns = computed(() => agentRuns.value.length > 0)
 /** 清空本轮 agent 运行记录（新一轮对话开始时调用） */
 function clearAgentRuns() {
   agentRuns.value = []
+}
+
+/** 切换到没有可复用快照的新会话时，原会话的执行态必须整体隔离。 */
+function resetSessionExecutionState() {
+  tabTaskState.value = null
+  parentTaskUi.value = createParentTaskUiState()
+  sessionLifecycle.value = createSessionLifecycleState()
+  taskActivity.value = createTaskActivityState()
+  pendingTools.value = []
+  pendingPermission.value = null
+  pendingChoice.value = null
+  resolvedConfirmationIds.value = new Set()
+  confirmationSubmitting.value = null
+  preferenceSuggestions.value = []
+  wfRunState.value = null
+  showWfPanel.value = false
+  _pendingResultMessage = null
+  stopTaskDurationTimer()
 }
 
 /** 格式化毫秒时长为可读字符串 */
@@ -2069,6 +2225,26 @@ interface QItem {
   time: number
   attachments?: PendingAttachment[]
   originalText?: string
+}
+
+function normalizeWorkflowAgentStatus(status: unknown): AgentRun['status'] {
+  const value = String(status || '')
+  if (value === 'done' || value === 'completed') return 'done'
+  if (value === 'paused') return 'paused'
+  if (value === 'error' || value === 'failed') return 'error'
+  if (value === 'spawning' || value === 'starting') return 'spawning'
+  return 'running'
+}
+
+function matchesWorkflowEvent(agent: AgentRun, event: any): boolean {
+  if (agent.source !== 'workflow') return false
+  const workflowId = String(event?.workflowId || event?.wfId || '')
+  return !workflowId || !agent.workflowId || agent.workflowId === workflowId
+}
+
+function matchesCurrentWorkflow(event: any): boolean {
+  const workflowId = String(event?.workflowId || event?.wfId || '')
+  return !workflowId || !wfRunState.value?.wfId || wfRunState.value.wfId === workflowId
 }
 
 interface PendingModelContextSwitch {
@@ -2194,8 +2370,12 @@ async function loadProviderModels() {
       if (mr.ok) {
         const {models: dyn} = await mr.json()
         if (Array.isArray(dyn) && dyn.length) {
-          // 动态模型无 name/contextWindow，id 即显示名
-          models.value = dyn.map((m: any) => ({id: m.value || m.id, name: m.displayName || m.value || m.id, contextWindow: undefined}))
+          // 动态模型通常没有 contextWindow；按 ID 合并预置目录，避免覆盖已知窗口。
+          const knownWindows = new Map(models.value.map(item => [item.id, item.contextWindow]))
+          models.value = dyn.map((m: any) => {
+            const id = m.value || m.id
+            return {id, name: m.displayName || id, contextWindow: m.contextWindow || knownWindows.get(id)}
+          })
           if (curModel) model.value = curModel
           else if (!model.value) model.value = models.value[0]?.id || ''
         }
@@ -2211,6 +2391,9 @@ async function loadProviderModels() {
     console.warn('供应商和模型加载失败', error)
     showToast(error?.message || '供应商和模型加载失败', 6000)
   } finally {
+    // 工作区壳可能先于模型目录恢复；目录加载完成后再为当前旧会话补齐窗口。
+    const tab = activeTab.value
+    if (tab) hydrateKnownContextWindowForTab(tab)
     _loadingProviderModels = false
   }
 }
@@ -2598,6 +2781,7 @@ async function _doHandleNewSession(workDir: string, encodedDir?: string, histSes
   // 切换标签页时若已有内存快照，只恢复连接，不清空用户已经看到的气泡。
   // 应用重启或真正新建/侧栏切换历史会话时没有快照，仍按原流程重置并加载磁盘历史。
   if (!preserveExistingState) {
+    resetSessionExecutionState()
     messages.value = []
     _loadedHistoryTexts = null
     usage.value = {input: 0, output: 0, thinking: 0, total: 0}
@@ -2616,13 +2800,16 @@ async function _doHandleNewSession(workDir: string, encodedDir?: string, histSes
   let historyLoadPromise: Promise<boolean> | null = null
   if (encodedDir && histSessionId && !preserveExistingState) {
     tab.historySessionId = histSessionId
-    historyLoadPromise = loadHistory(encodedDir, histSessionId)
+    // Gateway 新 Session ID 尚未返回；历史请求不能绑定当前 tab 里可能即将被替换的旧 runtime ID。
+    historyLoadPromise = loadHistory(encodedDir, histSessionId, 'append', true, true)
   }
   syncCurrentTabState()
 
   try {
     const curModelInfo = models.value.find(m => m.id === model.value)
     const curProvider = providers.value.find((p: any) => p.id === providerId.value)
+    // 模型目录已有上下文窗口时，连接建立前先解除未知态；SDK 快照随后会提供精确值。
+    if (curModelInfo?.contextWindow) applyKnownContextWindow(curModelInfo.contextWindow)
     const body: any = {
       ...buildSessionCreateRequest({workDir, resume: histSessionId, forkFrom}),
       ...buildModelSelectionPayload({
@@ -2661,12 +2848,18 @@ async function _doHandleNewSession(workDir: string, encodedDir?: string, histSes
     if (forkFrom && encodedDir && tab.historySessionId) {
       await loadHistory(encodedDir, tab.historySessionId, 'replace')
     } else if (historyLoadPromise) {
-      await historyLoadPromise
+      const historyLoaded = await historyLoadPromise
+      // 预加载可能与 Gateway 建立/轮换 Session 同时发生；创建完成后再补一次最终读取。
+      if (!historyLoaded && activeTabId.value === tab.id && tab.historySessionId) {
+        await loadHistory(encodeProjectName(tab.projectPath), tab.historySessionId, 'replace', true)
+      }
     }
     gitInfo.value = data.gitInfo || null
     sessionStartTime.value = Date.now()
     startSessionDurationTimer()
     loadUsage(data.sessionId)  // resume 时恢复已记忆的 token/费用
+    // 旧版本可能只保存了 maxTokens=0；恢复费用后再次用当前模型目录补齐窗口。
+    if (curModelInfo?.contextWindow) applyKnownContextWindow(curModelInfo.contextWindow)
     await connectWS(data.sessionId)
     restoreDraftForTab(tab)
     syncCurrentTabState()  // 将会话 ID + WebSocket 写回 tab
@@ -2679,7 +2872,8 @@ async function _doHandleNewSession(workDir: string, encodedDir?: string, histSes
     loadCheckpoints()                    // 预加载记录点，count badge 初始就能显示
     // 仅新建会话时刷新项目列表（新 .jsonl 需要出现在侧栏）；resume 已有会话时不刷，
     // 否则 scanProjects 按 mtime 重排会导致被点击的 session 跳到第一位
-    if (!histSessionId || forkFrom) await loadProjects()
+    // 项目扫描可能遍历大量 transcript；不能让它延长会话的 connecting 状态。
+    if (!histSessionId || forkFrom) void loadProjects()
   } catch (e: any) {
     const msg = e.message || String(e)
     if (!sessionCreated) {
@@ -2871,7 +3065,7 @@ async function handleNudge(msg: any) {
 
 /** 加载历史会话的消息记录（恢复会话时展示，仅文本角色，不含思考/工具） */
 let _loadHistorySeq = 0
-async function loadHistory(encodedDir: string, sId: string, mode: 'append' | 'replace' = 'append'): Promise<boolean> {
+async function loadHistory(encodedDir: string, sId: string, mode: 'append' | 'replace' = 'append', allowGatewaySessionChange = false, suppressError = false): Promise<boolean> {
   const seq = ++_loadHistorySeq
   const ownerTabId = activeTabId.value
   const ownerTab = tabSessions.value.find(tab => tab.id === ownerTabId)
@@ -2879,7 +3073,7 @@ async function loadHistory(encodedDir: string, sId: string, mode: 'append' | 're
     id: ownerTabId,
     projectPath: ownerTab?.projectPath || activeProject.value || '',
     historySessionId: sId,
-    gatewaySessionId: ownerTab?.state.sessionId || sessionId.value,
+    gatewaySessionId: allowGatewaySessionChange ? null : (ownerTab?.state.sessionId || sessionId.value),
   }
   const stillOwned = () => {
     const current = tabSessions.value.find(tab => tab.id === activeTabId.value)
@@ -2891,7 +3085,10 @@ async function loadHistory(encodedDir: string, sId: string, mode: 'append' | 're
     })
   }
   try {
-    const res = await fetch(`${GW}/api/projects/${encodedDir}/sessions/${sId}/messages`)
+    const primaryUrl = `${GW}/api/sessions/${encodeURIComponent(sId)}/messages`
+    let res = await fetch(primaryUrl)
+    // 旧 Gateway 没有 ID 主定位路由时，保留一次项目提示兼容回退。
+    if (res.status === 404) res = await fetch(`${GW}/api/projects/${encodedDir}/sessions/${encodeURIComponent(sId)}/messages`)
     if (seq !== _loadHistorySeq || !stillOwned()) return false
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const data = await res.json()
@@ -2924,7 +3121,7 @@ async function loadHistory(encodedDir: string, sId: string, mode: 'append' | 're
   } catch (e) {
     if (seq !== _loadHistorySeq || !stillOwned()) return false
     console.error('[loadHistory] 请求历史消息失败:', e)
-    messages.value.push({role: 'error', text: t('err.historyLoad'), time: Date.now()})
+    if (!suppressError) messages.value.push({role: 'error', text: t('err.historyLoad'), time: Date.now()})
   }
   scrollDown()
   return false
@@ -2992,6 +3189,10 @@ async function connectControlWS(forceRefresh = false) {
     controlWS = null
     if (_controlWSStopped) return
     _ctrlRetryCount++
+    appendSessionError(`消息注入控制通道已断开（${event.code || 1006}），正在重连`, {
+      key: `control-ws-close:${event.code || 1006}`,
+      prefix: '连接异常',
+    })
     showToast('消息注入控制通道已断开，正在重连...', 5000)
     const authFailed = event.code === 4003 || event.code === 1006
     const retryDelay = authFailed ? 250 : _ctrlReconnectDelay
@@ -3006,6 +3207,7 @@ async function connectControlWS(forceRefresh = false) {
   }
   thisWs.onerror = () => {
     dispatchBridgeNotice(classifyBridgeFailure({source: 'websocket', path: '/ws/control', serverCode: 'CONTROL_CHANNEL_ERROR'}))
+    appendSessionError('消息注入控制通道发生异常，正在重连', {key: 'control-ws-error', prefix: '连接异常'})
     thisWs.close()
   }
 }
@@ -3149,7 +3351,8 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
           msg = {...msg, tool_use_id: streamTool.tool_use_id, tool_name: streamTool.tool_name}
         }
       }
-      applyTaskActivityEvent(msg)
+      const lateFailureAfterSuccess = isLateFailureAfterSuccess(parentTaskUi.value, msg)
+      if (!lateFailureAfterSuccess) applyTaskActivityEvent(msg)
       const lifecycleBeforeEvent = sessionLifecycle.value
       sessionLifecycle.value = reduceSessionLifecycle(sessionLifecycle.value, msg)
       switch (msg.type) {
@@ -3181,6 +3384,20 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         break
       }
       case 'session_lifecycle_snapshot': {
+        if (msg.coordinator?.status === 'waiting_user') {
+          applyTaskActivityEvent({
+            type: 'task_coordinator_event',
+            taskId: msg.coordinator.taskId,
+            turnId: msg.coordinator.turnId,
+            status: msg.coordinator.status,
+            phase: msg.coordinator.phase,
+            revision: msg.coordinator.revision,
+            stepId: msg.coordinator.stepId,
+            detail: msg.coordinator.detail,
+            verification: msg.coordinator.verification,
+            event: 'task/snapshot',
+          })
+        }
         if (msg.task && typeof msg.task === 'object') {
           tabTaskState.value = msg.task as PersistedTaskState
           if (typeof msg.task.model === 'string' && msg.task.model) runtimeModel.value = msg.task.model
@@ -3207,13 +3424,22 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         } else if (!msg.active) {
           wfRunState.value = null
         }
+        if (['failed', 'incomplete', 'interrupted', 'review_paused'].includes(String(msg.task?.status || ''))) {
+          const lifecycleDetail = msg.task?.detail || msg.task?.error || `任务状态：${String(msg.task?.status)}`
+          appendSessionError(
+            lifecycleDetail,
+            {key: `lifecycle:${String(msg.task?.status)}:${String(msg.task?.sequence || msg.sequence || msg.task?.updatedAt || '')}:${sessionErrorText(lifecycleDetail)}`, scroll: fg},
+          )
+        }
         status.value = msg.active === true ? 'thinking' : 'idle'
+        if (msg.active !== true && msg.task && typeof msg.task === 'object') restoreDraftForTab(tab)
         if (msg.active !== true && msg.capabilities?.canSend === true && fg) {
           nextTick(() => { void flushMsgQueue() })
         }
         break
       }
       case 'session_state_snapshot': {
+        if (msg.contextUsage && typeof msg.contextUsage === 'object') applyContextUsageEvent(msg.contextUsage)
         const wasThinking = status.value === 'thinking'
         if (['default', 'acceptEdits', 'plan', 'bypassPermissions'].includes(String(msg.permissionMode))) {
           suppressPermissionSync = true
@@ -3227,14 +3453,23 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
           parentTaskUi.value = mergeParentTaskSnapshot(parentTaskUi.value, msg.taskState)
           if (persistedStatus === 'succeeded') clearStaleContinuationActions()
         }
-        if (fg && Array.isArray(msg.pendingConfirmations) && msg.pendingConfirmations.length > 0) {
-          const pending = msg.pendingConfirmations.find((item: any) => Number(item.expiresAt || 0) > Date.now())
+        // 后台 tab 也必须保存待确认内容；onmessage 已将全局 refs 临时切换到该 tab 快照，
+        // 切回前台时才能恢复问题和选项，而不是只留下“等待方案选择”状态。
+        if (Array.isArray(msg.pendingConfirmations)) {
+          confirmationSubmitting.value = null
+          const liveRequestIds = new Set(msg.pendingConfirmations.map((item: any) => String(item?.requestId || '')).filter(Boolean))
+          resolvedConfirmationIds.value = new Set([...resolvedConfirmationIds.value].filter(id => !liveRequestIds.has(id)))
+          const pending = msg.pendingConfirmations.find((item: any) => Number(item.expiresAt || 0) > Date.now()
+            && !resolvedConfirmationIds.value.has(String(item.requestId)))
           if (pending?.type === 'choice' && pendingChoice.value?.requestId !== pending.requestId) {
+            const questions = Array.isArray(pending.questions) && pending.questions.length
+              ? pending.questions.map((q: any, index: number) => ({...q, answerKey: String(q?.answerKey || `q-${index}`)}))
+              : [{question: String(pending.question || `请确认工具 ${pending.toolName || ''}`), answerKey: 'q-0', options: Array.isArray(pending.options) ? pending.options : []}]
             pendingChoice.value = {
               requestId: String(pending.requestId),
-              question: String(pending.question || `请确认工具 ${pending.toolName || ''}`),
-              options: Array.isArray(pending.options) ? pending.options : [],
-              customInputActive: false,
+              questions,
+              answers: pending.answers && typeof pending.answers === 'object' ? {...pending.answers} : {},
+              customInputActive: null,
               customInputText: '',
             }
           } else if (pending?.type === 'permission' && pendingPermission.value?.requestId !== pending.requestId) {
@@ -3243,33 +3478,27 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
               toolName: String(pending.toolName || ''),
               summary: `工具：${String(pending.toolName || '未知工具')}`,
             }
+          } else if (!pending && (pendingChoice.value || pendingPermission.value)) {
+            // 快照是 Gateway 当前 pending 集合的权威值；重连期间若错过 resolved 事件，不能继续展示已失效的按钮。
+            pendingChoice.value = null
+            pendingPermission.value = null
           }
         }
-        status.value = msg.generating === true || ['running', 'reviewing', 'changes_required', 'fixing'].includes(String(msg.taskState?.status || ''))
-          ? 'thinking'
-          : 'idle'
-        if (status.value === 'thinking' && !taskActivity.value.running) {
-          const persistedStatus = String(msg.taskState?.status || 'running')
-          const snapshotEvent = persistedStatus === 'reviewing'
-            ? {type: 'task_reviewing', detail: msg.taskState?.detail}
-            : persistedStatus === 'changes_required'
-              ? {type: 'task_changes_required', detail: msg.taskState?.detail}
-            : persistedStatus === 'fixing'
-              ? {type: 'task_fixing', detail: msg.taskState?.detail}
-              : {type: 'task_started', startedAt: msg.taskState?.startedAt}
-          applyTaskActivityEvent(snapshotEvent)
-        } else if (status.value === 'idle' && taskActivity.value.running) {
-          const persistedStatus = String(msg.taskState?.status || 'idle')
-          if (persistedStatus === 'succeeded') {
-            applyTaskActivityEvent({type: 'task_completed', detail: msg.taskState?.detail})
-          } else if (persistedStatus === 'stopped') {
-            applyTaskActivityEvent({type: 'generation_stopped'})
-          } else if (['failed', 'incomplete', 'interrupted', 'review_paused'].includes(persistedStatus)) {
-            applyTaskActivityEvent({type: 'task_failed', detail: msg.taskState?.detail})
-          } else {
-            taskActivity.value = createTaskActivityState()
-          }
+        const snapshotStatus = String(msg.taskState?.status || 'idle')
+        const snapshotTerminal = ['succeeded', 'stopped', 'failed', 'incomplete', 'interrupted', 'review_paused'].includes(snapshotStatus)
+        if (['failed', 'incomplete', 'interrupted', 'review_paused'].includes(snapshotStatus)) {
+          const snapshotDetail = msg.taskState?.detail || msg.taskState?.error || `任务状态：${snapshotStatus}`
+          appendSessionError(
+            snapshotDetail,
+            {key: `state-snapshot:${snapshotStatus}:${String(msg.taskState?.updatedAt || msg.sequence || '')}:${sessionErrorText(snapshotDetail)}`, scroll: fg},
+          )
         }
+        const snapshotGenerating = !snapshotTerminal && (msg.generating === true
+          || ['reviewing', 'changes_required', 'fixing'].includes(snapshotStatus))
+        status.value = snapshotGenerating ? 'thinking' : 'idle'
+        if (!snapshotGenerating) restoreDraftForTab(tab)
+        taskActivity.value = reconcileTaskActivitySnapshot(taskActivity.value, msg)
+        syncTaskActivityMessage()
         if (msg.taskState?.status === 'interrupted' && msg.taskState?.resumable && fg && !wasThinking
             && !messages.value.some(item => item.taskResult?.resumable && item.taskResult.continuationReason === 'execution_error')) {
           const draftKey = sessionDraftKey(draftIdentity(tab))
@@ -3356,6 +3585,15 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         if (fg) showToast(msg.message || '偏好保存失败', 5000)
         break
 
+      case 'setting_rejected': {
+        const detail = msg.code === 'invalid_permission_mode'
+          ? '权限模式无效，设置未应用'
+          : String(msg.message || '设置未应用')
+        appendSessionError(detail, {key: `setting-rejected:${String(msg.code || detail)}`, scroll: fg, prefix: '设置失败'})
+        if (fg) showToast(detail, 5000)
+        break
+      }
+
       case 'message_duplicate': {
         const messageId = String(msg.messageId || '')
         const duplicateInput = pendingInputTexts.get(messageId)
@@ -3394,7 +3632,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
             : msg.code === 'input_queue_full'
               ? '当前会话队列已满，请稍后重试'
               : `消息未接受${msg.code ? `（${msg.code}）` : ''}`
-        messages.value.push({role: 'error', text: reason, time: Date.now()})
+        appendSessionError(reason, {key: `message-rejected:${messageId || msg.code || reason}`})
         if (fg) showToast(reason)
         break
       }
@@ -3412,16 +3650,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
           if (fg) activeSessionId.value = historySessionId
 
         }
-        if (msg.contextWindow) {
-          const provisional = normalizeContextUiState({
-            totalTokens: usage.value.total,
-            maxTokens: msg.contextWindow,
-            rawMaxTokens: msg.contextWindow,
-            configuredSafetyCap: contextSafetyCap.value,
-          })
-          maxTokens.value = provisional.maxTokens || 0
-          rawMaxTokens.value = provisional.rawMaxTokens || 0
-        }
+        if (msg.contextWindow) applyKnownContextWindow(msg.contextWindow)
         if (msg.pricing) pricing.value = msg.pricing
         break
       }
@@ -3445,17 +3674,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
       }
 
       case 'context_usage': {
-        const normalized = normalizeContextUiState({...msg, configuredSafetyCap: contextSafetyCap.value})
-        usage.value.total = normalized.totalTokens
-        maxTokens.value = normalized.maxTokens || 0
-        rawMaxTokens.value = normalized.rawMaxTokens || normalized.maxTokens || 0
-        contextPercent.value = normalized.percentage || 0
-        contextPercentKnown.value = normalized.percentage !== null
-        if (normalized.percentage !== null && normalized.percentage >= 80 && normalized.percentage < 90 && contextWarningLevel < 80) {
-          contextWarningLevel = 80
-          messages.value.push({role: 'system', text: `上下文已使用 ${normalized.percentage}%，接近自动压缩阈值。`, time: Date.now()})
-        }
-        saveUsage()
+        applyContextUsageEvent(msg)
         break
       }
 
@@ -3563,7 +3782,11 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
               })
             } else {
               const tk = estimateTokens(assistantText)
-              messages.value.push({role: 'assistant', text: assistantText, time: messageTime, tools, tokens: tk, cost: estCost(tk)})
+              messages.value.push({
+                role: 'assistant', text: assistantText, time: messageTime, tools, tokens: tk, cost: estCost(tk),
+                provisionalTaskReply: taskActivity.value.running || parentTaskUi.value.phase === 'running'
+                  || parentTaskUi.value.phase === 'reviewing' || parentTaskUi.value.phase === 'fixing',
+              })
             }
           } else if (block.type === 'thinking' && block.thinking) {
             turnThinkingText += block.thinking  // 累计本轮思考文本, result 时估算思考 token
@@ -3737,8 +3960,8 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         break
 
       case 'permission_request':
-        // 后台 tab 的权限确认不弹 UI 横幅，避免污染前台
-        if (!fg) break
+        if (resolvedConfirmationIds.value.has(String(msg.requestId))) break
+        if (pendingPermission.value?.requestId === String(msg.requestId)) break
         // Claude 请求工具执行权限 → 弹出确认横幅
         pendingPermission.value = {
           requestId: msg.requestId,
@@ -3748,24 +3971,42 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         break
 
       case 'choice_request': {
-        // 后台 tab 的选择请求不弹 UI 横幅
-        if (!fg) break
+        if (resolvedConfirmationIds.value.has(String(msg.requestId))) break
+        if (pendingChoice.value?.requestId === String(msg.requestId)) break
+        // 后台 tab 同样写入自己的快照；只有当前前台 tab 会实际渲染横幅。
         // Claude 请求多选项选择 → 弹出选择横幅
-        const q = msg.questions?.[0] || {}
+        const questions = Array.isArray(msg.questions) && msg.questions.length
+          ? msg.questions.map((q: any, index: number) => ({question: String(q?.question || ''), answerKey: String(q?.answerKey || `q-${index}`), options: Array.isArray(q?.options) ? q.options : []}))
+          : [{question: t('ws.choose'), answerKey: 'q-0', options: []}]
         pendingChoice.value = {
           requestId: msg.requestId,
-          question: q.question || t('ws.choose'),
-          options: q.options || [],
-          customInputActive: false,
+          questions,
+          answers: msg.answers && typeof msg.answers === 'object' ? {...msg.answers} : {},
+          customInputActive: null,
           customInputText: ''
         }
         break
       }
 
+      case 'confirmation_response':
+        if (!msg.requestId) break
+        if (msg.ok === true) {
+          resolvedConfirmationIds.value.add(String(msg.requestId))
+          if (pendingPermission.value?.requestId === msg.requestId) pendingPermission.value = null
+          if (pendingChoice.value?.requestId === msg.requestId) pendingChoice.value = null
+          confirmationSubmitting.value = null
+          messages.value.push({role: 'system', text: '确认已提交，AI 正在继续执行', time: Date.now()})
+        } else {
+          confirmationSubmitting.value = null
+          showToast(msg.message || '确认请求已失效或已由其他端处理', 5000)
+        }
+        break
       case 'confirmation_resolved':
-        // 另一通道（如微信）已处理该确认请求 → 关闭本地弹框，避免重复操作
+        // 另一通道（如微信）已处理该确认请求，或 Gateway 广播结算结果。
+        if (msg.requestId) resolvedConfirmationIds.value.add(String(msg.requestId))
         if (pendingPermission.value?.requestId === msg.requestId) pendingPermission.value = null
         if (pendingChoice.value?.requestId === msg.requestId) pendingChoice.value = null
+        if (confirmationSubmitting.value === msg.requestId) confirmationSubmitting.value = null
         break
 
       case 'result': {
@@ -3779,16 +4020,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         const resultModelUsage = msg.modelUsage && typeof msg.modelUsage === 'object'
           ? (msg.modelUsage[model.value] || Object.values(msg.modelUsage)[0]) as any
           : null
-        if (resultModelUsage?.contextWindow) {
-          const resolved = normalizeContextUiState({
-            totalTokens: usage.value.total,
-            maxTokens: resultModelUsage.contextWindow,
-            rawMaxTokens: resultModelUsage.contextWindow,
-            configuredSafetyCap: contextSafetyCap.value,
-          })
-          maxTokens.value = resolved.maxTokens || 0
-          rawMaxTokens.value = resolved.rawMaxTokens || 0
-        }
+        if (resultModelUsage?.contextWindow) applyKnownContextWindow(resultModelUsage.contextWindow)
         const taskResult = normalizeTaskResult(msg)
         const reduced = reduceParentTaskUi(parentTaskUi.value, msg)
         parentTaskUi.value = reduced.state
@@ -3813,12 +4045,20 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         }
         _pendingResultMessage = resultMessage
         if (taskResult.outcome !== 'succeeded' && originalTask) {
-          saveDraftForTab(activeTab.value, originalTask, true)
+          // 后台标签页处理事件时全局 ref 已临时切换到该 tab；草稿归属必须使用事件所属 tab，不能写入前台 tab。
+          saveDraftForTab(tab, originalTask, true)
         }
         if (msg.usage) {
           usage.value.input = inp
           usage.value.thinking = think
           usage.value.output = pureOut
+          // 无 context_usage 能力时，以 Provider 首轮输入规模兜底，避免圆环永久停留在未知。
+          // 若初始化只提供了窗口，首次 result 也要把 0% 推进到可见占用；真实快照到达后不覆盖它。
+          if (maxTokens.value > 0 && (!contextPercentKnown.value || contextPercent.value === 0)) {
+            usage.value.total = Math.max(usage.value.total, inp + rawOut)
+            contextPercent.value = Math.min(100, Math.round(usage.value.total / maxTokens.value * 100))
+            contextPercentKnown.value = true
+          }
           const pi = pricing.value?.inputPrice || 0
           const po = pricing.value?.outputPrice || 0
           const cost = (inp / 1e6) * pi + (rawOut / 1e6) * po
@@ -3835,6 +4075,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
 
       case 'task_reviewing':
       case 'task_started':
+      case 'task_write_delegated':
       case 'primary_completed':
       case 'task_changes_required':
       case 'task_fixing':
@@ -3849,14 +4090,17 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
           if (msg.type === 'task_started') status.value = 'thinking'
         } else if (msg.type === 'task_completed') {
           if (!reduced.showCompletion) break
+          const completedTask = lastUserMessage || [...messages.value].reverse().find(item => item.role === 'user')?.text || ''
+          clearCompletedTaskDraftForTab(tab, completedTask)
           // Completion Gate 已收口父任务；任何旧 Workflow 投影都不能继续锁住输入区。
           wfRunState.value = null
           const totalDurationMs = Number(msg.durationMs ?? msg.taskState?.durationMs)
             || (taskActivity.value.startedAt ? Math.max(0, Date.now() - taskActivity.value.startedAt) : 0)
+          const provisionalReplies = removeProvisionalTaskReplies()
           const terminalReply = selectSucceededTaskSummary({
             reply: msg.reply,
             finalReplyText: msg.taskState?.finalReplyText || tabTaskState.value?.finalReplyText,
-          })
+          }) || normalizeAssistantText(provisionalReplies.at(-1)?.text)
           // SDK result 是中间状态，不是父任务最终总结；成功终态到来时必须丢弃它。
           _pendingResultMessage = null
           if (terminalReply) {
@@ -3883,12 +4127,21 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
             if (showFilePanel.value) loadFileTree()
             void flushMsgQueue()
           }
+        } else if (msg.type === 'task_write_delegated') {
+          status.value = 'thinking'
+          if (fg) syncPetState('thinking', {message: '等待主任务写入', bubble: msg.detail || '只读 Agent 已提交写入请求，主任务将继续处理'})
         } else if (msg.type === 'task_reviewing' || msg.type === 'task_changes_required' || msg.type === 'task_fixing') {
           status.value = 'thinking'
           if (fg) syncPetState('thinking', {message: msg.detail || '正在继续处理', bubble: msg.detail || '任务仍在进行中'})
         } else {
           const totalDurationMs = Number(msg.durationMs ?? msg.taskState?.durationMs)
             || (taskActivity.value.startedAt ? Math.max(0, Date.now() - taskActivity.value.startedAt) : 0)
+          const terminalDetail = msg.detail || msg.error || msg.message || t('sys.taskIncompleteShort')
+          appendSessionError(terminalDetail, {
+            key: `task-terminal:${msg.type}:${String(msg.taskId || msg.turnId || msg.sequence || msg.taskState?.updatedAt || '')}`,
+            scroll: fg,
+            prefix: msg.type === 'task_review_paused' ? '任务已暂停' : msg.type === 'task_verification_inconclusive' ? '任务验证未确定' : '任务未完成',
+          })
           if (_pendingResultMessage && shouldShowPendingResultForTerminal({
             terminalType: msg.type,
             pendingOutcome: _pendingResultMessage.taskResult?.outcome,
@@ -3909,6 +4162,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
 
       case 'generation_stopped':
         // Gateway 可能为同一停止操作逐条取消排队输入；只有携带主任务状态的终止事件生成结果气泡。
+        if (lateFailureAfterSuccess) break
         if (!msg.taskState && !msg.durationMs) break
         if (msg.taskState && typeof msg.taskState === 'object') tabTaskState.value = msg.taskState as PersistedTaskState
         // 主任务停止会先于 Workflow 子 Agent 的异步终止事件到达；
@@ -3934,8 +4188,10 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         status.value = 'idle'
         break
 
+      case 'stream_error':
       case 'error': {
         // SDK 错误：清空待处理工具，显示错误消息。同时清理 agent 追踪、turn 标记。
+        if (lateFailureAfterSuccess) break
         pendingTools.value = []
         const eventTaskState = msg.taskState && typeof msg.taskState === 'object' ? msg.taskState as PersistedTaskState : null
         const eventStatus = String(eventTaskState?.status || '')
@@ -3943,31 +4199,40 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         const resumableFromState = terminalTaskState
           ? eventStatus !== 'succeeded' && eventTaskState?.resumable === true
           : Boolean(tab.historySessionId)
-        messages.value.push({
-          role: eventStatus === 'succeeded' ? 'system' : 'error',
-          text: msg.message,
-          time: Date.now(),
-          taskResult: {
-            outcome: eventStatus === 'succeeded' ? 'succeeded' : 'failed',
-            continuationReason: eventStatus === 'succeeded' ? null : 'execution_error',
-            resumable: resumableFromState,
-            originalTask: lastUserMessage,
-            durationMs: Number(msg.durationMs ?? msg.taskState?.durationMs)
-              || (taskActivity.value.startedAt ? Math.max(0, Date.now() - taskActivity.value.startedAt) : 0),
-          },
-        })
+        const detail = msg.message || msg.error || msg.detail || (msg.type === 'stream_error' ? '响应流中断' : '会话执行异常')
+        if (eventStatus === 'succeeded') {
+          appendSessionError(detail, {key: `late-error:${msg.type}:${String(msg.taskId || msg.turnId || msg.sequence || '')}`, prefix: '收到延迟异常', scroll: fg})
+        } else {
+          const errorKey = `session-error:${msg.type}:${String(msg.taskId || msg.turnId || msg.sequence || msg.requestId || '')}`
+          if (!messages.value.some(item => item.role === 'error' && item.errorKey === errorKey)) {
+            messages.value.push({
+              role: 'error',
+              text: sessionErrorText(detail),
+              time: Date.now(),
+              errorKey,
+              taskResult: {
+                outcome: 'failed',
+                continuationReason: 'execution_error',
+                resumable: resumableFromState,
+                originalTask: lastUserMessage,
+                durationMs: Number(msg.durationMs ?? msg.taskState?.durationMs)
+                  || (taskActivity.value.startedAt ? Math.max(0, Date.now() - taskActivity.value.startedAt) : 0),
+              },
+            })
+          }
+        }
         tabTaskState.value = eventTaskState || {
           status: 'interrupted',
           outcome: 'failed',
           continuationReason: 'execution_error',
           resumable: Boolean(tab.historySessionId),
-          detail: String(msg.message || ''),
+          detail: sessionErrorText(detail),
           updatedAt: Date.now(),
         }
         status.value = 'idle'
-        applyTaskActivityEvent({
-          type: eventStatus === 'succeeded' ? 'task_completed' : 'task_failed',
-          detail: msg.message,
+          applyTaskActivityEvent({
+            type: eventStatus === 'succeeded' ? 'task_completed' : 'task_failed',
+          detail,
         })
         if (eventStatus === 'succeeded') {
           // 断流错误晚于成功聚合态到达时，历史错误气泡不能继续提供恢复按钮。
@@ -3976,10 +4241,10 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         if (fg) void flushMsgQueue()
         if (fg) {
           syncPetState(eventStatus === 'succeeded' ? 'success' : 'error', {
-            message: msg.message?.slice(0, 40),
+            message: sessionErrorText(detail).slice(0, 40),
             bubble: eventStatus === 'succeeded'
               ? petPick(BUBBLE_SUCCESS, myProject)
-              : petPick(BUBBLE_ERROR_SDK, myProject) + (msg.message?.slice(0, 50) || ''),
+              : petPick(BUBBLE_ERROR_SDK, myProject) + sessionErrorText(detail).slice(0, 50),
           })
           setTimeout(() => { syncPetState('idle'); petBubble.value = '' }, 3000)
         }
@@ -4070,6 +4335,27 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         break
       }
 
+      case 'agent_error':
+      case 'subagent_error': {
+        if (shouldIgnorePostCompletionEvent(parentTaskUi.value, msg)) break
+        const run = agentRuns.value.find(ag =>
+          (msg.toolUseId && ag.toolUseId === msg.toolUseId) ||
+          (msg.agentId && ag.id === msg.agentId) ||
+          (msg.id && ag.id === msg.id)
+        )
+        if (run) {
+          run.status = 'error'
+          run.doneTime = msg.ts || Date.now()
+          run.progress = sessionErrorText(msg.error || msg.message || msg.detail || 'Agent 执行失败')
+        }
+        appendSessionError(msg.error || msg.message || msg.detail || 'Agent 执行失败', {
+          key: `agent-error:${String(msg.toolUseId || msg.agentId || msg.id || msg.requestId || msg.ts || '')}`,
+          scroll: fg,
+          prefix: 'Agent 执行失败',
+        })
+        break
+      }
+
       case 'subagent_done': {
         const tgt = msg.agentType || msg.agentId
         for (const ag of agentRuns.value) {
@@ -4092,45 +4378,53 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
 
         // ── WS 重连时后端推送的 workflow/agent 运行态快照 ──
       case 'workflow_state_snapshot':
-        wfRunState.value = {
-          name: msg.name, status: msg.status, phases: msg.phases || [], currentPhase: msg.currentPhase || '',
-          logs: [], agents: msg.agents || [], tokenSpent: msg.tokenSpent || 0, wfId: msg.wfId,
-          startedAt: msg.startedAt,
-        }
-        // 恢复 agentRuns — 将快照中的 agent 注入内联卡片
-        for (const ag of (msg.agents || [])) {
-          const existing = agentRuns.value.find(a => a.id === ag.id && a.source === 'workflow')
-          if (!existing) {
+      case 'workflow_states_snapshot': {
+        const workflows = msg.type === 'workflow_states_snapshot' && Array.isArray(msg.workflows) ? msg.workflows : [msg]
+        const current = msg.currentWorkflow || workflows[0] || null
+        wfRunState.value = current ? {
+          name: current.name, status: current.status, phases: current.phases || [], currentPhase: current.currentPhase || '',
+          logs: [], agents: current.agents || [], tokenSpent: current.tokenSpent || 0, wfId: current.wfId,
+          startedAt: current.startedAt,
+        } : null
+        agentRuns.value = agentRuns.value.filter(agent => agent.source !== 'workflow')
+        for (const workflow of workflows) {
+          for (const ag of (workflow.agents || [])) {
+            const status = normalizeWorkflowAgentStatus(ag.status)
             agentRuns.value.push({
               id: ag.id,
               agentType: ag.agentType || ag.id,
               description: ag.description || '',
-              status: 'running',
-              spawnTime: Date.now(),
-              startTime: Date.now(),
-              doneTime: 0,
-              progress: '',
+              status,
+              spawnTime: workflow.startedAt || Date.now(),
+              startTime: status === 'spawning' ? 0 : (workflow.startedAt || Date.now()),
+              doneTime: status === 'done' || status === 'error' ? Date.now() : 0,
+              progress: ag.progress || '',
               source: 'workflow',
               currentTool: '',
               currentToolElapsed: 0,
+              workflowId: workflow.wfId,
+              workflowName: workflow.name,
             })
           }
         }
         break
+      }
 
         // ── Workflow 事件 ──
       case 'workflow_started':
+      case 'workflow_auto_started':
         wfRunState.value = {
           name: msg.name, status: 'running', phases: msg.phases || [], currentPhase: '',
           logs: [], agents: [], tokenSpent: 0, wfId: msg.workflowId,
         }
         showWfPanel.value = true
         // 新 workflow 开始: 清理前一轮的 workflow agent 记录
-        agentRuns.value = agentRuns.value.filter(a => a.source !== 'workflow')
+        agentRuns.value = agentRuns.value.filter(a => a.source !== 'workflow'
+          || (!!msg.workflowId && a.workflowId !== msg.workflowId))
         break
 
       case 'workflow_resumed':
-        if (wfRunState.value) {
+        if (wfRunState.value && matchesCurrentWorkflow(msg)) {
           wfRunState.value.status = 'running'
           // 恢复所有 paused 的 agent 为 running
           for (const a of wfRunState.value.agents) {
@@ -4139,22 +4433,22 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         }
         // 恢复 agentRuns 中的所有 paused workflow agent
         for (const ag of agentRuns.value) {
-          if (ag.source === 'workflow' && ag.status === 'paused') {
+          if (matchesWorkflowEvent(ag, msg) && ag.status === 'paused') {
             ag.status = 'running'
           }
         }
-        showWfPanel.value = true
+        if (matchesCurrentWorkflow(msg)) showWfPanel.value = true
         break
 
       case 'workflow_phase':
-        if (wfRunState.value) {
+        if (wfRunState.value && matchesCurrentWorkflow(msg)) {
           wfRunState.value.currentPhase = msg.phase
           wfRunState.value.phases = msg.phases || wfRunState.value.phases
         }
         break
 
       case 'workflow_agent_started': {
-        const existing = agentRuns.value.find(a => a.id === msg.id && a.source === 'workflow')
+        const existing = agentRuns.value.find(a => a.id === msg.id && matchesWorkflowEvent(a, msg))
         const metadata = {
           agentType: msg.agentType || msg.role || msg.id || 'Agent',
           description: msg.task || '',
@@ -4178,27 +4472,39 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
             status: 'running', spawnTime: msg.ts || Date.now(), startTime: msg.ts || Date.now(), doneTime: 0,
             progress: '', source: 'workflow', currentTool: '', currentToolElapsed: 0,
             eventSource: 'structured',
+            workflowId: msg.workflowId || wfRunState.value?.wfId,
+            workflowName: msg.name || wfRunState.value?.name,
           })
         }
         break
       }
 
       case 'workflow_agent_done':
+      case 'workflow_agent_blocked':
       case 'workflow_agent_error': {
-        const run = agentRuns.value.find(a => a.id === msg.id && a.source === 'workflow')
+        const run = agentRuns.value.find(a => a.id === msg.id && matchesWorkflowEvent(a, msg))
         if (run) {
-          run.status = msg.type === 'workflow_agent_done' ? 'done' : (msg.status === 'paused' ? 'paused' : 'error')
-          run.doneTime = msg.type === 'workflow_agent_done' ? (msg.ts || Date.now()) : 0
+          run.status = msg.type === 'workflow_agent_done' ? 'done' : msg.type === 'workflow_agent_blocked' ? 'blocked' : (msg.status === 'paused' ? 'paused' : 'error')
+          run.doneTime = msg.type === 'workflow_agent_done' || msg.type === 'workflow_agent_blocked' ? (msg.ts || Date.now()) : 0
           run.eventSource = 'structured'
           if (msg.error) run.progress = msg.error
           if (msg.actualModel) run.actualModel = msg.actualModel
           if (msg.phase) run.phase = msg.phase
         }
+        if (msg.type === 'workflow_agent_blocked') {
+          if (fg) syncPetState('thinking', {message: '等待主任务写入', bubble: msg.agentResult?.writeRequest?.reason || '只读 Agent 已提交写入请求'})
+        } else if (msg.type === 'workflow_agent_error') {
+          if (shouldIgnorePostCompletionEvent(parentTaskUi.value, msg)) break
+          appendSessionError(
+            msg.error || msg.message || msg.detail || `Agent ${String(msg.id || msg.agentLabel || 'unknown')} 执行失败`,
+            {key: `workflow-agent-error:${String(msg.id || msg.agentLabel || msg.requestId || msg.ts || '')}`, scroll: fg, prefix: 'Workflow Agent 执行失败'},
+          )
+        }
         break
       }
 
       case 'workflow_log':
-        if (wfRunState.value) {
+        if (wfRunState.value && matchesCurrentWorkflow(msg)) {
           wfRunState.value.logs.push({
             time: Date.now(),
             phase: msg.phase || wfRunState.value.currentPhase,
@@ -4217,7 +4523,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
             const typeMatch = msg.message?.match(/\(type=([\w-]+)\)/)
             const resolvedType = typeMatch ? typeMatch[1] : agInfo.label
             const toolMatch = msg.message?.match(/工具:\s*(.+)/)
-            const run = agentRuns.value.find(a => a.id === agInfo.id && a.source === 'workflow')
+            const run = agentRuns.value.find(a => a.id === agInfo.id && matchesWorkflowEvent(a, msg))
             if (run) {
               // 结构化事件是 Agent 生命周期的真实来源；日志仅兼容旧 Gateway，不能把运行中的门禁 Agent 提前标记完成。
               if (run.eventSource !== 'structured') {
@@ -4240,6 +4546,8 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
                 currentTool: toolMatch ? toolMatch[1].trim() : '',
                 currentToolElapsed: 0,
                 eventSource: 'log',
+                workflowId: msg.workflowId || wfRunState.value?.wfId,
+                workflowName: msg.name || wfRunState.value?.name,
               })
             }
           }
@@ -4247,7 +4555,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         break
 
       case 'workflow_done':
-        if (wfRunState.value) {
+        if (wfRunState.value && matchesCurrentWorkflow(msg)) {
           wfRunState.value.status = 'done'
           wfRunState.value.tokenSpent = msg.tokenSpent || 0
           // 同步标记 wfRunState.agents 里所有 running/paused 条目为 done
@@ -4257,7 +4565,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         }
         // 标记所有 workflow source 的 running/paused agent 为 done
         for (const ag of agentRuns.value) {
-          if (ag.source === 'workflow' && (ag.status === 'running' || ag.status === 'paused')) {
+          if (matchesWorkflowEvent(ag, msg) && (ag.status === 'running' || ag.status === 'paused')) {
             ag.status = 'done';
             ag.doneTime = Date.now()
           }
@@ -4265,7 +4573,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         break
 
       case 'workflow_paused':
-        if (wfRunState.value) {
+        if (wfRunState.value && matchesCurrentWorkflow(msg)) {
           wfRunState.value.status = 'paused'
           // 同步标记 wfRunState.agents 中所有 running 条目为 paused
           for (const a of wfRunState.value.agents) {
@@ -4274,14 +4582,14 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         }
         // 标记所有 workflow source 的 running agent 为 paused
         for (const ag of agentRuns.value) {
-          if (ag.source === 'workflow' && ag.status === 'running') {
+          if (matchesWorkflowEvent(ag, msg) && ag.status === 'running') {
             ag.status = 'paused'
           }
         }
         break
 
       case 'workflow_error':
-        if (wfRunState.value) {
+        if (wfRunState.value && matchesCurrentWorkflow(msg)) {
           wfRunState.value.status = 'error'
           // 同步标记所有 running/paused agent 为 error
           for (const a of wfRunState.value.agents) {
@@ -4290,26 +4598,31 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         }
         // 标记所有 workflow source 的 running/paused agent 为 error
         for (const ag of agentRuns.value) {
-          if (ag.source === 'workflow' && (ag.status === 'running' || ag.status === 'paused')) {
+          if (matchesWorkflowEvent(ag, msg) && (ag.status === 'running' || ag.status === 'paused')) {
             ag.status = 'error';
             ag.doneTime = Date.now()
           }
         }
+        appendSessionError(msg.error || msg.message || msg.detail || 'Workflow 执行失败', {
+          key: `workflow-error:${String(msg.workflowId || msg.wfId || msg.requestId || msg.ts || '')}`,
+          scroll: fg,
+          prefix: 'Workflow 执行失败',
+        })
         break
 
       case 'agent_paused': {
-        const pausedRun = agentRuns.value.find(a => a.id === msg.agentLabel && a.source === 'workflow')
+        const pausedRun = agentRuns.value.find(a => a.id === msg.agentLabel && matchesWorkflowEvent(a, msg))
         if (pausedRun) pausedRun.status = 'paused'
-        if (wfRunState.value) {
+        if (wfRunState.value && matchesCurrentWorkflow(msg)) {
           const ag = wfRunState.value.agents.find(a => a.id === msg.agentLabel)
           if (ag) ag.status = 'paused'
         }
         break
       }
       case 'agent_resumed': {
-        const resumedRun = agentRuns.value.find(a => a.id === msg.agentLabel && a.source === 'workflow')
+        const resumedRun = agentRuns.value.find(a => a.id === msg.agentLabel && matchesWorkflowEvent(a, msg))
         if (resumedRun) { resumedRun.status = 'running'; resumedRun.startTime = Date.now() }
-        if (wfRunState.value) {
+        if (wfRunState.value && matchesCurrentWorkflow(msg)) {
           const ag = wfRunState.value.agents.find(a => a.id === msg.agentLabel)
           if (ag) ag.status = 'running'
         }
@@ -4345,11 +4658,21 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
     if (ownsTabSocket && tab) tab.websocket = null
     if (ownsForegroundSocket) ws = null
     if (tab) tab.state.connected = false
-    const wasThinking = tab?.state.status === 'thinking' || (isFg() && status.value === 'thinking')
+    const wasThinking = wasSessionGeneratingAtSocketClose({
+      foreground: isFg(),
+      foregroundStatus: status.value,
+      tabStatus: tab?.state.status,
+    })
     if (wasThinking && tab) saveDraftForTab(tab, tab.state.lastUserMessage || lastUserMessage || inputText.value, true)
     if (isFg()) {
       connected.value = false; status.value = 'idle'
       syncPetState('disconnected', { bubble: petPick(BUBBLE_DISCONNECTED, myProject) })
+      appendSessionError(`会话连接已断开（${event.code || 1006}）${event.reason ? `：${event.reason}` : ''}${shouldRecoverMissingRuntimeSessionAfterClose(event.code) || event.code === 1001 || event.code === 1006 || event.code === 1011 || event.code === 1012 || event.code === 1013 ? '，正在尝试恢复' : ''}`, {
+        key: `ws-close:${mySid}:${event.code || 1006}`,
+        prefix: '连接异常',
+      })
+    } else {
+      appendSessionErrorToTab(myTabId, `会话连接已断开（${event.code || 1006}）${event.reason ? `：${event.reason}` : ''}`, `ws-close:${mySid}:${event.code || 1006}`)
     }
     if (shouldRecoverMissingRuntimeSessionAfterClose(event.code) && isFg() && myTabId) {
       // Gateway 重启后内存中的 runtime UUID 不再存在；使用已有历史会话重建，不能继续重连旧 UUID。
@@ -4378,9 +4701,12 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
     const foreground = isFg()
     if (foreground) {
       dispatchBridgeNotice(classifyBridgeFailure({source: 'websocket', path: `/ws/${mySid}`, serverCode: 'SESSION_CHANNEL_ERROR'}))
+      appendSessionError('会话实时连接发生异常，正在尝试恢复', {key: `ws-error:${mySid}`, prefix: '连接异常'})
       connected.value = false
       syncPetState('error', { message: 'Connection error', bubble: petPick(BUBBLE_ERROR_CONN, myProject) })
       setTimeout(() => syncPetState('disconnected'), 3000)
+    } else {
+      appendSessionErrorToTab(myTabId, '会话实时连接发生异常，正在尝试恢复', `ws-error:${mySid}`)
     }
     // Chromium 在握手失败或连接重置时可能只派发 error；不能依赖随后一定到达 onclose。
     // 复用同一 tab 的单一退避 timer，onclose 若随后到达会被 timer 去重。
@@ -4391,14 +4717,25 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
 }
 
 // ── Workflow 停止/恢复/提交 ──
+async function requireOkResponse(response: Response, fallback: string) {
+  const data = await response.json().catch(() => ({}))
+  if (!response.ok) throw new Error(String(data.error || data.reason || `${fallback}（HTTP ${response.status}）`))
+  return data
+}
+
 async function stopWf(mode: 'pause' | 'commit') {
   const name = wfRunState.value?.name
   if (!name) return
-  await apiFetch(`${GW}/api/workflows/${encodeURIComponent(name)}/stop`, {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({mode, sessionId: sessionId.value}),
-  })
+  try {
+    const response = await apiFetch(`${GW}/api/workflows/${encodeURIComponent(name)}/stop`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({mode, sessionId: sessionId.value}),
+    })
+    await requireOkResponse(response, 'Workflow 操作失败')
+  } catch (error) {
+    appendSessionError(error, {key: `workflow-stop:${name}:${mode}`, prefix: 'Workflow 操作失败'})
+  }
 }
 
 async function resumeWf() {
@@ -4406,31 +4743,46 @@ async function resumeWf() {
   if (!name) return
   const body: any = {sessionId: sessionId.value}
   if (wfNewBudget.value > 0) body.budgetMax = wfNewBudget.value
-  await apiFetch(`${GW}/api/workflows/${encodeURIComponent(name)}/resume`, {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(body),
-  })
+  try {
+    const response = await apiFetch(`${GW}/api/workflows/${encodeURIComponent(name)}/resume`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    })
+    await requireOkResponse(response, 'Workflow 操作失败')
+  } catch (error) {
+    appendSessionError(error, {key: `workflow-resume:${name}`, prefix: 'Workflow 操作失败'})
+  }
 }
 
 async function stopAgent(agentLabel: string) {
   const name = wfRunState.value?.name
   if (!name) return
-  await apiFetch(`${GW}/api/workflows/${encodeURIComponent(name)}/agents/${encodeURIComponent(agentLabel)}/stop`, {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({workflowId: wfRunState.value?.wfId}),
-  })
+  try {
+    const response = await apiFetch(`${GW}/api/workflows/${encodeURIComponent(name)}/agents/${encodeURIComponent(agentLabel)}/stop`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({workflowId: wfRunState.value?.wfId}),
+    })
+    await requireOkResponse(response, 'Agent 操作失败')
+  } catch (error) {
+    appendSessionError(error, {key: `agent-stop:${name}:${agentLabel}`, prefix: 'Agent 操作失败'})
+  }
 }
 
 async function resumeAgent(agentLabel: string) {
   const name = wfRunState.value?.name
   if (!name) return
-  await apiFetch(`${GW}/api/workflows/${encodeURIComponent(name)}/agents/${encodeURIComponent(agentLabel)}/resume`, {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({workflowId: wfRunState.value?.wfId}),
-  })
+  try {
+    const response = await apiFetch(`${GW}/api/workflows/${encodeURIComponent(name)}/agents/${encodeURIComponent(agentLabel)}/resume`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({workflowId: wfRunState.value?.wfId}),
+    })
+    await requireOkResponse(response, 'Agent 操作失败')
+  } catch (error) {
+    appendSessionError(error, {key: `agent-resume:${name}:${agentLabel}`, prefix: 'Agent 操作失败'})
+  }
 }
 
 // ── 消息气泡操作：复制 / 回填到输入框 ──
@@ -4607,6 +4959,7 @@ async function sendMessage() {
   try {
     prepared = prepareLargeInput(originalText, selectedAttachments)
   } catch (error: any) {
+    appendSessionError(error, {key: 'send-prepare-large-input', prefix: '发送任务失败'})
     showToast(error?.message || '超长输入转换失败', 6000)
     return
   }
@@ -4614,6 +4967,7 @@ async function sendMessage() {
   const attachments = prepared.attachments
   if (!text && !attachments?.length) return
   if (!ws || ws.readyState !== 1) {
+    appendSessionError('会话实时连接不可用，任务未发送', {key: 'send-not-connected', prefix: '发送任务失败'})
     showToast(t('ws.notConnected'))
     return
   }
@@ -4631,6 +4985,7 @@ async function sendMessage() {
       }
     } catch (error) {
       console.error(error)
+      appendSessionError(error, {key: 'send-message-dispatch-busy', prefix: '发送任务失败'})
       inputText.value = originalText
       saveDraftForTab(activeTab.value, originalText, true)
       showToast(t('ws.attachmentUploadFailed'))
@@ -4662,6 +5017,7 @@ async function sendMessage() {
     else showToast(t('ws.notConnected'))
   } catch (error) {
     console.error(error)
+    appendSessionError(error, {key: 'send-message-dispatch', prefix: '发送任务失败'})
     inputText.value = originalText
     saveDraftForTab(activeTab.value, originalText, true)
     showToast(t('ws.attachmentUploadFailed'))
@@ -4977,68 +5333,65 @@ async function cancelTask() {
 /** 用户点击允许/拒绝后，回传 decision 给 Gateway，插入系统消息记录操作 */
 function respondPermission(decision: 'allow' | 'deny') {
   const p = pendingPermission.value;
-  if (!p) return
+  if (!p || confirmationSubmitting.value === p.requestId) return
+  confirmationSubmitting.value = p.requestId
   if (!sendSessionPayload({
     type: 'permission_response',
     requestId: p.requestId,
     decision
   })) {
+    confirmationSubmitting.value = null
     showToast(t('ws.notConnected'))
     return
   }
-  messages.value.push({
-    role: 'system',
-    text: decision === 'allow' ? t('ws.allowed', {tool: p.toolName}) : t('ws.denied', {tool: p.toolName}),
-    time: Date.now()
-  })
-  pendingPermission.value = null
   nextTick(() => scrollDown(true))
 }
 
-/** 用户选择方案后，回传 optionIndex 给 Gateway */
-function respondChoice(optionIndex: number) {
+/** 记录一个问题的答案；全部问题完成后才一次性释放 SDK 的 AskUserQuestion Promise。 */
+function respondChoice(questionIndex: number, optionIndex: number) {
   const c = pendingChoice.value;
-  if (!c) return
+  if (!c || confirmationSubmitting.value === c.requestId) return
+  const question = c.questions[questionIndex]
+  const label = question?.options?.[optionIndex]?.label
+  if (!question || !label) return
+  c.answers = {...c.answers, [question.answerKey]: String(label)}
+  c.customInputActive = null
+  if (Object.keys(c.answers).length < c.questions.length) return
+  confirmationSubmitting.value = c.requestId
   if (!sendSessionPayload({
     type: 'choice_response',
     requestId: c.requestId,
-    questionIndex: 0,
-    optionIndex
+    answers: c.answers,
   })) {
+    confirmationSubmitting.value = null
     showToast(t('ws.notConnected'))
     return
   }
-  messages.value.push({
-    role: 'system',
-    text: t('ws.chose', {label: c.options[optionIndex]?.label || optionIndex}),
-    time: Date.now()
-  })
-  pendingChoice.value = null
   nextTick(() => scrollDown(true))
 }
 
-/** 用户通过"其他"输入自定义内容，回传文本给 Gateway */
-function respondChoiceCustom() {
+/** 保存当前问题的自定义答案；全部问题完成后一次性提交。 */
+function respondChoiceCustom(questionIndex: number) {
   const c = pendingChoice.value;
-  if (!c) return
+  if (!c || confirmationSubmitting.value === c.requestId) return
   const text = c.customInputText.trim()
   if (!text) return
+  const question = c.questions[questionIndex]
+  if (!question) return
+  c.answers = {...c.answers, [question.answerKey]: text}
+  c.customInputActive = null
+  c.customInputText = ''
+  if (Object.keys(c.answers).length < c.questions.length) return
+  confirmationSubmitting.value = c.requestId
   if (!sendSessionPayload({
     type: 'choice_response',
     requestId: c.requestId,
-    questionIndex: 0,
-    optionIndex: -1,
-    customText: text
+    answers: c.answers,
   })) {
+    confirmationSubmitting.value = null
     showToast(t('ws.notConnected'))
     return
   }
-  messages.value.push({
-    role: 'system',
-    text: t('ws.chose', {label: text}),
-    time: Date.now()
-  })
-  pendingChoice.value = null
   nextTick(() => scrollDown(true))
 }
 
@@ -5059,6 +5412,7 @@ async function sendQueued(item: QItem) {
   msgQueue.value = msgQueue.value.filter(q => q.id !== item.id)
   if (!ws || ws.readyState !== 1) {
     restoreQueueItems([item], ownerTabId)
+    appendSessionError('会话实时连接不可用，队列任务已保留', {key: `queued-not-connected:${item.id}`, prefix: '队列任务发送失败'})
     showToast(t('ws.notConnected'))
     return
   }
@@ -5069,6 +5423,7 @@ async function sendQueued(item: QItem) {
     }
   } catch (error) {
     console.error(error)
+    appendSessionError(error, {key: `queued-dispatch:${item.id}`, prefix: '队列任务发送失败'})
     restoreQueueItems([item], ownerTabId)
     showToast(t('ws.attachmentUploadFailed'))
   }
@@ -5129,6 +5484,7 @@ async function flushMsgQueue() {
         }
       } catch (error) {
         console.debug('队列消息 dispatch 失败，恢复剩余消息', error)
+        appendSessionError(error, {key: `queue-flush:${items[i].id}`, prefix: '队列任务发送失败'})
         restoreQueueItems(items.slice(i), ownerTabId)
         break
       }
@@ -5159,11 +5515,13 @@ async function injectNow(item: QItem) {
       messages.value.push({role: 'system', text: t('ws.injected'), time: Date.now()})
     } catch (error) {
       console.error(error)
+      appendSessionError(error, {key: `inject-now:${item.id}`, prefix: '补充指令发送失败'})
       restoreQueueItems([item], ownerTabId)
       showToast(t('ws.attachmentUploadFailed'))
     }
   } else {
     restoreQueueItems([item], ownerTabId)
+    appendSessionError('会话实时连接不可用，补充指令已保留', {key: `inject-not-connected:${item.id}`, prefix: '补充指令发送失败'})
     showToast(t('ws.notConnected'))
   }
 }
@@ -5941,8 +6299,7 @@ document.addEventListener('visibilitychange', onPageVisibility)
 
 // 组件卸载时清理 Monaco 实例及外部 model
 onBeforeUnmount(() => {
-  // 路由离开或窗口页面卸载时，先通知 Gateway 停止活动 Session；关闭 WebSocket 不能代替后台任务收口。
-  void stopActiveSessionsOnUnmount()
+  // 路由切换或组件卸载只释放本地连接；不能停止其他标签页仍在执行的任务。
   stopActivityClock()
   clearProjectLoadRetry()
   if (draftPersistTimer) { clearTimeout(draftPersistTimer); draftPersistTimer = null }
@@ -6623,9 +6980,14 @@ function loadUsage(sid: string) {
     if (d.usage) usage.value = {input: 0, output: 0, thinking: 0, total: 0, ...d.usage}
     if (typeof d.costTotal === 'number') costTotal.value = d.costTotal
     if (typeof d.contextPercent === 'number') contextPercent.value = d.contextPercent
-    if (typeof d.contextPercentKnown === 'boolean') contextPercentKnown.value = d.contextPercentKnown
-    if (typeof d.maxTokens === 'number') maxTokens.value = d.maxTokens
-    if (typeof d.rawMaxTokens === 'number') rawMaxTokens.value = d.rawMaxTokens
+    // 兼容旧缓存：0 不是有效窗口，不能覆盖 system_init/模型目录刚提供的窗口。
+    const storedMaxTokens = typeof d.maxTokens === 'number' && d.maxTokens > 0 ? d.maxTokens : 0
+    const storedRawMaxTokens = typeof d.rawMaxTokens === 'number' && d.rawMaxTokens > 0 ? d.rawMaxTokens : 0
+    if (storedMaxTokens > 0) maxTokens.value = storedMaxTokens
+    if (storedRawMaxTokens > 0) rawMaxTokens.value = storedRawMaxTokens
+    if (typeof d.contextPercentKnown === 'boolean') {
+      contextPercentKnown.value = d.contextPercentKnown && (storedMaxTokens > 0 || maxTokens.value > 0)
+    }
     if (d.pricing) pricing.value = d.pricing
   } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
 }
@@ -6646,8 +7008,9 @@ const tokenTooltip = computed(() => {
   const mt = maxTokens.value
   return {
     used: mt > 0 ? `${fmtTok(u.total)} / ${fmtTok(mt)}` : `${fmtTok(u.total)} / 未知`,
+    overLimit: mt > 0 && u.total > mt ? `已超过 ${fmtTok(u.total - mt)}` : '',
     actualMax: rawMaxTokens.value > 0 ? fmtTok(rawMaxTokens.value) : '未知',
-    pct: contextPercentKnown.value ? contextPercent.value.toFixed(1) + '%' : '未知',
+    pct: displayContextPercent.value === null ? '未知' : displayContextPercent.value.toFixed(1) + '%',
     input: fmtTok(u.input),
     thinking: u.thinking > 0 ? '~' + fmtTok(u.thinking) : '—',
     output: fmtTok(u.output),
@@ -6660,6 +7023,18 @@ const tokenTooltip = computed(() => {
     currency: pricing.value?.currency || 'CNY',
   }
 })
+
+/** 圆环显示值：旧会话可能只持久化了窗口和 token，直接派生占比避免残留未知态。 */
+const displayContextPercent = computed<number | null>(() => {
+  if (contextPercentKnown.value && (contextPercent.value > 0 || usage.value.total <= 0)) {
+    return Math.max(0, Math.min(100, contextPercent.value))
+  }
+  if (maxTokens.value > 0) return Math.max(0, Math.min(100, Math.round(usage.value.total / maxTokens.value * 100)))
+  return null
+})
+
+/** 上下文 token 超过有效窗口时，圆环仍封顶 100%，详情显示真实超出量。 */
+const contextOverLimit = computed(() => maxTokens.value > 0 && usage.value.total > maxTokens.value)
 </script>
 
 <template>
@@ -6843,7 +7218,7 @@ const tokenTooltip = computed(() => {
         <!-- 消息列表区域：v-for 遍历 messages，按 role 切换渲染模板 -->
         <div ref="chatRef" class="messages" @click="onMessageClick" @scroll="onMessagesScroll">
           <!-- 每条消息行：根据 role 控制对齐方向和动画延迟 -->
-          <div v-for="(msg, i) in renderedMessages" :key="(msg.time || 0) + '-' + i + '-' + msg.role" class="msg-row" :class="msg.role"
+          <div v-for="(msg, i) in renderedMessages" :key="messageRenderKey(msg)" class="msg-row" :class="msg.role"
                :style="{ animationDelay: `${Math.min(i * 20, 300)}ms` }">
             <!-- 系统消息：时间 + 文本，居中显示 -->
             <template v-if="msg.role === 'system'">
@@ -7311,28 +7686,29 @@ const tokenTooltip = computed(() => {
             <span class="tm-item tm-out">↑ {{ fmtTok(usage.output) }}</span>
           </div>
           <!-- 上下文圆环：可点击触发 /compact，悬停显示 token 与费用详情 tooltip -->
-          <div class="context-ring" :class="{ warning: contextPercentKnown && contextPercent >= 80, compacting: contextCompacting }" :title="t('ws.ctxRingTitle')"
+          <div class="context-ring" :class="{ warning: displayContextPercent !== null && displayContextPercent >= 80, 'over-limit': contextOverLimit, compacting: contextCompacting }" :title="t('ws.ctxRingTitle')"
                @click="runCompact">
             <svg width="40" height="40" viewBox="0 0 44 44">
               <circle cx="22" cy="22" r="18" fill="none" stroke="var(--border)" stroke-width="3.5"/>
               <circle cx="22" cy="22" r="18" fill="none" stroke-linecap="round"
-                      :stroke="contextPercentKnown && contextPercent >= 80 ? 'var(--warning)' : 'var(--accent-blue)'"
+                      :stroke="displayContextPercent !== null && displayContextPercent >= 80 ? 'var(--warning)' : 'var(--accent-blue)'"
                       stroke-width="3.5"
                       :stroke-dasharray="113.1"
-                      :stroke-dashoffset="113.1 - (contextPercent / 100) * 113.1"
+                      :stroke-dashoffset="113.1 - ((displayContextPercent || 0) / 100) * 113.1"
                       transform="rotate(-90 22 22)"
                       style="transition: stroke-dashoffset 0.4s var(--ease-out)"
                       class="ring-glow"
               />
               <text x="22" y="24" text-anchor="middle" fill="var(--text-secondary)" font-size="9"
                     font-family="var(--font-mono)" font-weight="500">
-                {{ contextCompacting ? '...' : contextPercentKnown ? contextPercent + '%' : '--' }}
+                {{ contextCompacting ? '...' : displayContextPercent !== null ? displayContextPercent + '%' : '--' }}
               </text>
             </svg>
             <div class="ring-tooltip glass">
               <div v-if="contextCompacting" class="tt-hint">正在压缩上下文，新的消息会排队</div>
-              <div v-else-if="contextPercentKnown && contextPercent >= 80" class="tt-hint">{{ t('ws.ctxHint', {pct: contextPercent}) }}</div>
+              <div v-else-if="displayContextPercent !== null && displayContextPercent >= 80" class="tt-hint">{{ t('ws.ctxHint', {pct: displayContextPercent}) }}</div>
               <div class="tt-row"><span>{{ t('ws.ttUsed') }}</span><span>{{ tokenTooltip.used }}</span></div>
+              <div v-if="tokenTooltip.overLimit" class="tt-hint over-limit-hint">{{ tokenTooltip.overLimit }}</div>
               <div class="tt-row"><span>模型实际窗口</span><span>{{ tokenTooltip.actualMax }}</span></div>
               <div class="tt-row"><span>{{ t('ws.ttPct') }}</span><span>{{ tokenTooltip.pct }}</span></div>
               <div class="tt-sep"></div>
@@ -7378,40 +7754,50 @@ const tokenTooltip = computed(() => {
               </div>
             </div>
             <div class="confirm-banner-actions">
-              <button class="confirm-btn cancel" @click="respondPermission('deny')">{{ t('ws.deny') }}</button>
-              <button class="confirm-btn primary" @click="respondPermission('allow')">{{ t('ws.allow') }}</button>
+              <button class="confirm-btn cancel" :disabled="confirmationSubmitting === pendingPermission.requestId" @click="respondPermission('deny')">{{ t('ws.deny') }}</button>
+              <button class="confirm-btn primary" :disabled="confirmationSubmitting === pendingPermission.requestId" @click="respondPermission('allow')">{{ t('ws.allow') }}</button>
             </div>
           </div>
 
           <!-- 方案选择横幅：问题文本 + 各选项按钮 -->
           <div v-if="pendingChoice" class="confirm-banner choice">
-            <div class="confirm-banner-question">
+            <div class="confirm-banner-question choice-heading">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                    stroke-linecap="round" style="flex-shrink:0">
                 <circle cx="12" cy="12" r="10"/>
                 <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/>
                 <line x1="12" y1="17" x2="12.01" y2="17"/>
               </svg>
-              {{ pendingChoice.question }}
+              {{ t('ws.choose') }}
             </div>
-            <div class="confirm-banner-options">
-              <button v-for="(o, i) in pendingChoice.options" :key="i" class="choice-opt-btn" @click="respondChoice(i)">
-                {{ i + 1 }}. {{ o.label }}
-              </button>
-              <!-- "其他"按钮：点击后展开自定义输入框 -->
-              <button v-if="!pendingChoice.customInputActive" class="choice-opt-btn other" @click="pendingChoice.customInputActive = true">
-                {{ pendingChoice.options.length + 1 }}. {{ t('ws.other') }}
-              </button>
-              <!-- 自定义输入区域 -->
-              <div v-if="pendingChoice.customInputActive" class="choice-custom-row">
-                <input
-                  v-model="pendingChoice.customInputText"
-                  class="choice-custom-input"
-                  :placeholder="t('ws.customPlaceholder')"
-                  @keyup.enter="respondChoiceCustom()"
-                />
-                <button class="choice-opt-btn confirm" @click="respondChoiceCustom()">{{ t('ws.send') }}</button>
-                <button class="choice-opt-btn cancel" @click="pendingChoice.customInputActive = false; pendingChoice.customInputText = ''">{{ t('ws.cancel') }}</button>
+            <div v-for="(question, questionIndex) in pendingChoice.questions" :key="question.question || questionIndex" class="choice-question-block">
+              <div class="choice-question-text">
+                <span v-if="pendingChoice.questions.length > 1">{{ questionIndex + 1 }}.</span>
+                {{ question.question }}
+              </div>
+              <div class="confirm-banner-options">
+                <button v-for="(o, optionIndex) in question.options" :key="optionIndex" class="choice-opt-btn"
+                        :class="{selected: pendingChoice.answers[question.question] === o.label}"
+                        :disabled="confirmationSubmitting === pendingChoice.requestId"
+                        @click="respondChoice(questionIndex, optionIndex)">
+                  {{ optionIndex + 1 }}. {{ o.label }}
+                </button>
+                <button v-if="pendingChoice.customInputActive !== questionIndex" class="choice-opt-btn other"
+                        :disabled="confirmationSubmitting === pendingChoice.requestId"
+                        @click="pendingChoice.customInputActive = questionIndex; pendingChoice.customInputText = ''">
+                  {{ question.options.length + 1 }}. {{ t('ws.other') }}
+                </button>
+                <div v-if="pendingChoice.customInputActive === questionIndex" class="choice-custom-row">
+                  <input
+                    v-model="pendingChoice.customInputText"
+                    class="choice-custom-input"
+                    :placeholder="t('ws.customPlaceholder')"
+                    :disabled="confirmationSubmitting === pendingChoice.requestId"
+                    @keyup.enter="respondChoiceCustom(questionIndex)"
+                  />
+                  <button class="choice-opt-btn confirm" :disabled="confirmationSubmitting === pendingChoice.requestId" @click="respondChoiceCustom(questionIndex)">{{ t('ws.send') }}</button>
+                  <button class="choice-opt-btn cancel" :disabled="confirmationSubmitting === pendingChoice.requestId" @click="pendingChoice.customInputActive = null; pendingChoice.customInputText = ''">{{ t('ws.cancel') }}</button>
+                </div>
               </div>
             </div>
           </div>
@@ -9750,6 +10136,16 @@ const tokenTooltip = computed(() => {
   cursor: default;
 }
 
+/* 覆盖摘要到弹出面板之间的移动路径，避免鼠标经过空隙时触发关闭。 */
+.task-activity::before {
+  position: absolute;
+  right: 0;
+  bottom: 100%;
+  left: 0;
+  height: 10px;
+  content: '';
+}
+
 .task-activity-summary-copy {
   min-width: 0;
 }
@@ -9803,7 +10199,17 @@ const tokenTooltip = computed(() => {
   pointer-events: none;
   visibility: hidden;
   transform: translateY(6px);
-  transition: transform 160ms var(--ease-out), visibility 0s linear 160ms;
+  transition: transform 160ms var(--ease-out), visibility 0s linear 360ms;
+}
+
+/* 摘要与上方面板之间的视觉间距不能变成 hover 断点，保证鼠标移动时命中同一控件。 */
+.task-activity-popover::after {
+  position: absolute;
+  right: 0;
+  bottom: -9px;
+  left: 0;
+  height: 9px;
+  content: '';
 }
 
 .task-activity:hover .task-activity-popover,
@@ -10592,6 +10998,11 @@ const tokenTooltip = computed(() => {
   filter: drop-shadow(0 0 3px rgba(210, 153, 34, 0.5));
 }
 
+.context-ring.over-limit .ring-glow {
+  stroke: var(--error) !important;
+  filter: drop-shadow(0 0 3px rgba(220, 70, 70, 0.55));
+}
+
 .ring-glow {
   filter: drop-shadow(0 0 3px rgba(91, 155, 213, 0.3));
 }
@@ -11213,6 +11624,11 @@ const tokenTooltip = computed(() => {
   border-radius: 10px;
 }
 
+.tt-hint.over-limit-hint {
+  color: var(--error);
+  background: rgba(220, 70, 70, 0.1);
+}
+
 .preference-banner-copy {
   display: flex;
   flex-direction: column;
@@ -11338,6 +11754,27 @@ const tokenTooltip = computed(() => {
   margin-bottom: 8px;
 }
 
+.choice-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.choice-question-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.choice-question-text {
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
 .confirm-banner-options {
   display: flex;
   flex-direction: column;
@@ -11359,6 +11796,17 @@ const tokenTooltip = computed(() => {
 .choice-opt-btn:hover {
   border-color: var(--accent);
   color: var(--accent);
+}
+
+.choice-opt-btn.selected {
+  border-color: var(--accent);
+  background: var(--bg-hover);
+  color: var(--accent);
+}
+
+.choice-opt-btn:disabled {
+  cursor: wait;
+  opacity: 0.55;
 }
 
 .choice-opt-btn.other {

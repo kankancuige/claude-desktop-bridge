@@ -120,7 +120,7 @@ function toolTitle(name: string): string {
 }
 
 function agentName(event: any): string {
-  return boundedText(event?.agentType || event?.agentName || event?.label || event?.agentId || event?.id, 80) || 'Agent'
+  return boundedText(event?.agentType || event?.agentName || event?.agentLabel || event?.label || event?.agentId || event?.id, 80) || 'Agent'
 }
 
 function eventId(event: any, fallback: string): string {
@@ -269,8 +269,9 @@ export function reduceTaskActivity(
     }
     const terminal = [
       'completed', 'failed', 'blocked', 'inconclusive', 'regression_detected', 'paused',
-      'diagnosis_required', 'awaiting_reproduction', 'blocked_external', 'architecture_change_required',
+      'diagnosis_required', 'awaiting_reproduction', 'blocked_external', 'architecture_change_required', 'waiting_user',
     ].includes(String(event.status || ''))
+    const waitingUser = event.status === 'waiting_user'
     const failed = terminal && event.status !== 'completed'
     const started = event.event === 'phase/started'
     const completed = event.event === 'phase/completed'
@@ -278,11 +279,11 @@ export function reduceTaskActivity(
     const evidence = boundedText(event.verification?.evidenceLevel, 20)
     const detail = [boundedText(event.role, 80), evidence ? `证据 ${evidence}` : '', boundedText(event.detail)].filter(Boolean).join(' · ')
     const title = labels[phase] || boundedText(event.detail) || '任务协调器'
-    state = activityState(state, phase === 'validate' ? 'verifying' : phase === 'review' ? 'reviewing' : failed ? 'blocked' : 'planning', !terminal, title, detail, type, now)
+    state = activityState(state, waitingUser ? 'waiting' : phase === 'validate' ? 'verifying' : phase === 'review' ? 'reviewing' : failed ? 'blocked' : 'planning', !terminal && !waitingUser, waitingUser ? '等待用户处理' : title, detail, type, now)
     return upsertEntry(state, {
       id: `coordinator:${event.stepId || phase || event.status || event.revision}`,
-      kind: phase === 'validate' ? 'verification' : 'coordinator', status,
-      title: `${started ? '开始' : completed ? '完成' : ''}${title}`,
+      kind: phase === 'validate' ? 'verification' : 'coordinator', status: waitingUser ? 'waiting' : status,
+      title: waitingUser ? '等待用户处理' : `${started ? '开始' : completed ? '完成' : ''}${title}`,
       detail, completedAt: status !== 'running' ? now : 0, eventType: type,
     }, now)
   }
@@ -306,6 +307,16 @@ export function reduceTaskActivity(
     return upsertEntry(state, {
       id: `task:auto-continue:${attempt}`, kind: 'task', status: 'running',
       title: '自动续跑当前任务', detail, eventType: type,
+    }, now)
+  }
+
+  if (type === 'workflow_auto_started') {
+    const name = boundedText(event.name || event.workflowId, 100) || '工作流'
+    const detail = boundedText(event.task || event.detail)
+    state = activityState(state, 'planning', true, `已自动启动 ${name}`, detail, type, now)
+    return upsertEntry(state, {
+      id: `workflow:auto:${eventId(event, name)}`, kind: 'workflow', status: 'running',
+      title: `自动工作流：${name}`, detail, eventType: type,
     }, now)
   }
 
@@ -415,6 +426,27 @@ export function reduceTaskActivity(
     }, now)
   }
 
+  if (type === 'agent_paused') {
+    const name = agentName(event)
+    const detail = boundedText(event.reason || event.detail || '等待恢复')
+    state = activityState(state, 'waiting', true, `Agent ${name} 已暂停`, detail, type, now)
+    return upsertEntry(state, {
+      id: `agent:${eventId(event, name)}`, kind: 'agent', status: 'waiting', title: `Agent ${name} 已暂停`,
+      detail, eventType: type,
+    }, now)
+  }
+
+  if (type === 'task_write_delegated') {
+    const requests = Array.isArray(event.requests) ? event.requests : []
+    const files = requests.flatMap((item: any) => item?.writeRequest?.requestedFiles || []).filter(Boolean).slice(0, 8)
+    const detail = boundedText(event.detail || (files.length ? `待主任务写入：${files.join(', ')}` : '待主任务执行写入'))
+    state = activityState(state, 'waiting', true, '等待主任务执行 Agent 写入', detail, type, now)
+    return upsertEntry(state, {
+      id: `waiting:${eventId(event, 'write-delegation')}`, kind: 'waiting', status: 'waiting',
+      title: '等待主任务执行 Agent 写入', detail, eventType: type,
+    }, now)
+  }
+
   if (type === 'permission_request' || type === 'choice_request') {
     const question = Array.isArray(event.questions) ? event.questions[0]?.question : event.question
     const permission = type === 'permission_request'
@@ -423,6 +455,17 @@ export function reduceTaskActivity(
     state = activityState(state, 'waiting', true, title, detail, type, now)
     return upsertEntry(state, {
       id: `waiting:${eventId(event, type)}`, kind: 'waiting', status: 'waiting', title, detail, eventType: type,
+    }, now)
+  }
+
+  if (type === 'stream_waiting') {
+    const waitingFor = boundedText(event.waitingFor, 30)
+    const title = waitingFor === 'permission' ? '等待工具权限确认'
+      : waitingFor === 'tool' ? '工具仍在执行，等待返回进度' : '正在等待 Provider 返回'
+    const detail = boundedText(event.message || (event.elapsedMs ? `已等待 ${Math.round(Number(event.elapsedMs) / 1000)} 秒` : ''))
+    state = activityState(state, 'waiting', true, title, detail, type, now)
+    return upsertEntry(state, {
+      id: 'waiting:stream', kind: 'waiting', status: 'waiting', title, detail, eventType: type,
     }, now)
   }
 
@@ -518,7 +561,13 @@ export function reduceTaskActivity(
     const status: TaskActivityEntryStatus = type === 'workflow_done' ? 'completed' : type === 'workflow_paused' ? 'waiting' : 'failed'
     const workflowId = eventId(event, 'current')
     state.entries = completeEntries(state.entries, now, entry => entry.kind === 'workflow' && entry.id.includes(workflowId), status)
-    return {...state, updatedAt: now, eventType: type}
+    if (type === 'workflow_paused') {
+      return activityState(state, 'waiting', false, '工作流已暂停，等待恢复', boundedText(event.detail || event.message), type, now)
+    }
+    if (type === 'workflow_error') {
+      return activityState(state, 'failed', false, '工作流执行失败', boundedText(event.error || event.message || event.detail), type, now)
+    }
+    return activityState(state, 'thinking', true, '工作流已完成，继续收口任务', boundedText(event.detail || event.message), type, now)
   }
 
   const terminal = type === 'task_completed'
@@ -540,6 +589,54 @@ export function reduceTaskActivity(
   }
 
   return state
+}
+
+/**
+ * 将 Gateway 重连快照收口到本地活动状态，避免旧的 stream_waiting 因快照缺少事件而一直显示。
+ */
+export function reconcileTaskActivitySnapshot(
+  current: TaskActivityState,
+  snapshot: any,
+  now = Date.now(),
+): TaskActivityState {
+  const state = createTaskActivityState(current)
+  const persistedStatus = String(snapshot?.taskState?.status || 'idle')
+  const writeRequests = Array.isArray(snapshot?.taskState?.writeRequests)
+    ? snapshot.taskState.writeRequests.filter((item: any) => item?.writeRequest?.requestedFiles?.length)
+    : []
+  // 写入委托是可恢复的等待态；重连快照必须独立重建提示，不能依赖已错过的实时事件。
+  if (writeRequests.length && !['succeeded', 'failed', 'stopped'].includes(persistedStatus)) {
+    const files = writeRequests.flatMap((item: any) => item.writeRequest.requestedFiles || []).filter(Boolean).slice(0, 8)
+    const detail = String(snapshot?.taskState?.detail || (files.length ? `待主任务写入：${files.join(', ')}` : '待主任务执行写入')).slice(0, 2000)
+    return reduceTaskActivity(state, {type: 'task_write_delegated', detail, requests: writeRequests}, now)
+  }
+  const terminalEvent = persistedStatus === 'succeeded'
+    ? {type: 'task_completed', detail: snapshot?.taskState?.detail}
+    : persistedStatus === 'stopped'
+      ? {type: 'generation_stopped', detail: snapshot?.taskState?.detail}
+      : ['failed', 'incomplete', 'interrupted', 'review_paused'].includes(persistedStatus)
+        ? {type: 'task_failed', detail: snapshot?.taskState?.detail}
+        : null
+  // 任务终态优先于清理阶段残留的 generating，避免成功/失败任务重连后再次变成运行中。
+  if (terminalEvent) return state.running ? reduceTaskActivity(state, terminalEvent, now) : createTaskActivityState()
+
+  // `running` 是持久化任务状态，不代表当前 SDK 仍有 turn；只有 live generating
+  // 或明确的审查/修复阶段才允许重连后恢复活动，避免旧状态伪装成 Provider 等待。
+  const active = snapshot?.generating === true
+    || ['reviewing', 'changes_required', 'fixing'].includes(persistedStatus)
+  if (active) {
+    if (state.running) return state
+    const event = persistedStatus === 'reviewing'
+      ? {type: 'task_reviewing', detail: snapshot?.taskState?.detail}
+      : persistedStatus === 'changes_required'
+        ? {type: 'task_changes_required', detail: snapshot?.taskState?.detail}
+        : persistedStatus === 'fixing'
+          ? {type: 'task_fixing', detail: snapshot?.taskState?.detail}
+          : {type: 'task_started', startedAt: snapshot?.taskState?.startedAt}
+    return reduceTaskActivity(state, event, now)
+  }
+
+  return createTaskActivityState()
 }
 
 export function taskActivityFreshness(

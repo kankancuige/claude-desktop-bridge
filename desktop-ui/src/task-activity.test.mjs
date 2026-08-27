@@ -6,7 +6,7 @@ import {transform} from 'esbuild'
 const source = readFileSync(new URL('./task-activity.ts', import.meta.url), 'utf8')
 const compiled = await transform(source, {loader: 'ts', format: 'esm', target: 'es2022'})
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(compiled.code).toString('base64')}`
-const {createTaskActivityState, reduceTaskActivity, taskActivityFreshness, isReviewLifecycleEvent} = await import(moduleUrl)
+const {createTaskActivityState, reduceTaskActivity, reconcileTaskActivitySnapshot, taskActivityFreshness, isReviewLifecycleEvent} = await import(moduleUrl)
 
 test('任务事件按开始、思考、工具、回复和审查阶段更新活动状态', () => {
   let state = createTaskActivityState()
@@ -139,6 +139,86 @@ test('补充指令不重置任务开始时间，长时间无事件分级提示',
   assert.equal(taskActivityFreshness(continued, 200_000).level, 'stale')
 })
 
+test('Provider 等待心跳在无 SDK 事件时保持可见进度', () => {
+  let state = reduceTaskActivity(createTaskActivityState(), {type: 'task_started'}, 100)
+  state = reduceTaskActivity(state, {type: 'stream_waiting', waitingFor: 'provider', elapsedMs: 15_000, message: '正在等待 Provider 返回首个事件'}, 15_100)
+  assert.equal(state.phase, 'waiting')
+  assert.equal(state.running, true)
+  assert.equal(state.title, '正在等待 Provider 返回')
+  assert.equal(state.entries.find(entry => entry.id === 'waiting:stream').status, 'waiting')
+  assert.equal(taskActivityFreshness(state, 15_101).level, 'active')
+})
+
+test('自动工作流与暂停终态在前端形成明确可见状态', () => {
+  let state = reduceTaskActivity(createTaskActivityState(), {type: 'task_started'}, 100)
+  state = reduceTaskActivity(state, {type: 'workflow_auto_started', workflowId: 'wf1', name: '最终审查', task: '检查改动'}, 200)
+  assert.equal(state.running, true)
+  assert.equal(state.title, '已自动启动 最终审查')
+  assert.equal(state.entries.find(entry => entry.id === 'workflow:auto:wf1').status, 'running')
+  state = reduceTaskActivity(state, {type: 'workflow_paused', workflowId: 'wf1'}, 300)
+  assert.equal(state.running, false)
+  assert.equal(state.phase, 'waiting')
+  assert.equal(state.title, '工作流已暂停，等待恢复')
+})
+
+test('重连收到终态快照时会收口旧的 Provider 等待状态', () => {
+  let state = reduceTaskActivity(createTaskActivityState(), {type: 'task_started'}, 100)
+  state = reduceTaskActivity(state, {type: 'stream_waiting', waitingFor: 'provider'}, 200)
+  const reconciled = reconcileTaskActivitySnapshot(state, {
+    generating: false,
+    pendingConfirmations: [],
+    taskState: {status: 'failed', detail: '上游请求超时', resumable: true},
+  }, 300)
+  assert.equal(reconciled.running, false)
+  assert.equal(reconciled.phase, 'failed')
+  assert.equal(reconciled.entries.some(entry => entry.status === 'waiting'), false)
+})
+
+test('重连收到 idle 快照时会清除没有真实任务的旧等待状态', () => {
+  let state = reduceTaskActivity(createTaskActivityState(), {type: 'task_started'}, 100)
+  state = reduceTaskActivity(state, {type: 'stream_waiting', waitingFor: 'provider'}, 200)
+  const reconciled = reconcileTaskActivitySnapshot(state, {generating: false, taskState: {status: 'idle'}}, 300)
+  assert.equal(reconciled.running, false)
+  assert.equal(reconciled.entries.length, 0)
+})
+
+test('持久化 running 但 live generating=false 时不会恢复旧 Provider 等待', () => {
+  let state = reduceTaskActivity(createTaskActivityState(), {type: 'task_started'}, 100)
+  state = reduceTaskActivity(state, {type: 'stream_waiting', waitingFor: 'provider'}, 200)
+  const reconciled = reconcileTaskActivitySnapshot(state, {generating: false, taskState: {status: 'running'}}, 300)
+  assert.equal(reconciled.running, false)
+})
+
+test('任务终态优先于清理阶段残留的 generating 标志', () => {
+  let state = reduceTaskActivity(createTaskActivityState(), {type: 'task_started'}, 100)
+  state = reduceTaskActivity(state, {type: 'stream_waiting', waitingFor: 'provider'}, 200)
+  const reconciled = reconcileTaskActivitySnapshot(state, {
+    generating: true,
+    taskState: {status: 'succeeded', detail: '已完成'},
+  }, 300)
+  assert.equal(reconciled.running, false)
+  assert.equal(reconciled.phase, 'completed')
+})
+
+test('重连快照含写入委托时恢复等待主任务写入提示且不依赖实时事件', () => {
+  const reconciled = reconcileTaskActivitySnapshot(createTaskActivityState(), {
+    generating: false,
+    taskState: {
+      status: 'incomplete',
+      continuationReason: 'write_permission_required',
+      detail: '只读 Agent 请求主任务修改文件',
+      writeRequests: [{
+        agentRunId: 'review-1',
+        writeRequest: {requestedFiles: ['gateway/agent.mjs']},
+      }],
+    },
+  }, 300)
+  assert.equal(reconciled.phase, 'waiting')
+  assert.equal(reconciled.running, true)
+  assert.equal(reconciled.entries.filter(entry => entry.id.startsWith('waiting:')).length, 1)
+  assert.match(reconciled.detail, /只读 Agent 请求主任务修改文件/)
+})
+
 test('达到单段轮数上限后自动续跑仍保持同一父任务运行', () => {
   let state = reduceTaskActivity(createTaskActivityState(), {type: 'task_started'}, 1_000)
   state = reduceTaskActivity(state, {
@@ -166,4 +246,26 @@ test('Coordinator 阶段、角色、验证证据和阻塞形成独立步骤', ()
   }, 200)
   assert.equal(state.running, false)
   assert.equal(state.entries.at(-1).status, 'failed')
+})
+
+test('Coordinator 等待用户时停止忙碌态并保留可见等待步骤', () => {
+  const state = reduceTaskActivity(createTaskActivityState(), {
+    type: 'task_coordinator_event', event: 'task/waiting-user', phase: 'validate',
+    status: 'waiting_user', detail: '请确认验证环境', stepId: 'wait-1',
+  }, 100)
+  assert.equal(state.running, false)
+  assert.equal(state.phase, 'waiting')
+  assert.equal(state.entries.at(-1).status, 'waiting')
+  assert.equal(state.title, '等待用户处理')
+})
+
+test('只读 Agent 写入委托显示为等待主任务处理而非失败', () => {
+  const state = reduceTaskActivity(createTaskActivityState(), {
+    type: 'task_write_delegated',
+    requests: [{writeRequest: {requestedFiles: ['gateway/a.mjs']}}],
+  }, 100)
+  assert.equal(state.phase, 'waiting')
+  assert.equal(state.running, true)
+  assert.match(state.title, /主任务执行 Agent 写入/)
+  assert.match(state.detail, /gateway\/a\.mjs/)
 })

@@ -16,23 +16,38 @@ const editWfContent = ref('')
 const wfSaving = ref(false)
 const wfSaved = ref(false)
 const wfCreateName = ref('')
+const wfEditLoading = ref(false)
+const wfError = ref('')
+
+async function readResponseError(response: Response, fallback: string) {
+  let detail = ''
+  try {
+    const data = await response.clone().json()
+    detail = String(data?.error || data?.message || '').trim()
+  } catch { /* 非 JSON 响应使用状态码 */ }
+  return detail || `${fallback}（HTTP ${response.status}）`
+}
 
 async function loadWfScripts() {
   wfLoading.value = true
+  wfError.value = ''
   try {
     const r = await fetch(`${GW}/api/workflows`);
-    if (r.ok) {
-      const d = await r.json();
-      wfScripts.value = d.workflows || []
-    }
-  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
-  wfLoading.value = false
+    if (!r.ok) throw new Error(await readResponseError(r, '加载 Workflow 失败'))
+    const d = await r.json();
+    wfScripts.value = d.workflows || []
+  } catch (error: any) {
+    wfError.value = error?.message || '加载 Workflow 失败'
+  } finally {
+    wfLoading.value = false
+  }
 }
 
 async function toggleWfScriptEnabled(wf: any) {
   if (wf.source !== 'builtin' || wf.required) return
   const previous = wf.enabled !== false
   wf.enabled = !previous
+  wfError.value = ''
   try {
     const response = await fetch(`${GW}/api/config/builtin-resources/workflow/${encodeURIComponent(wf.name.replace(/\.(?:mjs|js)$/, ''))}`, {
       method: 'PUT',
@@ -45,34 +60,47 @@ async function toggleWfScriptEnabled(wf: any) {
     await loadWfScripts()
   } catch (error) {
     wf.enabled = previous
-    console.warn('保存 Workflow 状态失败', error)
+    wfError.value = error instanceof Error ? error.message : '保存 Workflow 状态失败'
   }
 }
 
-function startWfEdit(wf: any) {
+async function startWfEdit(wf: any) {
   editingWfName.value = wf.name;
   editWfContent.value = '';
   wfSaved.value = false
-  fetch(`${GW}/api/workflows/${encodeURIComponent(wf.name)}`).then(r => r.json()).then(d => {
-    editWfContent.value = d.content || ''
-  }).catch(() => {
-  })
+  wfEditLoading.value = true
+  wfError.value = ''
+  try {
+    const response = await fetch(`${GW}/api/workflows/${encodeURIComponent(wf.name)}`)
+    if (!response.ok) throw new Error(await readResponseError(response, '加载 Workflow 脚本失败'))
+    const d = await response.json()
+    if (editingWfName.value === wf.name) editWfContent.value = d.content || ''
+  } catch (error: any) {
+    if (editingWfName.value === wf.name) wfError.value = error?.message || '加载 Workflow 脚本失败'
+  } finally {
+    if (editingWfName.value === wf.name) wfEditLoading.value = false
+  }
 }
 
 async function saveWfScript() {
   if (!editingWfName.value) return;
   wfSaving.value = true;
   wfSaved.value = false
+  wfError.value = ''
   try {
-    await fetch(`${GW}/api/workflows/${encodeURIComponent(editingWfName.value)}`, {
+    const response = await fetch(`${GW}/api/workflows/${encodeURIComponent(editingWfName.value)}`, {
       method: 'PUT',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({content: editWfContent.value})
     });
+    if (!response.ok) throw new Error(await readResponseError(response, '保存 Workflow 失败'))
     wfSaved.value = true;
     setTimeout(() => wfSaved.value = false, 3000)
-  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
-  wfSaving.value = false
+  } catch (error: any) {
+    wfError.value = error?.message || '保存 Workflow 失败'
+  } finally {
+    wfSaving.value = false
+  }
 }
 
 async function createWfScript() {
@@ -81,17 +109,22 @@ async function createWfScript() {
   const fn = n.endsWith('.mjs') ? n : n + '.mjs'
   const tpl = `export const meta = { name: '${n.replace(/\\.mjs$/, '')}', description: '', phases: [{ title: 'Step 1' }] }\n\nphase('Step 1')\nconst result = await agent('Your prompt here', { agentType: 'general-purpose', label: 'example' })\nlog(result)\n`
   wfSaving.value = true
+  wfError.value = ''
   try {
-    await fetch(`${GW}/api/workflows/${encodeURIComponent(fn)}`, {
+    const response = await fetch(`${GW}/api/workflows/${encodeURIComponent(fn)}`, {
       method: 'PUT',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({content: tpl})
     });
+    if (!response.ok) throw new Error(await readResponseError(response, '创建 Workflow 失败'))
     wfCreateName.value = '';
     await loadWfScripts();
-    startWfEdit({name: fn})
-  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
-  wfSaving.value = false
+    await startWfEdit({name: fn})
+  } catch (error: any) {
+    wfError.value = error?.message || '创建 Workflow 失败'
+  } finally {
+    wfSaving.value = false
+  }
 }
 
 const delTarget = ref<any>(null)
@@ -99,12 +132,17 @@ const delTarget = ref<any>(null)
 async function confirmDeleteWf() {
   const wf = delTarget.value;
   if (!wf) return;
+  wfError.value = ''
   try {
-    await fetch(`${GW}/api/workflows/${encodeURIComponent(wf.name)}`, {method: 'DELETE'});
+    const response = await fetch(`${GW}/api/workflows/${encodeURIComponent(wf.name)}`, {method: 'DELETE'});
+    if (!response.ok) throw new Error(await readResponseError(response, '删除 Workflow 失败'))
     await loadWfScripts();
     if (editingWfName.value === wf.name) editingWfName.value = ''
-  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
-  ;delTarget.value = null
+  } catch (error: any) {
+    wfError.value = error?.message || '删除 Workflow 失败'
+  } finally {
+    delTarget.value = null
+  }
 }
 
 function switchMode(m: 'dag' | 'script') {
@@ -288,20 +326,29 @@ const wfEnabled = ref(false)
 async function loadWfConfig() {
   try {
     const r = await fetch(`${GW}/api/config/workflow-settings`);
-    if (r.ok) {
-      const d = await r.json();
-      wfEnabled.value = !!d.enabled
-    }
-  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
+    if (!r.ok) throw new Error(await readResponseError(r, '加载 Workflow 开关失败'))
+    const d = await r.json();
+    wfEnabled.value = !!d.enabled
+  } catch (error: any) {
+    wfError.value = error?.message || '加载 Workflow 开关失败'
+  }
 }
 
 async function toggleWfEnabled() {
-  wfEnabled.value = !wfEnabled.value
-  await fetch(`${GW}/api/config/workflow-settings`, {
-    method: 'PUT',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({enabled: wfEnabled.value})
-  })
+  const previous = wfEnabled.value
+  wfEnabled.value = !previous
+  wfError.value = ''
+  try {
+    const response = await fetch(`${GW}/api/config/workflow-settings`, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({enabled: wfEnabled.value})
+    })
+    if (!response.ok) throw new Error(await readResponseError(response, '保存 Workflow 开关失败'))
+  } catch (error: any) {
+    wfEnabled.value = previous
+    wfError.value = error?.message || '保存 Workflow 开关失败'
+  }
 }
 
 onMounted(() => {
@@ -402,6 +449,11 @@ async function copyExportedScript() {
           </button>
         </template>
       </div>
+    </div>
+
+    <div v-if="wfError" class="wf-error-banner" role="alert">
+      <span>{{ wfError }}</span>
+      <button type="button" class="wf-error-close" title="关闭" @click="wfError = ''">×</button>
     </div>
 
     <!-- ── DAG 模式 ── -->
@@ -660,7 +712,8 @@ async function copyExportedScript() {
               </button>
             </div>
           </div>
-          <textarea v-model="editWfContent" class="code-editor" spellcheck="false"
+          <div v-if="wfEditLoading" class="wf-editor-loading">加载中...</div>
+          <textarea v-else v-model="editWfContent" class="code-editor" spellcheck="false"
                     style="flex:1;min-height:300px;font-family:var(--font-mono);font-size:13px;line-height:1.6;resize:none;border:none;background:var(--bg-deep);color:var(--text-primary);padding:14px;outline:none;border-radius:0"/>
           <div class="wf-editor-ftr">
             <span style="font-size:12px;color:var(--text-muted)">模型根据任务复杂度自主判断是否调用此脚本</span>
@@ -1378,6 +1431,37 @@ g:hover > .wf-x {
   padding: 8px 14px;
   border-bottom: 1px solid var(--border);
   background: var(--bg-base)
+}
+
+.wf-error-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 14px;
+  color: var(--error);
+  background: var(--bg-base);
+  border-bottom: 1px solid var(--error);
+  font-size: 12px;
+}
+
+.wf-error-close {
+  flex: 0 0 auto;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+}
+
+.wf-editor-loading {
+  display: grid;
+  flex: 1;
+  place-items: center;
+  color: var(--text-muted);
+  background: var(--bg-deep);
+  font-size: 12px;
 }
 
 .wf-editor-ftr {

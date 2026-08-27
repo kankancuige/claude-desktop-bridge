@@ -63,6 +63,25 @@ export function shouldShowPendingResultForTerminal(input: {terminalType?: unknow
   return pendingOutcome !== 'succeeded'
 }
 
+const FAILURE_EVENTS_AFTER_SUCCESS = new Set([
+  'task_failed', 'task_review_paused', 'task_verification_inconclusive', 'generation_stopped', 'stream_error', 'error',
+])
+
+/** 同一任务完成后，忽略没有更高身份/序列的新失败投影，避免迟到清理错误覆盖成功。 */
+export function isLateFailureAfterSuccess(current: ParentTaskUiState, event: any): boolean {
+  const state = createParentTaskUiState(current)
+  if (!state.completionShown || state.phase !== 'succeeded' || !FAILURE_EVENTS_AFTER_SUCCESS.has(String(event?.type || ''))) return false
+  const eventTaskId = String(event?.taskId || event?.taskState?.taskId || '')
+  return !eventTaskId || !state.taskId || eventTaskId === state.taskId
+}
+
+/** 成功总结展示后，旧回合进度事件不得再次追加步骤；新回合由 task_started 重新打开。 */
+export function shouldIgnorePostCompletionEvent(current: ParentTaskUiState, event: any): boolean {
+  const state = createParentTaskUiState(current)
+  if (!state.completionShown) return false
+  return String(event?.type || '') !== 'task_started'
+}
+
 export function createParentTaskUiState(input: Partial<ParentTaskUiState> = {}): ParentTaskUiState {
   return {
     phase: input.phase || 'idle',
@@ -83,6 +102,8 @@ export function mergeParentTaskSnapshot(current: ParentTaskUiState, snapshot: an
   const status = String(snapshot?.status || 'idle')
   const taskId = String(snapshot?.taskId || '')
   const sameTask = !taskId || !previous.taskId || taskId === previous.taskId
+  if (sameTask && previous.completionShown
+      && ['running', 'reviewing', 'changes_required', 'fixing', 'failed', 'incomplete', 'review_paused', 'stopped', 'interrupted'].includes(status)) return previous
   return createParentTaskUiState({
     phase: (['running', 'reviewing', 'changes_required', 'fixing', 'review_paused', 'succeeded', 'incomplete', 'failed'].includes(status)
       ? status
@@ -96,6 +117,7 @@ export function mergeParentTaskSnapshot(current: ParentTaskUiState, snapshot: an
 
 export function reduceParentTaskUi(current: ParentTaskUiState, event: any): {state: ParentTaskUiState, showCompletion: boolean} {
   const state = createParentTaskUiState(current)
+  if (isLateFailureAfterSuccess(state, event)) return {state, showCompletion: false}
   const eventTaskId = String(event?.taskId || '')
   const eventSequence = Number.isFinite(Number(event?.sequence)) ? Math.max(0, Math.trunc(Number(event.sequence))) : 0
   if (eventTaskId && state.taskId && eventTaskId === state.taskId && eventSequence > 0 && eventSequence <= state.sequence) {
@@ -114,6 +136,7 @@ export function reduceParentTaskUi(current: ParentTaskUiState, event: any): {sta
     return {state: {...eventState, primaryResultSeen: true}, showCompletion: false}
   }
   const phaseMap: Record<string, ParentTaskPhase> = {
+    task_write_delegated: 'incomplete',
     task_reviewing: 'reviewing',
     task_changes_required: 'changes_required',
     task_fixing: 'fixing',

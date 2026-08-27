@@ -8,11 +8,13 @@ const compiled = await transform(source, {loader: 'ts', format: 'esm', target: '
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(compiled.code).toString('base64')}`
 const {
   createParentTaskUiState,
+  isLateFailureAfterSuccess,
   mergeParentTaskSnapshot,
   reduceParentTaskUi,
   normalizeAssistantText,
   removeSupersededAssistantMessages,
   selectSucceededTaskSummary,
+  shouldIgnorePostCompletionEvent,
   shouldShowPendingResultForTerminal,
 } = await import(moduleUrl)
 
@@ -54,6 +56,14 @@ test('task_completed shows success exactly once', () => {
 
 test('验证不足保持未完成且不显示成功', () => {
   const reduced = reduceParentTaskUi(createParentTaskUiState({phase: 'running'}), {type: 'task_verification_inconclusive'})
+  assert.equal(reduced.state.phase, 'incomplete')
+  assert.equal(reduced.showCompletion, false)
+})
+
+test('写入委托进入未完成可继续状态，不显示成功终态', () => {
+  const reduced = reduceParentTaskUi(createParentTaskUiState({phase: 'running'}), {
+    type: 'task_write_delegated', taskId: 'task-1', sequence: 2, detail: '等待主任务写入',
+  })
   assert.equal(reduced.state.phase, 'incomplete')
   assert.equal(reduced.showCompletion, false)
 })
@@ -112,4 +122,22 @@ test('Completion Gate 拒绝成功时不追加 SDK 的成功统计', () => {
   assert.equal(shouldShowPendingResultForTerminal({
     terminalType: 'task_failed', pendingOutcome: 'failed',
   }), true)
+})
+
+test('成功总结展示后忽略同一任务的迟到失败事件和失败快照', () => {
+  const completed = createParentTaskUiState({phase: 'succeeded', taskId: 'task-1', completionShown: true, sequence: 8})
+  assert.equal(isLateFailureAfterSuccess(completed, {type: 'error', taskId: 'task-1'}), true)
+  assert.equal(isLateFailureAfterSuccess(completed, {type: 'task_failed', taskState: {taskId: 'task-1'}}), true)
+  assert.equal(isLateFailureAfterSuccess(completed, {type: 'generation_stopped', taskId: 'task-1'}), true)
+  assert.equal(isLateFailureAfterSuccess(completed, {type: 'task_failed', taskId: 'task-2'}), false)
+  assert.equal(mergeParentTaskSnapshot(completed, {status: 'failed', taskId: 'task-1', sequence: 9}).phase, 'succeeded')
+  assert.equal(mergeParentTaskSnapshot(completed, {status: 'running', taskId: 'task-1', sequence: 10}).phase, 'succeeded')
+})
+
+test('成功总结展示后忽略迟到的工作流进度，下一轮 task_started 可以重新开始', () => {
+  const completed = createParentTaskUiState({phase: 'succeeded', completionShown: true, taskId: 'task-1'})
+  assert.equal(shouldIgnorePostCompletionEvent(completed, {type: 'workflow_agent_done', workflowId: 'wf-1'}), true)
+  assert.equal(shouldIgnorePostCompletionEvent(completed, {type: 'workflow_log', message: '整理最终报告'}), true)
+  assert.equal(shouldIgnorePostCompletionEvent(completed, {type: 'workflow_agent_error', id: 'review'}), true)
+  assert.equal(shouldIgnorePostCompletionEvent(completed, {type: 'task_started', taskId: 'task-2'}), false)
 })

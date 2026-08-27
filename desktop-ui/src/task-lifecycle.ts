@@ -22,6 +22,14 @@ export function createSessionLifecycleState(input: Partial<SessionLifecycleState
   }
 }
 
+export function wasSessionGeneratingAtSocketClose(input: {
+  foreground: boolean
+  foregroundStatus?: string | null
+  tabStatus?: string | null
+}): boolean {
+  return (input.foreground ? input.foregroundStatus : input.tabStatus) === 'thinking'
+}
+
 export function reduceSessionLifecycle(current: SessionLifecycleState, event: any): SessionLifecycleState {
   const state = createSessionLifecycleState(current)
   if (event?.type === 'session_lifecycle_snapshot') {
@@ -44,13 +52,13 @@ export function reduceSessionLifecycle(current: SessionLifecycleState, event: an
   if (event?.type === 'message_accepted') {
     return {...state, awaitingAcceptance: false}
   }
-  if (['task_started', 'task_reviewing', 'task_changes_required', 'task_fixing', 'workflow_started', 'workflow_resumed'].includes(event?.type)) {
+  if (['task_started', 'task_reviewing', 'task_changes_required', 'task_fixing', 'workflow_started', 'workflow_auto_started', 'workflow_resumed'].includes(event?.type)) {
     return {...state, active: true, canSend: false, canStop: true, canContinue: false, awaitingAcceptance: false}
   }
   if (event?.type === 'task_coordinator_event') {
     const terminal = [
       'completed', 'failed', 'blocked', 'inconclusive', 'regression_detected', 'paused',
-      'diagnosis_required', 'awaiting_reproduction', 'blocked_external', 'architecture_change_required',
+      'diagnosis_required', 'awaiting_reproduction', 'blocked_external', 'architecture_change_required', 'waiting_user',
     ].includes(String(event.status || ''))
     return terminal
       ? {...state, received: true, active: false, canSend: true, canStop: false, canContinue: event.status !== 'completed', awaitingAcceptance: false}

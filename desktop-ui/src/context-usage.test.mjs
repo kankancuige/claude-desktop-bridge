@@ -6,7 +6,17 @@ import {transform} from 'esbuild'
 const source = readFileSync(new URL('./context-usage.ts', import.meta.url), 'utf8')
 const compiled = await transform(source, {loader: 'ts', format: 'esm', target: 'es2022'})
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(compiled.code).toString('base64')}`
-const {normalizeContextUiState, formatCompactSummary, isSyntheticCompactUiMessage} = await import(moduleUrl)
+const {normalizeContextUiState, contextPercentFromTokens, formatCompactSummary, isSyntheticCompactUiMessage} = await import(moduleUrl)
+
+test('已知上下文窗口即使当前 token 为 0 也返回 0%', () => {
+    assert.equal(contextPercentFromTokens(0, '200K'), 0)
+    assert.equal(contextPercentFromTokens(120000, 200000), 60)
+    assert.equal(contextPercentFromTokens(120000, null), null)
+})
+
+test('上下文超过最大窗口时占比封顶 100%', () => {
+    assert.equal(contextPercentFromTokens(220000, 200000), 100)
+})
 
 test('context UI uses SDK percentage and actual max tokens', () => {
     assert.deepEqual(normalizeContextUiState({
@@ -46,6 +56,36 @@ test('configured safety cap can only lower the actual SDK context window', () =>
         rawMaxTokens: 256000,
         percentage: 90,
         state: 'warning',
+    })
+})
+
+test('context usage accepts SDK wire aliases when a relay returns snake_case fields', () => {
+    assert.deepEqual(normalizeContextUiState({
+        total_tokens: 120000,
+        max_tokens: 200000,
+        raw_max_tokens: 256000,
+        percentage: 60,
+    }), {
+        totalTokens: 120000,
+        maxTokens: 200000,
+        rawMaxTokens: 256000,
+        percentage: 60,
+        state: 'normal',
+    })
+})
+
+test('真实 SDK context_usage 只有 raw_max_tokens 时圆环仍显示百分比', () => {
+    assert.deepEqual(normalizeContextUiState({
+        model: 'claude-sonnet-4-6',
+        total_tokens: 120000,
+        raw_max_tokens: 200000,
+        percentage: 60,
+    }), {
+        totalTokens: 120000,
+        maxTokens: 200000,
+        rawMaxTokens: 200000,
+        percentage: 60,
+        state: 'normal',
     })
 })
 

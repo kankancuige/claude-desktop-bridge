@@ -23,6 +23,7 @@ import {useRouter} from 'vue-router'
 import {t, setLocale} from '../i18n'
 import {isMemoryIndexReady, memoryModeLabelKey} from '../memory-mode.mjs'
 import WorkflowTab from './WorkflowTab.vue'
+import {apiFetch} from '../api'
 
 // ── Vue Router 实例 ──
 // 功能说明: 用于「返回工作区」按钮导航回主页
@@ -36,7 +37,7 @@ const GW = 'http://127.0.0.1:3456'
 // 功能说明: 控制左侧导航高亮状态和右侧内容区显示哪个配置模块
 // 实现方式: ref<string>，默认 'general'；switchTab() 负责切换并懒加载对应数据
 const activeTab = ref('general')
-type TabKey = 'general' | 'workbench' | 'skills' | 'agents' | 'commands' | 'hooks' | 'rules' | 'memory' | 'mcp' | 'workflow' | 'im' | 'scheduler' | 'oss'
+type TabKey = 'general' | 'workbench' | 'usage' | 'skills' | 'agents' | 'commands' | 'hooks' | 'rules' | 'memory' | 'mcp' | 'workflow' | 'im' | 'scheduler' | 'oss'
 
 // ── Tab 导航定义列表 ──
 // 功能说明: 左侧导航栏的入口项配置，每个包含 key（标识符）/ label（中文名）/ icon / desc（描述文字）
@@ -57,6 +58,12 @@ const tabs: { key: TabKey; label: string; icon: string; desc: string }[] = [
     label: '架构运行',
     icon: ri('<path d="M4 4h16v5H4zM4 13h7v7H4zM15 13h5v7h-5z"/>'),
     desc: '任务证据、Pitfall 与 AI 健康'
+  },
+  {
+    key: 'usage',
+    label: '调用日志',
+    icon: ri('<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 16v-4M12 16V8M16 16v-6"/>'),
+    desc: 'Token 用量与实时状态'
   },
   {
     key: 'skills',
@@ -238,6 +245,151 @@ async function updateWorkbenchPitfall(item: any, action: 'confirm' | 'ignore' | 
   }
 }
 
+// ── 模型调用日志 ──
+const usageLoading = ref(false)
+const usageError = ref('')
+const usageSummary = ref<any>(null)
+const usageTrend = ref<any[]>([])
+const usageEvents = ref<any[]>([])
+const usageActive = ref({active: false, count: 0})
+const usageRange = ref<'48h' | '7d' | '14d' | 'custom'>('14d')
+const usageFromDate = ref('')
+const usageToDate = ref('')
+const usagePage = ref(1)
+const usagePageSize = ref(10)
+let usagePollTimer: ReturnType<typeof setInterval> | null = null
+
+function usageNumber(value: unknown): number | null {
+  const n = Number(value)
+  return Number.isSafeInteger(n) && n >= 0 ? n : null
+}
+
+function formatUsageTokens(value: unknown): string {
+  const n = usageNumber(value)
+  if (n === null) return '未知'
+  return n.toLocaleString('zh-CN')
+}
+
+function formatUsageTime(value: unknown): string {
+  const n = usageNumber(value)
+  return n === null || n <= 0 ? '未记录' : new Date(n).toLocaleString('zh-CN')
+}
+
+function usageStatusLabel(value: unknown): string {
+  const labels: Record<string, string> = {pending: '未收口', completed: '已完成', failed: '失败', cancelled: '已取消'}
+  return labels[String(value || '').toLowerCase()] || '已完成'
+}
+
+function combinedUsageTokens(first: unknown, second: unknown): number | null {
+  const a = usageNumber(first)
+  const b = usageNumber(second)
+  return a === null && b === null ? null : (a || 0) + (b || 0)
+}
+
+function usageBarTotal(row: any): number {
+  return (usageNumber(row?.inputTokens) || 0) + (usageNumber(row?.outputTokens) || 0) + (usageNumber(row?.cacheReadInputTokens) || 0) + (usageNumber(row?.cacheCreationInputTokens) || 0)
+}
+
+const usageMaxBar = computed(() => Math.max(1, ...usageTrend.value.map(usageBarTotal)))
+const usagePageCount = computed(() => Math.max(1, Math.ceil(usageEvents.value.length / usagePageSize.value)))
+const usagePagedEvents = computed(() => {
+  const start = (usagePage.value - 1) * usagePageSize.value
+  return usageEvents.value.slice(start, start + usagePageSize.value)
+})
+
+function localDateValue(date: Date): string {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
+function localDateStart(value: string): number | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null
+  const [year, month, day] = value.split('-').map(Number)
+  const date = new Date(year, month - 1, day)
+  return Number.isNaN(date.getTime()) ? null : date.getTime()
+}
+
+function localDateEnd(value: string): number | null {
+  const start = localDateStart(value)
+  return start === null ? null : start + 24 * 60 * 60 * 1000 - 1
+}
+
+function usageRangeWindow(): {from: number; to: number} {
+  const now = Date.now()
+  if (usageRange.value === '48h') return {from: now - 48 * 60 * 60 * 1000, to: now}
+  if (usageRange.value === '7d') return {from: now - 7 * 24 * 60 * 60 * 1000, to: now}
+  if (usageRange.value === 'custom') {
+    const from = localDateStart(usageFromDate.value)
+    const to = localDateEnd(usageToDate.value)
+    if (from !== null && to !== null && from <= to) return {from, to}
+  }
+  return {from: now - 14 * 24 * 60 * 60 * 1000, to: now}
+}
+
+function usageBarTooltip(row: any): string {
+  const input = usageNumber(row?.inputTokens)
+  const output = usageNumber(row?.outputTokens)
+  const cache = combinedUsageTokens(row?.cacheReadInputTokens, row?.cacheCreationInputTokens)
+  return `${row?.day || '未知日期'}\n调用 ${usageNumber(row?.eventCount) ?? 0} 次\n输入 ${formatUsageTokens(input)}\n输出 ${formatUsageTokens(output)}\n缓存 ${formatUsageTokens(cache)}\n合计 ${usageBarTotal(row).toLocaleString('zh-CN')}`
+}
+
+function resetUsagePage() {
+  usagePage.value = 1
+}
+
+function changeUsagePage(page: number) {
+  usagePage.value = Math.min(Math.max(1, page), usagePageCount.value)
+}
+
+function onUsagePageSizeChange() {
+  usagePage.value = 1
+}
+
+function ensureUsageCustomDates() {
+  if (usageFromDate.value && usageToDate.value) return
+  const today = new Date()
+  const from = new Date(today)
+  from.setDate(today.getDate() - 13)
+  usageFromDate.value = localDateValue(from)
+  usageToDate.value = localDateValue(today)
+}
+
+function onUsageRangeChange() {
+  if (usageRange.value === 'custom') ensureUsageCustomDates()
+  resetUsagePage()
+  void loadUsage()
+}
+
+async function loadUsage() {
+  usageLoading.value = true
+  usageError.value = ''
+  try {
+    const window = usageRangeWindow()
+    const params = new URLSearchParams({limit: '500', from: String(window.from), to: String(window.to)})
+    const response = await fetch(`${GW}/api/usage/history?${params.toString()}`)
+    const data = await response.json()
+    if (!response.ok) throw new Error(data.error || '加载调用日志失败')
+    usageSummary.value = data.summary || null
+    usageTrend.value = Array.isArray(data.trend) ? data.trend : []
+    usageEvents.value = Array.isArray(data.events) ? data.events : []
+    usagePage.value = Math.min(usagePage.value, usagePageCount.value)
+    usageActive.value = data.activeSessions || {active: false, count: 0}
+  } catch (error: any) {
+    usageError.value = error?.message || '加载调用日志失败'
+  } finally {
+    usageLoading.value = false
+  }
+}
+
+function startUsagePolling() {
+  if (usagePollTimer) clearInterval(usagePollTimer)
+  usagePollTimer = setInterval(() => {
+    if (activeTab.value === 'usage') void loadUsage()
+  }, 5000)
+}
+
 // ── 常规设置数据 (General Tab) - AI 供应商 / API Key / 模型列表 / 会话参数 / 主题语言 ──
 const DEFAULT_SETTINGS = {
   // 功能说明: 默认模型 ID，服务端无配置时使用 DeepSeek v4 Pro
@@ -258,6 +410,12 @@ const DEFAULT_SETTINGS = {
   maxTurns: 40,
   // 功能说明: 单条消息 # 引用文件注入内容上限 (KB)，默认 200
   fileInjectLimitKB: 200,
+  // 功能说明: SDK 流 watchdog 统一由系统设置管理，单位为毫秒
+  streamWatchdog: {
+    idleTimeoutMs: 10 * 60 * 1000,
+    toolIdleTimeoutMs: 30 * 60 * 1000,
+    maxDurationMs: 2 * 60 * 60 * 1000,
+  },
   // 功能说明: 环境变量子对象，含 Base URL 和 API Key
   env: {
     ANTHROPIC_BASE_URL: 'https://api.deepseek.com/anthropic',
@@ -382,13 +540,15 @@ const tiersPointToSameModel = computed(() => {
 })
 
 async function loadModelTiers() {
+  modelTierError.value = ''
   try {
     const r = await fetch(`${GW}/api/config/workflow-settings`)
-    if (r.ok) {
-      const d = await r.json()
-      modelTiers.value = d.modelTiers || {}
-    }
-  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
+    if (!r.ok) throw new Error(`读取模型档位失败（HTTP ${r.status}）`)
+    const d = await r.json()
+    modelTiers.value = d.modelTiers || {}
+  } catch (error) {
+    modelTierError.value = error instanceof Error ? error.message : '读取模型档位失败'
+  }
 }
 
 async function saveModelTier(tier: string, modelId: string) {
@@ -430,6 +590,7 @@ async function loadSettings() {
       ...DEFAULT_SETTINGS,
       ...raw,
       env: {...DEFAULT_SETTINGS.env, ...(raw.env || {})},
+      streamWatchdog: {...DEFAULT_SETTINGS.streamWatchdog, ...(raw.streamWatchdog || {})},
     }
     const url = settings.value.env?.ANTHROPIC_BASE_URL || ''
     // 供应商推断：按 baseUrl 特征匹配，与 WorkspaceView loadProviderModels 保持一致
@@ -599,6 +760,11 @@ async function saveSettings() {
   // Ensure token is parsed before save
   onTokenBlur()
   settings.value.maxTurns = Math.min(100, Math.max(1, Math.trunc(Number(settings.value.maxTurns) || 40)))
+  settings.value.streamWatchdog = {
+    idleTimeoutMs: Math.min(30 * 60 * 1000, Math.max(30 * 1000, Math.trunc(Number(settings.value.streamWatchdog?.idleTimeoutMs) || DEFAULT_SETTINGS.streamWatchdog.idleTimeoutMs))),
+    toolIdleTimeoutMs: Math.min(2 * 60 * 60 * 1000, Math.max(60 * 1000, Math.trunc(Number(settings.value.streamWatchdog?.toolIdleTimeoutMs) || DEFAULT_SETTINGS.streamWatchdog.toolIdleTimeoutMs))),
+    maxDurationMs: Math.min(24 * 60 * 60 * 1000, Math.max(10 * 60 * 1000, Math.trunc(Number(settings.value.streamWatchdog?.maxDurationMs) || DEFAULT_SETTINGS.streamWatchdog.maxDurationMs))),
+  }
   try {
     const res = await fetch(`${GW}/api/config/settings`, {
       method: 'PUT',
@@ -759,26 +925,26 @@ const cavemanUpdateOk = ref(false)
 const cavemanUpdateError = ref('')
 
 async function loadCavemanConfig() {
-  try {
-    const r = await fetch(`${GW}/api/config/caveman`)
-    if (r.ok) {
-      const data = await r.json()
-      cavemanConfig.value = data
-      if (!cavemanUpdateVersion.value) {
-        cavemanUpdateVersion.value = data.cavemanUpdate?.latest || data.cavemanCurrent || ''
-      }
-    }
-  } catch (e) { console.error(e) }
+  const r = await fetch(`${GW}/api/config/caveman`)
+  if (!r.ok) throw new Error(`加载 Caveman 配置失败（HTTP ${r.status}）`)
+  const data = await r.json()
+  cavemanConfig.value = data
+  if (!cavemanUpdateVersion.value) {
+    cavemanUpdateVersion.value = data.cavemanUpdate?.latest || data.cavemanCurrent || ''
+  }
 }
 
 async function saveCavemanConfig() {
   try {
-    await fetch(`${GW}/api/config/caveman`, {
+    const response = await fetch(`${GW}/api/config/caveman`, {
       method: 'PUT',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({enabled: cavemanConfig.value.enabled, level: cavemanConfig.value.level}),
     })
-  } catch (e) { console.error(e) }
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  } catch (e: any) {
+    showAlert(`保存 Caveman 配置失败: ${e?.message || '网络错误'}`)
+  }
 }
 
 async function updateCaveman() {
@@ -811,27 +977,27 @@ const rtkUpdateOk = ref(false)
 const rtkUpdateError = ref('')
 
 async function loadRtkConfig() {
-  try {
-    const r = await fetch(`${GW}/api/config/rtk`)
-    if (r.ok) {
-      const data = await r.json()
-      rtkConfig.value = data
-      // 默认选中 latest，若没有则选 current
-      if (!rtkUpdateVersion.value) {
-        rtkUpdateVersion.value = data.rtkUpdate?.latest || data.rtkCurrent || ''
-      }
-    }
-  } catch (e) { console.error(e) }
+  const r = await fetch(`${GW}/api/config/rtk`)
+  if (!r.ok) throw new Error(`加载 RTK 配置失败（HTTP ${r.status}）`)
+  const data = await r.json()
+  rtkConfig.value = data
+  // 默认选中 latest，若没有则选 current
+  if (!rtkUpdateVersion.value) {
+    rtkUpdateVersion.value = data.rtkUpdate?.latest || data.rtkCurrent || ''
+  }
 }
 
 async function saveRtkConfig() {
   try {
-    await fetch(`${GW}/api/config/rtk`, {
+    const response = await fetch(`${GW}/api/config/rtk`, {
       method: 'PUT',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({enabled: rtkConfig.value.enabled}),
     })
-  } catch (e) { console.error(e) }
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  } catch (e: any) {
+    showAlert(`保存 RTK 配置失败: ${e?.message || '网络错误'}`)
+  }
 }
 
 async function updateRtk() {
@@ -889,13 +1055,10 @@ const skillsSourceCounts = computed(() => {
 // ── Skills 启用/禁用 ──
 const disabledSkills = ref<string[]>([])
 async function loadDisabledSkills() {
-  try {
-    const res = await fetch(`${GW}/api/config/disabled-skills`)
-    if (res.ok) {
-      const d = await res.json()
-      disabledSkills.value = d.disabled || []
-    }
-  } catch (e) { console.error(e) }
+  const res = await fetch(`${GW}/api/config/disabled-skills`)
+  if (!res.ok) throw new Error(`加载 Skill 启用状态失败（HTTP ${res.status}）`)
+  const d = await res.json()
+  disabledSkills.value = d.disabled || []
 }
 async function toggleSkillEnabled(skill: any) {
   if (skill.source === 'builtin') {
@@ -909,11 +1072,13 @@ async function toggleSkillEnabled(skill: any) {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({name, disabled}),
     })
-    if (res.ok) {
-      if (disabled) disabledSkills.value.push(name)
-      else disabledSkills.value = disabledSkills.value.filter(n => n !== name)
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      throw new Error(data.error || `HTTP ${res.status}`)
     }
-  } catch (e) { console.error(e) }
+    if (disabled) disabledSkills.value.push(name)
+    else disabledSkills.value = disabledSkills.value.filter(n => n !== name)
+  } catch (e: any) { showAlert(`更新 Skill 状态失败: ${e?.message || '网络错误'}`) }
 }
 
 // ── Skills 搜索（同时用于本地过滤 + 市场搜索）──
@@ -928,7 +1093,7 @@ function searchMarket() {
   fetch(`${GW}/api/config/skills-market?q=${encodeURIComponent(q)}`)
     .then(r => r.ok ? r.json() : Promise.reject(r))
     .then(d => { marketResults.value = d.results || [] })
-    .catch((error: unknown) => console.warn('搜索 Skills 市场失败', error))
+    .catch((error: any) => showAlert(`搜索 Skills 市场失败: ${error?.message || '网络错误'}`))
     .finally(() => { marketSearching.value = false })
 }
 async function installFromMarket(item: any) {
@@ -994,12 +1159,12 @@ async function loadSkills() {
   skillsLoading.value = true
   try {
     const res = await fetch(`${GW}/api/config/skills`)
-    if (res.ok) {
-      const data = await res.json()
-      skills.value = data.skills || []
-    }
-  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
-  skillsLoading.value = false
+    if (!res.ok) throw new Error(`加载 Skills 失败（HTTP ${res.status}）`)
+    const data = await res.json()
+    skills.value = data.skills || []
+  } finally {
+    skillsLoading.value = false
+  }
 }
 
 // ── 进入 Skill 全屏编辑模式 ──
@@ -1028,8 +1193,11 @@ async function saveSkill() {
     setTimeout(() => {
       skillSaved.value = false
     }, 3000)
-  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
-  skillSaving.value = false
+  } catch (error: any) {
+    showAlert(`${t('common.saveFailed')}: ${error?.message || ''}`)
+  } finally {
+    skillSaving.value = false
+  }
 }
 
 // ── 退出 Skill 编辑模式，清空编辑状态 ──
@@ -1098,12 +1266,12 @@ async function loadAgents() {
   agentsLoading.value = true
   try {
     const res = await fetch(`${GW}/api/config/agents`)
-    if (res.ok) {
-      const data = await res.json();
-      agents.value = data.agents || []
-    }
-  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
-  agentsLoading.value = false
+    if (!res.ok) throw new Error(`加载 Agents 失败（HTTP ${res.status}）`)
+    const data = await res.json();
+    agents.value = data.agents || []
+  } finally {
+    agentsLoading.value = false
+  }
 }
 
 // ── 进入 Agent 全屏编辑模式 ──
@@ -1129,8 +1297,11 @@ async function saveAgent() {
     setTimeout(() => {
       agentSaved.value = false
     }, 3000)
-  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
-  agentSaving.value = false
+  } catch (error: any) {
+    showAlert(`${t('common.saveFailed')}: ${error?.message || ''}`)
+  } finally {
+    agentSaving.value = false
+  }
 }
 
 // ── 退出 Agent 编辑模式 ──
@@ -1166,11 +1337,14 @@ async function createAgent() {
 // 功能说明: 确认后 DELETE /api/config/agents/:name，Gateway 会自动保留 .bak 备份
 async function deleteAgent(agent: any) {
   showConfirm(`确定删除 agent「${agent.name}」?（会保留 .bak 备份）`, async () => {
-    appConfirm.value = null
     try {
-      await fetch(`${GW}/api/config/agents/${encodeURIComponent(agent.name)}`, {method: 'DELETE'})
+      const response = await fetch(`${GW}/api/config/agents/${encodeURIComponent(agent.name)}`, {method: 'DELETE'})
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}))
+        throw new Error(data.error || `HTTP ${response.status}`)
+      }
       await loadAgents()
-    } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
+    } catch (error: any) { showAlert(`删除 Agent 失败: ${error?.message || '网络错误'}`) }
   })
 }
 
@@ -1201,14 +1375,14 @@ async function loadCommands() {
   commandsLoading.value = true
   try {
     const res = await fetch(`${GW}/api/config/commands`)
-    if (res.ok) {
-      const data = await res.json();
-      commands.value = data.commands || [];
-      commandsLive.value = !!data.live
-      commandsEnabled.value = data.builtinEnabled !== false
-    }
-  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
-  commandsLoading.value = false
+    if (!res.ok) throw new Error(`加载命令失败（HTTP ${res.status}）`)
+    const data = await res.json();
+    commands.value = data.commands || [];
+    commandsLive.value = !!data.live
+    commandsEnabled.value = data.builtinEnabled !== false
+  } finally {
+    commandsLoading.value = false
+  }
 }
 
 // ── 按搜索词过滤后的命令列表 ──
@@ -1246,9 +1420,11 @@ async function loadHooks() {
   hooksLoading.value = true
   try {
     const res = await fetch(`${GW}/api/config/hooks`)
-    if (res.ok) hooks.value = await res.json()
-  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
-  hooksLoading.value = false
+    if (!res.ok) throw new Error(`加载 Hooks 失败（HTTP ${res.status}）`)
+    hooks.value = await res.json()
+  } finally {
+    hooksLoading.value = false
+  }
 }
 
 // ── Hook 搜索关键词 ──
@@ -1295,8 +1471,11 @@ async function saveHook() {
     setTimeout(() => {
       hookSaved.value = false
     }, 3000)
-  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
-  hookSaving.value = false
+  } catch (error: any) {
+    showAlert(`${t('common.saveFailed')}: ${error?.message || ''}`)
+  } finally {
+    hookSaving.value = false
+  }
 }
 
 // ── 退出 Hook 编辑模式 ──
@@ -1390,12 +1569,12 @@ async function loadRules() {
   rulesLoading.value = true
   try {
     const res = await fetch(`${GW}/api/config/rules`)
-    if (res.ok) {
-      const data = await res.json()
-      rules.value = data.rules || []
-    }
-  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
-  rulesLoading.value = false
+    if (!res.ok) throw new Error(`加载 Rules 失败（HTTP ${res.status}）`)
+    const data = await res.json()
+    rules.value = data.rules || []
+  } finally {
+    rulesLoading.value = false
+  }
 }
 
 function startEditRule(rule: any) {
@@ -1420,8 +1599,11 @@ async function saveRule() {
     setTimeout(() => {
       ruleSaved.value = false
     }, 3000)
-  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
-  ruleSaving.value = false
+  } catch (error: any) {
+    showAlert(`${t('common.saveFailed')}: ${error?.message || ''}`)
+  } finally {
+    ruleSaving.value = false
+  }
 }
 
 function cancelEditRule() {
@@ -1652,7 +1834,6 @@ async function createMemory(encodedDir: string) {
 
 async function deleteMemory(filename: string, encodedDir: string) {
   showConfirm(`确定删除 ${filename} ?`, async () => {
-    appConfirm.value = null
     try {
       const response = await fetch(`${GW}/api/projects/${encodedDir}/memory/${encodeURIComponent(filename)}`, {method: 'DELETE'})
       if (!response.ok) {
@@ -1770,23 +1951,20 @@ async function loadMcp() {
   mcpLoading.value = true
   try {
     const res = await fetch(`${GW}/api/config/mcp`)
-    if (res.ok) {
-      const data = await res.json()
-      mcpPlugins.value = data.plugins || []
-    }
-  } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
-  mcpLoading.value = false
+    if (!res.ok) throw new Error(`加载 MCP 插件失败（HTTP ${res.status}）`)
+    const data = await res.json()
+    mcpPlugins.value = data.plugins || []
+  } finally {
+    mcpLoading.value = false
+  }
 }
 
 // ── 加载已禁用的 MCP 插件列表 ──
 async function loadDisabledMcpPlugins() {
-  try {
-    const res = await fetch(`${GW}/api/config/disabled-mcp-plugins`)
-    if (res.ok) {
-      const d = await res.json()
-      disabledMcpPlugins.value = d.disabled || []
-    }
-  } catch (e) { console.error(e) }
+  const res = await fetch(`${GW}/api/config/disabled-mcp-plugins`)
+  if (!res.ok) throw new Error(`加载 MCP 启用状态失败（HTTP ${res.status}）`)
+  const d = await res.json()
+  disabledMcpPlugins.value = d.disabled || []
 }
 
 // ── 切换 MCP 插件启用/禁用 ──
@@ -1802,11 +1980,13 @@ async function toggleMcpPlugin(plugin: any) {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({name, disabled}),
     })
-    if (res.ok) {
-      if (disabled) disabledMcpPlugins.value.push(name)
-      else disabledMcpPlugins.value = disabledMcpPlugins.value.filter(n => n !== name)
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      throw new Error(data.error || `HTTP ${res.status}`)
     }
-  } catch (e) { console.error(e) }
+    if (disabled) disabledMcpPlugins.value.push(name)
+    else disabledMcpPlugins.value = disabledMcpPlugins.value.filter(n => n !== name)
+  } catch (e: any) { showAlert(`更新 MCP 插件状态失败: ${e?.message || '网络错误'}`) }
 }
 
 // ── 切换 MCP 服务器启用/禁用 ──
@@ -1818,10 +1998,9 @@ async function toggleMcpServer(srv: any) {
       body: JSON.stringify({name: srv.name, transport: srv.transport, command: srv.command || undefined, args: srv.args || [], env: srv.env || {}, url: srv.url || undefined, headers: srv.headers || {}, enabled}),
     })
     const d = await res.json()
-    if (res.ok && d.ok) {
-      srv.enabled = enabled
-    }
-  } catch (e) { console.error(e) }
+    if (!res.ok || !d.ok) throw new Error(d.error || `HTTP ${res.status}`)
+    srv.enabled = enabled
+  } catch (e: any) { showAlert(`更新 MCP Server 状态失败: ${e?.message || '网络错误'}`) }
 }
 
 // ── 加载 MCP 服务器列表 ──
@@ -1830,12 +2009,12 @@ async function loadMcpServers() {
   mcpServersLoading.value = true
   try {
     const res = await fetch(`${GW}/api/config/mcp-servers`)
-    if (res.ok) {
-      const data = await res.json()
-      mcpServers.value = data.servers || []
-    }
-  } catch (e) { console.error(e) }
-  mcpServersLoading.value = false
+    if (!res.ok) throw new Error(`加载 MCP Server 失败（HTTP ${res.status}）`)
+    const data = await res.json()
+    mcpServers.value = data.servers || []
+  } finally {
+    mcpServersLoading.value = false
+  }
 }
 
 // ── 统一刷新 MCP（插件 + 服务器）──
@@ -1929,7 +2108,7 @@ const scheduledTasks = ref<any[]>([])
 const schedLoading = ref(false)
 const showSchedForm = ref(false)
 const editingSchedId = ref<string | null>(null)
-const schedForm = ref({cron: '', prompt: '', workDir: '', model: '', permissionMode: 'default', maxTurns: 20, enabled: true})
+const schedForm = ref({cron: '', prompt: '', workDir: '', model: '', permissionMode: 'bypassPermissions', maxTurns: 20, enabled: true})
 const schedSaving = ref(false)
 const schedSearch = ref('')
 const filteredScheduledTasks = computed(() => {
@@ -1994,15 +2173,17 @@ function resetSchedVisualForm() {
 async function loadScheduledTasks() {
   schedLoading.value = true
   try {
-    const r = await fetch(`${GW}/api/config/scheduled-tasks`)
-    if (r.ok) { const d = await r.json(); scheduledTasks.value = d.tasks || [] }
-  } catch (e) { console.error(e) }
+    const r = await apiFetch(`${GW}/api/config/scheduled-tasks`)
+    const d = await r.json().catch(() => ({}))
+    if (!r.ok) { showAlert('加载定时任务失败: ' + (d.error || r.status)); return }
+    scheduledTasks.value = d.tasks || []
+  } catch (e: any) { showAlert('加载定时任务失败: ' + (e.message || '网络错误')) }
   schedLoading.value = false
 }
 function openNewSched() {
   editingSchedId.value = null
   resetSchedVisualForm()
-  schedForm.value = {cron: '0 9 * * *', prompt: '', workDir: '', model: '', permissionMode: 'default', maxTurns: 20, enabled: true}
+  schedForm.value = {cron: '0 9 * * *', prompt: '', workDir: '', model: '', permissionMode: 'bypassPermissions', maxTurns: 20, enabled: true}
   showSchedForm.value = true
 }
 function editSched(t: any) {
@@ -2019,12 +2200,12 @@ async function saveSched() {
   try {
     let r
     if (editingSchedId.value) {
-      r = await fetch(`${GW}/api/config/scheduled-tasks/${editingSchedId.value}`, {
+      r = await apiFetch(`${GW}/api/config/scheduled-tasks/${editingSchedId.value}`, {
         method: 'PUT', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(f),
       })
     } else {
-      r = await fetch(`${GW}/api/config/scheduled-tasks`, {
+      r = await apiFetch(`${GW}/api/config/scheduled-tasks`, {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(f),
       })
@@ -2036,30 +2217,33 @@ async function saveSched() {
 }
 async function toggleSched(t: any) {
   try {
-    await fetch(`${GW}/api/config/scheduled-tasks/${t.id}`, {
+    const r = await apiFetch(`${GW}/api/config/scheduled-tasks/${t.id}`, {
       method: 'PUT', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({enabled: !t.enabled}),
     })
+    const d = await r.json().catch(() => ({}))
+    if (!r.ok) { showAlert('更新失败: ' + (d.error || r.status)); return }
     await loadScheduledTasks()
-  } catch (e) { console.error(e) }
+  } catch (e: any) { showAlert('更新失败: ' + (e.message || '网络错误')) }
 }
 async function runSchedNow(t: any) {
   try {
-    const r = await fetch(`${GW}/api/config/scheduled-tasks/${t.id}/run`, {method: 'POST'})
-    if (!r.ok) { const d = await r.json(); showAlert(d.error || '执行失败'); return }
-    const d = await r.json()
+    const r = await apiFetch(`${GW}/api/config/scheduled-tasks/${t.id}/run`, {method: 'POST'})
+    const d = await r.json().catch(() => ({}))
     if (d.reason === 'already_running') { showAlert('任务正在运行，已忽略本次触发'); return }
     if (d.reason === 'concurrency_limit') { showAlert('已达到定时任务并发上限'); return }
+    if (!r.ok) { showAlert(d.error || d.reason || '执行失败'); return }
     showAlert(d.started ? '任务已启动' : '任务未启动')
   } catch (e: any) { showAlert('执行失败: ' + (e.message || '')) }
 }
 async function deleteSched(id: string) {
   showConfirm('确定删除此定时任务？', async () => {
-    appConfirm.value = null
     try {
-      await fetch(`${GW}/api/config/scheduled-tasks/${id}`, {method: 'DELETE'})
+      const r = await apiFetch(`${GW}/api/config/scheduled-tasks/${id}`, {method: 'DELETE'})
+      const d = await r.json().catch(() => ({}))
+      if (!r.ok) { showAlert('删除失败: ' + (d.error || r.status)); return }
       await loadScheduledTasks()
-    } catch (e) { console.error(e) }
+    } catch (e: any) { showAlert('删除失败: ' + (e.message || '网络错误')) }
   })
 }
 
@@ -2104,8 +2288,8 @@ function confirmClearBindings(staleOnly: boolean) {
   const count = staleOnly ? imBindingTotals.value.stale : imBindingTotals.value.total
   if (count <= 0) return
   const message = staleOnly
-    ? `确定清理 ${count} 条已失效的会话绑定吗？下次收到消息时会重新绑定当前桌面会话。`
-    : `确定清空全部 ${count} 条会话绑定吗？平台凭据和配对关系不会被删除。`
+    ? `确定清理 ${count} 条历史会话路由吗？配对关系不会被删除。`
+    : `确定清空全部 ${count} 条会话路由吗？平台凭据和配对关系不会被删除。`
   showConfirm(message, () => { void clearBindings(staleOnly) })
 }
 
@@ -2217,11 +2401,18 @@ const unbindTarget = ref<any>(null)  // 待解绑的平台对象，非 null 时�
 
 // ── 通用玻璃态确认弹窗 / 提示弹窗 ──
 // 替代浏览器原生 confirm() / showAlert()，统一使用 glass 风格
-const appConfirm = ref<{ message: string; onOk: () => void } | null>(null)
+const appConfirm = ref<{ message: string; onOk: () => void | Promise<void> } | null>(null)
 const appAlert = ref<{ message: string } | null>(null)
 
-function showConfirm(message: string, onOk: () => void) {
+function showConfirm(message: string, onOk: () => void | Promise<void>) {
   appConfirm.value = {message, onOk}
+}
+
+function acceptAppConfirm() {
+  const confirmation = appConfirm.value
+  if (!confirmation) return
+  appConfirm.value = null
+  void confirmation.onOk()
 }
 
 function showAlert(message: string) {
@@ -2271,18 +2462,26 @@ function startQRPoll(platformId: string) {
   qrPollTimer = setInterval(async () => {
     try {
       const res = await fetch(`${GW}/api/config/adapters/${platformId}/qrcode/poll`, {method: 'POST'})
-      if (res.ok) {
-        const d = await res.json()
-        qrStatus.value = d.status === 'scaned' ? 'scanned' : d.status === 'confirmed' ? 'confirmed' : d.status === 'expired' ? 'expired' : 'wait'
-        if (d.status === 'confirmed') {
-          clearInterval(qrPollTimer);
-          setTimeout(() => {
-            closeBindModal();
-            loadIM()
-          }, 2000)
-        }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const d = await res.json()
+      qrStatus.value = d.status === 'scaned' ? 'scanned' : d.status === 'confirmed' ? 'confirmed' : d.status === 'expired' ? 'expired' : 'wait'
+      if (d.status === 'confirmed') {
+        clearInterval(qrPollTimer);
+        qrPollTimer = null
+        setTimeout(() => {
+          closeBindModal();
+          loadIM()
+        }, 2000)
+      } else if (d.status === 'expired') {
+        clearInterval(qrPollTimer)
+        qrPollTimer = null
       }
-    } catch (error) { console.debug('非关键 UI 操作失败，已按降级路径继续', error) }
+    } catch (error: any) {
+      qrStatus.value = 'expired'
+      if (qrPollTimer) clearInterval(qrPollTimer)
+      qrPollTimer = null
+      showAlert(`二维码状态读取失败: ${error?.message || '网络错误'}`)
+    }
   }, 2000)
 }
 
@@ -2368,6 +2567,7 @@ let petPollTimer: ReturnType<typeof setInterval> | null = null
 const tabLoaders: Partial<Record<TabKey, () => Promise<void>>> = {
   general: async () => { await Promise.all([loadSettings(), loadModelTiers()]) },
   workbench: () => Promise.all([loadWorkbench(), loadWorkbenchProjects()]).then(() => undefined),
+  usage: loadUsage,
   skills: () => Promise.all([loadSkills(), loadDisabledSkills()]).then(() => undefined),
   agents: loadAgents,
   commands: loadCommands,
@@ -2468,11 +2668,13 @@ function loadPetOptions() {
 
 onMounted(() => {
   void loadTabModule('general').catch(() => {})
+  startUsagePolling()
   startAutoRetryLoop()
 })
 
 onUnmounted(() => {
   if (retryTimer) clearInterval(retryTimer)
+  if (usagePollTimer) clearInterval(usagePollTimer)
   if (petPollTimer) clearInterval(petPollTimer)
   if (qrPollTimer) { clearInterval(qrPollTimer); qrPollTimer = null }  // QR 轮询可能正在进行，离开页面必须停
   if (_petPersistTimer) { clearTimeout(_petPersistTimer); _petPersistTimer = null }  // persist 300ms 可能未执行
@@ -2726,6 +2928,24 @@ onUnmounted(() => {
                   <span class="field-hint">{{ t('gen.fileInjectHint') }}</span>
                 </div>
                 <div class="field">
+                  <label>普通流空闲等待（分钟）</label>
+                  <input :value="Number(settings.streamWatchdog.idleTimeoutMs) / 60000" type="number" min="0.5" max="30" step="0.5" class="field-input mono"
+                         @change="settings.streamWatchdog.idleTimeoutMs = Math.round(Number(($event.target as HTMLInputElement).value) * 60000)"/>
+                  <span class="field-hint">连续没有 SDK 事件时的默认等待时间。</span>
+                </div>
+                <div class="field">
+                  <label>活动工具空闲等待（分钟）</label>
+                  <input :value="Number(settings.streamWatchdog.toolIdleTimeoutMs) / 60000" type="number" min="1" max="120" step="1" class="field-input mono"
+                         @change="settings.streamWatchdog.toolIdleTimeoutMs = Math.round(Number(($event.target as HTMLInputElement).value) * 60000)"/>
+                  <span class="field-hint">检测到工具执行时使用更长窗口。</span>
+                </div>
+                <div class="field">
+                  <label>任务最长运行（小时）</label>
+                  <input :value="Number(settings.streamWatchdog.maxDurationMs) / 3600000" type="number" min="0.17" max="24" step="0.5" class="field-input mono"
+                         @change="settings.streamWatchdog.maxDurationMs = Math.round(Number(($event.target as HTMLInputElement).value) * 3600000)"/>
+                  <span class="field-hint">绝对上限，防止异常任务无限挂起。</span>
+                </div>
+                <div class="field">
                   <label>{{ t('gen.theme') }}</label>
                   <select v-model="settings.theme" class="field-input">
                     <option value="system">{{ t('gen.theme.system') }}</option>
@@ -2878,6 +3098,84 @@ onUnmounted(() => {
                   <button class="btn-text" @click="updateWorkbenchPitfall(item, 'ignore')">忽略</button>
                   <button class="btn-text" @click="updateWorkbenchPitfall(item, 'archive')">归档</button>
                 </div>
+              </div>
+            </section>
+          </div>
+        </template>
+
+        <!-- ──── 调用日志 Tab: 当前状态、Token 趋势与调用明细 ──── -->
+        <template v-if="activeTab === 'usage'">
+          <div v-if="usageLoading && !usageSummary" class="loading-state">加载调用日志...</div>
+          <div v-else class="list-panel usage-panel">
+            <div v-if="usageError" class="error-banner">
+              <span>{{ usageError }}</span>
+              <button class="retry-btn" @click="loadUsage">重试</button>
+            </div>
+            <div class="module-header">
+              <div class="module-header-left">
+                <span class="module-title">调用日志</span>
+                <span class="usage-live-status" :class="{active: usageActive.active}">
+                  <span class="usage-status-dot"></span>{{ usageActive.active ? `正在调用 AI（${usageActive.count}）` : '当前空闲' }}
+                </span>
+              </div>
+              <button class="refresh-btn" :class="{spinning: usageLoading}" @click="loadUsage" :disabled="usageLoading" title="刷新">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 5v4h4M4 13a8.1 8.1 0 0 0 15.5 2M20 19v-4h-4"/></svg>
+              </button>
+            </div>
+            <div class="usage-filters" aria-label="调用日志时间筛选">
+              <label for="usage-range">按时间筛选</label>
+              <select id="usage-range" v-model="usageRange" class="usage-range-select" @change="onUsageRangeChange">
+                <option value="48h">最近 48 小时</option>
+                <option value="7d">最近 7 天</option>
+                <option value="14d">最近 14 天</option>
+                <option value="custom">自定义日期</option>
+              </select>
+              <template v-if="usageRange === 'custom'">
+                <input v-model="usageFromDate" class="usage-date-input" type="date" aria-label="开始日期" @change="resetUsagePage(); void loadUsage()"/>
+                <span class="usage-date-separator">至</span>
+                <input v-model="usageToDate" class="usage-date-input" type="date" aria-label="结束日期" @change="resetUsagePage(); void loadUsage()"/>
+              </template>
+            </div>
+            <div class="usage-metrics">
+              <div class="usage-metric"><span>调用次数</span><strong>{{ formatUsageTokens(usageSummary?.eventCount) }}</strong></div>
+              <div class="usage-metric"><span>输入 Token</span><strong>{{ formatUsageTokens(usageSummary?.inputTokens) }}</strong></div>
+              <div class="usage-metric"><span>输出 Token</span><strong>{{ formatUsageTokens(usageSummary?.outputTokens) }}</strong></div>
+              <div class="usage-metric"><span>缓存 Token</span><strong>{{ formatUsageTokens(combinedUsageTokens(usageSummary?.cacheReadInputTokens, usageSummary?.cacheCreationInputTokens)) }}</strong></div>
+              <div class="usage-metric"><span>Token 未知</span><strong>{{ formatUsageTokens(usageSummary?.unknownTokenEvents) }}</strong></div>
+            </div>
+            <section class="usage-section">
+              <div class="usage-section-heading"><h3 class="section-title">近 14 天 Token 趋势</h3><span class="usage-hint">输入 + 输出 + 缓存</span></div>
+              <div v-if="usageTrend.length" class="usage-chart" role="img" aria-label="Token 使用趋势柱状图">
+                <div v-for="row in usageTrend" :key="row.day" class="usage-chart-column">
+                  <div class="usage-bar-track"><div class="usage-bar" :title="usageBarTooltip(row)" :aria-label="usageBarTooltip(row)" :style="{height: `${Math.max(4, usageBarTotal(row) / usageMaxBar * 100)}%`}"></div></div>
+                  <span>{{ row.day.slice(5) }}</span>
+                </div>
+              </div>
+              <div v-else class="empty-state-sm">暂无可用趋势数据</div>
+            </section>
+            <section class="usage-section">
+              <div class="usage-section-heading"><h3 class="section-title">调用明细</h3><span class="usage-hint">共 {{ usageEvents.length }} 条</span></div>
+              <div v-if="usageEvents.length" class="usage-table-wrap">
+                <table class="usage-table">
+                  <thead><tr><th>时间</th><th>状态</th><th>模型</th><th>输入</th><th>输出</th><th>缓存</th><th>耗时</th><th>来源</th></tr></thead>
+                  <tbody><tr v-for="event in usagePagedEvents" :key="event.eventId">
+                    <td>{{ formatUsageTime(event.createdAt) }}</td><td>{{ usageStatusLabel(event.status) }}</td><td class="usage-model">{{ event.model || '未知模型' }}</td>
+                    <td>{{ formatUsageTokens(event.inputTokens) }}</td><td>{{ formatUsageTokens(event.outputTokens) }}</td>
+                    <td>{{ formatUsageTokens(combinedUsageTokens(event.cacheReadInputTokens, event.cacheCreationInputTokens)) }}</td>
+                    <td>{{ event.durationMs == null ? '未知' : `${formatUsageTokens(event.durationMs)} ms` }}</td><td>{{ event.source || 'unknown' }}</td>
+                  </tr></tbody>
+                </table>
+              </div>
+              <div v-else class="empty-state-sm">暂无模型调用记录。完成一次 AI 调用后会显示在这里。</div>
+              <div v-if="usageEvents.length" class="usage-pagination">
+                <button class="btn-text" :disabled="usagePage <= 1" @click="changeUsagePage(usagePage - 1)">上一页</button>
+                <span>第 {{ usagePage }} / {{ usagePageCount }} 页</span>
+                <select v-model.number="usagePageSize" class="usage-page-size" aria-label="每页条数" @change="onUsagePageSizeChange">
+                  <option :value="10">10 条/页</option>
+                  <option :value="20">20 条/页</option>
+                  <option :value="50">50 条/页</option>
+                </select>
+                <button class="btn-text" :disabled="usagePage >= usagePageCount" @click="changeUsagePage(usagePage + 1)">下一页</button>
               </div>
             </section>
           </div>
@@ -3555,11 +3853,11 @@ onUnmounted(() => {
               <div class="im-toolbar-actions">
                 <button v-if="imBindingTotals.stale > 0" class="btn-text im-binding-action"
                         :disabled="!!bindingCleanupMode" @click="confirmClearBindings(true)">
-                  {{ bindingCleanupMode === 'stale' ? '清理中...' : `清理失效绑定 (${imBindingTotals.stale})` }}
+                  {{ bindingCleanupMode === 'stale' ? '清理中...' : `清理历史路由 (${imBindingTotals.stale})` }}
                 </button>
                 <button v-if="imBindingTotals.total > 0" class="btn-text danger im-binding-action"
                         :disabled="!!bindingCleanupMode" @click="confirmClearBindings(false)">
-                  {{ bindingCleanupMode === 'all' ? '清理中...' : '清空全部绑定' }}
+                  {{ bindingCleanupMode === 'all' ? '清理中...' : '清空全部路由' }}
                 </button>
                 <button class="refresh-btn" :class="{ spinning: imLoading }" @click="loadIM" :disabled="imLoading"
                       :title="t('common.refresh')">
@@ -3592,11 +3890,15 @@ onUnmounted(() => {
                   <span class="im-label">{{ t('im.apiAddr') }}</span>
                   <code class="im-value">{{ p.baseUrl }}</code>
                 </div>
-                <div class="im-row" v-if="p.pairedUsers?.length">
+                <div class="im-row" v-if="p.pairedUserCount">
                   <span class="im-label">{{ t('im.boundUsers') }}</span>
+                  <span class="im-value">{{ p.pairedUserCount }} 个已配对</span>
+                </div>
+                <div class="im-row" v-if="p.bindings?.total">
+                  <span class="im-label">会话路由</span>
                   <span class="im-value">
-                    {{ p.bindings?.active || 0 }} 个活跃
-                    <template v-if="p.bindings?.stale"> · {{ p.bindings.stale }} 个失效</template>
+                    {{ p.bindings?.active || 0 }} 个当前
+                    <template v-if="p.bindings?.stale"> · {{ p.bindings.stale }} 个历史</template>
                   </span>
                 </div>
                 <div class="im-row" v-if="p.pairCode">
@@ -3722,6 +4024,13 @@ onUnmounted(() => {
 
         <!-- ──── 开源集成 Tab: 宠物 + Caveman + RTK 三合一管理 ──── -->
         <template v-if="activeTab === 'oss'">
+          <div v-if="moduleLoadFailed('oss')" class="error-banner">
+            <span>{{ t('common.loadFailed') }}</span>
+            <button class="retry-btn" @click="retryModule('oss')"
+                    :disabled="(retryCount['oss'] || 0) >= MAX_RETRIES">
+              {{ (retryCount['oss'] || 0) >= MAX_RETRIES ? t('common.retryMaxed') : t('common.retry') }}
+            </button>
+          </div>
           <div class="oss-cards">
             <!-- 桌面宠物 -->
             <section class="section-block oss-card">
@@ -3863,10 +4172,10 @@ onUnmounted(() => {
             </div>
 
             <!-- ── 错误/加载/空状态 ── -->
-            <div v-if="moduleLoadFailed('mcp') || moduleLoadFailed('mcpServers')" class="error-banner" style="margin-top:8px">
+            <div v-if="moduleLoadFailed('mcp')" class="error-banner" style="margin-top:8px">
               <span>{{ t('common.loadFailed') }}</span>
-              <button class="retry-btn" @click="refreshMcp" :disabled="(retryCount['mcp'] || 0) >= MAX_RETRIES && (retryCount['mcpServers'] || 0) >= MAX_RETRIES">
-                {{ (retryCount['mcp'] || 0) >= MAX_RETRIES && (retryCount['mcpServers'] || 0) >= MAX_RETRIES ? t('common.retryMaxed') : t('common.retry') }}
+              <button class="retry-btn" @click="retryModule('mcp')" :disabled="(retryCount['mcp'] || 0) >= MAX_RETRIES">
+                {{ (retryCount['mcp'] || 0) >= MAX_RETRIES ? t('common.retryMaxed') : t('common.retry') }}
               </button>
             </div>
             <div v-if="(mcpLoading || mcpServersLoading) && filteredMcpItems.length === 0" class="loading-state" style="margin-top:12px">{{ t('common.loading') }}</div>
@@ -4251,7 +4560,7 @@ onUnmounted(() => {
         <p class="qr-note">{{ appConfirm.message }}</p>
         <div class="qr-actions">
           <button class="btn-text" @click="appConfirm = null">{{ t('common.cancel') }}</button>
-          <button class="btn-primary danger" @click="appConfirm.onOk">{{ t('common.confirm') }}</button>
+          <button class="btn-primary danger" @click="acceptAppConfirm">{{ t('common.confirm') }}</button>
         </div>
       </div>
     </div>
@@ -6366,6 +6675,46 @@ input[type="time"].field-input::-webkit-calendar-picker-indicator {
 .workbench-pitfall-row p { margin:8px 0; color:var(--text-secondary); font-size:12px; white-space:pre-wrap; overflow-wrap:anywhere; }
 .workbench-pitfall-fields { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:8px; }
 .workbench-actions { display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin-top:10px; }
+.usage-panel { width: 100%; max-width: none; }
+.usage-filters { display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin:2px 0 20px; color:var(--text-muted); font-size:12px; }
+.usage-range-select, .usage-date-input, .usage-page-size { height:32px; padding:0 10px; color:var(--text-primary); background:var(--bg-raised); border:1px solid var(--border); border-radius:var(--radius-input); font:inherit; }
+.usage-range-select { min-width:150px; font-weight:600; }
+.usage-date-input { min-width:140px; }
+.usage-date-separator { color:var(--text-muted); }
+.usage-live-status { display:inline-flex; align-items:center; gap:6px; color:var(--text-muted); font-size:12px; }
+.usage-live-status.active { color:var(--warning); }
+.usage-status-dot { width:8px; height:8px; border-radius:50%; background:var(--text-muted); }
+.usage-live-status.active .usage-status-dot { background:var(--warning); box-shadow:0 0 0 3px color-mix(in srgb, var(--warning) 18%, transparent); }
+.usage-metrics { display:grid; grid-template-columns:repeat(5, minmax(0, 1fr)); gap:8px; margin:4px 0 24px; }
+.usage-metric { min-width:0; padding:12px; border:1px solid var(--border); border-radius:var(--radius-input); background:var(--bg-raised); }
+.usage-metric span { display:block; color:var(--text-muted); font-size:11px; }
+.usage-metric strong { display:block; margin-top:5px; color:var(--text-primary); font-family:var(--font-mono); font-size:18px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.usage-section { padding:18px 0; border-top:1px solid var(--border); }
+.usage-section-heading { display:flex; align-items:baseline; justify-content:space-between; gap:12px; }
+.usage-section-heading .section-title { flex:1; margin-bottom:12px; }
+.usage-hint { color:var(--text-muted); font-size:11px; }
+.usage-chart { display:flex; align-items:flex-end; gap:6px; height:180px; padding:10px 4px 0; overflow-x:auto; border-bottom:1px solid var(--border); }
+.usage-chart-column { display:flex; flex:1 0 22px; min-width:22px; height:100%; flex-direction:column; align-items:center; justify-content:flex-end; gap:6px; color:var(--text-muted); font-size:9px; }
+.usage-bar-track { display:flex; align-items:flex-end; width:100%; height:calc(100% - 18px); }
+.usage-bar { width:100%; min-height:4px; background:var(--accent); border-radius:3px 3px 0 0; }
+.usage-bar:hover { background:var(--text-primary); }
+.usage-table-wrap { overflow:auto; border:1px solid var(--border); }
+.usage-table { width:100%; min-width:760px; border-collapse:collapse; color:var(--text-secondary); font-size:12px; }
+.usage-table th, .usage-table td { padding:9px 10px; border-bottom:1px solid var(--border); text-align:left; white-space:nowrap; }
+.usage-table th { color:var(--text-muted); background:var(--bg-raised); font-weight:600; }
+.usage-table tbody tr:last-child td { border-bottom:0; }
+.usage-model { max-width:220px; overflow:hidden; text-overflow:ellipsis; }
+.usage-pagination { display:flex; align-items:center; justify-content:flex-end; gap:12px; margin-top:14px; color:var(--text-muted); font-size:12px; }
+.usage-pagination .btn-text:disabled { opacity:.45; cursor:not-allowed; }
+.usage-page-size { height:28px; min-width:88px; padding:0 7px; }
+@media (max-width: 760px) {
+  .usage-filters { align-items:stretch; flex-direction:column; }
+  .usage-range-select, .usage-date-input { width:100%; }
+  .usage-metrics { grid-template-columns:repeat(2, minmax(0, 1fr)); }
+  .usage-metric strong { font-size:16px; }
+  .usage-section-heading { align-items:flex-start; flex-direction:column; gap:0; }
+  .usage-pagination { justify-content:space-between; gap:6px; }
+}
 @media (max-width: 760px) {
   .workbench-filter { grid-template-columns:1fr; }
   .workbench-pitfall-fields { grid-template-columns:1fr; }

@@ -11,7 +11,9 @@ const {
   upsertSessionDraft,
   getSessionDraft,
   removeSessionDraft,
+  removeMatchingInterruptedSessionDraft,
   sessionDraftKey,
+  shouldRestoreSessionDraft,
 } = await import(moduleUrl)
 
 test('损坏或过期的草稿不会影响其他会话', () => {
@@ -50,4 +52,32 @@ test('草稿限制文本长度和条目数量', () => {
   }
   assert.deepEqual(Object.keys(store.drafts).sort(), ['sdk:1', 'sdk:2', 'sdk:3'])
   assert.equal(store.drafts['sdk:3'].text, 'text-3-a')
+})
+
+test('重启只在服务端确认任务中断且可继续时恢复中断草稿', () => {
+  const unsent = {text: '尚未发送', updatedAt: 1_000, interrupted: false}
+  const interrupted = {text: '上一个任务', updatedAt: 1_001, interrupted: true}
+
+  assert.equal(shouldRestoreSessionDraft(unsent, null), true)
+  assert.equal(shouldRestoreSessionDraft(interrupted, null), false)
+  assert.equal(shouldRestoreSessionDraft(interrupted, {status: 'succeeded', resumable: false}), false)
+  assert.equal(shouldRestoreSessionDraft(interrupted, {status: 'interrupted', resumable: true}), true)
+  assert.equal(shouldRestoreSessionDraft(interrupted, {status: 'stopped', resumable: true}), true)
+})
+
+test('成功终态只清理与已完成原任务匹配的中断草稿', () => {
+  const key = 'sdk:completed'
+  let store = upsertSessionDraft(parseSessionDraftStore(null, 1_000), key, '原任务', {
+    now: 1_001,
+    interrupted: true,
+  })
+  store = removeMatchingInterruptedSessionDraft(store, key, '其他任务')
+  assert.equal(getSessionDraft(store, key)?.text, '原任务')
+
+  store = removeMatchingInterruptedSessionDraft(store, key, '原任务')
+  assert.equal(getSessionDraft(store, key), null)
+
+  store = upsertSessionDraft(store, key, '用户新草稿', {now: 1_002, interrupted: false})
+  store = removeMatchingInterruptedSessionDraft(store, key, '用户新草稿')
+  assert.equal(getSessionDraft(store, key)?.text, '用户新草稿')
 })

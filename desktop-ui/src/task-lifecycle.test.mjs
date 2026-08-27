@@ -6,7 +6,7 @@ import {transform} from 'esbuild'
 const source = readFileSync(new URL('./task-lifecycle.ts', import.meta.url), 'utf8')
 const compiled = await transform(source, {loader: 'ts', format: 'esm', target: 'es2022'})
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(compiled.code).toString('base64')}`
-const {createSessionLifecycleState, reduceSessionLifecycle} = await import(moduleUrl)
+const {createSessionLifecycleState, reduceSessionLifecycle, wasSessionGeneratingAtSocketClose} = await import(moduleUrl)
 
 test('权威快照统一决定忙碌和操作能力', () => {
   const state = reduceSessionLifecycle(createSessionLifecycleState(), {
@@ -121,4 +121,22 @@ test('RCA 与外部阻塞状态作为可继续的稳定终态释放输入区', (
     assert.equal(state.active, false)
     assert.equal(state.canContinue, true)
   }
+})
+
+test('WebSocket 关闭时前台实时状态优先于滞后的 tab 快照', () => {
+  assert.equal(wasSessionGeneratingAtSocketClose({
+    foreground: true,
+    foregroundStatus: 'idle',
+    tabStatus: 'thinking',
+  }), false)
+  assert.equal(wasSessionGeneratingAtSocketClose({
+    foreground: true,
+    foregroundStatus: 'thinking',
+    tabStatus: 'idle',
+  }), true)
+  assert.equal(wasSessionGeneratingAtSocketClose({
+    foreground: false,
+    foregroundStatus: 'idle',
+    tabStatus: 'thinking',
+  }), true)
 })
