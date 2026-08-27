@@ -264,3 +264,12 @@ Desktop / WeChat / Feishu / DingTalk
 | availability | PostgreSQL 不可用时明确阻止启动或进入 degraded；外部环境不可用时明确阻塞 |
 
 延迟、吞吐、长时间稳定性和真实 IM 送达目前没有生产测量数据，不能由单元测试或临时项目 Smoke 代替。
+
+## IM 命令路由与授权边界
+
+- 配对身份、项目目录访问和当前 Session ownership 是三个独立概念。各 IM adapter 在进入命令引擎前完成配对；Gateway HTTP 入口校验平台 adapter token 与 identity headers；只有作用于当前 Session 的操作再解析 binding。
+- `/p`、`/ss`、`/i`、`/h`、`/sw`、`/sws`、`/ns` 不要求预先存在 Session。项目与会话目录只返回现有摘要字段；导航类命令只投递桌面 control channel，不直接修改 Session runtime。
+- `/stop`、`/m` 和普通消息必须解析当前 Session 并验证 ownership。没有 Session 返回明确提示；Gateway 或桌面控制通道不可用时分别按既有 3–5 秒 timeout 返回失败，不伪报命令已执行。
+- 主动通知接收人按“精确 Session binding > 唯一已配对用户 > 拒绝投递”解析。不得按最近活跃时间猜用户；多用户或零用户返回明确缺少接收人，通知意图保留失败状态供配置恢复后重试。
+- 本地单用户部署中，所有已配对 IM 身份共享本机项目目录。若产品边界扩展到不互信多用户，必须先增加持久化 project ACL、显式授权与撤销流程，并为目录、历史、控制和通知分别验证隔离。
+- 本改动不新增持久化数据或迁移；回滚命令分类不会破坏数据，但会重新产生项目选择的循环依赖，因此只允许在出现未关闭的授权漏洞时临时关闭无 Session 命令并给出明确错误。

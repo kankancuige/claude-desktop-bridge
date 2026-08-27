@@ -10,6 +10,7 @@ Incomplete: None
 ## 业务目标与边界
 
 - 主要用户是单机桌面用户；同一桌面进程可同时打开多个项目/会话，并接收微信、飞书、钉钉消息。
+- 已配对 IM 用户必须能在没有活跃 Session 时使用项目目录、会话目录、状态、帮助和桌面导航命令；普通对话、停止和镜像等当前会话操作仍要求明确 Session 所有权。
 - 已接受的用户消息和 AI 正文在应用重启后必须可查询，并能使用原 SDK conversation ID 继续后续回合。
 - “暂停”表示取消当前生成，不承诺恢复进程栈、未完成工具调用或正在运行的第三方副作用。
 - 关闭项目页签不得删除 transcript；只有显式删除会话才允许删除持久化记录。
@@ -34,6 +35,7 @@ Incomplete: None
 | Bridge 配置独立 | Rule、Skill、MCP、Agent、Hook、Workflow、IM 和会话数据只读写 Bridge 私有根目录；正常运行不得读取 `~/.claude` 或 `~/.codex` | DRIVER / CONFIRMED | 用户明确要求完全独立；配置根目录或 SDK 启动方式变化时复核 |
 | 兼容迁移 | 首次迁移必须幂等、非破坏且保留旧数据；任一条目失败可在下次启动重试，不允许以空目录覆盖已有目标 | DRIVER / CONFIRMED | 用户数据连续性要求；迁移清单或目录结构变化时复核 |
 | 统一任务入口 | desktop、wechat、feishu、dingtalk 和内部 Workflow 的任务接收必须共享校验、去重、排队、模型路由和停止语义 | DRIVER / CONFIRMED | 用户要求；新增入口或任务协议变化时复核 |
+| IM 命令可达性 | 已配对身份负责进入命令通道；项目选择类命令不得反向依赖当前 Session，当前会话副作用不得绕过 ownership | DRIVER / CONFIRMED | 用户实测；IM 命令、配对模型或多用户部署变化时复核 |
 | Bridge 事件恢复 | 已接受任务在 100ms 内写入不含正文的连续事件日志；强制重启后能投影最后任务状态 | DRIVER / ASSUMED | 本阶段目标；完成 crash smoke 后升级证据 |
 | Agent 能力协商 | 必需能力不满足时在 SDK query 启动前失败，不允许接受后忽略或静默降级 | DRIVER / CONFIRMED | 用户此前遇到 Agent 只分析不修改；新增 Provider 时复核 |
 | Provider 释放 | Gateway shutdown 后 Provider、observer、timer 和子进程必须在 2.2s 总关闭窗口内进入释放流程 | DRIVER / ASSUMED | 当前 shutdown 上限；增加长驻 Provider 时复核 |

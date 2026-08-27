@@ -187,3 +187,11 @@ Incomplete: None
 - 1.6.1 隔离安装/冷启动烟测已通过：临时安装包启动后短窗口观察到 Gateway `3456`、DeepSeek/OpenCode/Codex Relay 代理 `8787/8788/8789` 监听，日志包含 PostgreSQL 初始化、Gateway 启动和 WebSocket 连接；签名仍不纳入本地使用验收。
 - 同一临时安装目录的静默卸载退出码为 0，应用文件已移除；覆盖升级和异常回滚仍未在本轮执行。
 - 1.5.0→1.6.1 临时覆盖安装后，安装目录中的 Gateway `package.json` 版本为 `1.6.1`，应用文件存在且测试结束无 Bridge 端口残留；中断安装原子回滚未验证。
+
+## IM 命令与 Session 绑定边界（2026-08-27）
+
+- 微信、飞书和钉钉都先在各自 adapter 内校验配对用户，再调用共用 `im/im-commands.mjs`；普通文本随后调用 `/api/sessions/resolve` 并注入当前 Session。
+- 旧实现对除帮助外的全部斜杠命令统一执行 Session resolve，导致 `/p`、`/ss`、`/i` 和 `/ns` 在没有活跃 Session 时提前返回 409，目标命令 handler 没有执行。
+- 当前命令层只为 `stop` 和 `mirror` 执行 Session resolve。项目/会话目录只返回摘要，桌面切换与新建只投递 control nudge；历史正文、普通对话、停止和镜像仍保留原 Session/项目所有权校验。
+- 主动通知先使用精确 Session binding；找不到时仅在对应平台恰好有一个已配对用户时投递，两个及以上用户不猜接收人。设置页分别显示配对数量与当前/历史 Session 路由，历史路由不再表述为 IM 配对失效。
+- 当前产品边界是本地单用户桌面应用。若引入互不信任的多用户或远程共享 Gateway，项目目录必须增加独立 ACL，不能重新用“当前 Session 绑定”代替项目授权。
