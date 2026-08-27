@@ -1,5 +1,22 @@
 # 当前任务状态
 
+## 2026-08-27 确认、等待和提示生命周期全面修复
+
+- 已修复：AskUserQuestion/权限确认的唯一身份、重复结算、重连恢复、IM 并发关联与容量提示、确认后继续执行、Scheduler 无人值守权限、Workflow 快照隔离、Coordinator `waiting_user` 恢复和 AI 活动统计。
+- 补充审查修复：DeepSeek/OpenCode 在客户端断开后取消真实上游；DeepSeek SSE 首块实时透传；IM 提交期间 adapter 停止后取消迟到 accepted 的孤儿任务；Workflow/Settings 写失败和模块加载失败显示前端提示；二维码轮询失败停止重复请求并显示过期/错误。
+- 追加修复：Workflow 自动触发、手动启动和恢复现在继承会话 `permissionMode`；最终审查 Agent 明确使用只读 `reviewer` 角色，避免完全自动会话被错误判为只读写入冲突。
+- Relay 结论：日志中的不同 `requestId` 是不同请求，均为 `attempt: 1`；官方文档支持 429/500/503 的有界重试，但没有找到 Responses 创建请求的幂等保证，因此未猜测性修改 relay 重试协议。
+- 验证：`node --test gateway` 829/829；此前 `node --test desktop-ui/src desktop-ui/electron` 174/174；`pnpm exec vue-tsc --noEmit`、`pnpm exec vite build`、相关 `node --check`、`git diff --check` 均通过。Vite 只有既有大 chunk 警告。
+- 外部验收缺口：未启动真实 Gateway/Electron/Provider/IM；真实 Provider 重试与计费、三种 IM 投递、Electron 重连 UI、真实确认后 AI 端到端继续执行仍需对应环境证据。
+- 约束：未提交、未推送、未安装依赖、未启动或停止外部服务；保留全部既有 dirty worktree 改动。
+
+## 2026-08-26 会话卡住根因与修复
+
+- 根因证据：`WebSynchronous` 对应 Claude CLI 仍在运行；Gateway 日志显示 Codex relay 首次响应前连续 120 秒请求超时并重试，期间 SDK 没有事件，UI 只能显示 stale；权限请求超时还会自动 deny。
+- 已修复：Gateway 组合根补齐 `lineDiffStats`/`computeLineDiff` 注入；relay 为请求、每次上游尝试、响应头、重试等待和最终结果增加无凭据阶段日志；SDK 流等待期间每 15 秒广播 `stream_waiting`，UI 显示 Provider/权限/工具等待阶段，且不重置 watchdog。
+- 验证：relay/session/UI 定向测试通过；`node --test gateway` 777/777；`node --test desktop-ui/src desktop-ui/electron` 148/148；相关 `node --check` 与 `git diff --check` 通过。
+- 未决：当前真实上游 `https://api.claudecode.net.cn` 仍出现请求级超时，需切换可用 Provider 或供应商恢复后再做真实端到端验收；当前 Electron/Gateway 进程未重启，新源码需下次 Gateway 启动加载。
+
 - 更新时间：2026-08-25
 - 工作目录：`D:\ckd\Projects\claude-desktop-bridge`
 - 用户要求：继续执行到本地使用场景达到理想状态；签名不纳入验收；不得提交或推送。
