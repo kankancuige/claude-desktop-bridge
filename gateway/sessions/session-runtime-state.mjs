@@ -10,6 +10,7 @@ export function getSessionRuntimeState(session) {
         generating: Boolean(session?._generating || pendingInputs || pendingMessages || session?._rebuildPromise),
         pendingInputs,
         pendingConfirmations: summarizePendingConfirmations(session),
+        ...(session?.contextUsage ? {contextUsage: session.contextUsage} : {}),
         diagnostics: session?.diagnostics?.summary?.() || {count: 0, byPhase: {}, byError: {}},
     }
 }
@@ -30,12 +31,21 @@ function summarizePendingConfirmations(session) {
         requestId: String(entry.requestId || entry.id || '').slice(0, 200),
         type: entry.type === 'choice' ? 'choice' : 'permission',
         toolName: String(entry.toolName || '').slice(0, 200),
+        ...(entry.toolUseId ? {toolUseId: String(entry.toolUseId).slice(0, 200)} : {}),
         turnId: String(entry.turnId || '').slice(0, 200) || null,
         source: String(entry.source || 'desktop').slice(0, 40),
         userId: String(entry.userId || '').slice(0, 200) || null,
         expiresAt: Number(entry.expiresAt || 0),
         question: entry.type === 'choice' ? String(entry.questions?.[0]?.question || '').slice(0, 1000) : '',
         options: entry.type === 'choice' ? (Array.isArray(entry.questions?.[0]?.options) ? entry.questions[0].options.slice(0, 20).map(option => ({label: String(option?.label || '').slice(0, 300)})) : []) : [],
+        questions: entry.type === 'choice' ? (Array.isArray(entry.questions) ? entry.questions.slice(0, 4).map(question => ({
+            question: String(question?.question || '').slice(0, 1000),
+            ...(question?.answerKey ? {answerKey: String(question.answerKey).slice(0, 40)} : {}),
+            options: Array.isArray(question?.options) ? question.options.slice(0, 20).map(option => ({label: String(option?.label || '').slice(0, 300)})) : [],
+        })) : []) : [],
+        answers: entry.type === 'choice' && entry.input?.answers && typeof entry.input.answers === 'object'
+            ? Object.fromEntries(Object.entries(entry.input.answers).slice(0, 20).map(([question, answer]) => [String(question).slice(0, 1000), String(answer).slice(0, 300)]))
+            : {},
     }))
 }
 import {consumeTaskInput} from './task-input-queue.mjs'

@@ -1,6 +1,12 @@
 import {mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync} from 'node:fs'
 import {dirname, join} from 'node:path'
 
+const PAIRED_USER_FILE_NAMES = Object.freeze({
+    wechat: 'bridge-paired.json',
+    feishu: 'bridge-paired-feishu.json',
+    dingtalk: 'bridge-paired-dingtalk.json',
+})
+
 function normalizeUsers(users, maxUsers = 10_000) {
     const result = []
     for (const value of users || []) {
@@ -19,6 +25,12 @@ export function loadPairedUsers(filePath) {
         if (error?.code !== 'ENOENT') console.debug('读取 IM 配对白名单失败', error)
         return new Set()
     }
+}
+
+export function loadPairedUserCount(bridgeHome, platform) {
+    const fileName = PAIRED_USER_FILE_NAMES[platform]
+    if (!fileName || !bridgeHome) return 0
+    return loadPairedUsers(join(bridgeHome, fileName)).size
 }
 
 export function savePairedUsers(filePath, users) {

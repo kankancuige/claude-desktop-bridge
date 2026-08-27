@@ -64,3 +64,21 @@ test('成功结果投影暂时显示 idle 时仍忽略清理残留', () => {
     assert.equal(snapshot.active, false)
     assert.equal(snapshot.capabilities.canSend, true)
 })
+
+test('waiting_user Coordinator 在重连快照中解除输入锁并保留提示', () => {
+    const snapshot = createTaskLifecycleSnapshot({
+        runtime: {generating: true},
+        task: {status: 'running', resumable: false},
+        coordinator: {
+            taskId: 'task-1', turnId: 'turn-1', status: 'waiting_user', phase: 'implement', revision: 4,
+            execution: {currentStepId: 'step-1'}, blockers: [{detail: '请选择验证环境\n后继续'}],
+            verification: {status: 'not_started', evidenceLevel: 'L0'},
+        },
+    })
+    assert.equal(snapshot.active, false)
+    assert.deepEqual(snapshot.capabilities, {canSend: true, canStop: false, canContinue: true})
+    assert.deepEqual(snapshot.coordinator, {
+        taskId: 'task-1', turnId: 'turn-1', status: 'waiting_user', phase: 'implement', revision: 4,
+        stepId: 'step-1', detail: '请选择验证环境 后继续', verification: {status: 'not_started', evidenceLevel: 'L0'},
+    })
+})

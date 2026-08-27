@@ -107,6 +107,21 @@ test('失败或阻塞终态也生成与终态一致的执行报告', () => {
     assert.ok(reports[0].unresolvedRisks.includes('真实环境未验证'))
 })
 
+test('主任务完成委托文件后解除只读 Agent 的 blocked 门禁', () => {
+    const coordinator = createTaskCoordinator()
+    const runtime = createTaskWorkbenchRuntime({coordinator})
+    const taskPlan = plan(['implement', 'validate', 'report'])
+    runtime.acceptTask({plan: taskPlan, projectContext: {projectKey: 'D--work'}})
+    const task = coordinator.getTaskSnapshot('task-1')
+    coordinator.transition('task-1', {
+        type: 'agent/blocked', agentRunId: 'agent-review', stepId: task.execution.currentStepId,
+        role: 'reviewer', result: {status: 'blocked', writeRequest: {requestedFiles: ['gateway/a.mjs']}},
+    })
+    const next = runtime.recordPrimaryResult('task-1', {status: 'completed', summary: '主任务已写入', changedFiles: ['gateway/a.mjs']})
+    assert.equal(next.agents['agent-review'].status, 'completed')
+    assert.equal(next.agents['agent-review'].writeRequest.requestedFiles[0], 'gateway/a.mjs')
+})
+
 test('所有稳定非成功终态都生成状态一致的执行报告', () => {
     const statuses = [
         'failed', 'paused', 'blocked', 'inconclusive', 'regression_detected',

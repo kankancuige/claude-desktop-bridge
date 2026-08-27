@@ -54,3 +54,12 @@ test('PostgresStateCompat 写入失败只标记 degraded', async () => {
     assert.equal(store.degraded, true)
     assert.equal(store.degradedReason, 'ECONNRESET')
 })
+
+test('PostgresStateCompat 默认时间窗口使用当前时间', async () => {
+    const gateway = fakeGateway()
+    const store = createPostgresStateCompat({gateway, now: () => 1_700_000_000_000})
+    await store.load()
+    const window = store.normalizeUsageWindow()
+    assert.equal(window.to, 1_700_000_000_000)
+    assert.equal(window.from, 1_700_000_000_000 - 14 * 24 * 60 * 60 * 1000)
+})

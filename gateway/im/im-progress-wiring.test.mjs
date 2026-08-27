@@ -31,6 +31,17 @@ test('旧的逐工具通知出口已移除', () => {
     }
 })
 
+test('三种 IM 适配器都显示确认编号、拒绝歧义回复并通知跨通道结算', () => {
+    for (const source of adapterSources) {
+        assert.match(source, /pendingConfirm\.matchReply\(uid, text\)/)
+        assert.match(source, /confirmMatch\.reason === 'ambiguous'/)
+        assert.match(source, /added\.entry\.replyToken/)
+        assert.match(source, /added\.reason\?\.endsWith\('capacity'\)/)
+        assert.match(source, /function onConfirmResolved\(sessionId, requestId, resolution = \{\}\)/)
+        assert.match(source, /该确认已由桌面端或其他通道处理/)
+    }
+})
+
 test('验证不足使用稳定任务投影和可重试终态通知 ID', () => {
     assert.match(indexSource, /type === 'task_verification_inconclusive'[\s\S]*?taskStateForInconclusive/)
     assert.match(indexSource, /task_verification_inconclusive\)\$\//)

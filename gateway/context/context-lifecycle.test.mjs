@@ -68,6 +68,37 @@ test('context usage event carries the effective auto compact threshold', () => {
     assert.equal(event.reason, 'running')
 })
 
+test('context usage accepts SDK snake_case payload aliases', () => {
+    assert.deepEqual(normalizeContextUsage({
+        total_tokens: 120000,
+        max_tokens: 200000,
+        raw_max_tokens: 256000,
+        percentage: 60,
+    }), {
+        totalTokens: 120000,
+        maxTokens: 200000,
+        rawMaxTokens: 256000,
+        percentage: 60,
+        categories: [],
+    })
+})
+
+test('真实 SDK context_usage 仅返回 raw_max_tokens 时仍计算上下文占用', () => {
+    assert.deepEqual(normalizeContextUsage({
+        model: 'claude-sonnet-4-6',
+        total_tokens: 120000,
+        raw_max_tokens: 200000,
+        percentage: 60,
+        categories: [],
+    }), {
+        totalTokens: 120000,
+        maxTokens: 200000,
+        rawMaxTokens: 200000,
+        percentage: 60,
+        categories: [],
+    })
+})
+
 test('Gateway 上下文采样有超时且不会永久占用 in-flight 状态', () => {
     const start = streamServiceSource.indexOf('async function refreshContextUsage')
     const end = streamServiceSource.indexOf('function maybeRefreshContextUsage', start)

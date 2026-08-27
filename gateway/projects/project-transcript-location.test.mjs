@@ -8,6 +8,7 @@ import {
     decodeProjectDirectorySegment,
     findSessionTranscript,
     listProjectTranscriptCandidates,
+    resolveSessionTranscript,
 } from './project-transcript-location.mjs'
 import {createPostgresStateFixture} from '../test-support/postgres-state-fixture.mjs'
 import {createSessionRepository} from '../storage/repositories/session-repository.mjs'
@@ -134,6 +135,28 @@ test('显式 workDir 可定位旧版 Unicode 丢失的编码目录', () => {
     })
 })
 
+test('transcript cwd 可定位项目名含连字符的旧编码目录', () => {
+    const bridgeHome = createClaudeHome()
+    const actualDir = 'D--hcd----znzpxt-yt'
+    const sessionId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const projectDir = join(bridgeHome, 'projects', actualDir)
+    mkdirSync(projectDir)
+    writeFileSync(join(projectDir, `${sessionId}.jsonl`), JSON.stringify({
+        type: 'user', cwd: 'D:\\hcd\\系统\\znzpxt-yt', message: {content: '历史'},
+    }))
+
+    assert.deepEqual(findSessionTranscript({
+        bridgeHome,
+        encodedDir: 'D--hcd-系统-znzpxt-yt',
+        sessionId,
+    }), {
+        status: 'found',
+        encodedDir: actualDir,
+        filePath: join(projectDir, `${sessionId}.jsonl`),
+        fallback: true,
+    })
+})
+
 test('项目候选按真实 cwd 跨旧编码目录聚合并按时间倒序', () => {
     const bridgeHome = createClaudeHome()
     const workDir = 'D:/hcd/扳手/协航/WindowsFormsApp1'
@@ -181,4 +204,35 @@ test('会话索引命中快速路径，文件删除后清理陈旧索引并回�
     unlinkSync(join(projectDir, `${sessionId}.jsonl`))
     assert.deepEqual(listProjectTranscriptCandidates({bridgeHome, encodedDir, workDir, repository: createSessionRepository({stateStore: store})}), [])
     assert.deepEqual(store.listSessionIndex(encodedDir), [])
+})
+
+test('resolver 以 historySessionId 主定位并返回真实 cwd', () => {
+    const bridgeHome = createClaudeHome()
+    const sessionId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const projectDir = join(bridgeHome, 'projects', 'D--hcd----znzpxt-yt')
+    mkdirSync(projectDir)
+    const transcriptPath = join(projectDir, `${sessionId}.jsonl`)
+    writeFileSync(transcriptPath, JSON.stringify({type: 'user', cwd: 'D:\\hcd\\系统\\znzpxt-yt'}))
+    const result = resolveSessionTranscript({
+        bridgeHome,
+        sessionId,
+        projectHint: 'D--hcd-系统-znzpxt-yt',
+    })
+    assert.equal(result.status, 'found')
+    assert.equal(result.encodedDir, 'D--hcd----znzpxt-yt')
+    assert.equal(result.workDir, 'd:/hcd/系统/znzpxt-yt')
+    assert.equal(result.filePath, transcriptPath)
+})
+
+test('resolver 对同一 historySessionId 的多个候选返回 ambiguous', () => {
+    const bridgeHome = createClaudeHome()
+    const sessionId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+    for (const encodedDir of ['D--one', 'D--two']) {
+        const projectDir = join(bridgeHome, 'projects', encodedDir)
+        mkdirSync(projectDir)
+        writeFileSync(join(projectDir, `${sessionId}.jsonl`), '{}\n')
+    }
+    const result = resolveSessionTranscript({bridgeHome, sessionId})
+    assert.equal(result.status, 'ambiguous')
+    assert.deepEqual(result.matches.map(item => item.encodedDir), ['D--one', 'D--two'])
 })

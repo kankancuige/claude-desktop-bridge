@@ -28,6 +28,14 @@ function decodedDirectoryWorkDir(encodedDir) {
     return match ? `${match[1]}:/${match[2].replace(/-/g, '/')}` : ''
 }
 
+// 目录编码是有损的（旧项目目录可能丢失 Unicode），但 transcript 的 cwd
+// 保留了原始路径；用同一编码规则重算可以正确处理项目名中的连字符。
+function encodedDirectoryWorkDir(workDir) {
+    const normalized = String(workDir || '').replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/+$/, '')
+    const match = normalized.match(/^([A-Za-z]):\/(.*)$/)
+    return match ? `${match[1]}--${match[2].replace(/\//g, '-')}` : normalized.replace(/\//g, '-')
+}
+
 function transcriptWorkDir(filePath) {
     try {
         const lines = readFileSync(filePath, 'utf8').slice(0, 64 * 1024).split('\n')
@@ -48,11 +56,22 @@ function transcriptWorkDir(filePath) {
 
 function transcriptMatchesWorkDir(filePath, requestedEncodedDir, workDir) {
     const explicit = normalizeWorkDir(workDir)
-    const expected = normalizeWorkDir(decodedDirectoryWorkDir(requestedEncodedDir))
     const actual = transcriptWorkDir(filePath)
     if (explicit) return actual === explicit
-    if (!expected) return true
-    return !actual || actual === expected
+    // transcript 有 cwd 时，以真实 cwd 的编码结果为准，避免把项目名中的 `-`
+    // 误当成目录分隔符（例如 `znzpxt-yt`）。无 cwd 的旧/半写入 transcript
+    // 仍沿用旧的宽松兼容路径。
+    if (actual) return encodedDirectoryWorkDir(actual).toLowerCase() === String(requestedEncodedDir || '').toLowerCase()
+    const expected = normalizeWorkDir(decodedDirectoryWorkDir(requestedEncodedDir))
+    return !expected || !actual || actual === expected
+}
+
+function safeTranscriptPath(filePath) {
+    try { return statSync(filePath).isFile() ? filePath : null } catch { return null }
+}
+
+function candidateWorkDir(filePath) {
+    return transcriptWorkDir(filePath)
 }
 
 function readTranscriptExcerpt(filePath, maxBytes) {
@@ -228,5 +247,86 @@ export function findSessionTranscript({bridgeHome, encodedDir, sessionId, workDi
     }
     if (matches.length === 1) return {...matches[0], status: 'found', fallback: true}
     if (matches.length > 1) return {status: 'ambiguous', matches: matches.map(item => item.encodedDir)}
+    return {status: 'missing'}
+}
+
+/**
+ * 以 historySessionId 为主身份解析 transcript。项目提示只用于缩小候选和
+ * 权限校验，不能单独决定文件位置；索引陈旧时回退到受限只读扫描。
+ */
+export function resolveSessionTranscript({bridgeHome, sessionId, projectHint = '', workDir = '', repository = null} = {}) {
+    if (!validSessionId(sessionId)) return {status: 'invalid'}
+    const hint = projectHint ? decodeProjectDirectorySegment(projectHint) : ''
+    if (projectHint && !hint) return {status: 'invalid'}
+    const requestedWorkDir = normalizeWorkDir(workDir)
+    const projectsRoot = join(bridgeHome, 'projects')
+    const matches = new Map()
+    const add = (row, source = 'scan') => {
+        if (!row?.filePath) return
+        const filePath = safeTranscriptPath(row.filePath)
+        if (!filePath) return
+        const actualWorkDir = candidateWorkDir(filePath) || normalizeWorkDir(row.workDir)
+        if (requestedWorkDir && actualWorkDir && actualWorkDir !== requestedWorkDir) return
+        // projectHint 不是身份约束；旧目录编码可能与提示不同。若调用方提供
+        // workDir，则上面的真实 cwd 校验才是跨项目隔离条件。
+        const encodedDir = row.encodedDir || row.projectKey || ''
+        if (!encodedDir) return
+        matches.set(filePath, {sessionId, encodedDir, workDir: actualWorkDir || requestedWorkDir || '', filePath, source})
+    }
+
+    // 索引是同一 session_index 的派生查询；文件仍需存在并重新校验 cwd。
+    try {
+        const indexedRows = repository?.findBySessionId?.(sessionId) || []
+        for (const row of (Array.isArray(indexedRows) ? indexedRows : [indexedRows])) {
+            if (!row) continue
+            const indexedPath = safeTranscriptPath(row.transcriptPath)
+            if (!indexedPath
+                || (row.mtime != null && Number(statSync(indexedPath).mtimeMs) !== Number(row.mtime))
+                || (row.size != null && Number(statSync(indexedPath).size) !== Number(row.size))) {
+                if (row.transcriptPath) repository?.removeByTranscriptPath?.(row.transcriptPath)
+                continue
+            }
+            add({
+                ...row,
+                encodedDir: row.projectKey,
+                filePath: indexedPath,
+                workDir: row.workDir,
+            }, 'index')
+        }
+    } catch {
+        // 索引不可用时继续只读回查，不能阻断历史恢复。
+    }
+
+    if (existsSync(projectsRoot)) {
+        const directories = []
+        try {
+            for (const entry of readdirSync(projectsRoot, {withFileTypes: true})) {
+                if (!entry.isDirectory()) continue
+                if (hint && entry.name === hint) directories.unshift(entry.name)
+                else directories.push(entry.name)
+            }
+        } catch {
+            return matches.size === 1 ? {status: 'found', ...matches.values().next().value} : matches.size > 1 ? {status: 'ambiguous', matches: [...matches.values()].map(({encodedDir, filePath}) => ({encodedDir, filePath}))} : {status: 'missing'}
+        }
+        for (const directoryName of directories) {
+            const projectDir = join(projectsRoot, directoryName)
+            const candidateIds = new Set([sessionId])
+            try {
+                const sessionMap = JSON.parse(readFileSync(join(projectDir, 'bridge-session-map.json'), 'utf8'))
+                const mapped = sessionMap?.[sessionId]
+                if (validSessionId(mapped)) candidateIds.add(mapped)
+                const reverseMapped = sessionMap?.[`@rev:${sessionId}`]
+                if (validSessionId(reverseMapped)) candidateIds.add(reverseMapped)
+            } catch {
+                // Session map 缺失或正在写入时直接按 transcript ID 检查。
+            }
+            for (const candidateId of candidateIds) {
+                const filePath = join(projectDir, `${candidateId}.jsonl`)
+                add({encodedDir: directoryName, filePath}, candidateId === sessionId ? 'scan' : 'session-map')
+            }
+        }
+    }
+    if (matches.size === 1) return {status: 'found', ...matches.values().next().value}
+    if (matches.size > 1) return {status: 'ambiguous', matches: [...matches.values()].map(({encodedDir, filePath}) => ({encodedDir, filePath}))}
     return {status: 'missing'}
 }

@@ -1,6 +1,7 @@
 import {isAbsolute, relative, resolve} from 'node:path'
 import {assertAgentCapabilities} from './agent-capabilities.mjs'
 import {normalizeAgentResult} from './agent-result.mjs'
+import {canDelegateWriteToParent, normalizePermissionMode} from './agent-permission.mjs'
 
 const REQUIRED = ['taskId', 'stepId', 'role', 'goal', 'workDir', 'modelTier', 'permissionMode']
 
@@ -22,13 +23,29 @@ function inside(root, file) {
 }
 
 function assertChangedFiles(input, result, definition) {
-    if (definition?.writable !== true && result.changedFiles.length) {
-        throw dispatchError(`只读 Agent 声明修改了文件: ${result.changedFiles[0]}`, 'AGENT_SCOPE_VIOLATION')
-    }
     const targets = new Set(input.targetFiles.map(file => resolve(input.workDir, file).toLowerCase()))
-    for (const file of result.changedFiles) {
+    const declaredFiles = [...result.changedFiles, ...(result.writeRequest?.requestedFiles || [])]
+    for (const file of declaredFiles) {
         if (!inside(input.workDir, file)) throw dispatchError(`Agent 修改越过项目边界: ${file}`, 'AGENT_SCOPE_VIOLATION')
         if (targets.size && !targets.has(resolve(input.workDir, file).toLowerCase())) throw dispatchError(`Agent 修改未授权目标文件: ${file}`, 'AGENT_SCOPE_VIOLATION')
+    }
+    const readOnly = canDelegateWriteToParent({permissionMode: normalizePermissionMode(input.permissionMode), agentWritable: definition?.writable === true})
+    if (!readOnly) return result
+    const requestedFiles = [...new Set([
+        ...(result.writeRequest?.requestedFiles || []),
+        ...result.changedFiles,
+    ])].slice(0, 50)
+    if (!requestedFiles.length) return result
+    return {
+        ...result,
+        status: 'blocked',
+        changedFiles: [],
+        writeRequest: {
+            requestedFiles,
+            requestedAction: result.writeRequest?.requestedAction || 'apply_changes',
+            reason: result.writeRequest?.reason || '当前 Agent 或会话没有写入权限，请交由主任务执行',
+        },
+        nextAction: result.nextAction || '交由主任务执行写入后重新验证',
     }
 }
 
@@ -39,7 +56,6 @@ export function createAgentDispatcher({registry, execute, publish = () => {}, ma
             const input = normalizeInput(rawInput)
             const definition = registry.get(input.agentId || input.role)
             if (!definition || !definition.enabled) throw dispatchError('Agent 不存在或已关闭', 'AGENT_UNAVAILABLE')
-            if (input.permissionMode === 'plan' && definition.writable) throw dispatchError('只读权限不允许写入 Agent', 'AGENT_PERMISSION_DENIED')
             assertAgentCapabilities(input.capabilities || {}, input.requirements || {}, {provider: input.provider || 'unknown'})
             const agentRunId = String(input.agentRunId || `${input.stepId}:agent:1`)
             const mailboxMessages = mailbox?.consume?.({toAgent: definition.role, taskId: input.taskId, limit: 20}) || []
@@ -47,10 +63,11 @@ export function createAgentDispatcher({registry, execute, publish = () => {}, ma
             try {
                 const rawResult = await execute({...input, agentRunId, definition, mailboxMessages})
                 const result = normalizeAgentResult(rawResult, {...input, agentRunId, role: definition.role})
-                assertChangedFiles(input, result, definition)
-                for (const message of mailboxMessages) mailbox?.ack?.(message.messageId, {status: result.status === 'completed' ? 'consumed' : 'failed'})
-                publish({type: result.status === 'completed' ? 'agent/completed' : 'agent/failed', taskId: input.taskId, stepId: input.stepId, agentRunId, role: definition.role, result})
-                return result
+                const safeResult = assertChangedFiles(input, result, definition)
+                for (const message of mailboxMessages) mailbox?.ack?.(message.messageId, {status: safeResult.status === 'completed' ? 'consumed' : 'failed'})
+                const eventType = safeResult.status === 'completed' ? 'agent/completed' : safeResult.status === 'blocked' ? 'agent/blocked' : 'agent/failed'
+                publish({type: eventType, taskId: input.taskId, stepId: input.stepId, agentRunId, role: definition.role, result: safeResult})
+                return safeResult
             } catch (error) {
                 for (const message of mailboxMessages) mailbox?.ack?.(message.messageId, {status: 'pending'})
                 publish({type: 'agent/failed', taskId: input.taskId, stepId: input.stepId, agentRunId, role: definition.role, code: error?.code || 'AGENT_EXECUTION_FAILED'})

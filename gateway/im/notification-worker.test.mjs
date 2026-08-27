@@ -80,4 +80,23 @@ await completedWorker.flush()
 completedWorker.stop()
 assert.equal(workerStateChanges.at(-1).state, 'sent')
 assert.equal(workerStateChanges.at(-1).notificationId, 'task-1:task_completed')
+
+{
+    const delays = []
+    const entries = [
+        {id: 'n1', payload: {text: '1'}},
+        {id: 'n2', payload: {text: '2'}},
+        {id: 'n3', payload: {text: '3'}},
+    ]
+    const outbox = {
+        due: () => entries,
+        complete: () => true,
+        fail: () => true,
+        status: () => ({state: 'sent', lastError: ''}),
+    }
+    const worker = startNotificationWorker({outbox, deliver: async () => true, delayMs: 400, delay: async ms => delays.push(ms), intervalMs: 60_000})
+    await worker.flush()
+    worker.stop()
+    assert.deepEqual(delays, [400, 400])
+}
 console.log('notification-worker tests passed')

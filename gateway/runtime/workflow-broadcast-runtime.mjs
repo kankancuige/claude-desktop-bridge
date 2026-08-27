@@ -9,7 +9,9 @@ export function createWorkflowBroadcastRuntime({
     noteTaskWorkflowTerminal,
     takeDeferredPrimaryResult,
     updateTaskCompletion,
+    updateTaskState = null,
     applyTaskCompletionEffects,
+    taskCompletionEventForClient = null,
     appendSessionEvent,
     reportImProgressEvent,
     broadcast,
@@ -28,6 +30,39 @@ export function createWorkflowBroadcastRuntime({
         const snapshot = coordinatorTaskId ? coordinator?.getTaskSnapshot(coordinatorTaskId) : null
         const step = snapshot?.plan?.steps?.find(item => item.status === 'running')
             || snapshot?.plan?.steps?.find(item => item.phase === snapshot.phase) || null
+        const writeRequests = [
+            ...(Array.isArray(message?.writeRequests) ? message.writeRequests : []),
+            ...(message?.agentResult?.writeRequest ? [{
+                agentRunId: `${message.workflowId || 'workflow'}:${message.id || 'agent'}`,
+                role: message.role || message.agentType || 'agent',
+                writeRequest: message.agentResult.writeRequest,
+                nextAction: message.agentResult.nextAction || '',
+            }] : []),
+        ].filter(item => item?.writeRequest?.requestedFiles?.length)
+        if (session && writeRequests.length) {
+            const seen = session._agentWriteRequestIds || (session._agentWriteRequestIds = new Set())
+            const fresh = writeRequests.filter(item => {
+                const key = `${item.agentRunId || ''}:${(item.writeRequest.requestedFiles || []).join('|')}`
+                if (seen.has(key)) return false
+                seen.add(key)
+                return true
+            })
+            if (fresh.length) {
+                session._pendingAgentWriteRequests = [
+                    ...(session._pendingAgentWriteRequests || []), ...fresh,
+                ].slice(-50)
+                updateTaskState?.(session, sessionId, {
+                    ...(session.taskState || {}),
+                    writeRequests: session._pendingAgentWriteRequests,
+                    detail: fresh.map(item => item.writeRequest.reason).join('; ').slice(0, 2000),
+                })
+                taskCompletionEventForClient?.(session, sessionId, 'task_write_delegated', {
+                    requests: fresh,
+                    permissionMode: session.permissionMode || 'default',
+                    requiresParentWrite: true,
+                })
+            }
+        }
         if (coordinatorTaskId && message?.workflowId) {
             const workbench = getTaskWorkbench()
             if (message.type === 'workflow_started') workbench?.recordTaskEvent(coordinatorTaskId, {type: 'workflow/started', workflowId: message.workflowId})
@@ -36,11 +71,13 @@ export function createWorkflowBroadcastRuntime({
             else if (message.type === 'workflow_agent_started') workbench?.recordAgentEvent(coordinatorTaskId, {
                 type: 'agent/started', agentRunId: `${message.workflowId}:${message.id || 'agent'}`,
                 stepId: step?.stepId || null, role: message.role || message.agentType || 'developer',
+                agentType: message.agentType, name: message.name, purpose: message.purpose, goal: message.goal,
             })
-            else if (message.type === 'workflow_agent_done' || message.type === 'workflow_agent_error') workbench?.recordAgentEvent(coordinatorTaskId, {
-                type: message.type === 'workflow_agent_done' ? 'agent/completed' : 'agent/failed',
+            else if (message.type === 'workflow_agent_done' || message.type === 'workflow_agent_blocked' || message.type === 'workflow_agent_error') workbench?.recordAgentEvent(coordinatorTaskId, {
+                type: message.type === 'workflow_agent_done' ? 'agent/completed' : message.type === 'workflow_agent_blocked' ? 'agent/blocked' : 'agent/failed',
                 agentRunId: `${message.workflowId}:${message.id || 'agent'}`,
                 stepId: step?.stepId || null, role: message.role || message.agentType || 'developer',
+                agentType: message.agentType, name: message.name, purpose: message.purpose, goal: message.goal,
                 result: message.agentResult || null,
             })
         }

@@ -79,10 +79,17 @@ test('runtime snapshot exposes sanitized pending confirmation summaries', () => 
     assert.deepEqual(state.pendingConfirmations[0], {
         requestId: 'r1', type: 'choice', toolName: 'AskUserQuestion', turnId: 't1', source: 'desktop', userId: 'u1',
         expiresAt: 123, question: '选择方案', options: [{label: 'A'}, {label: 'B'}],
+        questions: [{question: '选择方案', options: [{label: 'A'}, {label: 'B'}]}],
+        answers: {},
     })
 })
 
 test('runtime snapshot exposes the session permission mode', () => {
     assert.equal(getSessionRuntimeState({permissionMode: 'acceptEdits'}).permissionMode, 'acceptEdits')
     assert.equal(getSessionRuntimeState({permissionMode: 'invalid'}).permissionMode, 'default')
+})
+
+test('runtime snapshot carries the latest context usage for reconnecting desktop clients', () => {
+    const contextUsage = {type: 'context_usage', totalTokens: 1200, maxTokens: 200000, percentage: 1}
+    assert.deepEqual(getSessionRuntimeState({contextUsage}).contextUsage, contextUsage)
 })

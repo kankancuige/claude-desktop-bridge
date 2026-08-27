@@ -46,16 +46,19 @@ export function calculateAutoCompactWindow(actualWindow, configuredSafetyCap) {
 }
 
 export function normalizeContextUsage(raw) {
-    const totalTokens = parseTokenCount(raw?.totalTokens) || 0
-    const maxTokens = parseTokenCount(raw?.maxTokens)
-    const rawMaxTokens = parseTokenCount(raw?.rawMaxTokens) || maxTokens
+    const totalTokens = parseTokenCount(raw?.totalTokens ?? raw?.total_tokens) || 0
+    const rawMaxTokens = parseTokenCount(raw?.rawMaxTokens ?? raw?.raw_max_tokens)
+    // SDK 的真实 get_context_usage 响应只提供 raw_max_tokens；它就是当前
+    // percentage 使用的窗口，不能因缺少兼容字段 max_tokens 而退化为未知。
+    const maxTokens = parseTokenCount(raw?.maxTokens ?? raw?.max_tokens) || rawMaxTokens
+    const effectiveRawMaxTokens = rawMaxTokens || maxTokens
     const percentage = Number.isFinite(Number(raw?.percentage))
         ? Math.max(0, Math.min(100, Math.round(Number(raw.percentage))))
         : maxTokens ? Math.min(100, Math.round(totalTokens / maxTokens * 100)) : null
     return {
         totalTokens,
         maxTokens,
-        rawMaxTokens,
+        rawMaxTokens: effectiveRawMaxTokens,
         percentage,
         categories: Array.isArray(raw?.categories) ? raw.categories : [],
     }

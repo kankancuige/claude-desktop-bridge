@@ -5,6 +5,7 @@ import {runImTask} from './im-task-runner.mjs'
 function fakeTaskCommands(result = {type: 'message_accepted', messageId: 'm1', turnId: 'turn-1', queuePosition: 0}) {
     let listener = null
     let disposed = false
+    const cancellations = []
     return {
         submitTask: async command => ({...result, messageId: command.messageId || result.messageId}),
         observeTask: (_sessionId, _identity, next) => {
@@ -12,7 +13,9 @@ function fakeTaskCommands(result = {type: 'message_accepted', messageId: 'm1', t
             return () => { disposed = true }
         },
         publish(event) { listener?.(event) },
+        cancelTask: async (sessionId, identity) => { cancellations.push({sessionId, identity}) },
         get disposed() { return disposed },
+        get cancellations() { return cancellations },
     }
 }
 
@@ -68,6 +71,27 @@ test('IM runner 在适配器停止时释放 observer', async () => {
     assert.equal(service.disposed, true)
 })
 
+test('IM runner 提交期间适配器停止会取消随后才 accepted 的孤儿任务', async () => {
+    let resolveSubmission
+    const service = fakeTaskCommands()
+    service.submitTask = () => new Promise(resolve => { resolveSubmission = resolve })
+    const controller = new AbortController()
+    const running = runImTask({
+        taskCommands: service, sessionId: 's1', source: 'dingtalk', userId: 'u1', content: '继续',
+        signal: controller.signal,
+    })
+    await Promise.resolve()
+    controller.abort()
+    resolveSubmission({type: 'message_accepted', messageId: 'm1', turnId: 'turn-late', queuePosition: 0})
+
+    const result = await running
+    assert.equal(result.reason, 'adapter_stopped')
+    assert.deepEqual(service.cancellations, [{
+        sessionId: 's1',
+        identity: {source: 'dingtalk', userId: 'u1', reason: 'im_adapter_stopped_after_submit'},
+    }])
+})
+
 test('IM runner 可直接消费 task_completed.reply 作为最终回复', async () => {
     const service = fakeTaskCommands()
     const running = runImTask({
@@ -97,5 +121,26 @@ test('IM runner 将验证不足作为可继续终态，不等待超时', async (
     assert.equal(result.reason, 'task_verification_inconclusive')
     assert.match(finished[0].replyText, /只完成构建，尚未执行测试/)
     assert.equal(finished[0].notificationId, 'n3')
+    assert.equal(service.disposed, true)
+})
+
+test('IM 回合超时先取消后台任务再释放 observer', async () => {
+    const service = fakeTaskCommands()
+    let timeoutCallback = null
+    const running = runImTask({
+        taskCommands: service, sessionId: 's1', source: 'wechat', userId: 'u1', content: '执行',
+        timeoutOptions: {
+            setTimer: callback => { timeoutCallback = callback; return {unref() {}} },
+            clearTimer() {},
+        },
+    })
+    await Promise.resolve()
+    timeoutCallback()
+    const result = await running
+    assert.equal(result.reason, 'timeout')
+    assert.deepEqual(service.cancellations, [{
+        sessionId: 's1',
+        identity: {source: 'wechat', userId: 'u1', reason: 'im_timeout'},
+    }])
     assert.equal(service.disposed, true)
 })

@@ -273,10 +273,10 @@ const files=Array.isArray(args.files)?args.files.slice(0,80):[]
 const domains=Array.isArray(args.riskDomains)&&args.riskDomains.length?args.riskDomains.slice(0,8):['correctness']
 if(files.length===0)return {passed:true,findings:[],summary:'没有真实文件差异，跳过最终审查',tier}
 phase('Review')
-const review=await agent('只审查本轮列出的变更文件，不扫描整个仓库，不修改文件。允许读取这些文件的直接调用方和直接依赖以判断回归，但问题必须定位到变更文件，不能把未修改模块扩展成审查对象。\\n目标目录: '+target+'\\n审查模式: '+mode+'\\n风险域: '+domains.join(', ')+'\\n变更文件:\\n'+files.map((f,i)=>(i+1)+'. '+f.path+' ('+(f.lines||1)+' lines)').join('\\n')+'\\n只报告能用当前代码证据确认的真实问题。critical/high 默认 blocking；medium/low 默认 advisory。',{label:'final-review',phase:'Review',modelTier:tier,schema:{type:'object',properties:{findings:{type:'array',items:{type:'object',properties:{severity:{type:'string',enum:['critical','high','medium','low']},blocking:{type:'boolean'},title:{type:'string'},description:{type:'string'},file:{type:'string'},line:{type:'number'},suggestion:{type:'string'}},required:['severity','title','description','file']}},summary:{type:'string'}},required:['findings','summary']}})
+const review=await agent('只审查本轮列出的变更文件，不扫描整个仓库，不修改文件。允许读取这些文件的直接调用方和直接依赖以判断回归，但问题必须定位到变更文件，不能把未修改模块扩展成审查对象。\\n目标目录: '+target+'\\n审查模式: '+mode+'\\n风险域: '+domains.join(', ')+'\\n变更文件:\\n'+files.map((f,i)=>(i+1)+'. '+f.path+' ('+(f.lines||1)+' lines)').join('\\n')+'\\n只报告能用当前代码证据确认的真实问题。critical/high 默认 blocking；medium/low 默认 advisory。',{label:'final-review',agentType:'reviewer',phase:'Review',modelTier:tier,schema:{type:'object',properties:{findings:{type:'array',items:{type:'object',properties:{severity:{type:'string',enum:['critical','high','medium','low']},blocking:{type:'boolean'},title:{type:'string'},description:{type:'string'},file:{type:'string'},line:{type:'number'},suggestion:{type:'string'}},required:['severity','title','description','file']}},summary:{type:'string'}},required:['findings','summary']}})
 let findings=review?.findings||[]
 const candidates=findings.filter(i=>i.blocking===true||i.severity==='critical'||i.severity==='high').slice(0,8)
-if(tier==='power'&&candidates.length>0){phase('Verify');const verified=await parallel(candidates.map((finding,index)=>()=>agent('尝试证伪以下最终审查发现，只根据可定位代码证据判断:\\n'+JSON.stringify(finding),{label:'verify:'+index,phase:'Verify',modelTier:'power',schema:{type:'object',properties:{isReal:{type:'boolean'},reason:{type:'string'}},required:['isReal','reason']}}).then(verdict=>({finding,verdict}))));const realKeys=new Set(verified.filter(i=>i?.verdict?.isReal).map(i=>i.finding.file+'\\0'+i.finding.title));findings=findings.filter(i=>!(i.blocking===true||i.severity==='critical'||i.severity==='high')||realKeys.has(i.file+'\\0'+i.title))}
+if(tier==='power'&&candidates.length>0){phase('Verify');const verified=await parallel(candidates.map((finding,index)=>()=>agent('尝试证伪以下最终审查发现，只根据可定位代码证据判断:\\n'+JSON.stringify(finding),{label:'verify:'+index,agentType:'reviewer',phase:'Verify',modelTier:'power',schema:{type:'object',properties:{isReal:{type:'boolean'},reason:{type:'string'}},required:['isReal','reason']}}).then(verdict=>({finding,verdict}))));const realKeys=new Set(verified.filter(i=>i?.verdict?.isReal).map(i=>i.finding.file+'\\0'+i.finding.title));findings=findings.filter(i=>!(i.blocking===true||i.severity==='critical'||i.severity==='high')||realKeys.has(i.file+'\\0'+i.title))}
 const blocking=findings.filter(i=>i.blocking===true||i.severity==='critical'||i.severity==='high')
 return {passed:blocking.length===0,findings,summary:blocking.length>0?'最终审查发现 '+blocking.length+' 个阻断问题':(review?.summary||'最终审查通过'),tier}
 `,
@@ -1574,8 +1574,10 @@ function stopWorkflow(nameOrRunKey) {
         parentSid: state._parentSid, args: state._args, workDir: state._workDir,
         journalCache: state._journalCache, tokenSpent: state._tokenSpent,
         currentPhase: state._currentPhase,
-        _countedKeys: [...(state._countedKeys || [])],
-        _agentAborts: new Map(state._agentAborts || []),
+         _countedKeys: [...(state._countedKeys || [])],
+         _agentResults: new Map(state._agentResults || []),
+         _writeRequests: [...(state._writeRequests || [])],
+         _agentAborts: new Map(state._agentAborts || []),
         _agentHandles: new Map(state._agentHandles || []),
         _pausedAgents: new Map(state._pausedAgents || []),
     })
@@ -1791,9 +1793,11 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
         _aborted: false, _journalCache: journalCache, _tokenSpent: tokenSpent,
         _currentPhase: currentPhase,
         _countedKeys: _countedKeys,
-        _agentAborts: resumeState?._agentAborts || new Map(),
-        _agentHandles: resumeState?._agentHandles || new Map(),
-        _pausedAgents: resumeState?._pausedAgents || new Map(),
+         _agentAborts: resumeState?._agentAborts || new Map(),
+         _agentHandles: resumeState?._agentHandles || new Map(),
+         _agentResults: resumeState?._agentResults || new Map(),
+         _writeRequests: resumeState?._writeRequests || [],
+         _pausedAgents: resumeState?._pausedAgents || new Map(),
     }
     // 暴露 abort 控制（必须在 _runStates.set 之前定义，防止 stopWorkflow 竞态拿到没有 _abort 的 state）
     runState._abort = () => {
@@ -2032,12 +2036,13 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
                                         mailbox: activeDeps().getAgentMailbox?.() || null,
                                         publish: event => _broadcast({
                                             type: event.type === 'agent/started' ? 'workflow_agent_started'
-                                                : event.type === 'agent/completed' ? 'workflow_agent_done' : 'workflow_agent_error',
+                                                : event.type === 'agent/completed' ? 'workflow_agent_done'
+                                                    : event.type === 'agent/blocked' ? 'workflow_agent_blocked' : 'workflow_agent_error',
                                             workflowId: wfId,
                                             ...agentMetadata,
                                             id: agentLabel,
                                             role: event.role || agentMetadata.role,
-                                            status: event.type === 'agent/started' ? 'running' : event.type === 'agent/completed' ? 'done' : 'error',
+                                            status: event.type === 'agent/started' ? 'running' : event.type === 'agent/completed' ? 'done' : event.type === 'agent/blocked' ? 'blocked' : 'error',
                                             agentResult: event.result || null,
                                             error: event.code || null,
                                             ts: Date.now(),
@@ -2069,6 +2074,7 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
                                                 summary: typeof rawWorkflowResult === 'string' ? rawWorkflowResult.slice(0, 2000) : String(raw.summary || 'Agent 已返回结构化结果'),
                                                 changedFiles: raw.changedFiles || [], tests: raw.tests || [], findings: raw.findings || [],
                                                 blockers: raw.blockers || [], regressions: raw.regressions || [], nextAction: raw.nextAction || '',
+                                                writeRequest: raw.writeRequest || null,
                                             }
                                         },
                                     })
@@ -2096,6 +2102,17 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
                                         _countedKeys.add(cacheKey)
                                         runState._tokenSpent = tokenSpent
                                     }
+                                    runState._agentResults.set(agentLabel, result)
+                                    if (result?.writeRequest) {
+                                        runState._writeRequests = [...(runState._writeRequests || []).filter(item => item.agentRunId !== result.agentRunId), {
+                                            agentRunId: result.agentRunId,
+                                            role: result.role,
+                                            writeRequest: result.writeRequest,
+                                            nextAction: result.nextAction,
+                                        }].slice(-50)
+                                    }
+                                    // 保持 Workflow 脚本原有的 agent() 返回值兼容；结构化
+                                    // AgentResult 另存于运行状态和 workflow_done 事件供主任务消费。
                                     sendToChild({type: 'agent_result', callId, result: rawWorkflowResult})
                                 } catch (e) {
                                     if (e.code === 'BUDGET_EXCEEDED' && !aborted) aborted = true
@@ -2216,6 +2233,7 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
         _broadcast({
             type: 'workflow_done', workflowId: wfId, name,
             result: typeof result === 'string' ? result.substring(0, 2000) : (result ? JSON.stringify(result).substring(0, 2000) : ''),
+            writeRequests: (runState._writeRequests || []).slice(-50),
             logs: logs.slice(-100), tokenSpent,
         })
 
@@ -2225,9 +2243,15 @@ async function _runWorkflowInternal(name, parentSid, extraArgs, resumeState = nu
         if (s?.pushStream && extraArgs?._returnToParent !== false) {
             const preview = typeof result === 'string' ? result.substring(0, 4000)
                 : (result ? JSON.stringify(result, null, 2).substring(0, 4000) : '(无输出)')
+            const writeRequests = (runState._writeRequests || []).slice(-20)
+            const delegation = writeRequests.length
+                ? '\n\n[Bridge 写入委托]\n只读 Agent 发现以下变更需要写入：\n'
+                    + JSON.stringify(writeRequests, null, 2).substring(0, 8000)
+                    + '\n请由主任务依据当前会话权限执行写入，完成后重新验证；不要把 Agent 的 changedFiles 声明当作已写入证据。'
+                : ''
             s.pushStream.push({
                 type: 'user', session_id: parentSid,
-                message: {role: 'user', content: [{type: 'text', text: taskWorkflowResultMarker(wfId) + '\n[Workflow "' + name + '" 完成]\n' + preview}]},
+                message: {role: 'user', content: [{type: 'text', text: taskWorkflowResultMarker(wfId) + '\n[Workflow "' + name + '" 完成]\n' + preview + delegation}]},
                 parent_tool_use_id: null,
             })
         }
@@ -2385,6 +2409,20 @@ function serializeSessionWorkflowState(wfId, state) {
             }
         }
     }
+    if (state._journalCache) {
+        for (const cached of Object.values(state._journalCache)) {
+            const label = String(cached?.label || '').trim()
+            if (!label || cached?.result == null || agents.find(agent => agent.id === label)) continue
+            agents.push({
+                id: label,
+                agentType: label,
+                description: String(cached.prompt || '').slice(0, 100),
+                status: 'done',
+                source: 'workflow',
+                progress: '',
+            })
+        }
+    }
     const phases = state.phases || []
     return {
         wfId,
@@ -2428,6 +2466,7 @@ export {
     getRunState,
     getSessionWorkflowState,
     getSessionWorkflowStates,
+    serializeSessionWorkflowState,
     presetRunState,
     stopWorkflow,
     stopWorkflowAgent,

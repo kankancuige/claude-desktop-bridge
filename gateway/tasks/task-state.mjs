@@ -7,7 +7,7 @@ const REASONS = new Set([
     'max_turns', 'max_budget', 'max_rounds', 'max_tokens', 'max_duration',
     'max_retries', 'max_message_hops', 'max_agents', 'no_progress',
     'session_mode', 'blocked', 'waiting_for_event', 'execution_error',
-    'structured_output', 'stopped', 'unknown_error', null,
+    'structured_output', 'write_permission_required', 'stopped', 'unknown_error', null,
 ])
 const NOTIFICATION_STATES = new Set(['pending', 'sent', 'failed', 'dead'])
 const PERMISSION_MODES = new Set(['default', 'acceptEdits', 'plan', 'bypassPermissions'])
@@ -80,6 +80,8 @@ export function normalizeTaskState(raw = {}, {recoverRunning = false, now = Date
     }
     if (Object.prototype.hasOwnProperty.call(input, 'execution')) normalized.execution = normalizeExecutionProjection(input.execution)
     if (Object.prototype.hasOwnProperty.call(input, 'context')) normalized.context = normalizeContextProjection(input.context)
+    const writeRequests = normalizeWriteRequests(input.writeRequests)
+    if (writeRequests.length) normalized.writeRequests = writeRequests
     if (['title', 'summary', 'goal', 'requestText', 'source', 'projectKey'].some(key => Object.prototype.hasOwnProperty.call(input, key))) {
         Object.assign(normalized, {
             title: text(input.title, 80),
@@ -107,6 +109,20 @@ function normalizeNotifications(value) {
         }
     }
     return result
+}
+
+function normalizeWriteRequests(value) {
+    return (Array.isArray(value) ? value : []).slice(-50).map(item => ({
+        agentRunId: text(item?.agentRunId, 240),
+        role: text(item?.role, 80),
+        nextAction: text(item?.nextAction, 500),
+        writeRequest: {
+            requestedFiles: (Array.isArray(item?.writeRequest?.requestedFiles) ? item.writeRequest.requestedFiles : [])
+                .map(file => text(file, 500)).filter(Boolean).slice(0, 50),
+            requestedAction: text(item?.writeRequest?.requestedAction, 160) || 'apply_changes',
+            reason: redactTaskDetail(item?.writeRequest?.reason, 1200) || '需要主任务执行写入',
+        },
+    })).filter(item => item.writeRequest.requestedFiles.length)
 }
 
 function normalizeExecutionProjection(value) {
@@ -280,6 +296,7 @@ export function taskStateForClient(state) {
         review: normalized.review,
         updatedAt: normalized.updatedAt,
     }
+    if (normalized.writeRequests?.length) result.writeRequests = normalized.writeRequests
     if (normalized.execution) result.execution = normalized.execution
     if (normalized.context) result.context = normalized.context
     return result

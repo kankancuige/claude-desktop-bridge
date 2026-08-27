@@ -49,6 +49,7 @@ import {normalizeImMessageId, validateImText} from './im-input.mjs'
 import {runImTask} from './im-task-runner.mjs'
 import {PendingConfirmRegistry} from './pending-confirm.mjs'
 import {findLatestAdapterUserForSession} from './adapter-bindings.mjs'
+import {sendTextParts} from './reliable-text.mjs'
 import {BRIDGE_HOME} from '../config/bridge-home.mjs'
 
 const log = createLogger('dingtalk')
@@ -281,9 +282,14 @@ export function startDingTalkAdapter(token, {taskCommands, repository, onNotific
         }
 
         // ── 第2层: 挂起确认拦截 ──
-        const pc = pendingConfirm.peek(uid)
+        const confirmMatch = pendingConfirm.matchReply(uid, text)
+        if (confirmMatch.reason === 'ambiguous' || confirmMatch.reason === 'token_not_found') {
+            await sendMsg(uid, `当前有多个待确认项，请按编号回复，例如：#${confirmMatch.tokens?.[0] || '1'} y 或 #${confirmMatch.tokens?.[0] || '1'} 1`)
+            return
+        }
+        const pc = confirmMatch.entry
         if (pc) {
-            const parsed = parseConfirmReply(text, pc.type)
+            const parsed = parseConfirmReply(confirmMatch.replyText, pc.type)
             if (!parsed) {
                 await sendMsg(uid, pc.type === 'choice' ? '请回复选项编号（如 1、2）' : '请回复 y/确认 或 n/拒绝')
                 return
@@ -299,6 +305,10 @@ export function startDingTalkAdapter(token, {taskCommands, repository, onNotific
                 if (r.ok || d.reason === 'already_resolved') {
                     pendingConfirm.remove(uid, pc)
                     await sendMsg(uid, d.ok ? '已提交' : '该请求已处理')
+                } else if (d.reason === 'confirmation_incomplete') {
+                    const nextQuestion = pc.questions?.[Object.keys(d.answers || {}).length]
+                    const nextOptions = (nextQuestion?.options || []).map((option, index) => `${index + 1}. ${option.label}`).join('\n')
+                    await sendMsg(uid, `✅ ${d.message || '已记录，请继续回答剩余问题'}${nextQuestion ? `\n\n${nextQuestion.question}\n${nextOptions}` : ''}`)
                 } else {
                     await sendMsg(uid, '提交失败，请稍后重试')
                 }
@@ -384,26 +394,22 @@ export function startDingTalkAdapter(token, {taskCommands, repository, onNotific
     const notificationWorker = startNotificationWorker({
         outbox,
         deliver: payload => sendMsg(payload.userId, payload.text),
+        delayMs: 400,
         log,
         onStateChange: event => onNotificationStateChange?.({...event, platform: 'dingtalk'}),
     })
 
     async function sendReliableText(userId, text, notificationId = null) {
         if (stopped) return {sent: false, queued: false, error: 'adapter_stopped'}
-        const parts = splitTextByUtf8Bytes(text, 4000)
-        let sent = true
-        let queued = false
-        let lastError = ''
-        for (let i = 0; i < parts.length; i++) {
-            const content = parts.length > 1 ? `【${i + 1}/${parts.length}】${parts[i]}` : parts[i]
-            const result = await sendOrQueue(outbox, {userId, text: content}, payload => sendMsg(payload.userId, payload.text), {
-                id: notificationId ? `${notificationId}:part:${i + 1}` : undefined,
-            })
-            if (!result.sent) sent = false
-            if (result.queued) queued = true
-            if (result.error) lastError = result.error
-        }
-        return {sent, queued: !sent && queued, error: lastError, parts: parts.length}
+        return sendTextParts({
+            text,
+            split: value => splitTextByUtf8Bytes(value, 4000),
+            delay: ms => new Promise(resolve => setTimeout(resolve, ms)),
+            delayMs: 400,
+            sendPart: (content, index) => sendOrQueue(outbox, {userId, text: content}, payload => sendMsg(payload.userId, payload.text), {
+                id: notificationId ? `${notificationId}:part:${index + 1}` : undefined,
+            }),
+        })
     }
 
     // ── injectAndWait ── 进程内统一任务提交与事件消费
@@ -419,20 +425,26 @@ export function startDingTalkAdapter(token, {taskCommands, repository, onNotific
             signal: taskAbortController.signal,
             loadMirror: () => shouldSkipReply(sessionId, userId),
             onPermission: msg => {
-                if (pendingConfirm.add(userId, {sessionId, requestId: msg.requestId, type: 'permission'})) {
-                    return sendReliableText(userId, `需要授权\n工具: ${msg.toolName}\n\n回复 y/确认 允许，n/拒绝 拒绝`)
+                const added = pendingConfirm.add(userId, {sessionId, requestId: msg.requestId, type: 'permission', toolUseId: msg.toolUseId})
+                if (added.ok) {
+                    return sendReliableText(userId, `确认 #${added.entry.replyToken}\n工具: ${msg.toolName}\n\n回复 #${added.entry.replyToken} y 允许，#${added.entry.replyToken} n 拒绝`)
                 }
+                if (added.reason?.endsWith('capacity')) return sendReliableText(userId, '待确认项过多，请先处理已有确认')
             },
             onChoice: msg => {
                 const lines = []
-                const question = msg.questions?.[0]
-                if (question?.question) lines.push(question.question)
-                ;(question?.options || []).forEach((option, index) => lines.push(`${index + 1}. ${option.label}`))
-                if (pendingConfirm.add(userId, {
-                    sessionId, requestId: msg.requestId, type: 'choice', questions: msg.questions,
-                })) {
-                    return sendReliableText(userId, `请选择\n${lines.join('\n')}\n\n回复选项编号`)
+                for (const question of (msg.questions || [])) {
+                    if (question?.question) lines.push(question.question)
+                    ;(question?.options || []).forEach((option, index) => lines.push(`${index + 1}. ${option.label}`))
                 }
+                const added = pendingConfirm.add(userId, {
+                    sessionId, requestId: msg.requestId, type: 'choice', questions: msg.questions,
+                    toolUseId: msg.toolUseId,
+                })
+                if (added.ok) {
+                    return sendReliableText(userId, `确认 #${added.entry.replyToken}\n${lines.join('\n')}\n\n回复 #${added.entry.replyToken} 选项编号`)
+                }
+                if (added.reason?.endsWith('capacity')) return sendReliableText(userId, '待确认项过多，请先处理已有确认')
             },
             onStopped: () => sessionQueue.cancel(sessionId),
             onFinish: async ({reason, replyText, toolCount, notificationId, mirrorEnabled}) => {
@@ -473,7 +485,7 @@ export function startDingTalkAdapter(token, {taskCommands, repository, onNotific
         } catch (error) {
             log.debug({err: error, sessionId: sid?.slice(0, 8)}, '读取钉钉镜像状态失败')
         }
-        return findLatestAdapterUserForSession(ad, 'dingtalk', sid)
+        return findLatestAdapterUserForSession(ad, 'dingtalk', sid, pairedUsers)
     }
 
     // ── onConfirmRequest ── 镜像确认请求
@@ -482,27 +494,38 @@ export function startDingTalkAdapter(token, {taskCommands, repository, onNotific
         if (!uid || !pairedUsers.has(uid)) return
         if (info.type === 'choice') {
             const lines = [];
-            const q = info.questions?.[0]
-            if (q?.question) lines.push(q.question)
-            ;
-            (q?.options || []).forEach((o, i) => lines.push(`${i + 1}. ${o.label}`))
+            for (const q of (info.questions || [])) {
+                if (q?.question) lines.push(q.question)
+                ;(q?.options || []).forEach((o, i) => lines.push(`${i + 1}. ${o.label}`))
+            }
             const added = pendingConfirm.add(uid, {
                 sessionId: info.sessionId,
                 requestId: info.requestId,
                 type: 'choice',
-                questions: info.questions
+                questions: info.questions,
+                toolUseId: info.toolUseId,
             })
-            if (added) sendReliableText(uid, `请选择(桌面)\n${lines.join('\n')}\n\n回复选项编号`)
+            if (added.ok) sendReliableText(uid, `确认 #${added.entry.replyToken}（桌面）\n${lines.join('\n')}\n\n回复 #${added.entry.replyToken} 选项编号`)
+            else if (added.reason?.endsWith('capacity')) sendReliableText(uid, '待确认项过多，请先处理已有确认')
         } else {
-            if (pendingConfirm.add(uid, {sessionId: info.sessionId, requestId: info.requestId, type: 'permission'})) {
-                sendReliableText(uid, `需要授权(桌面)\n工具: ${info.toolName}\n\n回复 y/确认 允许，n/拒绝 拒绝`)
+            const added = pendingConfirm.add(uid, {sessionId: info.sessionId, requestId: info.requestId, type: 'permission', toolUseId: info.toolUseId})
+            if (added.ok) {
+                sendReliableText(uid, `确认 #${added.entry.replyToken}（桌面）\n工具: ${info.toolName}\n\n回复 #${added.entry.replyToken} y 允许，#${added.entry.replyToken} n 拒绝`)
+            } else if (added.reason?.endsWith('capacity')) {
+                sendReliableText(uid, '待确认项过多，请先处理已有确认')
             }
         }
     }
 
     // ── onConfirmResolved ── 确认已被其它通道处理
-    function onConfirmResolved(sessionId, requestId) {
-        pendingConfirm.removeByRequest(sessionId, requestId)
+    function onConfirmResolved(sessionId, requestId, resolution = {}) {
+        const removed = pendingConfirm.removeByRequest(sessionId, requestId)
+        if (!removed || resolution.wonBy === 'dingtalk') return
+        const text = resolution.wonBy === 'timeout' ? '该确认已超时并取消'
+            : resolution.wonBy === 'abort' ? '该确认已取消'
+                : '该确认已由桌面端或其他通道处理'
+        void sendReliableText(removed.userId, text)
+            .catch(error => log.warn({err: error}, '发送确认结算通知失败'))
     }
 
     // ── sendToUser ── Mirror 发送到绑定用户(支持长文本分段)
@@ -669,6 +692,7 @@ export function startDingTalkAdapter(token, {taskCommands, repository, onNotific
     return {
         onConfirmRequest, onConfirmResolved, findUserForSession, sendToUser,
         notificationStatus: notificationWorker.summary, notificationState: id => outbox.status(id), pairingCode: () => pairCode,
+        pairedUserCount: () => pairedUsers.size,
         retryNotifications, discardNotifications, connectionStatus, stop,
     }
 }

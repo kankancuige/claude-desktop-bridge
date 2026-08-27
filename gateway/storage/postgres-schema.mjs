@@ -193,6 +193,9 @@ export const schemaCommentDefinitions = Object.freeze({
             duration_ms: '本次请求耗时，毫秒。',
             retry_count: '本次请求重试次数。',
             created_at: '用量事件产生时间，Unix epoch 毫秒时间戳。',
+            status: '调用生命周期状态，例如 pending、completed、failed 或 cancelled。',
+            ended_at: '调用结束时间，Unix epoch 毫秒时间戳；未结束时为空。',
+            error_code: '调用异常或取消的有界错误码，不包含凭据和正文。',
         },
     },
     pitfalls: {
@@ -250,7 +253,7 @@ export function schemaCommentSql(schemaName = 'bridge', {includeVector = false} 
     return statements.join('\n')
 }
 
-export function schemaSql(schemaName = 'bridge') {
+export function schemaSql(schemaName = 'bridge', {includeComments = true} = {}) {
     const schema = identifier(schemaName, 'bridge')
     return `
 CREATE SCHEMA IF NOT EXISTS ${schema};
@@ -407,9 +410,14 @@ CREATE TABLE IF NOT EXISTS ${schema}.model_usage_events (
     usage_source TEXT NOT NULL,
     duration_ms BIGINT,
     retry_count INTEGER NOT NULL DEFAULT 0,
-    created_at BIGINT NOT NULL
+    created_at BIGINT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'completed',
+    ended_at BIGINT,
+    error_code TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_usage_session ON ${schema}.model_usage_events (session_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_usage_created_at ON ${schema}.model_usage_events (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_usage_project_created_at ON ${schema}.model_usage_events (project_key, created_at DESC);
 CREATE TABLE IF NOT EXISTS ${schema}.pitfalls (
     id TEXT PRIMARY KEY,
     project_key TEXT NOT NULL,
@@ -447,14 +455,21 @@ CREATE TABLE IF NOT EXISTS ${schema}.pitfall_links (
 INSERT INTO ${schema}.schema_version (id, version, updated_at)
 VALUES (1, 1, EXTRACT(EPOCH FROM clock_timestamp())::BIGINT)
 ON CONFLICT (id) DO NOTHING;
-${schemaCommentSql(schemaName)}
+${includeComments ? schemaCommentSql(schemaName) : ''}
 `
 }
 
 export async function ensurePostgresSchema(client, {schema = 'bridge', vectorDimensions = null} = {}) {
     if (!client?.query) throw new TypeError('PostgreSQL client is required')
     const extension = await client.query("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector') AS enabled")
-    await client.query(schemaSql(schema))
+    // 先建表，再补齐生命周期列，最后执行列注释；这样旧账本表不会因新增列尚未存在而在 COMMENT 处失败。
+    await client.query(schemaSql(schema, {includeComments: false}))
+    // 兼容已存在的账本表：生命周期字段用于保留中途断线/取消的调用记录。
+    const usageTable = `${identifier(schema, 'bridge')}.model_usage_events`
+    await client.query(`ALTER TABLE ${usageTable} ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'completed'`)
+    await client.query(`ALTER TABLE ${usageTable} ADD COLUMN IF NOT EXISTS ended_at BIGINT`)
+    await client.query(`ALTER TABLE ${usageTable} ADD COLUMN IF NOT EXISTS error_code TEXT`)
+    await client.query(schemaCommentSql(schema))
     let configuredDimensions = null
     if (extension.rows?.[0]?.enabled === true && vectorDimensions !== null && vectorDimensions !== undefined) {
         configuredDimensions = normalizeVectorDimensions(vectorDimensions)

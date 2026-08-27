@@ -47,6 +47,15 @@ assert.equal(findLatestAdapterUserForSession({
     c: {platform: 'feishu', userId: 'other', sessionId: 's1', updatedAt: 3},
 }, 'wechat', 's1'), 'new')
 
+assert.equal(findLatestAdapterUserForSession({}, 'wechat', 'new-session', ['only-user']), 'only-user')
+assert.equal(findLatestAdapterUserForSession({}, 'wechat', 'new-session', ['user-1', 'user-2']), null)
+assert.equal(findLatestAdapterUserForSession({
+    exact: {platform: 'wechat', userId: 'bound-user', sessionId: 'new-session', updatedAt: 1},
+}, 'wechat', 'new-session', ['only-user', 'bound-user']), 'bound-user')
+assert.equal(findLatestAdapterUserForSession({
+    exact: {platform: 'wechat', userId: 'old-unpaired-user', sessionId: 'new-session', updatedAt: 1},
+}, 'wechat', 'new-session', ['only-user']), 'only-user')
+
 const multiUser = upsertAdapterBinding(source, {
     platform: 'wechat', userId: 'wx-user-5678', sessionId: 's-live', workDir: 'D:\\code', updatedAt: 300,
 }, platforms)

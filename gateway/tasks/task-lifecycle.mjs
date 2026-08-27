@@ -25,7 +25,7 @@ export function getCurrentSessionWorkflow(workflows = []) {
     return sortSessionWorkflows(workflows)[0] || null
 }
 
-export function createTaskLifecycleSnapshot({sessionId = '', runtime = {}, task = {}, workflows = []} = {}) {
+export function createTaskLifecycleSnapshot({sessionId = '', runtime = {}, task = {}, workflows = [], coordinator = null} = {}) {
     const orderedWorkflows = sortSessionWorkflows(workflows)
     const taskStatus = String(task?.status || 'idle')
     const runtimeGenerating = runtime?.generating === true
@@ -38,8 +38,21 @@ export function createTaskLifecycleSnapshot({sessionId = '', runtime = {}, task 
     const runtimeActive = (runtimeGenerating && !taskTerminal) || taskWorkflowPending
     const taskActive = ACTIVE_TASK_PHASES.has(taskStatus)
     const workflowActive = orderedWorkflows.some(workflow => ACTIVE_WORKFLOW_STATUSES.has(String(workflow?.status || '')))
-    const active = runtimeActive || taskActive || workflowActive
+    const coordinatorWaiting = coordinator?.status === 'waiting_user'
+    const active = workflowActive || (!coordinatorWaiting && (runtimeActive || taskActive))
     const resumable = task?.resumable === true && TERMINAL_TASK_PHASES.has(taskStatus)
+    const coordinatorSummary = coordinator?.taskId ? {
+        taskId: String(coordinator.taskId).slice(0, 240),
+        turnId: coordinator.turnId ? String(coordinator.turnId).slice(0, 240) : null,
+        status: String(coordinator.status || '').slice(0, 80),
+        phase: coordinator.phase ? String(coordinator.phase).slice(0, 80) : null,
+        revision: number(coordinator.revision),
+        stepId: coordinator.execution?.currentStepId ? String(coordinator.execution.currentStepId).slice(0, 240) : null,
+        detail: String(coordinator.blockers?.[0]?.detail || '').replace(/[\0\r\n]+/g, ' ').trim().slice(0, 1000),
+        verification: coordinator.verification && typeof coordinator.verification === 'object'
+            ? {status: String(coordinator.verification.status || '').slice(0, 80), evidenceLevel: String(coordinator.verification.evidenceLevel || '').slice(0, 40)}
+            : null,
+    } : null
 
     return {
         version: 1,
@@ -55,10 +68,11 @@ export function createTaskLifecycleSnapshot({sessionId = '', runtime = {}, task 
         },
         workflows: orderedWorkflows,
         currentWorkflow: orderedWorkflows[0] || null,
+        coordinator: coordinatorSummary,
         capabilities: {
             canSend: !active,
             canStop: active,
-            canContinue: !active && resumable,
+            canContinue: !active && (resumable || coordinatorWaiting),
         },
     }
 }

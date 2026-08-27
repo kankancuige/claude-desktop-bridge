@@ -10,14 +10,15 @@ export function createTaskCommandRuntime(deps = {}) {
         MODEL, decideTask, resolveTurnModelRoute, loadWfConfig, validateProviderModel,
         acceptSessionInput, rollbackSessionInput, appendSessionEvent, markVisibleSession,
         isUserSessionSource, broadcastDesktop, getBroadcastDesktop = () => broadcastDesktop, createTaskCompletionState, createTurnIdentity,
-        createTaskWorkflowGate, initializeTaskWorkbenchSession, userPreferences, updateTaskState,
+        createTaskWorkflowGate, initializeTaskWorkbenchSession, getWaitingCoordinatorTask, resumeWaitingCoordinatorTask, userPreferences, updateTaskState,
         taskCompletionEventForClient, broadcast, getBroadcast = () => broadcast, resolveSdkInputContent, buildTaskPitfallReminder,
         routeSkills, createSessionContextEnvelope, resolveContextReusePolicy,
         resolveProviderCapabilityProfile, buildModelHandoffPrompt, beginTurn,
         shouldCaptureTurnCheckpoint, closeSessionRuntime, startClaudeAgent, PushStream,
         loadAgentDefinitions, makeQueryOptions, getMakeQueryOptions = () => makeQueryOptions,
         startStreamPump, getStartStreamPump = () => startStreamPump, failPendingSessionInputs,
-        autoTriggerWorkflow, persistTaskEvent = null,
+        autoTriggerWorkflow, persistTaskEvent = null, updateTaskCompletion, broadcastTaskLifecycle,
+        clearStreamWatchdog, armStreamWatchdog,
     } = deps
     if (!sessions || !taskInputQueue || !sessionCoordinator || !IM_SOURCES) throw new TypeError('task runtime dependencies are required')
 
@@ -32,6 +33,59 @@ export function createTaskCommandRuntime(deps = {}) {
         // 事件序号需要跨进程重启避开旧投影；时间戳作为新进程的单调起点，不暴露给用户。
         session._taskEventRevision = Math.max(Number(session._taskEventRevision || 0), Date.now())
         for (const event of session._pendingTaskEvents) event.eventRevision = ++session._taskEventRevision
+    }
+
+    function boundedError(error) {
+        return String(error?.message || error || '任务启动失败')
+            .replace(/[\0\r\n]+/g, ' ')
+            .replace(/(bearer\s+)[^\s,;]+/gi, '$1[REDACTED]')
+            .replace(/((?:api[-_]?key|token|secret|password)=)[^&\s]+/gi, '$1[REDACTED]')
+            .trim().slice(0, 500) || '任务启动失败'
+    }
+
+    async function finalizeTaskStartFailure(session, sessionId, error, {rebuildToken = null} = {}) {
+        if (!session) return false
+        if (rebuildToken && !sessionCoordinator.isCurrent(session, rebuildToken)) return false
+        const detail = boundedError(error)
+        if (rebuildToken) sessionCoordinator.fail(session, rebuildToken)
+        clearStreamWatchdog?.(session)
+        try {
+            await closeSessionRuntime?.(session, {sessionId, reason: 'runtime_start_failed'})
+        } catch (closeError) {
+            log.warn({err: closeError, sessionId: sessionId.slice(0, 8)}, '任务启动失败时关闭运行时失败')
+        }
+        session.query = null
+        session.pushStream = null
+        session.pendingTurn = null
+        session._pendingTurns = []
+        session._generating = false
+        session.activeTurnId = null
+        session.activeTurnIdentity = null
+        session._autoContinuationRequest = null
+        failPendingSessionInputs?.(sessionId, session, Object.assign(new Error(detail), {code: 'task_start_failed'}))
+        const completedAt = Date.now()
+        session.taskCompletedAt = completedAt
+        let completionHandled = false
+        try {
+            if (typeof updateTaskCompletion === 'function' && session.taskCompletion) {
+                updateTaskCompletion(session, sessionId, {type: 'runtime_failed', detail})
+                taskCompletionEventForClient?.(session, sessionId, 'task_failed', {code: 'task_start_failed', detail})
+                completionHandled = true
+            }
+        } catch (completionError) {
+            log.warn({err: completionError, sessionId: sessionId.slice(0, 8)}, '任务启动失败时完成状态广播失败，使用兜底状态')
+        }
+        if (!completionHandled) {
+            updateTaskState?.(session, sessionId, {
+                status: 'interrupted', outcome: 'failed', continuationReason: 'execution_error', detail,
+                startedAt: session.taskStartedAt || completedAt, completedAt,
+                durationMs: Math.max(0, completedAt - Number(session.taskStartedAt || completedAt)),
+            })
+        }
+        appendSessionEvent?.(session, 'runtime/failed', {code: 'task_start_failed', detail})
+        broadcastTaskLifecycle?.(sessionId)
+        log.error({err: error, sessionId: sessionId.slice(0, 8), code: 'task_start_failed'}, '任务启动失败，已收口终态')
+        return true
     }
 
     async function flushTaskEvents(session) {
@@ -56,6 +110,8 @@ export function createTaskCommandRuntime(deps = {}) {
     const userId = command.userId || null
     const desktopInput = !IM_SOURCES.has(source)
     const activeTurnInput = Boolean(s._generating || s.activeTurnId || s._pendingInputs?.length)
+    const waitingCoordinatorTask = !activeTurnInput ? getWaitingCoordinatorTask?.(s) : null
+    const continuingTaskInput = activeTurnInput || Boolean(waitingCoordinatorTask)
     // 必须在热刷新 Provider/模型前捕获旧投影，否则重建原因会被新的运行配置覆盖。
     const contextEnvelopeBeforeSettings = s.contextEnvelope || createSessionContextEnvelope(s)
     let acceptedInput = null
@@ -83,8 +139,11 @@ export function createTaskCommandRuntime(deps = {}) {
         const requestedModelMode = desktopInput && VALID_MODEL_MODES.has(command.modelMode)
             ? command.modelMode
             : (s.modelMode || (command.model ? 'fixed' : 'auto'))
-        const taskDecision = activeTurnInput && s.taskDecision
+        const continuedDecision = s.taskDecision?.version
             ? s.taskDecision
+            : waitingCoordinatorTask?.plan?.decision?.version ? waitingCoordinatorTask.plan.decision : null
+        const taskDecision = continuingTaskInput && continuedDecision
+            ? continuedDecision
             : decideTask({
                 text: desktopInput && command.taskText?.trim() ? command.taskText : command.content,
                 previousDecision: s.taskDecision,
@@ -92,7 +151,7 @@ export function createTaskCommandRuntime(deps = {}) {
                 attachmentEvidence: desktopInput && command.hasAttachments,
             })
         const taskRoute = resolveTurnModelRoute({
-            activeTurn: activeTurnInput,
+            activeTurn: continuingTaskInput,
             currentMode: s.modelMode,
             currentModel: s.queryOpts?.model,
             currentTier: s.modelTier,
@@ -129,18 +188,18 @@ export function createTaskCommandRuntime(deps = {}) {
         }
         try {
             const rootTaskId = `${sessionId}:${acceptedInput.turnId}`
-            const metadata = !activeTurnInput ? createTaskMetadata({
+            const metadata = !continuingTaskInput ? createTaskMetadata({
                 taskText: desktopInput ? command.taskText : '',
                 content: command.content,
                 source,
             }) : {}
-            const inputMetadata = activeTurnInput ? createTaskMetadata({content: command.content, source}) : null
-            const acceptedEvent = activeTurnInput
-                ? buildTaskEventPayload('task/input-appended', s, {taskId: s.taskCompletionTaskId, turnId: acceptedInput.turnId, source, messageId: acceptedInput.messageId, queuePosition: acceptedInput.queuePosition, summary: inputMetadata.summary, requestText: inputMetadata.requestText})
+            const inputMetadata = continuingTaskInput ? createTaskMetadata({content: command.content, source}) : null
+            const acceptedEvent = continuingTaskInput
+                ? buildTaskEventPayload('task/input-appended', s, {taskId: waitingCoordinatorTask?.taskId || s.taskCompletionTaskId, turnId: acceptedInput.turnId, source, messageId: acceptedInput.messageId, queuePosition: acceptedInput.queuePosition, summary: inputMetadata.summary, requestText: inputMetadata.requestText})
                 : buildTaskEventPayload('task/created', s, {taskId: rootTaskId, turnId: acceptedInput.turnId, source, messageId: acceptedInput.messageId, ...metadata})
             appendSessionEvent(s, acceptedEvent.type, acceptedEvent.payload, {critical: true})
             queueTaskEvent(s, acceptedEvent.type, acceptedEvent.payload)
-            if (!activeTurnInput) {
+            if (!continuingTaskInput) {
                 const accepted = buildTaskEventPayload('task/accepted', s, {taskId: rootTaskId, turnId: acceptedInput.turnId, source, messageId: acceptedInput.messageId, queuePosition: acceptedInput.queuePosition})
                 appendSessionEvent(s, accepted.type, accepted.payload, {critical: true})
                 queueTaskEvent(s, accepted.type, accepted.payload)
@@ -173,7 +232,18 @@ export function createTaskCommandRuntime(deps = {}) {
             }
         }
 
-        if (!activeTurnInput) {
+        if (waitingCoordinatorTask) {
+            const resumed = resumeWaitingCoordinatorTask?.(s)
+            if (!resumed || resumed.status === 'waiting_user') {
+                rollbackSessionInput(s, acceptedInput)
+                acceptedInput = null
+                return {type: 'message_rejected', messageId: command.messageId, code: 'task_resume_failed', message: '原任务恢复失败，请刷新会话后重试'}
+            }
+            s.taskCompletionTaskId = resumed.taskId
+            s.taskCompletionTurnId = resumed.turnId || s.taskCompletionTurnId
+        }
+
+        if (!continuingTaskInput) {
             s.taskStartedAt = Date.now()
             s.taskCompletedAt = 0
             s.taskCompletion = createTaskCompletionState({phase: 'running'})
@@ -195,23 +265,29 @@ export function createTaskCommandRuntime(deps = {}) {
             s.autoContinuationTurns = 0
             s._lastContextUsageAt = 0
 
-            await initializeTaskWorkbenchSession({
-                session: s,
-                taskId: s.taskCompletionTaskId,
-                turnId: acceptedInput.turnId,
-                sessionId,
-                source,
-                userId,
-                taskText: desktopInput ? command.taskText : '',
-                content: command.content,
-                goal: desktopInput && command.taskText?.trim() ? command.taskText : command.content,
-                decision: taskDecision,
-            })
+            try {
+                await initializeTaskWorkbenchSession({
+                    session: s,
+                    taskId: s.taskCompletionTaskId,
+                    turnId: acceptedInput.turnId,
+                    sessionId,
+                    source,
+                    userId,
+                    taskText: desktopInput ? command.taskText : '',
+                    content: command.content,
+                    goal: desktopInput && command.taskText?.trim() ? command.taskText : command.content,
+                    decision: taskDecision,
+                })
+            } catch (error) {
+                await finalizeTaskStartFailure(s, sessionId, error)
+                acceptedInput = null
+                return {type: 'message_rejected', messageId: command.messageId, code: 'task_start_failed', message: `任务启动失败：${boundedError(error)}`}
+            }
         }
 
         // 只在新任务入口观察候选；同一执行中的补充消息不能把一次要求误计为多次偏好。
         let preferenceSuggestions = []
-        if (!activeTurnInput) {
+        if (!continuingTaskInput) {
             try {
                 preferenceSuggestions = userPreferences.observe({
                     projectDir: s.workDir,
@@ -237,7 +313,7 @@ export function createTaskCommandRuntime(deps = {}) {
             projectKey: s.workDir || '',
         })
         await flushTaskEvents(s)
-        if (!activeTurnInput) {
+        if (!continuingTaskInput) {
             taskCompletionEventForClient(s, sessionId, 'task_started', {
                 modelTier: taskDecision.modelTier, risk: taskDecision.risk,
             })
@@ -273,7 +349,7 @@ export function createTaskCommandRuntime(deps = {}) {
         const modeChanged = taskRoute.mode !== previousModelMode
         const contextChanged = nextProfile !== (s.contextProfile || 'full')
         let sdkInputContent = await resolveSdkInputContent(sessionId, s, command.content)
-            + (!activeTurnInput ? buildTaskPitfallReminder(s.taskPitfallReminders) : '')
+            + (!continuingTaskInput ? buildTaskPitfallReminder(s.taskPitfallReminders) : '')
         if (s.taskContextPlan) updateTaskState(s, sessionId, {...s.taskState, context: s.taskContextPlan})
         const nextSkillRoute = routeSkills({text: sdkInputContent, workDir: s.workDir, profile: nextProfile})
         const skillRouteChanged = JSON.stringify(nextSkillRoute) !== JSON.stringify(s.skillRoute || [])
@@ -390,8 +466,7 @@ export function createTaskCommandRuntime(deps = {}) {
                         return
                     }
                     log.error({err: error, sessionId: sessionId.slice(0, 8)}, 'rebuild 失败')
-                    sessionCoordinator.fail(s, myRebuildId)
-                    failPendingSessionInputs(sessionId, s, error)
+                    return finalizeTaskStartFailure(s, sessionId, error, {rebuildToken: myRebuildId})
                 })
                 sessionCoordinator.attachPromise(s, myRebuildId, rebuildPromise)
             }
@@ -402,9 +477,10 @@ export function createTaskCommandRuntime(deps = {}) {
                 parent_tool_use_id: null,
             })
             s.hasUserTurns = true
+            armStreamWatchdog?.(sessionId, s, s.query)
         }
 
-        if (!command.noWorkflow && !activeTurnInput) {
+        if (!command.noWorkflow && !continuingTaskInput) {
             autoTriggerWorkflow(sessionId, command.content, taskDecision).catch(error => {
                 log.warn({err: error, sessionId: sessionId.slice(0, 8)}, 'autoTriggerWorkflow 异常')
             })
@@ -424,6 +500,11 @@ export function createTaskCommandRuntime(deps = {}) {
                 turnId: acceptedInput.turnId,
                 reason: typeof error?.code === 'string' ? error.code.slice(0, 120) : 'submit_failed',
             })
+        }
+        if (!activeTurnInput && s.taskCompletionTaskId) {
+            await finalizeTaskStartFailure(s, sessionId, error)
+            acceptedInput = null
+            return {type: 'message_rejected', messageId: command.messageId, code: 'task_start_failed', message: `任务启动失败：${boundedError(error)}`}
         }
         throw error
     }

@@ -14,16 +14,27 @@ test('缺失身份、能力不支持和越权修改均显式拒绝', async () =>
     await assert.rejects(dispatcher.dispatchAgent(base), error => error?.code === 'AGENT_SCOPE_VIOLATION')
 })
 
-test('只读 Agent 即使文件位于项目内也不能声明修改', async () => {
+test('只读 Agent 的项目内修改声明转换为交给主任务的写入请求', async () => {
     const registry = createAgentRegistry()
     const dispatcher = createAgentDispatcher({
         registry,
         execute: async () => ({status: 'completed', summary: '错误声明', changedFiles: ['inside.mjs']}),
     })
-    await assert.rejects(dispatcher.dispatchAgent({
+    const result = await dispatcher.dispatchAgent({
         agentId: 'reviewer', taskId: 't', stepId: 's', role: 'reviewer', goal: '审查',
         workDir: resolve('.'), targetFiles: ['inside.mjs'], modelTier: 'balanced', permissionMode: 'plan',
-    }), error => error?.code === 'AGENT_SCOPE_VIOLATION')
+    })
+    assert.equal(result.status, 'blocked')
+    assert.deepEqual(result.changedFiles, [])
+    assert.deepEqual(result.writeRequest.requestedFiles, ['inside.mjs'])
+})
+
+test('只读 Agent 的写入请求越过项目边界时仍然拒绝', async () => {
+    const dispatcher = createAgentDispatcher({
+        registry: createAgentRegistry(),
+        execute: async () => ({status: 'completed', writeRequest: {requestedFiles: ['..\\outside.mjs']}}),
+    })
+    await assert.rejects(dispatcher.dispatchAgent({...base, agentId: 'reviewer', role: 'reviewer', permissionMode: 'plan'}), error => error?.code === 'AGENT_SCOPE_VIOLATION')
 })
 
 test('合法结构化结果发出统一生命周期事件', async () => {

@@ -1,3 +1,5 @@
+import {resolveEffectivePermissionMode} from '../agents/agent-permission.mjs'
+
 export function inferWorkflowAgentTier({label, phase, workflowTier} = {}) {
     const normalizedLabel = String(label || '').toLowerCase()
     const normalizedPhase = String(phase || '').toLowerCase()
@@ -48,5 +50,5 @@ export function shouldAutoTriggerFinalReview({decision, outcome, changedFileCoun
 }
 
 export function resolveWorkflowPermissionMode({parentPermissionMode, agentPermissionMode} = {}) {
-    return parentPermissionMode || agentPermissionMode || 'acceptEdits'
+    return resolveEffectivePermissionMode({parentPermissionMode, agentPermissionMode})
 }

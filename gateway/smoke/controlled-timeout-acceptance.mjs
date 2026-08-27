@@ -1,6 +1,6 @@
 /**
  * 受控真实 Provider idle-timeout 验收。
- * 仅在 Gateway 以 BRIDGE_STREAM_IDLE_TIMEOUT_MS=30000（或更小的有效值）启动时运行，
+ * 仅在 Gateway 的系统设置 streamWatchdog.idleTimeoutMs=30000（或更小的有效值）下运行，
  * 不记录 Prompt、回复、凭据或路径；收到正常 result 只能判定为未触发 timeout。
  */
 import assert from 'node:assert/strict'
@@ -8,11 +8,13 @@ import {readFileSync} from 'node:fs'
 import {join} from 'node:path'
 import WebSocket from 'ws'
 import {BRIDGE_HOME} from '../config/bridge-home.mjs'
+import {normalizeStreamWatchdogConfig} from '../config/stream-watchdog-config.mjs'
 
 if (process.env.BRIDGE_RUN_CONTROLLED_TIMEOUT_ACCEPTANCE !== '1') {
   console.log('受控 Provider timeout 验收已跳过；设置 BRIDGE_RUN_CONTROLLED_TIMEOUT_ACCEPTANCE=1 后运行。')
 } else {
-  const configuredTimeout = Number(process.env.BRIDGE_STREAM_IDLE_TIMEOUT_MS || 0)
+  const settings = JSON.parse(readFileSync(join(BRIDGE_HOME, 'settings.json'), 'utf8'))
+  const configuredTimeout = normalizeStreamWatchdogConfig(settings.streamWatchdog).idleTimeoutMs
   assert.ok(configuredTimeout >= 30_000 && configuredTimeout <= 45_000,
     'Gateway 必须以 30000–45000ms 的 idle timeout 启动')
   const token = readFileSync(join(BRIDGE_HOME, 'bridge-token'), 'utf8').trim()

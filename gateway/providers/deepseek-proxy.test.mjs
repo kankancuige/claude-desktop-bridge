@@ -90,3 +90,47 @@ test('DeepSeek 代理限制在校验后的上游，并支持安全切换目标',
         else process.env.BRIDGE_DS_PORT = oldProxyPort
     }
 })
+
+test('DeepSeek 代理在上游结束前透传首个响应块', async () => {
+    const oldAllowLocal = process.env.BRIDGE_ALLOW_LOCAL_PROVIDER
+    const oldProxyPort = process.env.BRIDGE_DS_PORT
+    process.env.BRIDGE_ALLOW_LOCAL_PROVIDER = '1'
+    process.env.BRIDGE_DS_PORT = String(await reservePort())
+
+    let releaseUpstream
+    const upstreamRelease = new Promise(resolve => { releaseUpstream = resolve })
+    const upstream = createServer(async (req, res) => {
+        for await (const _chunk of req) { /* 排空请求 */ }
+        res.writeHead(200, {'Content-Type': 'text/plain'})
+        res.write('first')
+        await upstreamRelease
+        res.end('second')
+    })
+
+    try {
+        const upstreamPort = await listen(upstream)
+        await startDeepSeekProxy(`http://127.0.0.1:${upstreamPort}`)
+        const response = await fetch(`${getProxyUrl()}/v1/messages`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({model: 'deepseek-chat', messages: [{role: 'user', content: 'stream'}]}),
+        })
+        const reader = response.body.getReader()
+        const first = await Promise.race([
+            reader.read(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('首块透传超时')), 1000)),
+        ])
+        assert.equal(Buffer.from(first.value).toString('utf8'), 'first')
+        releaseUpstream()
+        const second = await reader.read()
+        assert.equal(Buffer.from(second.value).toString('utf8'), 'second')
+    } finally {
+        releaseUpstream?.()
+        await stopDeepSeekProxy()
+        if (upstream.listening) await close(upstream)
+        if (oldAllowLocal === undefined) delete process.env.BRIDGE_ALLOW_LOCAL_PROVIDER
+        else process.env.BRIDGE_ALLOW_LOCAL_PROVIDER = oldAllowLocal
+        if (oldProxyPort === undefined) delete process.env.BRIDGE_DS_PORT
+        else process.env.BRIDGE_DS_PORT = oldProxyPort
+    }
+})

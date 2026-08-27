@@ -39,13 +39,20 @@ export function listAdapterBindings(input, {allowedPlatforms = [], isSessionActi
         .sort((a, b) => Number(b.boundAt || 0) - Number(a.boundAt || 0))
 }
 
-export function findLatestAdapterUserForSession(input, platform, sessionId) {
+export function findLatestAdapterUserForSession(input, platform, sessionId, pairedUserIds = null) {
     let latest = null
     for (const binding of Object.values(input || {})) {
         if (!binding || binding.platform !== platform || binding.sessionId !== sessionId || !binding.userId) continue
         if (!latest || Number(binding.updatedAt || 0) > Number(latest.updatedAt || 0)) latest = binding
     }
-    return latest?.userId || null
+
+    const paired = new Set()
+    for (const value of pairedUserIds || []) {
+        if (typeof value !== 'string' || !value || value.length > 512 || /[\0\r\n]/.test(value)) continue
+        paired.add(value)
+    }
+    if (latest?.userId && (pairedUserIds === null || paired.has(latest.userId))) return latest.userId
+    return paired.size === 1 ? paired.values().next().value : null
 }
 
 export function upsertAdapterBinding(input, binding, allowedPlatforms = []) {

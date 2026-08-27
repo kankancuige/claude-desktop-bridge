@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import {createTaskCoordinator, createTaskSnapshot, transitionTask} from './task-coordinator.mjs'
+import {canCompleteTask, createTaskCoordinator, createTaskSnapshot, transitionTask} from './task-coordinator.mjs'
 import {createTaskPlan} from './task-plan.mjs'
 
 function plan() {
@@ -96,6 +96,21 @@ test('环境阻塞、新回归和未验证保持非完成终态', () => {
     }
 })
 
+test('失败或中断 Workflow 会阻断完成门禁', () => {
+    for (const status of ['failed', 'interrupted']) {
+        const coordinator = createTaskCoordinator({now: () => 1})
+        coordinator.accept(plan())
+        for (const step of plan().steps) coordinator.transition('t1', {type: 'phase/completed', stepId: step.stepId, phase: step.phase})
+        coordinator.transition('t1', {type: 'workflow/started', workflowId: `wf-${status}`})
+        coordinator.transition('t1', {type: 'workflow/failed', workflowId: `wf-${status}`})
+        coordinator.transition('t1', {type: 'verification/result', status: 'passed', evidenceLevel: 'L2', testsExecuted: true})
+        coordinator.transition('t1', {type: 'notification/intent-persisted', persisted: true})
+        const snapshot = coordinator.transition('t1', {type: 'task/complete-requested'})
+        assert.equal(snapshot.status, 'inconclusive')
+        assert.match(snapshot.blockers.at(-1).detail, /failed_workflows/)
+    }
+})
+
 test('终态后只允许附加执行报告，迟到状态事件不能改写终态', () => {
     const coordinator = createTaskCoordinator()
     const taskPlan = createTaskPlan({taskId: 'report-terminal', turnId: 't', sessionId: 's', workDir: 'D:\\work', phases: ['report']})
@@ -142,6 +157,21 @@ test('Agent 投影包含身份、目的、结果计数和有界时间线，不�
     assert.equal(state.timeline.at(-1).summary, '测试通过')
 })
 
+test('只读 Agent 写入委托保持 blocked 投影并阻止完成门禁', () => {
+    const coordinator = createTaskCoordinator()
+    const taskPlan = plan()
+    coordinator.accept(taskPlan)
+    const state = coordinator.transition('t1', {
+        type: 'agent/blocked', agentRunId: 'agent-write', agentType: 'reviewer', role: 'reviewer',
+        stepId: taskPlan.steps[0].stepId,
+        result: {status: 'blocked', writeRequest: {requestedFiles: ['a.mjs'], requestedAction: 'apply_changes', reason: '需要主任务写入'}},
+    })
+    assert.equal(state.agents['agent-write'].status, 'blocked')
+    assert.deepEqual(state.agents['agent-write'].writeRequest.requestedFiles, ['a.mjs'])
+    assert.equal(state.agents['agent-write'].endedAt > 0, true)
+    assert.equal(canCompleteTask(state).reasons.includes('agent_write_delegation_pending'), true)
+})
+
 test('Agent 时间线最多保留最近 40 条', () => {
     const coordinator = createTaskCoordinator({now: () => 1})
     coordinator.accept(plan())
@@ -184,4 +214,22 @@ test('计划推进 API 拒绝跳步，并在阻塞恢复后从原步骤继续', 
     assert.equal(resumed.status, 'running')
     const advanced = coordinator.advancePlannedTask({taskId: taskPlan.taskId, stepId: taskPlan.steps[0].stepId, result: {status: 'completed', summary: '完成'}})
     assert.equal(advanced.nextStepId, taskPlan.steps[1].stepId)
+})
+
+test('恢复持久化 waiting_user 任务时重新派发原可执行步骤', () => {
+    const coordinator = createTaskCoordinator()
+    const taskPlan = createTaskPlan({taskId: 'waiting', turnId: 't', sessionId: 's', phases: ['implement', 'report']})
+    coordinator.accept(taskPlan)
+    const waiting = coordinator.transition(taskPlan.taskId, {type: 'task/waiting-user', detail: '等待用户选择'})
+    waiting.plan.steps[0].status = 'pending'
+    waiting.execution.currentStepId = null
+
+    const restored = createTaskCoordinator()
+    restored.restore(waiting)
+    const resumed = restored.resumePlannedTask({taskId: taskPlan.taskId})
+
+    assert.equal(resumed.status, 'running')
+    assert.equal(resumed.execution.currentStepId, taskPlan.steps[0].stepId)
+    assert.equal(resumed.plan.steps[0].status, 'running')
+    assert.deepEqual(resumed.blockers, [])
 })

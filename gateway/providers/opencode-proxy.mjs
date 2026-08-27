@@ -9,6 +9,7 @@
 
 import {createServer} from 'node:http'
 import {createLogger} from '../shared/logger.mjs'
+import {createProviderClientLifecycle} from './provider-client-lifecycle.mjs'
 
 const log = createLogger('opencode-proxy')
 
@@ -98,6 +99,7 @@ export function stopOpenCodeProxy() {
 }
 
 async function handleRequest(clientReq, clientRes) {
+    let clientLifecycle = null
     try {
         if (clientReq.method === 'GET' && clientReq.url === '/health') {
             clientRes.writeHead(200); clientRes.end('ok'); return
@@ -136,11 +138,13 @@ async function handleRequest(clientReq, clientRes) {
             return
         }
 
+        clientLifecycle = createProviderClientLifecycle(clientReq, clientRes)
+
         const r = await fetch(UPSTREAM, {
             method: 'POST',
             headers: {'Content-Type':'application/json', 'Authorization':`Bearer ${apiKey}`, 'x-api-key': apiKey},
             body: JSON.stringify(openai),
-            signal: AbortSignal.timeout(120000),
+            signal: AbortSignal.any([clientLifecycle.signal, AbortSignal.timeout(120000)]),
         })
 
         if (!r.ok) {
@@ -176,12 +180,14 @@ async function handleRequest(clientReq, clientRes) {
 
     } catch(e) {
         log.error({err: e}, 'proxy error')
-        if (!clientRes.headersSent) {
+        if (!clientRes.destroyed && !clientRes.writableEnded && !clientRes.headersSent) {
             clientRes.writeHead(e.statusCode || (e instanceof SyntaxError ? 400 : 500), {'Content-Type':'application/json'})
             clientRes.end(JSON.stringify({error:{message:e.statusCode === 413 ? 'payload too large' : e.message}}))
-        } else {
+        } else if (!clientRes.destroyed && !clientRes.writableEnded) {
             clientRes.destroy(e)
         }
+    } finally {
+        clientLifecycle?.finish()
     }
 }
 

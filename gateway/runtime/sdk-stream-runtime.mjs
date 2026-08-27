@@ -6,6 +6,8 @@
  */
 import {createSdkStreamService} from './sdk-stream-service.mjs'
 import {createTaskRunBudget} from '../tasks/task-run-budget.mjs'
+import {clearSessionToolActivity, observeSessionToolActivity} from '../sessions/session-tool-activity.mjs'
+import {contextUsageEvent} from '../context/context-lifecycle.mjs'
 
 export function createSdkStreamRuntime(deps = {}) {
     const {sessions, sessionCoordinator, PushStream, loadCliSettings, makeQueryOptions, startClaudeAgent, log, updateTaskCompletion, applyTaskCompletionEffects, broadcastTurn, taskStateForClient, taskStateForError, updateTaskState, failPendingSessionInputs, appendSessionEvent, persistSessionMirrors, persistSdkSessionId, sessionVisibilitySource, getProjectVisibility, markVisibleSession, broadcastDesktop, dynamicCache, builtinCache, persistDynamicCache, taskWorkflowResultIdFromMessage, consumeTaskWorkflowResultTurn, taskInputQueue, IM_SOURCES, createTurnIdentity, loadWfConfig, getWorkflow, runWfScript, finishTaskWorkflowResultTurn, hasPendingTaskWorkflow, consumePendingSessionInputOnResult, sdkStreamAdapter, broadcastTaskLifecycle, classifyTaskResult, resolveAutoContinuation, maybeUpdateProjectCache, finalizeCheckpoint, shouldCaptureTurnCheckpoint, beginTurn, resolveFinalReviewPlan, canResumeTask, deferPrimaryResultForTaskWorkflow, takeDeferredPrimaryResult, taskCompletionEventForClient, taskWorkbench, getTaskWorkbench, taskCoordinator, maybeInjectProjectCache, maybeInjectGitContext, clearTaskWorkflowGate, clearStreamWatchdog, markSessionDeleted, finishImProgressReporters, clearAdapterBindingsForSessions, invalidateProjectsCache, deleteSessionFiles, armStreamWatchdog, withTimeout, getStateStore, getSessionProjectKey, getFocusedSessionId, setFocusedSessionId} = deps
@@ -21,7 +23,7 @@ export function createSdkStreamRuntime(deps = {}) {
         broadcast: broadcastTurn,
         logger: log,
     })
-    const {refreshContextUsage, recordProviderUsage, maybeRefreshContextUsage} = sdkStreamService
+    const {refreshContextUsage, recordProviderUsage, beginProviderUsage, finishProviderUsage, failProviderUsage, maybeRefreshContextUsage} = sdkStreamService
 
 async function startAutoContinuation(sessionId, session, request) {
     if (!session || sessions.get(sessionId) !== session || session._autoContinuationRequest !== request
@@ -117,6 +119,14 @@ async function startStreamPump(sessionId) {
     try {
         for await (const sdkMsg of myQuery) {
             armStreamWatchdog(sessionId, s, myQuery)
+            // 新版 SDK 会在 assistant/result 消息内携带上下文快照；优先消费该快照，
+            // 避免控制请求与流读取并发时 getContextUsage 暂时拿不到响应。
+            const inlineContextUsage = sdkMsg?.context_usage || sdkMsg?.message?.context_usage
+            if (inlineContextUsage && typeof inlineContextUsage === 'object') {
+                const event = contextUsageEvent(inlineContextUsage, {reason: `inline:${sdkMsg.type || 'event'}`})
+                s.contextUsage = event
+                broadcastTurn(sessionId, event, s.activeTurnIdentity)
+            }
             maybeRefreshContextUsage(sessionId, s, `running:${sdkMsg.type || 'event'}`)
             if (sdkMsg.type === 'system' && sdkMsg.subtype === 'init') {
                 if (sdkMsg.session_id) {
@@ -177,6 +187,8 @@ async function startStreamPump(sessionId) {
             // SDK 真正消费 user prompt 时才切换回合上下文。输入可能提前排队，不能在
             // WebSocket 到达时重置上一回合的文本和工具计数，否则镜像会串回合。
             if (sdkMsg.type === 'user') {
+                // 先落 pending 账本，再等待 Provider 继续产出；即使后续没有 result，也能保留本次调用。
+                await beginProviderUsage(sessionId, s, sdkMsg)
                 const workflowResultId = taskWorkflowResultIdFromMessage(sdkMsg.message)
                 const consumedWorkflowResult = consumeTaskWorkflowResultTurn(s._taskWorkflowGate, workflowResultId)
                 const inputMeta = consumedWorkflowResult ? null : taskInputQueue.consume(s)
@@ -223,6 +235,7 @@ async function startStreamPump(sessionId) {
                                     ...wfArgs,
                                     _runKey: `${wfName}:${sessionId}`,
                                     _taskOwned: true,
+                                    _permissionMode: s.permissionMode || 'default',
                                     _taskId: s.coordinatorTaskId || s.taskCompletionTaskId,
                                     _taskDecision: s.taskDecision || null,
                                     _projectContext: s.projectContext || null,
@@ -235,7 +248,7 @@ async function startStreamPump(sessionId) {
                 }
             }
             // result 只标志主 SDK 回合结束；父任务是否完成由 task-completion 协调器决定。
-            if (sdkMsg.type === 'result') recordProviderUsage(sessionId, s, sdkMsg)
+            if (sdkMsg.type === 'result') await finishProviderUsage(sessionId, s, sdkMsg)
             if (sdkMsg.type === 'result' && s._internalWorkflowResultTurnId) {
                 const workflowTurn = finishTaskWorkflowResultTurn(
                     s._taskWorkflowGate,
@@ -426,9 +439,16 @@ async function startStreamPump(sessionId) {
                 s.taskCompletionDecision = completionDecision
                 s.taskCompletionIdentity = s.activeTurnIdentity ? {...s.activeTurnIdentity} : s.taskCompletionIdentity || null
                 s.taskFinalReplyText = String(s.turnText || s.lastTaskResult.result || '').trim().slice(-100000)
+                const changedPaths = new Set((checkpoint?.files || []).map(file => String(file.path || '').replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase()))
+                const pendingWriteRequests = Array.isArray(s._pendingAgentWriteRequests) ? s._pendingAgentWriteRequests : []
+                const unresolvedWriteRequests = pendingWriteRequests.filter(item => !(item.writeRequest?.requestedFiles || []).length
+                    || !(item.writeRequest.requestedFiles || []).every(file => changedPaths.has(String(file).replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase())))
+                if (pendingWriteRequests.length) s._pendingAgentWriteRequests = unresolvedWriteRequests
                 const currentTaskWorkbench = typeof getTaskWorkbench === 'function' ? getTaskWorkbench() : taskWorkbench
                 if (s.coordinatorTaskId && currentTaskWorkbench) {
-                    const primaryStatus = taskResult.outcome === 'succeeded'
+                    const primaryStatus = unresolvedWriteRequests.length > 0 && s.permissionMode === 'plan'
+                        ? 'inconclusive'
+                        : taskResult.outcome === 'succeeded'
                         ? 'completed'
                         : taskResult.outcome === 'incomplete' ? 'inconclusive' : 'failed'
                     currentTaskWorkbench.recordPrimaryResult(s.coordinatorTaskId, {
@@ -447,11 +467,19 @@ async function startStreamPump(sessionId) {
                         externalBlocker: taskResult.continuationReason === 'environment_unavailable',
                     })
                 }
+                const delegatedWriteBlocked = unresolvedWriteRequests.length > 0 && s.permissionMode === 'plan'
                 const primaryResultEvent = {
                     type: 'primary_result',
                     result: {
                         ...taskResult,
-                        detail: s.lastTaskResult.result,
+                        ...(delegatedWriteBlocked ? {
+                            outcome: 'incomplete',
+                            continuationReason: 'write_permission_required',
+                            delegatedWriteRequests: unresolvedWriteRequests,
+                        } : {}),
+                        detail: delegatedWriteBlocked
+                            ? '只读会话无法执行 Agent 写入委托，请切换为可写权限后继续'
+                            : s.lastTaskResult.result,
                         text: s.taskFinalReplyText,
                     },
                     reviewPlan,
@@ -476,6 +504,7 @@ async function startStreamPump(sessionId) {
                 ? {...sdkMsg, num_turns: s.lastTaskResult.numTurns}
                 : sdkMsg
             const wsMsg = sdkStreamAdapter.toClientEvent(clientSdkMsg, sessionId)
+            observeSessionToolActivity(s, sdkMsg, wsMsg, Date.now())
             if (wsMsg) broadcastTurn(sessionId, {
                 ...wsMsg,
                 turnId: s.activeTurnId || null,
@@ -503,10 +532,13 @@ async function startStreamPump(sessionId) {
                     maybeInjectGitContext(sessionId, s)
                 } catch (error) { log.debug({err: error}, '非关键操作失败，已按降级路径继续') }
             }
+            // 状态更新发生在本轮事件处理之后，立即按新状态重设动态 watchdog。
+            armStreamWatchdog(sessionId, s, myQuery)
         }
     } catch (e) {
         log.error({err: e, sessionId: sessionId?.slice(0, 8)}, 'pump 异常')
         const failedSession = sessions.get(sessionId)
+        if (failedSession?._activeModelUsageEventId) await failProviderUsage(sessionId, failedSession, e?.code || 'stream_error')
         const failedTurnIdentity = failedSession?.activeTurnIdentity ? {...failedSession.activeTurnIdentity} : null
         const watchdogTriggered = failedSession?._streamWatchdogTriggered === myQuery
         if (failedSession?.query === myQuery && !watchdogTriggered) {
@@ -550,6 +582,7 @@ async function startStreamPump(sessionId) {
     } finally {
         const s2 = sessions.get(sessionId);
         if (s2?._streamWatchdogQuery === myQuery) clearStreamWatchdog(s2, myQuery)
+        if (s2?.query === myQuery) clearSessionToolActivity(s2)
         if (s2?._streamWatchdogTriggered === myQuery) s2._streamWatchdogTriggered = null
         const autoContinuationRequest = s2?.query === myQuery ? s2._autoContinuationRequest : null
         // 仅当 query 未被重建替换时才置空，避免覆盖新 pump 持有的 query

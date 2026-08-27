@@ -2,6 +2,7 @@ import {identifier} from './postgres-schema.mjs'
 
 function text(value, fallback = '') { return value == null ? fallback : String(value) }
 function number(value, fallback = null) {
+    if (value == null || String(value).trim() === '') return fallback
     const parsed = Number(value)
     return Number.isFinite(parsed) ? parsed : fallback
 }
@@ -73,7 +74,7 @@ export class PostgresStateCompat {
                 q(`SELECT pitfall_id AS "pitfallId", kind, target, created_at AS "createdAt" FROM ${this.schema}.pitfall_links`),
                 q(`SELECT task_id AS "taskId", project_key AS "projectKey", session_id AS "sessionId", status, evidence_level AS "evidenceLevel", created_at AS "createdAt", updated_at AS "updatedAt", report_json AS report FROM ${this.schema}.execution_reports`),
                 q(`SELECT campaign_id AS "campaignId", task_id AS "taskId", project_key AS "projectKey", status, created_at AS "createdAt", updated_at AS "updatedAt", campaign_json AS campaign FROM ${this.schema}.verification_campaigns`),
-                q(`SELECT event_id AS "eventId", project_key AS "projectKey", session_id AS "sessionId", model, provider_key AS "providerKey", context_fingerprint AS "contextFingerprint", policy, cache_eligibility AS "cacheEligibility", reason_codes AS "reasonCodes", input_tokens AS "inputTokens", output_tokens AS "outputTokens", cache_read_input_tokens AS "cacheReadInputTokens", cache_creation_input_tokens AS "cacheCreationInputTokens", usage_source AS source, duration_ms AS "durationMs", retry_count AS "retryCount", created_at AS "createdAt" FROM ${this.schema}.model_usage_events`),
+                q(`SELECT event_id AS "eventId", project_key AS "projectKey", session_id AS "sessionId", model, provider_key AS "providerKey", context_fingerprint AS "contextFingerprint", policy, cache_eligibility AS "cacheEligibility", reason_codes AS "reasonCodes", input_tokens AS "inputTokens", output_tokens AS "outputTokens", cache_read_input_tokens AS "cacheReadInputTokens", cache_creation_input_tokens AS "cacheCreationInputTokens", usage_source AS source, duration_ms AS "durationMs", retry_count AS "retryCount", created_at AS "createdAt", status, ended_at AS "endedAt", error_code AS "errorCode" FROM ${this.schema}.model_usage_events`),
             ])
             this.schemaVersion = number(schema[0]?.version, 0)
             for (const row of entries) {
@@ -137,6 +138,7 @@ export class PostgresStateCompat {
     listVisibleSessions(projectKey, max = 100) { return this.listSessionIndex(projectKey, {limit: max, visibility: 'visible'}) }
     getSessionCatalog(projectKey, sessionId) { const row = this._sessions.get(key(projectKey, sessionId)); return row ? {...row, mirrors: json(row.mirrors,null)} : null }
     getSessionCatalogs(projectKey, sessionIds = []) { const wanted = new Set(sessionIds.map(text)); return new Map(this.listSessionIndex(projectKey, {limit: 5000}).filter(row => wanted.has(row.sessionId)).map(row => [row.sessionId,row])) }
+    findSessionIndexById(sessionId) { const id = text(sessionId); return [...this._sessions.values()].filter(row => row.sessionId === id || row.sdkSessionId === id).map(row => ({...row, mirrors: json(row.mirrors, null)})) }
     updateSessionSettings(projectKey, sessionId, patch = {}) { const id=key(projectKey,sessionId); const row=this._sessions.get(id); if(!row)return false; const next={...row,...patch,updatedAt:this.now()}; this._sessions.set(id,next); this.upsertSessionIndex(next); return true }
     updateSessionSettingsByIds(projectKey, ids, patch = {}) { let count=0; for(const row of this.listSessionIndex(projectKey,{limit:5000})) if(ids.map(text).includes(row.sessionId)||ids.map(text).includes(row.sdkSessionId)){this.updateSessionSettings(projectKey,row.sessionId,patch);count++} return count>0 }
     removeSessionIndex(transcriptPath) { for(const [id,row] of this._sessions) if(row.transcriptPath===transcriptPath){this._sessions.delete(id);this._enqueue(()=>this.gateway.query(`DELETE FROM ${this.schema}.session_index WHERE transcript_path = $1`,[transcriptPath]));return true} return false }
@@ -181,7 +183,11 @@ export class PostgresStateCompat {
     getVerificationCampaign(id){return this._campaigns.get(text(id))||null}
     listVerificationCampaigns(projectKey,{taskId=null,limit:max=100}={}){return [...this._campaigns.values()].filter(row=>row.projectKey===text(projectKey)&&(!taskId||row.taskId===text(taskId))).sort((a,b)=>number(b.updatedAt,0)-number(a.updatedAt,0)).slice(0,limit(max))}
     appendModelUsageEvent(event={}){if(this._usage.has(text(event.eventId)))return false;this._usage.set(text(event.eventId),event);this._enqueue(()=>this.gateway.state.appendModelUsageEvent(event));return true}
+    updateModelUsageEvent(eventId,event={}){const id=text(eventId);const current=this._usage.get(id);if(!current)return false;const row={...current,...event,eventId:id};this._usage.set(id,row);this._enqueue(()=>this.gateway.state.updateModelUsageEvent(id,row));return true}
     listModelUsageEvents(sessionId,{limit:max=100}={}){return [...this._usage.values()].filter(row=>row.sessionId===text(sessionId)).sort((a,b)=>number(b.createdAt,0)-number(a.createdAt,0)).slice(0,limit(max))}
+    normalizeUsageWindow({from=null,to=null}={}){const end=number(to,this.now());const start=number(from,end-14*24*60*60*1000);return {from:Math.min(start,end),to:Math.max(start,end)}}
+    listModelUsageHistory({from=null,to=null,projectKey=null,limit:max=100}={}){const window=this.normalizeUsageWindow({from,to});return [...this._usage.values()].filter(row=>number(row.createdAt,0)>=window.from&&number(row.createdAt,0)<=window.to&&(!projectKey||row.projectKey===text(projectKey))).sort((a,b)=>number(b.createdAt,0)-number(a.createdAt,0)).slice(0,limit(max)).map(row=>({...row}))}
+    summarizeModelUsage({from=null,to=null,projectKey=null}={}){const window=this.normalizeUsageWindow({from,to});const rows=this.listModelUsageHistory({from:window.from,to:window.to,projectKey,limit:500});const sum=field=>rows.reduce((total,row)=>total+(Number.isSafeInteger(Number(row[field]))?Number(row[field]):0),0);const trendMap=new Map();for(const row of rows){const day=new Date(number(row.createdAt,0)).toISOString().slice(0,10);const item=trendMap.get(day)||{day,eventCount:0,inputTokens:0,outputTokens:0,cacheReadInputTokens:0,cacheCreationInputTokens:0};item.eventCount++;for(const field of ['inputTokens','outputTokens','cacheReadInputTokens','cacheCreationInputTokens'])if(Number.isSafeInteger(Number(row[field])))item[field]+=Number(row[field]);trendMap.set(day,item)}return {from:window.from,to:window.to,totals:{eventCount:rows.length,unknownTokenEvents:rows.filter(row=>row.inputTokens==null||row.outputTokens==null).length,inputTokens:sum('inputTokens'),outputTokens:sum('outputTokens'),cacheReadInputTokens:sum('cacheReadInputTokens'),cacheCreationInputTokens:sum('cacheCreationInputTokens')},trend:[...trendMap.values()].sort((a,b)=>a.day.localeCompare(b.day))}}
 }
 
 function cryptoRandom(){ return `state-${Date.now()}-${Math.random().toString(36).slice(2,12)}` }

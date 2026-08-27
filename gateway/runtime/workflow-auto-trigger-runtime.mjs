@@ -103,6 +103,8 @@ async function autoTriggerWorkflow(sessionId, msgContent, taskDecision = null) {
             ? sessions.get(sessionId)?.queryOpts?.model || null
             : null,
         _taskDecision: taskDecision || null,
+        // 自动 Workflow 必须继承当前会话权限；否则主会话的 bypassPermissions 会在子 Agent 链路丢失。
+        _permissionMode: sessions.get(sessionId)?.permissionMode || 'default',
         _taskId: sessions.get(sessionId)?.coordinatorTaskId || sessions.get(sessionId)?.taskCompletionTaskId || null,
         _projectContext: sessions.get(sessionId)?.projectContext || null,
         _taskOwned: true,

@@ -52,6 +52,8 @@ export async function runImTask({
     let toolCount = 0
     let terminalNotificationId = null
     let completionTimer = null
+    let timeoutTriggered = false
+    let completionReason = ''
     let disposeObserver = () => {}
     let resolveDone
     const bufferedEvents = []
@@ -67,6 +69,7 @@ export async function runImTask({
     const finish = async (reason, error = null) => {
         if (done) return
         done = true
+        completionReason = reason
         turnTimeout.stop()
         disposeObserver()
         if (completionTimer) clearTimeout(completionTimer)
@@ -91,7 +94,17 @@ export async function runImTask({
 
     const turnTimeout = createImTurnTimeout({
         ...timeoutOptions,
-        onTimeout: () => { void finish('timeout') },
+        onTimeout: () => {
+            timeoutTriggered = true
+            void (async () => {
+                try {
+                    await taskCommands.cancelTask?.(sessionId, {source, userId, reason: 'im_timeout'})
+                } catch (error) {
+                    onError(error, {phase: 'timeout_cancel'})
+                }
+                await finish('timeout')
+            })()
+        },
     })
 
     const handleEvent = async event => {
@@ -129,6 +142,7 @@ export async function runImTask({
                 await finish(event.type)
             }
         } else if (event.type === 'generation_stopped') {
+            if (timeoutTriggered) return
             await onStopped(event)
             await finish('stopped')
         } else if (event.type === 'error') {
@@ -173,6 +187,17 @@ export async function runImTask({
         const error = new Error('任务提交未返回有效 accepted 结果')
         onError(error, {phase: 'submit_result'})
         await finish('submit_error', error)
+        return donePromise
+    }
+
+    if (done) {
+        try {
+            await taskCommands.cancelTask?.(sessionId, {
+                source, userId, reason: `im_${completionReason || 'owner_lost'}_after_submit`,
+            })
+        } catch (error) {
+            onError(error, {phase: 'post_submit_cancel', reason: completionReason})
+        }
         return donePromise
     }
 

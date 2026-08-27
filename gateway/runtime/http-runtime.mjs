@@ -5,6 +5,7 @@ import {createAdapterConfigRoutes} from '../http/adapter-config-routes.mjs'
 import {createMemoryRoutes} from '../http/memory-routes.mjs'
 import {createWorkflowRoutes} from '../http/workflow-routes.mjs'
 import {createWorkbenchRoutes} from '../http/workbench-routes.mjs'
+import {createUsageRoutes} from '../http/usage-routes.mjs'
 import {createHttpRequestHandler} from '../http/request-handler.mjs'
 
 /**
@@ -50,6 +51,11 @@ export function createHttpRuntime({routeContext, providerConfig = {}} = {}) {
         getSessionLinkResolver: routeContext.getSessionLinkResolver,
         decode: routeContext.safeDecodeURIComponent,
     })
+    const usageRoutes = createUsageRoutes({
+        getUsageStore: routeContext.getUsageStore,
+        getSessions: routeContext.getSessions,
+        getState: routeContext.getState,
+    })
     const handleHttpRequest = createHttpRequestHandler({
         port: routeContext.PORT,
         allowTokenEndpoint: routeContext.ALLOW_TOKEN_ENDPOINT,
@@ -68,6 +74,7 @@ export function createHttpRuntime({routeContext, providerConfig = {}} = {}) {
             memoryRoutes,
             workflowRoutes,
             workbenchRoutes,
+            usageRoutes,
         ],
         readBody: routeContext.readBody,
         logHttpRequest: routeContext.logHttpRequest,
@@ -75,6 +82,6 @@ export function createHttpRuntime({routeContext, providerConfig = {}} = {}) {
     })
     return {
         handleHttpRequest,
-        routes: {configRoutes, sessionMutationRoutes, sessionFileRoutes, providerConfigRoutes, adapterConfigRoutes, memoryRoutes, workflowRoutes, workbenchRoutes},
+        routes: {configRoutes, sessionMutationRoutes, sessionFileRoutes, providerConfigRoutes, adapterConfigRoutes, memoryRoutes, workflowRoutes, workbenchRoutes, usageRoutes},
     }
 }

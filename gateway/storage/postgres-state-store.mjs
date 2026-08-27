@@ -13,6 +13,7 @@ function safeJson(value, fallback = {}) {
 }
 
 function token(value, fallback = null) {
+    if (value == null || String(value).trim() === '') return fallback
     const parsed = Number(value)
     return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : fallback
 }
@@ -52,7 +53,16 @@ export class PostgresStateStore {
     async appendModelUsageEvent(event = {}) {
         const eventId = required(event.eventId, 'eventId')
         const source = ['provider_observed', 'partial', 'unknown'].includes(event.source) ? event.source : 'unknown'
-        const result = await this.gateway.query(`INSERT INTO ${this.usageTable} (event_id, project_key, session_id, model, provider_key, context_fingerprint, policy, cache_eligibility, reason_codes, input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, usage_source, duration_ms, retry_count, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12,$13,$14,$15,$16,$17) ON CONFLICT (event_id) DO NOTHING`, [eventId, event.projectKey ? String(event.projectKey).slice(0, 240) : null, event.sessionId ? String(event.sessionId).slice(0, 240) : null, event.model ? String(event.model).slice(0, 240) : null, event.providerKey ? String(event.providerKey).slice(0, 96) : null, event.contextFingerprint ? String(event.contextFingerprint).slice(0, 96) : null, event.policy ? String(event.policy).slice(0, 64) : null, event.cacheEligibility ? String(event.cacheEligibility).slice(0, 64) : null, safeJson(Array.isArray(event.reasonCodes) ? event.reasonCodes.slice(0, 12) : []), token(event.inputTokens), token(event.outputTokens), token(event.cacheReadInputTokens), token(event.cacheCreationInputTokens), source, token(event.durationMs), token(event.retryCount, 0), token(event.createdAt, Date.now())])
+        const status = ['pending', 'completed', 'failed', 'cancelled'].includes(event.status) ? event.status : 'completed'
+        const result = await this.gateway.query(`INSERT INTO ${this.usageTable} (event_id, project_key, session_id, model, provider_key, context_fingerprint, policy, cache_eligibility, reason_codes, input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, usage_source, duration_ms, retry_count, created_at, status, ended_at, error_code) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) ON CONFLICT (event_id) DO NOTHING`, [eventId, event.projectKey ? String(event.projectKey).slice(0, 240) : null, event.sessionId ? String(event.sessionId).slice(0, 240) : null, event.model ? String(event.model).slice(0, 240) : null, event.providerKey ? String(event.providerKey).slice(0, 96) : null, event.contextFingerprint ? String(event.contextFingerprint).slice(0, 96) : null, event.policy ? String(event.policy).slice(0, 64) : null, event.cacheEligibility ? String(event.cacheEligibility).slice(0, 64) : null, safeJson(Array.isArray(event.reasonCodes) ? event.reasonCodes.slice(0, 12) : []), token(event.inputTokens), token(event.outputTokens), token(event.cacheReadInputTokens), token(event.cacheCreationInputTokens), source, token(event.durationMs), token(event.retryCount, 0), token(event.createdAt, Date.now()), status, token(event.endedAt), event.errorCode ? String(event.errorCode).slice(0, 120) : null])
+        return Number(result.rowCount || 0) > 0
+    }
+
+    async updateModelUsageEvent(eventId, event = {}) {
+        const id = required(eventId, 'eventId')
+        const source = ['provider_observed', 'partial', 'unknown'].includes(event.source) ? event.source : 'unknown'
+        const status = ['pending', 'completed', 'failed', 'cancelled'].includes(event.status) ? event.status : 'completed'
+        const result = await this.gateway.query(`UPDATE ${this.usageTable} SET model=$2, provider_key=$3, context_fingerprint=$4, policy=$5, cache_eligibility=$6, reason_codes=$7::jsonb, input_tokens=$8, output_tokens=$9, cache_read_input_tokens=$10, cache_creation_input_tokens=$11, usage_source=$12, duration_ms=$13, retry_count=$14, status=$15, ended_at=$16, error_code=$17 WHERE event_id=$1`, [id, event.model ? String(event.model).slice(0, 240) : null, event.providerKey ? String(event.providerKey).slice(0, 96) : null, event.contextFingerprint ? String(event.contextFingerprint).slice(0, 96) : null, event.policy ? String(event.policy).slice(0, 64) : null, event.cacheEligibility ? String(event.cacheEligibility).slice(0, 64) : null, safeJson(Array.isArray(event.reasonCodes) ? event.reasonCodes.slice(0, 12) : []), token(event.inputTokens), token(event.outputTokens), token(event.cacheReadInputTokens), token(event.cacheCreationInputTokens), source, token(event.durationMs), token(event.retryCount, 0), status, token(event.endedAt), event.errorCode ? String(event.errorCode).slice(0, 120) : null])
         return Number(result.rowCount || 0) > 0
     }
 
@@ -113,8 +123,39 @@ export class PostgresStateStore {
 
     async listModelUsageEvents(sessionId, {limit = 100} = {}) {
         const safeLimit = Math.max(1, Math.min(500, Number(limit) || 100))
-        const result = await this.gateway.query(`SELECT event_id AS "eventId", project_key AS "projectKey", session_id AS "sessionId", model, provider_key AS "providerKey", context_fingerprint AS "contextFingerprint", policy, cache_eligibility AS "cacheEligibility", reason_codes AS "reasonCodes", input_tokens AS "inputTokens", output_tokens AS "outputTokens", cache_read_input_tokens AS "cacheReadInputTokens", cache_creation_input_tokens AS "cacheCreationInputTokens", usage_source AS source, duration_ms AS "durationMs", retry_count AS "retryCount", created_at AS "createdAt" FROM ${this.usageTable} WHERE session_id = $1 ORDER BY created_at DESC LIMIT $2`, [required(sessionId, 'sessionId'), safeLimit])
+        const result = await this.gateway.query(`SELECT event_id AS "eventId", project_key AS "projectKey", session_id AS "sessionId", model, provider_key AS "providerKey", context_fingerprint AS "contextFingerprint", policy, cache_eligibility AS "cacheEligibility", reason_codes AS "reasonCodes", input_tokens AS "inputTokens", output_tokens AS "outputTokens", cache_read_input_tokens AS "cacheReadInputTokens", cache_creation_input_tokens AS "cacheCreationInputTokens", usage_source AS source, duration_ms AS "durationMs", retry_count AS "retryCount", created_at AS "createdAt", status, ended_at AS "endedAt", error_code AS "errorCode" FROM ${this.usageTable} WHERE session_id = $1 ORDER BY created_at DESC LIMIT $2`, [required(sessionId, 'sessionId'), safeLimit])
         return result.rows || []
+    }
+
+    normalizeUsageWindow({from = null, to = null} = {}) {
+        const now = Date.now()
+        const end = token(to, now)
+        const start = token(from, end - 14 * 24 * 60 * 60 * 1000)
+        return {from: Math.min(start, end), to: Math.max(start, end)}
+    }
+
+    async listModelUsageHistory({from = null, to = null, projectKey = null, limit = 100} = {}) {
+        const window = this.normalizeUsageWindow({from, to})
+        const values = [window.from, window.to]
+        const where = ['created_at >= $1', 'created_at <= $2']
+        if (projectKey) { values.push(required(projectKey, 'projectKey')); where.push(`project_key = $${values.length}`) }
+        const safeLimit = Math.max(1, Math.min(500, Number(limit) || 100))
+        values.push(safeLimit)
+        const result = await this.gateway.query(`SELECT event_id AS "eventId", project_key AS "projectKey", session_id AS "sessionId", model, provider_key AS "providerKey", context_fingerprint AS "contextFingerprint", policy, cache_eligibility AS "cacheEligibility", reason_codes AS "reasonCodes", input_tokens AS "inputTokens", output_tokens AS "outputTokens", cache_read_input_tokens AS "cacheReadInputTokens", cache_creation_input_tokens AS "cacheCreationInputTokens", usage_source AS source, duration_ms AS "durationMs", retry_count AS "retryCount", created_at AS "createdAt", status, ended_at AS "endedAt", error_code AS "errorCode" FROM ${this.usageTable} WHERE ${where.join(' AND ')} ORDER BY created_at DESC LIMIT $${values.length}`, values)
+        return result.rows || []
+    }
+
+    async summarizeModelUsage({from = null, to = null, projectKey = null} = {}) {
+        const window = this.normalizeUsageWindow({from, to})
+        const values = [window.from, window.to]
+        const where = ['created_at >= $1', 'created_at <= $2']
+        if (projectKey) { values.push(required(projectKey, 'projectKey')); where.push(`project_key = $${values.length}`) }
+        const predicate = where.join(' AND ')
+        const [totalsResult, trendResult] = await Promise.all([
+            this.gateway.query(`SELECT COUNT(*)::bigint AS "eventCount", COUNT(*) FILTER (WHERE input_tokens IS NULL OR output_tokens IS NULL)::bigint AS "unknownTokenEvents", SUM(input_tokens)::bigint AS "inputTokens", SUM(output_tokens)::bigint AS "outputTokens", SUM(cache_read_input_tokens)::bigint AS "cacheReadInputTokens", SUM(cache_creation_input_tokens)::bigint AS "cacheCreationInputTokens" FROM ${this.usageTable} WHERE ${predicate}`, values),
+            this.gateway.query(`SELECT TO_CHAR(TO_TIMESTAMP(created_at / 1000.0), 'YYYY-MM-DD') AS day, COUNT(*)::bigint AS "eventCount", SUM(input_tokens)::bigint AS "inputTokens", SUM(output_tokens)::bigint AS "outputTokens", SUM(cache_read_input_tokens)::bigint AS "cacheReadInputTokens", SUM(cache_creation_input_tokens)::bigint AS "cacheCreationInputTokens" FROM ${this.usageTable} WHERE ${predicate} GROUP BY 1 ORDER BY 1 ASC`, values),
+        ])
+        return {from: window.from, to: window.to, totals: totalsResult.rows?.[0] || {}, trend: trendResult.rows || []}
     }
 }
 

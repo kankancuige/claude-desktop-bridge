@@ -80,6 +80,7 @@ export function createSessionStopRuntime({
             }
             const stoppedTurnId = resolvePrimaryStopTurnId(session)
             const stoppedTurnIdentity = session.activeTurnIdentity ? {...session.activeTurnIdentity} : null
+            if (typeof session._finishModelUsage === 'function') await session._finishModelUsage('cancelled', 'stop_generation')
             updateTaskCompletion(session, sessionId, {type: 'user_stopped', detail: '用户已暂停任务'})
             const taskWorkbench = getTaskWorkbench()
             if (session.coordinatorTaskId && taskWorkbench) taskWorkbench.recordTaskEvent(session.coordinatorTaskId, {type: 'task/paused', detail: '用户已暂停任务'})

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import {test} from 'node:test'
-import {createWorkflowRuntime, getRunState, getSessionWorkflowStates, presetRunState, stopWorkflow} from './workflow-runner.mjs'
+import {createWorkflowRuntime, getRunState, getSessionWorkflowStates, presetRunState, serializeSessionWorkflowState, stopWorkflow} from './workflow-runner.mjs'
 
 test('Workflow Runtime 实例的异步依赖上下文彼此隔离', () => {
     const sessionA = `session-a-${Date.now()}`
@@ -71,4 +71,23 @@ test('重启后从 PostgreSQL 恢复父会话 Workflow，存活状态降为可�
     assert.equal(restored.tokenSpent, 42)
     assert.equal(getRunState(workflowId)?.status, 'paused')
     assert.equal(saved.at(-1).status, 'paused')
+})
+
+test('Workflow 快照保留 Agent 实际状态并包含已完成 Agent', () => {
+    const state = {
+        name: 'review', status: 'running', phases: [], startedAt: 1,
+        _agentHandles: new Map([
+            ['active', {status: 'running', _prompt: '执行中'}],
+            ['paused-live', {status: 'paused', _prompt: '暂停中'}],
+        ]),
+        _pausedAgents: new Map([['paused', {prompt: '等待恢复'}]]),
+        _journalCache: {
+            doneHash: {label: 'done', prompt: '已完成检查', result: 'ok', timestamp: 2},
+        },
+    }
+    const snapshot = serializeSessionWorkflowState('wf-1', state)
+    assert.equal(snapshot.agents.find(agent => agent.id === 'active').status, 'running')
+    assert.equal(snapshot.agents.find(agent => agent.id === 'paused-live').status, 'paused')
+    assert.equal(snapshot.agents.find(agent => agent.id === 'paused').status, 'paused')
+    assert.equal(snapshot.agents.find(agent => agent.id === 'done').status, 'done')
 })

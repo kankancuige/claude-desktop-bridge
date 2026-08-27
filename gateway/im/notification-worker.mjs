@@ -2,7 +2,7 @@ function baseNotificationId(id) {
     return String(id || '').replace(/:part:\d+$/, '')
 }
 
-export function startNotificationWorker({outbox, deliver, log, onStateChange = null, intervalMs = 30_000} = {}) {
+export function startNotificationWorker({outbox, deliver, log, onStateChange = null, intervalMs = 30_000, delay = ms => new Promise(resolve => setTimeout(resolve, ms)), delayMs = 0} = {}) {
     if (!outbox || typeof deliver !== 'function') throw new TypeError('outbox and deliver are required')
     let running = false
     let stopped = false
@@ -19,7 +19,9 @@ export function startNotificationWorker({outbox, deliver, log, onStateChange = n
         if (running || stopped) return
         running = true
         try {
-            for (const entry of outbox.due()) {
+            const due = outbox.due()
+            for (let index = 0; index < due.length; index++) {
+                const entry = due[index]
                 if (stopped) break
                 try {
                     const delivered = await deliver(entry.payload)
@@ -54,6 +56,7 @@ export function startNotificationWorker({outbox, deliver, log, onStateChange = n
                     }
                     log?.warn?.({err: error, notificationId: entry.id}, '通知重试失败')
                 }
+                if (!stopped && index < due.length - 1 && delayMs > 0) await delay(delayMs)
             }
         } finally {
             running = false

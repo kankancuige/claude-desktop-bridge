@@ -158,4 +158,17 @@ test('任务起止时间和总耗时可持久化并投影给客户端', () => {
     assert.equal(client.durationMs, 3600)
 })
 
+test('写入委托可持久化并安全投影给客户端', () => {
+    const state = createTaskStatePatch({
+        status: 'incomplete', continuationReason: 'write_permission_required',
+        writeRequests: [{
+            agentRunId: 'review-1', role: 'reviewer', nextAction: '主任务执行写入',
+            writeRequest: {requestedFiles: ['gateway/a.mjs'], requestedAction: 'apply_changes', reason: '需要主任务权限'},
+        }],
+    })
+    const restored = recoverTaskState(state)
+    assert.equal(restored.writeRequests.length, 1)
+    assert.deepEqual(taskStateForClient(restored).writeRequests[0].writeRequest.requestedFiles, ['gateway/a.mjs'])
+})
+
 console.log('task-state tests passed')

@@ -15,6 +15,7 @@ import {request as httpsRequest} from 'node:https'
 import {createHash} from 'node:crypto'
 import {createLogger} from '../shared/logger.mjs'
 import {resolveProviderUrl} from '../security/provider-url-security.mjs'
+import {createProviderClientLifecycle} from './provider-client-lifecycle.mjs'
 
 const log = createLogger('proxy')
 
@@ -213,6 +214,7 @@ async function readLimitedBody(stream, limit) {
 // ══════════════════════════════════════════════════════
 
 async function handleProxyRequest(clientReq, clientRes, target) {
+    let clientLifecycle = null
     try {
         const upstreamUrl = target.parsed
         // 健康检查不读取请求体，避免无意义的大 body/slowloris 占用。
@@ -330,7 +332,16 @@ async function handleProxyRequest(clientReq, clientRes, target) {
         const upstreamPath = (upstreamUrl.pathname || '').replace(/\/+$/, '') + clientReq.url
 
         const requestUpstream = upstreamUrl.protocol === 'http:' ? httpRequest : httpsRequest
-        const proxyReq = requestUpstream({
+        let upstreamResRef = null
+        let proxyReq = null
+        clientLifecycle = createProviderClientLifecycle(clientReq, clientRes)
+        clientLifecycle.signal.addEventListener('abort', () => {
+            // 客户端已断开时必须终止真实上游请求，否则 Provider 仍会执行到超时并消耗资源。
+            proxyReq?.destroy?.(clientLifecycle.signal.reason)
+            upstreamResRef?.destroy?.()
+        }, {once: true})
+
+        proxyReq = requestUpstream({
             hostname: upstreamUrl.hostname,
             port: upstreamUrl.port || (upstreamUrl.protocol === 'http:' ? 80 : 443),
             path: upstreamPath,
@@ -338,38 +349,45 @@ async function handleProxyRequest(clientReq, clientRes, target) {
             headers: upstreamHeaders,
             lookup: (_hostname, _options, callback) => callback(null, target.address, target.family),
         }, (upstreamRes) => {
+            upstreamResRef = upstreamRes
             // ── 6. Bug B: 缓存响应中的 thinking 块 ──
             const responseChunks = []
             let responseBytes = 0
             let responseTooLarge = false
+            clientRes.writeHead(upstreamRes.statusCode, copyEndToEndHeaders(upstreamRes.headers))
             upstreamRes.on('data', (chunk) => {
                 if (responseTooLarge) return
                 responseBytes += chunk.length
                 if (responseBytes > MAX_PROXY_RESPONSE_BYTES) {
                     responseTooLarge = true
                     upstreamRes.destroy(new Error('proxy response body too large'))
-                    if (!clientRes.headersSent) {
-                        clientRes.writeHead(502, {'Content-Type': 'application/json'})
-                        clientRes.end(JSON.stringify({error: 'proxy_response_too_large'}))
-                    }
+                    clientRes.destroy(new Error('proxy response body too large'))
+                    clientLifecycle.finish()
                     return
                 }
                 responseChunks.push(chunk)
+                if (!clientRes.write(chunk)) {
+                    upstreamRes.pause()
+                    clientRes.once('drain', () => upstreamRes.resume())
+                }
             })
             upstreamRes.on('end', () => {
                 if (responseTooLarge) return
                 const responseBody = Buffer.concat(responseChunks).toString('utf8')
                 cacheResponseThinking(sessionFp, responseBody)
-
-                // 透传响应
-                clientRes.writeHead(upstreamRes.statusCode, copyEndToEndHeaders(upstreamRes.headers))
-                clientRes.end(responseBody)
+                clientRes.end()
+                clientLifecycle.finish()
             })
             upstreamRes.on('error', (error) => {
-                if (responseTooLarge || clientRes.headersSent) return
+                if (responseTooLarge || clientRes.headersSent) {
+                    if (!clientRes.destroyed && !clientRes.writableEnded) clientRes.destroy(error)
+                    clientLifecycle.finish()
+                    return
+                }
                 log.error({err: error}, '读取上游响应失败')
                 clientRes.writeHead(502, {'Content-Type': 'application/json'})
                 clientRes.end(JSON.stringify({error: 'proxy_upstream_response_error'}))
+                clientLifecycle.finish()
             })
         })
 
@@ -378,10 +396,11 @@ async function handleProxyRequest(clientReq, clientRes, target) {
         })
         proxyReq.on('error', (e) => {
             log.error({err: e}, '上游请求失败')
-            if (!clientRes.headersSent) {
+            if (!clientRes.destroyed && !clientRes.writableEnded && !clientRes.headersSent) {
                 clientRes.writeHead(502)
                 clientRes.end(JSON.stringify({error: 'proxy_upstream_error', message: e.message}))
             }
+            clientLifecycle.finish()
         })
 
         proxyReq.write(modifiedBody)
@@ -393,6 +412,7 @@ async function handleProxyRequest(clientReq, clientRes, target) {
             clientRes.writeHead(e.statusCode || 500, {'Content-Type': 'application/json'})
             clientRes.end(JSON.stringify({error: e.statusCode === 413 ? 'proxy_request_too_large' : 'proxy_internal_error'}))
         }
+        clientLifecycle?.finish()
     }
 }
 

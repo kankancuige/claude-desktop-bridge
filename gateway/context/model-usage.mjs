@@ -37,7 +37,7 @@ function safeReasons(value) {
         : []
 }
 
-export function createModelUsageEvent({eventId, sessionId, projectKey, envelope, policy, usage, durationMs = null, retryCount = 0, createdAt = Date.now()} = {}) {
+export function createModelUsageEvent({eventId, sessionId, projectKey, envelope, policy, usage, durationMs = null, retryCount = 0, createdAt = Date.now(), status = 'completed', endedAt = null, errorCode = null} = {}) {
     const normalized = normalizeProviderUsage(usage)
     return {
         eventId: safeText(eventId) || null,
@@ -52,6 +52,9 @@ export function createModelUsageEvent({eventId, sessionId, projectKey, envelope,
         durationMs: normalizeToken(durationMs),
         retryCount: normalizeToken(retryCount) ?? 0,
         createdAt: normalizeToken(createdAt) ?? Date.now(),
+        status: ['pending', 'completed', 'failed', 'cancelled'].includes(status) ? status : 'completed',
+        endedAt: normalizeToken(endedAt),
+        errorCode: safeText(errorCode, 120),
         ...normalized,
     }
 }

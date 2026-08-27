@@ -13,6 +13,16 @@ function nextRevision(snapshot) {
     return Number(snapshot?.revision || 0) + 1
 }
 
+function normalizedPath(value) {
+    return String(value || '').replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase()
+}
+
+function writeRequestResolved(request, changedFiles) {
+    const changed = new Set((Array.isArray(changedFiles) ? changedFiles : []).map(normalizedPath).filter(Boolean))
+    const requested = request?.writeRequest?.requestedFiles || []
+    return requested.length > 0 && requested.every(file => changed.has(normalizedPath(file)))
+}
+
 export function createTaskWorkbenchRuntime({coordinator, pitfallService = null, persistReport = () => {}} = {}) {
     if (!coordinator?.accept || !coordinator?.transition || !coordinator?.dispatchTask) {
         throw new TypeError('Task Workbench Runtime 需要 Coordinator')
@@ -105,6 +115,15 @@ export function createTaskWorkbenchRuntime({coordinator, pitfallService = null, 
                 task.changedFiles.push(...result.changedFiles)
                 task.tests.push(...result.tests)
                 task.regressions.push(...result.regressions)
+            }
+            if (result.status === 'completed' && result.changedFiles.length) {
+                for (const agent of Object.values(next.agents || {})) {
+                    if (agent.status !== 'blocked' || !agent.writeRequest || !writeRequestResolved(agent, result.changedFiles)) continue
+                    next = transition(taskId, {
+                        type: 'agent/write-resolved', agentRunId: agent.agentRunId, stepId: agent.stepId,
+                        role: agent.role, result: {...result, summary: '主任务已按委托完成写入'},
+                    })
+                }
             }
             for (const [index, finding] of result.findings.entries()) {
                 next = transition(taskId, {

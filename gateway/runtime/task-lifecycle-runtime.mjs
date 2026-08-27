@@ -66,7 +66,10 @@ export function createTaskLifecycleRuntime({
         return createTaskStatePatch({
             status,
             outcome: status === 'succeeded' ? 'succeeded' : status === 'failed' ? 'failed' : status === 'incomplete' ? 'incomplete' : null,
-            continuationReason: status === 'failed' || status === 'review_paused' ? 'execution_error' : null,
+            continuationReason: status === 'failed' || status === 'review_paused'
+                ? 'execution_error'
+                : status === 'incomplete' && /写入权限|write_permission_required/i.test(String(detail || completion.detail || ''))
+                    ? 'write_permission_required' : null,
             resumable: !['succeeded'].includes(status) && Boolean(session?.lastSessionId || session?._hasConversation),
             subtype: session?.lastTaskResult?.subtype || null,
             detail: detail || completion.detail || session?.lastTaskResult?.result || '',
@@ -77,6 +80,7 @@ export function createTaskLifecycleRuntime({
             finalReplyText: session?.taskFinalReplyText || session?.taskState?.finalReplyText || '',
             finalReplyAvailable: Boolean(session?.taskFinalReplyText || session?.taskState?.finalReplyText),
             notifications: session?.taskState?.notifications || {},
+            writeRequests: session?._pendingAgentWriteRequests || session?.taskState?.writeRequests || [],
             permissionMode: session?.permissionMode || session?.taskState?.permissionMode || 'default',
             model: session?.queryOpts?.model || session?.taskState?.model || null,
             sdkSessionId: session?.lastSessionId,
@@ -134,6 +138,17 @@ export function createTaskLifecycleRuntime({
         return getTaskWorkbench()?.requestCompletion(snapshot.taskId, {notificationIntentPersisted}) || null
     }
 
+    function getWaitingCoordinatorTask(session) {
+        const snapshot = session?.coordinatorTaskId ? getTaskCoordinator()?.getTaskSnapshot(session.coordinatorTaskId) : null
+        return snapshot?.status === 'waiting_user' ? snapshot : null
+    }
+
+    function resumeWaitingCoordinatorTask(session) {
+        const snapshot = getWaitingCoordinatorTask(session)
+        if (!snapshot) return null
+        return getTaskCoordinator()?.resumePlannedTask({taskId: snapshot.taskId}) || null
+    }
+
     function requiredTaskNotificationPlatforms(session) {
         const turnIdentity = session?.taskCompletionIdentity || session?.activeTurnIdentity || null
         return resolveRequiredNotificationPlatforms({identity: turnIdentity, mirrors: session?.mirrors || {}})
@@ -166,7 +181,8 @@ export function createTaskLifecycleRuntime({
         if (!session) return null
         let workflows = []
         try { workflows = getSessionWorkflowStates(sessionId) } catch (error) { logger.debug({err: error, sessionId: sessionId?.slice(0, 8)}, '读取任务生命周期 Workflow 快照失败') }
-        return createTaskLifecycleSnapshot({sessionId, runtime: {...getSessionRuntimeState(session), taskWorkflowPending: hasPendingTaskWorkflow(session._taskWorkflowGate)}, task: getTaskStateForSessionClient()(session), workflows})
+        const coordinator = session.coordinatorTaskId ? getTaskCoordinator()?.getTaskSnapshot(session.coordinatorTaskId) : null
+        return createTaskLifecycleSnapshot({sessionId, runtime: {...getSessionRuntimeState(session), taskWorkflowPending: hasPendingTaskWorkflow(session._taskWorkflowGate)}, task: getTaskStateForSessionClient()(session), workflows, coordinator})
     }
 
     function broadcastTaskLifecycle(sessionId) {
@@ -174,5 +190,5 @@ export function createTaskLifecycleRuntime({
         if (snapshot) getBroadcastDesktop()(sessionId, {type: 'session_lifecycle_snapshot', ...snapshot})
     }
 
-    return {updateTaskState, taskStateFromCompletion, updateTaskNotificationState, initializeTaskWorkbenchSession, buildTaskPitfallReminder, requestCoordinatorCompletion, requiredTaskNotificationPlatforms, taskStateWithNotificationIntents, updateTaskCompletion, getTaskLifecycleSnapshot, broadcastTaskLifecycle}
+    return {updateTaskState, taskStateFromCompletion, updateTaskNotificationState, initializeTaskWorkbenchSession, buildTaskPitfallReminder, requestCoordinatorCompletion, getWaitingCoordinatorTask, resumeWaitingCoordinatorTask, requiredTaskNotificationPlatforms, taskStateWithNotificationIntents, updateTaskCompletion, getTaskLifecycleSnapshot, broadcastTaskLifecycle}
 }

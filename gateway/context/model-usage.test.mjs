@@ -41,9 +41,11 @@ test('usage event 只包含脱敏 envelope 投影，不包含 Prompt、凭据或
     assert.doesNotMatch(JSON.stringify(event), /secret|private|rawPath/i)
 })
 
-test('Gateway 仅在 SDK result 上创建脱敏 usage ledger 事件', () => {
+test('Gateway 在 SDK 回合开始落 pending，并在 result/异常时收口 usage ledger', () => {
     const resultBranch = streamRuntimeSource
-    assert.match(resultBranch, /recordProviderUsage\(sessionId, s, sdkMsg\)/)
+    assert.match(resultBranch, /beginProviderUsage\(sessionId, s, sdkMsg\)/)
+    assert.match(resultBranch, /finishProviderUsage\(sessionId, s, sdkMsg\)/)
+    assert.match(resultBranch, /failProviderUsage\(sessionId, failedSession/)
     assert.match(streamServiceSource, /appendModelUsageEvent\?\.\(event\)/)
     assert.doesNotMatch(streamServiceSource.slice(streamServiceSource.indexOf('function recordProviderUsage'), streamServiceSource.indexOf('function maybeRefreshContextUsage')), /prompt|apiKey|rawPath/i)
 })

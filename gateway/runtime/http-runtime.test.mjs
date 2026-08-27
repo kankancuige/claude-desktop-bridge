@@ -20,6 +20,6 @@ test('HTTP Runtime 统一创建路由并保持路由顺序', () => {
     }
     const runtime = createHttpRuntime({routeContext: context})
     assert.equal(typeof runtime.handleHttpRequest, 'function')
-    assert.equal(Object.keys(runtime.routes).length, 8)
+    assert.equal(Object.keys(runtime.routes).length, 9)
     assert.deepEqual(seen, [])
 })

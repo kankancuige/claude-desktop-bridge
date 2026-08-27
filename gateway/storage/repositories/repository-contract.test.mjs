@@ -9,7 +9,7 @@ import {createWorkbenchRepository} from './workbench-repository.mjs'
 
 function adapter() {
     return {
-        listSessionIndex: () => [], getSessionCatalog: () => null, upsertSessionCatalog: value => value, upsertSessionCatalogBatch: () => true, removeSessionCatalog: () => true, updateSessionSettingsByIds: () => true,
+        listSessionIndex: () => [], findSessionIndexById: () => [], getSessionCatalog: () => null, upsertSessionCatalog: value => value, upsertSessionCatalogBatch: () => true, removeSessionCatalog: () => true, updateSessionSettingsByIds: () => true,
         listWorkbenchProjectKeys: () => [], getTaskState: () => null, listTaskStates: () => [], recordTaskTransition: () => true, listExecutionReports: () => [], getExecutionReport: () => null, listPitfalls: () => [], listRecentPitfalls: () => [],
         recordPitfall: () => ({}), recordPitfallOccurrence: () => true, updatePitfallStatus: () => true, linkPitfall: () => true, getPitfall: () => null,
         loadEntries: () => new Map(), replaceEntries: () => true, clearEntries: () => 0, summarizeEntries: () => ({}),

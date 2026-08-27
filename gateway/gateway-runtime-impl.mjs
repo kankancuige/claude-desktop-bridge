@@ -17,13 +17,14 @@ import {safeBasename, safeChildPath} from './security/path-security.mjs'
 import {query, deleteSession, forkSession} from './providers/claude-agent-sdk-runtime.mjs'
 import {BRIDGE_HOME, prepareBridgeHome} from './config/bridge-home.mjs'
 import {getBuiltinResourceState, setBuiltinResourceEnabled} from './config/builtin-resources.mjs'
+import {normalizeStreamWatchdogConfig} from './config/stream-watchdog-config.mjs'
 import {createLogger, logHttpRequest} from './shared/logger.mjs'
 import {buildSessionStopResponse, getSessionStopScope, hasStoppableSessionWork, resolvePrimaryStopTurnId, selectCancelledInputTurns} from './sessions/session-stop.mjs'
 import {resolveSessionResume} from './sessions/session-resume.mjs'
 import {consumePendingSessionInputOnResult, getSessionRuntimeState} from './sessions/session-runtime-state.mjs'
 import {classifyTranscriptFile} from './projects/transcript-classifier.mjs'
 import {parseSessionHistory} from './sessions/session-history.mjs'
-import {findSessionTranscript, listProjectTranscriptCandidates} from './projects/project-transcript-location.mjs'
+import {findSessionTranscript, listProjectTranscriptCandidates, resolveSessionTranscript as resolveSessionTranscriptLocation} from './projects/project-transcript-location.mjs'
 import {removeSessionMapEntry, resolveMappedGatewaySessionId, updateSessionMap} from './sessions/session-map-consistency.mjs'
 import {isUserSessionSource, loadSessionVisibility, markSessionVisible, migrateLegacySessionVisibility, removeSessionVisibility, sessionVisibilitySource, shouldShowSession} from './sessions/session-visibility.mjs'
 import {initialSessionIdentity, resolveSessionCreateMode} from './sessions/session-create-mode.mjs'
@@ -69,6 +70,7 @@ import {
 import {buildProjectContext} from './projects/project-context.mjs'
 import {validateProviderUrl, buildProviderModelsUrl, buildProviderFallbackUrls} from './security/provider-url-security.mjs'
 import {upsertAdapterBinding} from './im/adapter-bindings.mjs'
+import {loadPairedUserCount} from './im/paired-users.mjs'
 import {scheduleSessionBackgroundInitialization} from './sessions/session-background-init.mjs'
 import {
     buildIncompleteMirrorText,
@@ -411,11 +413,6 @@ const claudeExecutableRuntime = createClaudeExecutableRuntime({
 })
 const {resolveFromPkgDir, getClaudeExe, setClaudeExe} = claudeExecutableRuntime
 const MODEL = process.env.ANTHROPIC_MODEL || 'deepseek-v4-pro'
-// SDK 长时间没有任何事件时收口为可恢复中断，避免上游断流后 async iterator 永久挂起。
-// 可用 BRIDGE_STREAM_IDLE_TIMEOUT_MS 调整，默认 3 分钟；工具有持续 progress 事件时不会触发。
-const STREAM_IDLE_TIMEOUT_MS = Math.min(30 * 60 * 1000, Math.max(30 * 1000,
-    Number.parseInt(process.env.BRIDGE_STREAM_IDLE_TIMEOUT_MS || '180000', 10) || 180000))
-
 // 模型名直传，不做映射；缺失值必须保持为空，由调用点按当前 Bridge 供应商配置回退。
 function mapModel(name) {
     return normalizeExplicitModel(name)
@@ -533,6 +530,7 @@ const confirmationRuntime = createConfirmationRuntime({
     getConfirmHooks: () => imRuntime?.confirmHooks || [],
     broadcastTurn: (...args) => broadcastTurn(...args),
     broadcast: (...args) => broadcast(...args),
+    broadcastDesktop: (...args) => broadcastDesktop(...args),
     shouldRouteMirror,
     logger: log,
 })
@@ -659,6 +657,8 @@ const {
     initializeTaskWorkbenchSession,
     buildTaskPitfallReminder,
     requestCoordinatorCompletion,
+    getWaitingCoordinatorTask,
+    resumeWaitingCoordinatorTask,
     requiredTaskNotificationPlatforms,
     taskStateWithNotificationIntents,
     updateTaskCompletion,
@@ -672,8 +672,10 @@ const sessionInputRuntime = createSessionInputRuntime({
     getBroadcastTurn: () => broadcastTurn,
     sessions,
     sessionCoordinator,
-    streamIdleTimeoutMs: STREAM_IDLE_TIMEOUT_MS,
+    streamHeartbeatIntervalMs: 15 * 1000,
+    getStreamTimeoutConfig: () => normalizeStreamWatchdogConfig(loadCliSettings().streamWatchdog),
     updateTaskCompletion,
+    updateTaskState,
     applyTaskCompletionEffects,
     taskStateForError,
     updateTaskState,
@@ -735,12 +737,13 @@ const taskCommandRuntime = createTaskCommandRuntime({
     MODEL, decideTask, resolveTurnModelRoute, loadWfConfig, validateProviderModel,
     acceptSessionInput, rollbackSessionInput, appendSessionEvent, markVisibleSession,
     isUserSessionSource, getBroadcastDesktop: () => broadcastDesktop, createTaskCompletionState, createTurnIdentity,
-    createTaskWorkflowGate, initializeTaskWorkbenchSession, userPreferences, updateTaskState,
+    createTaskWorkflowGate, initializeTaskWorkbenchSession, getWaitingCoordinatorTask, resumeWaitingCoordinatorTask, userPreferences, updateTaskState,
     taskCompletionEventForClient, getBroadcast: () => broadcast, resolveSdkInputContent, buildTaskPitfallReminder,
     routeSkills, createSessionContextEnvelope, resolveContextReusePolicy,
     resolveProviderCapabilityProfile, buildModelHandoffPrompt, beginTurn,
     shouldCaptureTurnCheckpoint, closeSessionRuntime, startClaudeAgent, PushStream,
     loadAgentDefinitions, getMakeQueryOptions: () => makeQueryOptions, getStartStreamPump: () => startStreamPump, failPendingSessionInputs,
+    updateTaskCompletion, broadcastTaskLifecycle, clearStreamWatchdog, armStreamWatchdog,
     autoTriggerWorkflow,
     persistTaskEvent: (session, event) => {
         const repository = stateRepositories()?.workbench
@@ -953,7 +956,9 @@ const workflowBroadcastRuntime = createWorkflowBroadcastRuntime({
     noteTaskWorkflowTerminal,
     takeDeferredPrimaryResult,
     updateTaskCompletion,
+    updateTaskState,
     applyTaskCompletionEffects,
+    taskCompletionEventForClient,
     appendSessionEvent,
     reportImProgressEvent,
     broadcast,
@@ -1175,6 +1180,7 @@ const sdkStreamAdapter = createSdkStreamAdapter({
 })
 const sdkStreamRuntimeDependencies = {
     sessions,
+    getStateStore: () => bridgeStateDb,
     sessionCoordinator,
     PushStream,
     loadCliSettings,
@@ -1276,7 +1282,7 @@ createWebSocketSessionRuntime({
     adapterOwnsSession, getFocusedSessionId,
     setFocusedSessionId,
     getSessionRuntimeState, taskStateForSessionClient, getTaskLifecycleSnapshot,
-    userPreferences, getSessionWorkflowState, taskCommands, VALID_PERMISSION_MODES,
+    userPreferences, getSessionWorkflowState, getSessionWorkflowStates, taskCommands, VALID_PERMISSION_MODES,
     updateTaskState, persistSessionCatalogSettings, settlePending: settlePendingRuntime, decisionToResult: decisionToResultRuntime,
     broadcastDesktop, log,
 })
@@ -1466,7 +1472,7 @@ gatewayRouteContext = {
     safeDecodeURIComponent, safeChildPath, safeBasename,
     sessions, controlClients, getFocusedSessionId, setFocusedSessionId, taskCommands, taskCoordinator, taskWorkbench,
     taskInputQueue, sessionCoordinator, sessionRuntime, sessionCatalogProjectKey,
-    scanProjects, listProjectSessions, deleteSessionFiles, findSessionTranscript, parseSessionHistory,
+    scanProjects, listProjectSessions, deleteSessionFiles, findSessionTranscript, resolveSessionTranscript: resolveHistoryTranscript, parseSessionHistory,
     loadTaskState, saveTaskState, recoverTaskState, repairPersistedTaskState, restoreCoordinatorSnapshot,
     loadSessionMap, saveSessionMap, lookupGatewaySessionId, lookupSdkSessionId,
     persistSdkSessionId, removeSdkSessionId, markVisibleSession, removeVisibleSession,
@@ -1474,15 +1480,18 @@ gatewayRouteContext = {
     getSessionRuntimeState, closeSessionRuntime, stopSessionGeneration, settlePending: settlePendingRuntime,
     query, forkSession, startClaudeAgent, makeQueryOptions, startStreamPump,
     createSessionRuntime, PushStream, createTaskCompletionState, createTaskStatePatch,
-    buildFileSnapshot, buildGitContext, currentFileScan, diffSnapshotVsCurrent,
+    buildFileSnapshot, buildGitContext, currentFileScan, lineDiffStats, computeLineDiff, diffSnapshotVsCurrent,
     saveSnapshot, loadSnapshot, saveCheckpoints, loadCheckpoints, rewindToCheckpoint,
     buildProjectCache, loadProjectCache, saveProjectCache, updateProjectCache,
     getUploadDir, prepareUploadDir, prepareSessionUploadDir, cleanupSessionUploads, parseMultipart,
     describeAttachment, isImageAttachment, isBinaryPath, resolveSafe,
     getAdapterHook, confirmHooks, startAdapter, stopAdapter, restartAdapter,
     clearAdapterPlatformState, listAdapterBindings, loadAdapterConfig, saveAdapterConfig,
+    getPersistedPairedUserCount: platform => loadPairedUserCount(BRIDGE_HOME, platform),
     normalizeWeChatBaseUrl, platformEntryFilePath,
     stateRepositories, scheduledTaskStore, scheduledRuns, cron, SCHEDULED_TASKS_FILE,
+    getUsageStore: () => stateRepositories()?.usage || bridgeStateDb,
+    getSessions: () => sessions,
     getNotificationRepository: () => stateRepositories()?.notification,
     registerScheduledJob, destroyScheduledJob, executeScheduledTask,
         listWorkflows: (...args) => workflowRuntime.listWorkflows(...args),
@@ -1533,6 +1542,16 @@ async function scanProjects() {
 
 async function listProjectSessions(ed) {
     return projectSessionRuntime.listProjectSessions(ed)
+}
+
+function resolveHistoryTranscript({sessionId, projectHint = '', workDir = ''} = {}) {
+    return resolveSessionTranscriptLocation({
+        bridgeHome: BRIDGE_HOME,
+        sessionId,
+        projectHint,
+        workDir,
+        repository: stateRepositories()?.session,
+    })
 }
 
 async function deleteSessionFiles(sessionId, relatedSessionIds = []) {

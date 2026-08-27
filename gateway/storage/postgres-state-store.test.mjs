@@ -23,6 +23,38 @@ test('PostgreSQL state repository 使用参数化 usage SQL 并保留 JSON 字�
     assert.doesNotMatch(usage.text, /e1|s1|partial/)
 })
 
+test('PostgresStateStore 按时间窗口返回用量明细和汇总', async () => {
+    const calls = []
+    const gateway = {query: async (text, values) => {
+        calls.push({text, values})
+        if (/COUNT\(\*\)/.test(text)) return {rows: [{eventCount: '2', unknownTokenEvents: '1', inputTokens: '8', outputTokens: '3', cacheReadInputTokens: null, cacheCreationInputTokens: '2'}]}
+        if (/GROUP BY/.test(text)) return {rows: [{day: '2026-08-27', eventCount: '2', inputTokens: '8', outputTokens: '3', cacheReadInputTokens: null, cacheCreationInputTokens: '2'}]}
+        return {rows: [{eventId: 'e1', createdAt: 10}]}
+    }}
+    const store = createPostgresStateStore({gateway})
+    const events = await store.listModelUsageHistory({from: 1, to: 20, projectKey: 'p', limit: 999})
+    assert.equal(events.length, 1)
+    assert.equal(calls[0].values.at(-1), 500)
+    const summary = await store.summarizeModelUsage({from: 1, to: 20, projectKey: 'p'})
+    assert.equal(summary.totals.eventCount, '2')
+    assert.equal(calls.some(call => call.values.includes('p')), true)
+})
+
+test('PostgresStateStore 默认时间窗口不把 null 解析为 Unix epoch', async () => {
+    const calls = []
+    const gateway = {query: async (text, values) => {
+        calls.push({text, values})
+        if (/COUNT\(\*\)/.test(text)) return {rows: [{eventCount: '0'}]}
+        if (/GROUP BY/.test(text)) return {rows: []}
+        return {rows: []}
+    }}
+    const store = createPostgresStateStore({gateway})
+    await store.listModelUsageHistory()
+    const [from, to] = calls[0].values
+    assert.ok(from > 1_000_000_000_000)
+    assert.ok(to > from)
+})
+
 test('state entries replace 在一个事务中清理并批量写入', async () => {
     const gateway = fakeGateway()
     const store = createPostgresStateStore({gateway})

@@ -37,6 +37,7 @@ import {normalizeImMessageId, validateImText} from './im-input.mjs'
 import {runImTask} from './im-task-runner.mjs'
 import {PendingConfirmRegistry} from './pending-confirm.mjs'
 import {findLatestAdapterUserForSession} from './adapter-bindings.mjs'
+import {sendTextParts} from './reliable-text.mjs'
 import {BRIDGE_HOME} from '../config/bridge-home.mjs'
 
 const log = createLogger('wechat')
@@ -312,9 +313,14 @@ export function startWeChatAdapter(token, {taskCommands, repository, onNotificat
 
         // ── 第2层: 挂起确认拦截 ──
         // 该用户有未完成的确认请求时，本条消息视为确认回复而非新 prompt
-        const pc = pendingConfirm.peek(uid)
+        const confirmMatch = pendingConfirm.matchReply(uid, text)
+        if (confirmMatch.reason === 'ambiguous' || confirmMatch.reason === 'token_not_found') {
+            await sendMsg(uid, ctx, `当前有多个待确认项，请按编号回复，例如：#${confirmMatch.tokens?.[0] || '1'} y 或 #${confirmMatch.tokens?.[0] || '1'} 1`)
+            return
+        }
+        const pc = confirmMatch.entry
         if (pc) {
-            const parsed = parseConfirmReply(text, pc.type)
+            const parsed = parseConfirmReply(confirmMatch.replyText, pc.type)
             if (!parsed) {
                 await sendMsg(uid, ctx, pc.type === 'choice' ? '请回复选项编号（如 1、2）' : '请回复 y/确认 或 n/拒绝')
                 return
@@ -331,6 +337,10 @@ export function startWeChatAdapter(token, {taskCommands, repository, onNotificat
                     pendingConfirm.remove(uid, pc)
                     if (d.ok) await sendMsg(uid, ctx, '✅ 已提交，继续处理中...')
                     else await sendMsg(uid, ctx, '该请求已处理（可能桌面端已操作或已超时）')
+                } else if (d.reason === 'confirmation_incomplete') {
+                    const nextQuestion = pc.questions?.[Object.keys(d.answers || {}).length]
+                    const nextOptions = (nextQuestion?.options || []).map((option, index) => `${index + 1}. ${option.label}`).join('\n')
+                    await sendMsg(uid, ctx, `✅ ${d.message || '已记录，请继续回答剩余问题'}${nextQuestion ? `\n\n${nextQuestion.question}\n${nextOptions}` : ''}`)
                 } else {
                     await sendMsg(uid, ctx, '提交失败，请稍后重试')
                 }
@@ -438,20 +448,26 @@ export function startWeChatAdapter(token, {taskCommands, repository, onNotificat
             signal: taskAbortController.signal,
             loadMirror: () => shouldSkipReply(sessionId, userId),
             onPermission: msg => {
-                if (pendingConfirm.add(userId, {sessionId, requestId: msg.requestId, type: 'permission'})) {
-                    return sendReliableText(userId, ctx, `🔐 需要授权\n工具: ${msg.toolName}\n${permSummary(msg.input)}\n\n回复 y/确认 允许，n/拒绝 拒绝`)
+                const added = pendingConfirm.add(userId, {sessionId, requestId: msg.requestId, type: 'permission', toolUseId: msg.toolUseId, ctx})
+                if (added.ok) {
+                    return sendReliableText(userId, ctx, `🔐 确认 #${added.entry.replyToken}\n工具: ${msg.toolName}\n${permSummary(msg.input)}\n\n回复 #${added.entry.replyToken} y 允许，#${added.entry.replyToken} n 拒绝`)
                 }
+                if (added.reason?.endsWith('capacity')) return sendReliableText(userId, ctx, '待确认项过多，请先处理已有确认')
             },
             onChoice: msg => {
                 const lines = []
-                const question = msg.questions?.[0]
-                if (question?.question) lines.push(question.question)
-                ;(question?.options || []).forEach((option, index) => lines.push(`${index + 1}. ${option.label}`))
-                if (pendingConfirm.add(userId, {
-                    sessionId, requestId: msg.requestId, type: 'choice', questions: msg.questions,
-                })) {
-                    return sendReliableText(userId, ctx, `🔢 请选择\n${lines.join('\n')}\n\n回复选项编号`)
+                for (const question of (msg.questions || [])) {
+                    if (question?.question) lines.push(question.question)
+                    ;(question?.options || []).forEach((option, index) => lines.push(`${index + 1}. ${option.label}`))
                 }
+                const added = pendingConfirm.add(userId, {
+                    sessionId, requestId: msg.requestId, type: 'choice', questions: msg.questions,
+                    toolUseId: msg.toolUseId, ctx,
+                })
+                if (added.ok) {
+                    return sendReliableText(userId, ctx, `🔢 确认 #${added.entry.replyToken}\n${lines.join('\n')}\n\n回复 #${added.entry.replyToken} 选项编号`)
+                }
+                if (added.reason?.endsWith('capacity')) return sendReliableText(userId, ctx, '待确认项过多，请先处理已有确认')
             },
             onConfirmationResolved: (msg, {mirrorEnabled}) => {
                 if (msg.wonBy && msg.wonBy !== 'wechat' && pendingConfirm.removeByRequest(sessionId, msg.requestId) && !mirrorEnabled) {
@@ -548,26 +564,23 @@ export function startWeChatAdapter(token, {taskCommands, repository, onNotificat
     const notificationWorker = startNotificationWorker({
         outbox,
         deliver: deliverNotification,
+        delay: wait,
+        delayMs: 400,
         log,
         onStateChange: event => onNotificationStateChange?.({...event, platform: 'wechat'}),
     })
 
     async function sendReliableText(userId, contextToken, text, notificationId = null) {
         if (stopped) return {sent: false, queued: false, error: 'adapter_stopped'}
-        const parts = splitTextByUtf8Bytes(text, 3500)
-        let sent = true
-        let queued = false
-        let lastError = ''
-        for (let i = 0; i < parts.length; i++) {
-            const content = parts.length > 1 ? `【${i + 1}/${parts.length}】${parts[i]}` : parts[i]
-            const result = await sendOrQueue(outbox, {
+        return sendTextParts({
+            text,
+            split: value => splitTextByUtf8Bytes(value, 3500),
+            delay: wait,
+            delayMs: 400,
+            sendPart: (content, index) => sendOrQueue(outbox, {
                 kind: 'direct', userId, contextToken: contextToken || '', text: content,
-            }, deliverNotification, {id: notificationId ? `${notificationId}:part:${i + 1}` : undefined})
-            if (!result.sent) sent = false
-            if (result.queued) queued = true
-            if (result.error) lastError = result.error
-        }
-        return {sent, queued: !sent && queued, error: lastError, parts: parts.length}
+            }, deliverNotification, {id: notificationId ? `${notificationId}:part:${index + 1}` : undefined}),
+        })
     }
 
     // ── buildHeaders ──
@@ -598,7 +611,7 @@ export function startWeChatAdapter(token, {taskCommands, repository, onNotificat
         } catch (error) {
             log.debug({err: error, sessionId: sid?.slice(0, 8)}, '读取微信镜像状态失败')
         }
-        return findLatestAdapterUserForSession(ad, 'wechat', sid)
+        return findLatestAdapterUserForSession(ad, 'wechat', sid, pairedUsers)
     }
 
     // ── onConfirmRequest ── 镜像确认请求(桌面端发起)
@@ -610,20 +623,26 @@ export function startWeChatAdapter(token, {taskCommands, repository, onNotificat
         if (!uid || !pairedUsers.has(uid)) return
         if (info.type === 'choice') {
             const lines = []
-            const q = info.questions?.[0]
-            if (q?.question) lines.push(q.question)
-            ;
-            (q?.options || []).forEach((o, i) => lines.push(`${i + 1}. ${o.label}`))
+            for (const q of (info.questions || [])) {
+                if (q?.question) lines.push(q.question)
+                ;(q?.options || []).forEach((o, i) => lines.push(`${i + 1}. ${o.label}`))
+            }
             const added = pendingConfirm.add(uid, {
                 sessionId: info.sessionId,
                 requestId: info.requestId,
                 type: 'choice',
-                questions: info.questions
+                questions: info.questions,
+                toolUseId: info.toolUseId,
+                ctx: '',
             })
-            if (added) sendReliableText(uid, '', `🔢 请选择（桌面）\n${lines.join('\n')}\n\n回复选项编号`)
+            if (added.ok) sendReliableText(uid, '', `🔢 确认 #${added.entry.replyToken}（桌面）\n${lines.join('\n')}\n\n回复 #${added.entry.replyToken} 选项编号`)
+            else if (added.reason?.endsWith('capacity')) sendReliableText(uid, '', '待确认项过多，请先处理已有确认')
         } else {
-            if (pendingConfirm.add(uid, {sessionId: info.sessionId, requestId: info.requestId, type: 'permission'})) {
-                sendReliableText(uid, '', `🔐 需要授权（桌面）\n工具: ${info.toolName}\n${permSummary(info.input)}\n\n回复 y/确认 允许，n/拒绝 拒绝`)
+            const added = pendingConfirm.add(uid, {sessionId: info.sessionId, requestId: info.requestId, type: 'permission', toolUseId: info.toolUseId, ctx: ''})
+            if (added.ok) {
+                sendReliableText(uid, '', `🔐 确认 #${added.entry.replyToken}（桌面）\n工具: ${info.toolName}\n${permSummary(info.input)}\n\n回复 #${added.entry.replyToken} y 允许，#${added.entry.replyToken} n 拒绝`)
+            } else if (added.reason?.endsWith('capacity')) {
+                sendReliableText(uid, '', '待确认项过多，请先处理已有确认')
             }
         }
     }
@@ -631,8 +650,14 @@ export function startWeChatAdapter(token, {taskCommands, repository, onNotificat
     // ── onConfirmResolved ── 确认已被其它通道处理
     // 功能说明: 桌面端或其它通道已处理该确认 → 清除本地对应挂起
     // 实现方式: 遍历 pendingConfirm，按 sessionId + requestId 精确匹配并删除
-    function onConfirmResolved(sessionId, requestId) {
-        pendingConfirm.removeByRequest(sessionId, requestId)
+    function onConfirmResolved(sessionId, requestId, resolution = {}) {
+        const removed = pendingConfirm.removeByRequest(sessionId, requestId)
+        if (!removed || resolution.wonBy === 'wechat') return
+        const text = resolution.wonBy === 'timeout' ? '该确认已超时并取消'
+            : resolution.wonBy === 'abort' ? '该确认已取消'
+                : '该确认已由桌面端或其他通道处理'
+        void sendReliableText(removed.userId, removed.entry?.ctx || '', text)
+            .catch(error => log.warn({err: error}, '发送确认结算通知失败'))
     }
 
     // ── sendToUser ── Mirror 发送到绑定用户(支持长文本分段)
@@ -708,6 +733,7 @@ export function startWeChatAdapter(token, {taskCommands, repository, onNotificat
         retryNotifications,
         discardNotifications,
         pairingCode: () => pairCode,
+        pairedUserCount: () => pairedUsers.size,
         connectionStatus: () => ({state: stopped ? 'stopped' : 'running'}),
         stop,
     }

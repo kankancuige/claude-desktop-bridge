@@ -72,3 +72,7 @@ test('父流程只读权限覆盖 Agent 的写入权限', () => {
     assert.equal(resolveWorkflowPermissionMode({agentPermissionMode: 'default'}), 'default')
     assert.equal(resolveWorkflowPermissionMode({}), 'acceptEdits')
 })
+
+test('完全自动父流程允许写入 Agent 继承 bypassPermissions', () => {
+    assert.equal(resolveWorkflowPermissionMode({parentPermissionMode: 'bypassPermissions', agentPermissionMode: 'plan'}), 'bypassPermissions')
+})

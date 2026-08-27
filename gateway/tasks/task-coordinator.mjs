@@ -18,9 +18,9 @@ function boundedText(value, max = 240) {
 
 function agentProjection(event, previous = {}, updatedAt) {
     const result = event.result && typeof event.result === 'object' ? event.result : null
-    const status = event.type === 'agent/started' ? 'running' : event.type.split('/')[1]
+    const status = event.statusOverride || (event.type === 'agent/started' ? 'running' : event.type.split('/')[1])
     const startedAt = previous.startedAt || (status === 'running' ? updatedAt : null)
-    const endedAt = status === 'completed' || status === 'failed' ? updatedAt : previous.endedAt || null
+    const endedAt = ['completed', 'failed', 'blocked', 'inconclusive', 'cancelled'].includes(status) ? updatedAt : previous.endedAt || null
     return {
         ...previous,
         agentRunId: boundedText(event.agentRunId, 240),
@@ -33,6 +33,7 @@ function agentProjection(event, previous = {}, updatedAt) {
         status,
         result: result ? clone(result) : previous.result || null,
         resultSummary: boundedText(result?.summary || previous.resultSummary, 400),
+        writeRequest: result?.writeRequest ? clone(result.writeRequest) : previous.writeRequest || null,
         changedFileCount: Array.isArray(result?.changedFiles) ? Math.min(result.changedFiles.length, 200) : Number(previous.changedFileCount || 0),
         testCount: Array.isArray(result?.tests) ? Math.min(result.tests.length, 50) : Number(previous.testCount || 0),
         startedAt,
@@ -69,9 +70,11 @@ export function canCompleteTask(snapshot = {}) {
     const unfinishedSteps = required.filter(step => !['completed', 'skipped'].includes(step.status))
     const activeAgents = Object.values(snapshot.agents || {}).filter(agent => ['starting', 'running'].includes(agent.status))
     const activeWorkflows = Object.values(snapshot.workflows || {}).filter(workflow => ['starting', 'running'].includes(workflow.status))
+    const failedWorkflows = Object.values(snapshot.workflows || {}).filter(workflow => ['failed', 'interrupted'].includes(workflow.status))
     const blockingFindings = (snapshot.findings || []).filter(item => item.blocking === true && item.resolved !== true)
     const missingAgentResults = required.filter(step => step.agentRequired === true && !Object.values(snapshot.agents || {})
         .some(agent => agent.stepId === step.stepId && agent.status === 'completed' && agent.result))
+    const pendingAgentWrites = Object.values(snapshot.agents || {}).filter(agent => agent.status === 'blocked' && agent.writeRequest)
     const needsValidation = required.some(step => step.phase === 'validate')
     const validationPassed = snapshot.verification?.status === 'passed'
     const testsExecuted = snapshot.verification?.testsExecuted === true || !needsValidation
@@ -80,8 +83,10 @@ export function canCompleteTask(snapshot = {}) {
     if (unfinishedSteps.length) reasons.push('required_steps_unfinished')
     if (activeAgents.length) reasons.push('active_agents')
     if (activeWorkflows.length) reasons.push('active_workflows')
+    if (failedWorkflows.length) reasons.push('failed_workflows')
     if (blockingFindings.length) reasons.push('blocking_findings')
     if (missingAgentResults.length) reasons.push('agent_result_missing')
+    if (pendingAgentWrites.length) reasons.push('agent_write_delegation_pending')
     if (needsValidation && !validationPassed) reasons.push('verification_not_passed')
     if (!testsExecuted) reasons.push('tests_not_executed')
     if (!notificationReady) reasons.push('notification_intent_not_persisted')
@@ -226,6 +231,22 @@ export function transitionTask(current, event = {}) {
             }
             break
         }
+        case 'agent/blocked': {
+            const id = String(event.agentRunId || '')
+            if (id) {
+                next.agents[id] = agentProjection(event, next.agents[id], next.updatedAt)
+                appendAgentTimeline(next, event, next.agents[id])
+            }
+            break
+        }
+        case 'agent/write-resolved': {
+            const id = String(event.agentRunId || '')
+            if (id) {
+                next.agents[id] = agentProjection({...event, statusOverride: 'completed'}, next.agents[id], next.updatedAt)
+                appendAgentTimeline(next, event, next.agents[id])
+            }
+            break
+        }
         case 'workflow/started':
         case 'workflow/completed':
         case 'workflow/failed': {
@@ -337,7 +358,12 @@ export function createTaskCoordinator({persist = () => {}, publish = () => {}, n
         return {nextStepId: nextStep?.stepId || null, status: next.status, reasons: [], snapshot: next}
     }
     const pausePlannedTask = ({taskId, reason = 'manual_pause'} = {}) => transition(taskId, {type: 'task/paused', detail: boundedText(reason, 400)})
-    const resumePlannedTask = ({taskId} = {}) => transition(taskId, {type: 'task/resumed'})
+    const resumePlannedTask = ({taskId} = {}) => {
+        let snapshot = transition(taskId, {type: 'task/resumed'})
+        if (!snapshot || snapshot.execution?.currentStepId) return snapshot
+        snapshot = dispatchTask(taskId)
+        return snapshot
+    }
     return {
         accept(plan) {
             const existing = tasks.get(plan?.taskId)

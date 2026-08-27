@@ -89,7 +89,9 @@ export function createHttpRequestHandler({
                 return
             }
             const sessionRoute = url.pathname.match(/^\/api\/sessions\/([^/]+)/)
+            const historyMessagesRoute = req.method === 'GET' && /^\/api\/sessions\/[^/]+\/messages$/.test(url.pathname)
             if (sessionRoute && !['resolve', 'focused'].includes(sessionRoute[1])
+                && !historyMessagesRoute
                 && !adapterOwnsSession?.(requestIdentity.source, requestIdentity.userId, sessionRoute[1])) {
                 res.writeHead(403)
                 res.end(JSON.stringify({error: 'session ownership mismatch'}))

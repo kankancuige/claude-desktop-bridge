@@ -7,7 +7,7 @@ export function createWebSocketSessionRuntime(deps = {}) {
         wss, controlClients, sessions, IM_SOURCES, safeDecodeURIComponent,
         adapterOwnsSession, getFocusedSessionId, setFocusedSessionId,
         getSessionRuntimeState, taskStateForSessionClient, getTaskLifecycleSnapshot,
-        userPreferences, getSessionWorkflowState, taskCommands, VALID_PERMISSION_MODES,
+        userPreferences, getSessionWorkflowState, getSessionWorkflowStates = null, taskCommands, VALID_PERMISSION_MODES,
         updateTaskState, persistSessionCatalogSettings, settlePending, decisionToResult,
         broadcastDesktop, log,
     } = deps
@@ -81,9 +81,12 @@ export function createWebSocketSessionRuntime(deps = {}) {
     // 切换 tab 重连时发送当前 workflow/agent 运行态快照，供前端恢复 agent 面板
     if (params.source === 'desktop') {
         try {
-            const wfState = getSessionWorkflowState(sessionId)
-            if (wfState) {
-                ws.send(JSON.stringify({type: 'workflow_state_snapshot', ...wfState}))
+            const workflows = typeof getSessionWorkflowStates === 'function'
+                ? getSessionWorkflowStates(sessionId)
+                : (getSessionWorkflowState(sessionId) ? [getSessionWorkflowState(sessionId)] : [])
+            if (workflows.length) {
+                const currentWorkflow = workflows.find(item => item.status === 'running' || item.status === 'starting' || item.status === 'paused') || workflows[0]
+                ws.send(JSON.stringify({type: 'workflow_states_snapshot', workflows, currentWorkflow}))
             }
         } catch (error) {
             log.debug({err: error, sessionId: sessionId?.slice(0, 8)}, '发送工作流状态快照失败')
@@ -152,12 +155,28 @@ export function createWebSocketSessionRuntime(deps = {}) {
         // 桌面端权限/方案选择响应
         if (msg.type === 'permission_response' && msg.requestId) {
             const entry = s.pending?.get(msg.requestId)
-            if (entry) settlePending(sessionId, msg.requestId, decisionToResult(entry, msg.decision), 'desktop')
+            if (!entry) {
+                ws.send(JSON.stringify({type: 'confirmation_response', ok: false, requestId: String(msg.requestId), code: 'confirmation_not_pending', message: '确认请求已失效或已由其他端处理'}))
+                return
+            }
+            const settled = settlePending(sessionId, msg.requestId, decisionToResult(entry, msg.decision), 'desktop')
+            ws.send(JSON.stringify({type: 'confirmation_response', ok: settled, requestId: String(msg.requestId), code: settled ? 'confirmed' : 'confirmation_not_pending'}))
             return
         }
         if (msg.type === 'choice_response' && msg.requestId) {
             const entry = s.pending?.get(msg.requestId)
-            if (entry) settlePending(sessionId, msg.requestId, decisionToResult(entry, null, msg.optionIndex, msg.questionIndex, msg.customText), 'desktop')
+            if (!entry) {
+                ws.send(JSON.stringify({type: 'confirmation_response', ok: false, requestId: String(msg.requestId), code: 'confirmation_not_pending', message: '确认请求已失效或已由其他端处理'}))
+                return
+            }
+            const result = decisionToResult(entry, null, msg.optionIndex, msg.questionIndex, msg.customText, msg.answers)
+            if (result?.incomplete) {
+                if (result.answers && entry.input && typeof entry.input === 'object') entry.input.answers = {...result.answers}
+                ws.send(JSON.stringify({type: 'confirmation_response', ok: false, requestId: String(msg.requestId), code: 'confirmation_incomplete', message: result.message || '请完成所有问题后再提交'}))
+                return
+            }
+            const settled = settlePending(sessionId, msg.requestId, result, 'desktop')
+            ws.send(JSON.stringify({type: 'confirmation_response', ok: settled, requestId: String(msg.requestId), code: settled ? 'confirmed' : 'confirmation_not_pending'}))
             return
         }
         if (msg.type === 'user_message') {
@@ -183,7 +202,14 @@ export function createWebSocketSessionRuntime(deps = {}) {
             log.error({err: error, sessionId: sessionId?.slice(0, 8), source: ws._source}, 'WebSocket 消息处理异常')
             if (ws.readyState === 1) {
                 try {
-                    ws.send(JSON.stringify({type: 'error', code: 'message_handler_failed', message: '消息处理失败，请稍后重试'}))
+                    const detail = String(error?.message || error || '未知错误')
+                        .replace(/[\0\r\n]+/g, ' ')
+                        .replace(/(bearer\s+)[^\s,;]+/gi, '$1[REDACTED]')
+                        .replace(/((?:api[-_]?key|token|secret|password)=)[^&\s]+/gi, '$1[REDACTED]')
+                        .trim().slice(0, 300) || '未知错误'
+                    const code = typeof error?.code === 'string' && /^[A-Za-z0-9_.-]{1,80}$/.test(error.code)
+                        ? error.code : 'message_handler_failed'
+                    ws.send(JSON.stringify({type: 'error', code, message: `消息处理失败：${detail}`}))
                 } catch (sendError) {
                     log.debug({err: sendError, sessionId: sessionId?.slice(0, 8)}, 'WebSocket 错误响应发送失败')
                 }

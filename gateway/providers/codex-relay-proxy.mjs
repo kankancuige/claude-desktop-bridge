@@ -15,6 +15,7 @@ const RETRYABLE_STATUS_CODES = new Set([408, 409, 425, 429, 500, 502, 503, 504, 
 const RETRYABLE_NETWORK_CODES = new Set(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENETUNREACH', 'EHOSTUNREACH'])
 const OVERLOAD_PATTERN = /\b(?:overload(?:ed)?|server(?:s)?\s+(?:are\s+)?busy|capacity|temporar(?:y|ily)\s+unavailable|try\s+again\s+later)\b/i
 const TEST_IDLE_DELAY_MAX_MS = 2 * 60 * 1000
+let relayRequestCounter = 0
 
 let proxyServer = null
 let proxyPort = 0
@@ -179,13 +180,15 @@ function upstreamMessage(detail) {
     return raw.replace(/\s+/g, ' ').slice(0, 500)
 }
 
-async function requestUpstreamWithRetry(route, body, {stream, signal} = {}) {
+async function requestUpstreamWithRetry(route, body, {stream, signal, requestId} = {}) {
     let lastError = null
     for (let attempt = 1; attempt <= MAX_UPSTREAM_ATTEMPTS; attempt++) {
         try {
+            log.info({requestId, attempt, maxAttempts: MAX_UPSTREAM_ATTEMPTS, model: route.model}, 'Codex relay upstream attempt')
             const target = await resolveProviderUrl(route.upstream)
             target.apiKey = route.apiKey
             const upstream = await requestUpstream(target, body, {stream, signal})
+            log.info({requestId, attempt, statusCode: upstream.res.statusCode, model: route.model}, 'Codex relay upstream response headers received')
             if (upstream.res.statusCode >= 200 && upstream.res.statusCode < 300) {
                 return {upstream, attempts: attempt, detail: ''}
             }
@@ -197,13 +200,15 @@ async function requestUpstreamWithRetry(route, body, {stream, signal} = {}) {
             }
             const delayMs = retryDelayMs(attempt, upstream.res.headers)
             log.warn({
+                requestId,
                 statusCode: upstream.res.statusCode,
                 attempt,
                 maxAttempts: MAX_UPSTREAM_ATTEMPTS,
                 delayMs,
-                requestId: upstreamRequestId(detail, upstream.res.headers) || undefined,
+                upstreamRequestId: upstreamRequestId(detail, upstream.res.headers) || undefined,
                 model: route.model,
             }, 'Codex relay upstream busy, retrying')
+            log.info({requestId, attempt, delayMs, model: route.model}, 'Codex relay retry wait')
             await waitForRetry(delayMs, signal)
         } catch (error) {
             lastError = error
@@ -212,7 +217,7 @@ async function requestUpstreamWithRetry(route, body, {stream, signal} = {}) {
                 throw error
             }
             const delayMs = retryDelayMs(attempt)
-            log.warn({err: error, attempt, maxAttempts: MAX_UPSTREAM_ATTEMPTS, delayMs, model: route.model}, 'Codex relay network error, retrying')
+            log.warn({requestId, err: error, attempt, maxAttempts: MAX_UPSTREAM_ATTEMPTS, delayMs, model: route.model}, 'Codex relay network error, retrying')
             await waitForRetry(delayMs, signal)
         }
     }
@@ -268,17 +273,21 @@ async function handleRequest(req, res) {
         return
     }
     const abort = new AbortController()
+    const requestId = `relay-${Date.now().toString(36)}-${(++relayRequestCounter).toString(36)}`
+    const startedAt = Date.now()
     const abortClient = () => abort.abort()
     req.once('aborted', abortClient)
     res.once('close', abortClient)
     try {
+        log.info({requestId}, 'Codex relay request started')
         const raw = await readRequestBody(req)
         const body = JSON.parse(raw.toString('utf8'))
         const request = toResponsesRequest(body, route.model)
         await injectControlledIdleBeforeUpstream(abort.signal)
-        const result = await requestUpstreamWithRetry(route, JSON.stringify(request), {stream: Boolean(body.stream), signal: abort.signal})
+        const result = await requestUpstreamWithRetry(route, JSON.stringify(request), {stream: Boolean(body.stream), signal: abort.signal, requestId})
         const upstream = result.upstream
         if (upstream.res.statusCode < 200 || upstream.res.statusCode >= 300) {
+            log.warn({requestId, attempts: result.attempts, statusCode: upstream.res.statusCode, durationMs: Date.now() - startedAt}, 'Codex relay request failed')
             sendError(res, upstream.res.statusCode || 502, detailedUpstreamError(
                 upstream.res.statusCode || 502,
                 result.detail,
@@ -299,14 +308,16 @@ async function handleRequest(req, res) {
             })()
             for await (const frame of translateResponsesSse(limited, body.model || route.model)) res.write(frame)
             if (!res.writableEnded) res.end()
+            log.info({requestId, attempts: result.attempts, durationMs: Date.now() - startedAt}, 'Codex relay request completed')
             return
         }
         const response = fromResponsesJson(JSON.parse(await readResponseBody(upstream.res)), body.model || route.model)
         res.writeHead(200, {'content-type': 'application/json; charset=utf-8'})
         res.end(JSON.stringify(response))
+        log.info({requestId, attempts: result.attempts, durationMs: Date.now() - startedAt}, 'Codex relay request completed')
     } catch (error) {
         if (error?.name === 'AbortError' || abort.signal.aborted) return
-        log.warn({err: error, statusCode: error?.statusCode}, 'Codex relay request failed')
+        log.warn({requestId, err: error, statusCode: error?.statusCode, durationMs: Date.now() - startedAt}, 'Codex relay request failed')
         const attempts = Number(error?.retryAttempts || 1)
         const message = attempts > 1
             ? `Codex 中转站网络请求失败，已自动尝试 ${attempts} 次：${String(error?.message || error)}`

@@ -12,6 +12,11 @@ export class SessionRepository {
     }
     list({projectKey, limit = 100, visibility = null} = {}) { return this.#store.listSessionIndex(required(projectKey, 'projectKey'), {limit, visibility}) }
     listAll({projectKey, limit = 100, visibility = null} = {}) { return this.list({projectKey, limit, visibility}) }
+    findBySessionId(sessionId) {
+        const id = required(sessionId, 'sessionId')
+        if (typeof this.#store.findSessionIndexById === 'function') return this.#store.findSessionIndexById(id)
+        return []
+    }
     getMany({projectKey, sessionIds = []} = {}) { return this.#store.getSessionCatalogs(required(projectKey, 'projectKey'), sessionIds.map(value => required(value, 'sessionId'))) }
     get({projectKey, sessionId} = {}) { return this.#store.getSessionCatalog(required(projectKey, 'projectKey'), required(sessionId, 'sessionId')) }
     upsert(record = {}) { return this.#store.upsertSessionCatalog(record) }

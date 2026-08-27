@@ -1,4 +1,5 @@
 import nodeCrypto from 'node:crypto'
+import {normalizePermissionMode} from '../agents/agent-permission.mjs'
 
 /** Provider/SDK query options 组装边界。 */
 export function createQueryOptionsRuntime(deps = {}) {
@@ -25,7 +26,7 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
     const apiKey = requestedApiKey || configuredApiKey
     let baseUrl = body.baseUrl || cliS.env?.ANTHROPIC_BASE_URL
     const exe = body.claudeExe || process.env.CLAUDE_EXE || cliS.claudeExe || getClaudeExe()
-    const permissionMode = VALID_PERMISSION_MODES.has(body.permissionMode) ? body.permissionMode : 'default'
+    const permissionMode = normalizePermissionMode(body.permissionMode)
     const requestedMaxTurns = Number(body.maxTurns || cliS.maxTurns || 40)
     const contextProfile = normalizeContextProfile(body.contextProfile)
     const requestedSkillRoute = Array.isArray(body.skillRoute)

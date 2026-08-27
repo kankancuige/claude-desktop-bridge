@@ -70,7 +70,7 @@ async function executeScheduledTask(id) {
         text: task.prompt,
         taskDecision: scheduledDecision,
         model: task.model || MODEL,
-        permissionMode: task.permissionMode || 'default',
+        permissionMode: task.permissionMode || 'bypassPermissions',
         maxTurns: Math.min(100, Math.max(1, Number(task.maxTurns) || 20)),
     }
     const sessionId = task.sessionId || crypto.randomUUID()

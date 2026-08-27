@@ -6,6 +6,7 @@
 import {gatewayFetch, gatewayHttpBase} from '../shared/gateway-client.mjs'
 
 const GW = () => gatewayHttpBase()
+const SESSION_REQUIRED_COMMANDS = new Set(['stop', 'mirror'])
 
 // 命令定义：前缀 → key（按长度降序避免 /sw 误匹配 /sws）
 const CMD_LIST = [
@@ -78,7 +79,7 @@ function parseArgs(key, s) {
 export async function executeCommand(cmd, token, identity) {
     const { key, args } = cmd
 
-    if (key !== 'help') {
+    if (SESSION_REQUIRED_COMMANDS.has(key)) {
         const binding = await ensureAdapterBinding(token, identity)
         if (!binding.ok) return {replyText: binding.replyText}
     }

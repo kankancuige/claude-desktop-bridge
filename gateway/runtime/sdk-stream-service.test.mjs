@@ -35,3 +35,27 @@ test('Provider usage 只通过注入的状态存储和广播出口落账', () =>
     assert.equal(persisted.length, 1)
     assert.equal(events[0].type, 'model_usage_observed')
 })
+
+test('Provider usage 在回合开始落 pending，并在结束时更新同一事件', async () => {
+    const persisted = []
+    const updates = []
+    const service = createSdkStreamService({
+        withTimeout: promise => promise,
+        getStateStore: () => ({
+            appendModelUsageEvent: event => { persisted.push(event); return Promise.resolve(true) },
+            updateModelUsageEvent: (id, event) => { updates.push([id, event]); return Promise.resolve(true) },
+        }),
+        getSessionProjectKey: () => 'project',
+        broadcast() {},
+        now: () => 100,
+    })
+    const session = {workDir: 'D:/project'}
+    const id = await service.beginProviderUsage('s1', session, {type: 'user'})
+    assert.equal(persisted.length, 1)
+    assert.equal(persisted[0].status, 'pending')
+    const result = await service.finishProviderUsage('s1', session, {usage: {input_tokens: 2, output_tokens: 1}})
+    assert.equal(result.event.eventId, id)
+    assert.equal(result.event.status, 'completed')
+    assert.equal(updates.length, 1)
+    assert.equal(updates[0][0], id)
+})

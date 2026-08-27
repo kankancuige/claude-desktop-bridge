@@ -113,6 +113,9 @@ export function createSessionRuntime({
         _inputIds: new Map(),
         activeTurnId: null,
         activeTurnIdentity: null,
+        // 当前 SDK 工具调用的活动快照，供 watchdog 区分长工具和断流。
+        _activeTools: new Map(),
+        _streamWatchdogStartedAt: 0,
         depth,
         ...extra,
     }
