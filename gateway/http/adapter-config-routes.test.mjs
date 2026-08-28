@@ -52,3 +52,32 @@ test('立即执行冲突保留具体 reason', async () => {
     assert.equal(res.statusCode, 409)
     assert.deepEqual(JSON.parse(res.body), {ok: false, started: false, reason: 'already_running'})
 })
+
+test('通知重试等待适配器完成本轮发送后再返回最新状态', async () => {
+    let finishRetry
+    const retryFinished = new Promise(resolve => { finishRetry = resolve })
+    const handle = createAdapterConfigRoutes({
+        ADAPTER_PLATFORMS: ['wechat'],
+        getAdapterHook: () => ({
+            retryNotifications: async () => {
+                await retryFinished
+                return {reset: 8, pending: 0, failed: 8, dead: 0, sent: 0}
+            },
+        }),
+    })
+    const res = response()
+    const request = handle({
+        req: {method: 'POST'}, res,
+        url: new URL('http://local/api/config/adapters/wechat/notifications/retry'),
+    })
+
+    await Promise.resolve()
+    assert.equal(res.statusCode, 0)
+    finishRetry()
+    await request
+
+    assert.equal(res.statusCode, 202)
+    assert.deepEqual(JSON.parse(res.body), {
+        ok: true, reset: 8, pending: 0, failed: 8, dead: 0, sent: 0,
+    })
+})

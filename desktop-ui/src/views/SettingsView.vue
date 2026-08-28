@@ -181,7 +181,9 @@ function workbenchReportStatus(value: unknown): string {
 
 function workbenchReportTitle(report: any): string {
   const title = String(report?.title || report?.summary || '').trim()
-  return title || '未命名任务'
+  if (title && title !== '未命名任务') return title.slice(0, 80)
+  const fallback = String(report?.summary || '').trim().split(/\r?\n/).map(line => line.replace(/^\s*(?:#{1,6}\s+|[-*+]\s+)/, '').trim()).find(Boolean) || ''
+  return fallback.slice(0, 80) || '未命名任务'
 }
 
 function workbenchReportStep(step: any): string {

@@ -4,6 +4,7 @@ export interface WorkspaceTabShell {
   label: string
   sessionId: string | null
   historySessionId: string | null
+  taskState?: Record<string, unknown> | null
 }
 
 export interface WorkspaceShell {
@@ -20,6 +21,18 @@ function cleanString(value: unknown): string | null {
   if (typeof value !== 'string') return null
   const trimmed = value.trim()
   return trimmed ? trimmed : null
+}
+
+function normalizePersistedTaskState(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object') return null
+  const state = {...value as Record<string, unknown>}
+  if (state.status === 'running') {
+    state.status = 'interrupted'
+    state.outcome = 'failed'
+    state.continuationReason = 'execution_error'
+    state.resumable = true
+  }
+  return state
 }
 
 export function parseWorkspaceShell(raw: string | null | undefined): WorkspaceShell {
@@ -40,6 +53,7 @@ export function parseWorkspaceShell(raw: string | null | undefined): WorkspaceSh
             label: cleanString(tab?.label) || projectPath,
             sessionId: cleanString(tab?.sessionId),
             historySessionId: cleanString(tab?.historySessionId),
+            taskState: normalizePersistedTaskState(tab?.taskState),
           }
         }).filter((item): item is WorkspaceTabShell => !!item)
       : []

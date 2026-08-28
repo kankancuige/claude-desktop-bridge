@@ -31,6 +31,7 @@ test('Workbench 任务事件时间线显示中文标题和具体状态描述', (
 test('Workbench 任务名称优先使用元数据，不把 UUID 作为可见标题', () => {
   assert.equal(model.taskDisplayName({...task('running'), title: '修复登录', summary: '摘要'}), '修复登录')
   assert.equal(model.taskDisplayName({...task('running'), title: '', summary: '摘要'}), '摘要')
+  assert.equal(model.taskDisplayName({...task('running'), title: '未命名任务', summary: '修复任务列表标题'}), '修复任务列表标题')
   assert.equal(model.taskDisplayName({...task('running'), taskId: '550e8400-e29b-41d4-a716-446655440000', taskKey: undefined}), '未命名任务')
 })
 

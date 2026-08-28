@@ -39,6 +39,22 @@ test('workspace shell keeps only serializable project and session descriptors', 
   assert.equal(parsed.activeTabId, 'tab-1')
 })
 
+test('重启前的 running 状态恢复为等待用户继续的 interrupted', () => {
+  const parsed = parseWorkspaceShell(JSON.stringify({
+    version: 1,
+    projects: ['D:/work'],
+    tabs: [{
+      id: 'tab-1', projectPath: 'D:/work', label: 'work', sessionId: 'gateway-1', historySessionId: null,
+      taskState: {status: 'running', resumable: false, requestText: '执行原任务'},
+    }],
+    activeTabId: 'tab-1', activeProject: 'D:/work',
+  }))
+  assert.deepEqual(parsed.tabs[0].taskState, {
+    status: 'interrupted', outcome: 'failed', continuationReason: 'execution_error',
+    resumable: true, requestText: '执行原任务',
+  })
+})
+
 test('unknown active tab is not restored', () => {
   const parsed = parseWorkspaceShell(JSON.stringify({
     projects: [], tabs: [], activeTabId: 'missing', activeProject: null,

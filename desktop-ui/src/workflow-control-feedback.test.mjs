@@ -24,16 +24,24 @@ test('非当前 Workflow 的恢复和失败事件不会改写当前面板', () =
     }
 })
 
-test('Workflow 和 Agent 控制操作都检查 response.ok', () => {
-    for (const [start, end] of [
-        ['async function stopWf', 'async function resumeWf'],
-        ['async function resumeWf', 'async function stopAgent'],
-        ['async function stopAgent', 'async function resumeAgent'],
-        ['async function resumeAgent', '// ──'],
-    ]) {
-        const from = source.indexOf(start)
-        const to = source.indexOf(end, from + start.length)
-        assert.ok(from >= 0 && to > from)
-        assert.match(source.slice(from, to), /requireOkResponse\(/)
-    }
+test('Workflow 暂停收敛到主任务入口且提交操作检查 response.ok', () => {
+    const from = source.indexOf('async function stopWf')
+    const to = source.indexOf('// ── 消息气泡操作', from)
+    assert.ok(from >= 0 && to > from)
+    const controls = source.slice(from, to)
+    assert.match(controls, /if \(mode === 'pause'\) \{\s*await cancelTask\(\)/)
+    assert.match(controls, /requireOkResponse\(/)
+    assert.doesNotMatch(source, /async function resumeWf/)
+    assert.doesNotMatch(source, /async function resumeAgent/)
+})
+
+test('权限模式切换等待服务端确认且发送失败时恢复旧值', () => {
+    const watcherStart = source.indexOf('watch(permissionMode')
+    const watcherEnd = source.indexOf('// ═══════════════════════════════════════════', watcherStart)
+    assert.ok(watcherStart >= 0 && watcherEnd > watcherStart)
+    const watcher = source.slice(watcherStart, watcherEnd)
+    assert.match(watcher, /if \(hasSession && !sendSessionPayload\(\{type: 'setting_change', permissionMode: newVal\}\)\)/)
+    assert.match(watcher, /permissionMode\.value = oldVal/)
+    assert.match(source, /case 'setting_changed'/)
+    assert.match(source, /resolvedRequestIds/)
 })

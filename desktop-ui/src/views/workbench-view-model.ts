@@ -16,7 +16,6 @@ export type WorkbenchTask = {
   updatedAt?: number
   startedAt?: number
   completedAt?: number
-  execution?: {mode?: string; currentStepId?: string | null; continuationCount?: number; budget?: {remaining?: {rounds?: number; tokens?: number; durationMs?: number} | null}} | null
   context?: {profile?: string; estimatedInputTokens?: number; maxInputTokens?: number; selectedLayers?: string[]; omitted?: Array<{layer?: string; reason?: string}>} | null
   execution?: {
     mode?: 'session' | 'workflow' | 'mission' | string
@@ -314,8 +313,10 @@ export function taskEventSummary(event: Record<string, any> = {}): string {
 }
 
 export function taskDisplayName(task: WorkbenchTask): string {
-  const preferred = String(task.title || task.summary || '').trim()
-  if (preferred && !isOpaqueTaskId(preferred)) return preferred.slice(0, 80)
+  const preferred = [task.title, task.summary]
+    .map(value => String(value || '').trim())
+    .find(value => value && value !== '未命名任务' && !isOpaqueTaskId(value))
+  if (preferred) return preferred.slice(0, 80)
   const legacy = String(task.taskKey || task.taskId || '').replace(/:coordinator$/, '').trim()
   return /^[0-9a-f]{8}-[0-9a-f-]{20,}$/i.test(legacy) || /^[0-9a-f]{32,}$/i.test(legacy) ? '未命名任务' : legacy || '未命名任务'
 }
