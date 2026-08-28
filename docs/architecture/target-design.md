@@ -65,6 +65,8 @@ Incomplete: None
 - key 优先使用 SDK conversation ID，尚未获得时使用项目路径和 Gateway ID组成的临时 key。
 - value 只含文本、更新时间和 interrupted 标记；文本限制 900 KB，最多 100 项，默认保留 30 天。
 - 发送被 Gateway 接受后清除对应草稿；暂停、发送失败、断线或关闭 tab 前立即保存。
+- interrupted draft 只保存暂停/中断任务的恢复依据，不自动写回输入框；可恢复终态由输入框主按钮提供显式继续入口。
+- 暂停后存在新文字或附件时，发送操作优先于继续操作；Gateway 将其作为新的 Task Command，不恢复旧 Coordinator。
 
 ### 错误事件
 
@@ -115,7 +117,8 @@ interface BridgeNotice {
 
 - 单元测试：workspace shell/draft 兼容、错误分类/脱敏/去重、resume 缺失决策、stop 幂等结果。
 - 构建：Gateway tests、`vue-tsc --noEmit`、Vite build、`git diff --check`。
-- runtime：新建回合 -> 暂停 -> 退出 -> 重启 -> 历史正文和草稿恢复 -> 继续发送；断开 Gateway 时出现提示，恢复后消失。
+- runtime：新建回合 -> 暂停 -> 输入框保持为空并显示继续 -> 退出 -> 重启 -> 同一继续入口恢复；断开 Gateway 时出现提示，恢复后消失。
+- runtime：暂停后直接输入新内容 -> 新 `task/created` 被接受 -> 旧暂停任务不恢复、不自动拼接，但 transcript 与既有副作用仍保留。
 - runtime：源会话 -> 显式分支 -> 新 SDK ID 保留源历史；空白新会话发送“加上”时命中最近有效会话，普通独立问题不注入。
 
 ## 统一任务命令、事件日志与 Provider
