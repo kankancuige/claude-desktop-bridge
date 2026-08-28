@@ -5,7 +5,7 @@
 
 **核心亮点**：微信 / 飞书 / 钉钉消息**直接注入当前活跃 session**，桌面端实时同步显示 Claude 回复。
 
-当前稳定版本：**v1.7.1**。可直接从 [GitHub Releases](https://github.com/kankancuige/claude-desktop-bridge/releases/tag/v1.7.1) 下载 Windows、macOS 和 Linux 安装包。
+当前稳定版本：**v1.7.2**。可直接从 [GitHub Releases](https://github.com/kankancuige/claude-desktop-bridge/releases/tag/v1.7.2) 下载 Windows、macOS 和 Linux 安装包。
 
 喜欢这个项目可以点个star哦~
 
@@ -362,7 +362,7 @@ Code → Actions → 最新一次 Workflow run → Artifacts
 └── Claude-Desktop-Bridge-Linux/
 ```
 
-推送版本标签（例如 `v1.7.1`）会在质量门禁通过后自动构建并创建 GitHub Release。发布包名称包含版本号，当前 `v1.7.1` 已提供 Windows `.exe/.zip`、macOS `.dmg/.zip` 和 Linux `.AppImage/.zip`。
+推送版本标签（例如 `v1.7.2`）会在质量门禁通过后自动构建并创建 GitHub Release。发布包名称包含版本号，当前 `v1.7.2` 将由标签流水线生成 Windows `.exe/.zip`、macOS `.dmg/.zip` 和 Linux `.AppImage/.zip`。
 
 也可手动触发：Actions → 三平台构建 → Run workflow。
 
