@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {createSessionStopRuntime} from './session-stop-runtime.mjs'
 import {createSessionResourceRuntime} from './session-resource-runtime.mjs'
+import {taskStateForStop} from '../tasks/task-state.mjs'
 
 test('Session Stop Runtime 对无可停止工作返回稳定结果', async () => {
     const runtime = createSessionStopRuntime({
@@ -52,8 +53,11 @@ test('Workflow-only 停止清理 Gate、pending 输入和运行时资源', async
         closeSessionRuntime: async value => { calls.push('runtime-close'); value.query = null; value.pushStream = null },
         finalizeCheckpoint() {},
         cancelPendingSessionInputs() { cancelled += 1; return 1 },
-        taskStateForStop: () => ({}), updateTaskState() {}, appendSessionEvent() {},
-        broadcastTurn() {}, taskStateForClient: value => value,
+        taskStateForStop,
+        updateTaskState(value, _sessionId, state) { value.taskState = state; calls.push(`state:${state.status}`) },
+        appendSessionEvent(_session, type) { calls.push(`event:${type}`) },
+        broadcastTurn(_sessionId, event) { calls.push(`turn:${event.type}`) },
+        taskStateForClient: value => value,
     })
     const result = await runtime.stopSessionGeneration('s1', session)
     assert.deepEqual(result, {stopped: true, scope: 'workflow', cancelledInputs: 1, turnId: null})
@@ -64,6 +68,11 @@ test('Workflow-only 停止清理 Gate、pending 输入和运行时资源', async
     assert.equal(session.pushStream, null)
     assert.ok(calls.includes('stop-workflow:wf-1'))
     assert.ok(calls.includes('runtime-close'))
+    assert.ok(calls.includes('completion-update'))
+    assert.ok(calls.includes('state:stopped'))
+    assert.ok(calls.includes('event:runtime/stopped'))
+    assert.ok(calls.includes('turn:generation_stopped'))
+    assert.equal(session.taskState.resumable, true)
 })
 
 test('主任务停止会关闭 SDK Query 并取消 native Agent 进程的控制信号', async () => {

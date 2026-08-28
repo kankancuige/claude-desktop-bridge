@@ -8,9 +8,11 @@ function optionalSessionId(value, field) {
 export function resolveSessionCreateMode(body = {}) {
     const resume = optionalSessionId(body.resume, 'resume')
     const forkFrom = optionalSessionId(body.forkFrom, 'forkFrom')
-    if (resume && forkFrom) throw new TypeError('resume and forkFrom are mutually exclusive')
+    const recoverSessionId = optionalSessionId(body.recoverSessionId, 'recoverSessionId')
+    if ([resume, forkFrom, recoverSessionId].filter(Boolean).length > 1) throw new TypeError('resume, forkFrom and recoverSessionId are mutually exclusive')
     if (resume) return {mode: 'resume', sourceSessionId: resume}
     if (forkFrom) return {mode: 'fork', sourceSessionId: forkFrom}
+    if (recoverSessionId) return {mode: 'recover', sourceSessionId: recoverSessionId}
     return {mode: 'new', sourceSessionId: null}
 }
 
@@ -22,4 +24,11 @@ export function initialSessionIdentity(sourceSessionId) {
         lastSessionId: id,
         _hasConversation: Boolean(id),
     }
+}
+
+/** recovery-only runtime 不启动 SDK，但必须记住显式继续所需的 conversation ID。 */
+export function resolveRecoveryRuntimeIdentity(taskState = {}) {
+    const sdkSessionId = optionalSessionId(taskState?.sdkSessionId, 'sdkSessionId')
+    if (sdkSessionId) return sdkSessionId
+    return optionalSessionId(taskState?.historySessionId, 'historySessionId')
 }

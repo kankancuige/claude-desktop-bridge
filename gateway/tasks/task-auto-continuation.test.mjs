@@ -9,6 +9,8 @@ const streamRuntimeSource = readFileSync(new URL('../runtime/sdk-stream-runtime.
 const sessionStopRuntimeSource = readFileSync(new URL('../runtime/session-stop-runtime.mjs', import.meta.url), 'utf8')
 const coordinatorSource = readFileSync(new URL('../sessions/session-coordinator.mjs', import.meta.url), 'utf8')
 const streamAdapterSource = readFileSync(new URL('../sessions/sdk-stream-adapter.mjs', import.meta.url), 'utf8')
+const sessionMutationSource = readFileSync(new URL('../http/session-mutation-routes.mjs', import.meta.url), 'utf8')
+const startupRuntimeSource = readFileSync(new URL('../runtime/startup-runtime.mjs', import.meta.url), 'utf8')
 
 test('max turns 按任务档位限制自动续跑次数', () => {
     const cases = [
@@ -86,26 +88,13 @@ test('未知档位使用 balanced 上限且提示不要求用户重复原任务'
     assert.match(result.prompt, /不要重新开始/)
 })
 
-test('Gateway 自动续跑沿用原 SDK 会话，并在重建完成前串行排队追加消息', () => {
-    const start = streamRuntimeSource.indexOf('async function startAutoContinuation')
-    const end = streamRuntimeSource.indexOf('async function startStreamPump', start)
-    assert.ok(start >= 0 && end > start)
-    const rebuild = streamRuntimeSource.slice(start, end)
-    assert.match(rebuild, /session\.lastSessionId/)
-    assert.match(rebuild, /opts\.resume = session\.lastSessionId/)
-    assert.match(rebuild, /maxContextTokens: session\.queryOpts\?\.bridgeContextSafetyCap/)
-    assert.match(rebuild, /sessionCoordinator\.beginRebuild\(session, request\.prompt\)/)
-    assert.match(rebuild, /sessionCoordinator\.attachPromise\(session, rebuildId, rebuildPromise\)/)
-    assert.match(rebuild, /sessionCoordinator\.consumePendingMessages\(session, rebuildId\)/)
-    assert.match(rebuild, /session\._autoContinuationRequest !== request/)
-    assert.match(rebuild, /session\._autoContinuationRequest = null/)
+test('max_turns 统一落入输入框继续入口，不在 Gateway 自动重建 Query', () => {
+    assert.doesNotMatch(streamRuntimeSource, /startAutoContinuation/)
+    assert.doesNotMatch(streamRuntimeSource, /_autoContinuationRequest\s*=/)
+    assert.match(streamRuntimeSource, /请点击输入框继续按钮/)
+    assert.match(streamRuntimeSource, /appendSessionEvent\(s, 'task\/continuation-paused'/)
+    assert.doesNotMatch(streamRuntimeSource, /task_auto_continuing/)
     assert.match(streamAdapterSource, /isAutoContinuationPrompt\(userText\)/)
-
-    const pumpStart = streamRuntimeSource.indexOf('async function startStreamPump')
-    const pumpEnd = streamRuntimeSource.indexOf('return {startStreamPump, startAutoContinuation}', pumpStart)
-    const pump = streamRuntimeSource.slice(pumpStart, pumpEnd)
-    assert.doesNotMatch(pump, /setImmediate\(\(\) => \{\s*void startAutoContinuation/)
-    assert.match(pump, /void startAutoContinuation\(sessionId, s2, autoContinuationRequest\)/)
 })
 
 test('停止会话先失效 rebuild token，异步续跑完成后不能复活任务', () => {
@@ -116,7 +105,27 @@ test('停止会话先失效 rebuild token，异步续跑完成后不能复活任
     const invalidate = stop.indexOf("sessionCoordinator.cancel(session, 'stop_generation')")
     const close = stop.indexOf('await closeSessionRuntime')
     assert.ok(invalidate >= 0 && close > invalidate)
-    assert.match(stop, /session\._autoContinuationRequest = null/)
+    assert.doesNotMatch(stop, /_autoContinuationRequest/)
     assert.match(coordinatorSource, /invalidate\(session\)/)
     assert.match(coordinatorSource, /session\._rebuildId = null/)
+})
+
+test('Gateway 重启恢复只投影可继续状态，不自动恢复普通任务', () => {
+    const restoreStart = sessionMutationSource.indexOf('const persistedTaskState = repairPersistedTaskState')
+    const restoreEnd = sessionMutationSource.indexOf('queueMicrotask(() => reconcileTaskNotificationIntents', restoreStart)
+    assert.ok(restoreStart >= 0 && restoreEnd > restoreStart)
+    const restore = sessionMutationSource.slice(restoreStart, restoreEnd)
+
+    assert.match(restore, /recoverTaskState\(createdSession\.taskState\)/)
+    assert.doesNotMatch(restore, /startAutoContinuation\(/)
+    assert.doesNotMatch(restore, /resumeWaitingCoordinatorTask\(/)
+
+    const bootStart = startupRuntimeSource.indexOf('async function bootGateway')
+    const bootEnd = startupRuntimeSource.indexOf('return {bootGateway}', bootStart)
+    const boot = startupRuntimeSource.slice(bootStart, bootEnd)
+    assert.match(boot, /resumeScheduledTasks\(\)/)
+    assert.doesNotMatch(boot, /startAutoContinuation\(/)
+    assert.doesNotMatch(boot, /resumeWaitingCoordinatorTask\(/)
+
+    assert.doesNotMatch(streamRuntimeSource, /async function startAutoContinuation/)
 })

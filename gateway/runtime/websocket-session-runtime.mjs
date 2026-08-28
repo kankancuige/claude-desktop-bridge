@@ -142,14 +142,18 @@ export function createWebSocketSessionRuntime(deps = {}) {
                 updateTaskState(s, sessionId, {...(s.taskState || {}), permissionMode: newPerm})
                 persistSessionCatalogSettings(s, sessionId, {permissionMode: newPerm})
                 log.info({sessionId: sessionId?.slice(0,8), permissionMode: newPerm}, 'permissionMode 变更 (即时)')
-                if (newPerm === 'bypassPermissions' && s.pending) {
-                    for (const [rid, entry] of s.pending) {
-                        if (entry.type === 'permission') {
-                            settlePending(sessionId, rid, {behavior: 'allow', updatedInput: entry.input}, 'auto')
-                        }
+            }
+            const resolvedRequestIds = []
+            // 全自动是会话层的授权承诺：即使模式值未变化，也收口竞态窗口内留下的权限请求。
+            if (newPerm === 'bypassPermissions' && s.pending) {
+                for (const [rid, entry] of [...s.pending]) {
+                    if (entry.type !== 'permission') continue
+                    if (settlePending(sessionId, rid, {behavior: 'allow', updatedInput: entry.input}, 'auto')) {
+                        resolvedRequestIds.push(String(rid))
                     }
                 }
             }
+            ws.send(JSON.stringify({type: 'setting_changed', permissionMode: newPerm, resolvedRequestIds}))
             return
         }
         // 桌面端权限/方案选择响应

@@ -59,7 +59,6 @@ export function createSessionStopRuntime({
                 // 否则 taskWorkflowPending 会继续把已经停止的会话判定为 active。
                 clearTaskWorkflowGate(session._taskWorkflowGate)
                 session._internalWorkflowResultTurnId = null
-                session._autoContinuationRequest = null
                 session.autoContinuationCount = 0
                 session.autoContinuationTurns = 0
                 sessionCoordinator.cancel(session, 'stop_generation')
@@ -75,6 +74,21 @@ export function createSessionStopRuntime({
                 session._generating = false
                 session.activeTurnId = null
                 session.activeTurnIdentity = null
+                session.lastSessionId = session.lastSessionId || sessionId
+                const completedAt = Date.now()
+                session.taskCompletedAt = completedAt
+                const startedAt = Number(session.taskStartedAt || session.taskState?.startedAt || completedAt)
+                updateTaskCompletion(session, sessionId, {type: 'user_stopped', detail: '用户已暂停任务'})
+                updateTaskState(session, sessionId, taskStateForStop({
+                    ...(session.taskState || {}),
+                    sdkSessionId: session.lastSessionId,
+                    historySessionId: session.lastSessionId,
+                    startedAt,
+                    completedAt,
+                    durationMs: Math.max(0, completedAt - startedAt),
+                }))
+                appendSessionEvent(session, 'runtime/stopped', {turnId: null, cancelledInputs, durationMs: session.taskState.durationMs})
+                getBroadcastTurn()(sessionId, {type: 'generation_stopped', turnId: null, durationMs: session.taskState.durationMs, taskState: getTaskStateForClient()(session.taskState)})
                 broadcastTaskLifecycle(sessionId)
                 return {stopped: true, scope: 'workflow', cancelledInputs, turnId: null}
             }
@@ -86,7 +100,6 @@ export function createSessionStopRuntime({
             if (session.coordinatorTaskId && taskWorkbench) taskWorkbench.recordTaskEvent(session.coordinatorTaskId, {type: 'task/paused', detail: '用户已暂停任务'})
             clearTaskWorkflowGate(session._taskWorkflowGate)
             session._internalWorkflowResultTurnId = null
-            session._autoContinuationRequest = null
             session.autoContinuationCount = 0
             session.autoContinuationTurns = 0
             sessionCoordinator.cancel(session, 'stop_generation')
@@ -106,7 +119,11 @@ export function createSessionStopRuntime({
             const completedAt = Date.now()
             session.taskCompletedAt = completedAt
             const startedAt = Number(session.taskStartedAt || session.taskState?.startedAt || completedAt)
-            updateTaskState(session, sessionId, taskStateForStop({sdkSessionId: session.lastSessionId, historySessionId: session.lastSessionId, startedAt, completedAt, durationMs: Math.max(0, completedAt - startedAt)}))
+            updateTaskState(session, sessionId, taskStateForStop({
+                ...(session.taskState && typeof session.taskState === 'object' ? session.taskState : {}),
+                sdkSessionId: session.lastSessionId, historySessionId: session.lastSessionId,
+                startedAt, completedAt, durationMs: Math.max(0, completedAt - startedAt),
+            }))
             appendSessionEvent(session, 'runtime/stopped', {turnId: stoppedTurnId, cancelledInputs, durationMs: session.taskState.durationMs})
             getBroadcastTurn()(sessionId, {type: 'generation_stopped', turnId: stoppedTurnId, durationMs: session.taskState.durationMs, taskState: getTaskStateForClient()(session.taskState)}, stoppedTurnIdentity)
             broadcastTaskLifecycle(sessionId)

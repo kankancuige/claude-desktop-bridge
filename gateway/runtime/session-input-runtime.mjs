@@ -81,6 +81,14 @@ export function createSessionInputRuntime({
         return Boolean(session._generating || session.activeTurnId || session._rebuildPromise || session._pendingInputs?.length)
     }
 
+    function latestToolActivityAt(session) {
+        let latest = 0
+        for (const entry of session?._activeTools?.values?.() || []) {
+            latest = Math.max(latest, Number(entry?.lastProgressAt || entry?.startedAt || 0))
+        }
+        return latest
+    }
+
     function armStreamWatchdog(sessionId, session, query) {
         if (!session || !query || session.query !== query || streamIdleTimeoutMs <= 0) return
         // 长连接 query 在等待用户首条消息时也会存在，不能把它当成正在执行的回合。
@@ -105,6 +113,13 @@ export function createSessionInputRuntime({
                 ? Math.min(idleTimeout, 5 * 60 * 1000)
                 : hasActiveTool ? toolIdleTimeout : idleTimeout
             const remainingMs = Math.max(0, maxDuration - elapsedMs)
+            const activityAt = hasActiveTool
+                ? latestToolActivityAt(session) || Number(session._lastSdkEventAt || startedAt)
+                : Number(session._lastSdkEventAt || startedAt)
+            const idleAgeMs = Math.max(0, now() - activityAt)
+            const remainingIdleMs = hasPendingConfirmation
+                ? idleWindowMs
+                : Math.max(0, idleWindowMs - idleAgeMs)
             session._streamWatchdogTimer = setTimer(() => {
                 if (sessions.get(sessionId) !== session || session.query !== query || !hasActiveStreamWork(session) || !sessionCoordinator.isTimeoutCurrent(session, query)) {
                     session._streamWatchdogTimer = null
@@ -113,12 +128,20 @@ export function createSessionInputRuntime({
                 const currentStartedAt = Number(session.taskStartedAt || session._streamWatchdogStartedAt || now())
                 const currentElapsedMs = Math.max(0, now() - currentStartedAt)
                 if (currentElapsedMs < maxDuration) {
-                    // 重新读取状态：工具可能在本次计时期间开始、推进或结束。
+                    // 确认请求有独立 timeout；仍在等待时不与用户交互计时竞争。
                     if (session.pending?.size > 0) {
                         schedule()
                         return
                     }
-                    if (session._activeTools?.size > 0) {
+                    const configuredNow = typeof getStreamTimeoutConfig === 'function' ? getStreamTimeoutConfig() : null
+                    const activeToolNow = Boolean(session._activeTools?.size)
+                    const currentWindowMs = activeToolNow
+                        ? (Number(configuredNow?.toolIdleTimeoutMs) > 0 ? configuredNow.toolIdleTimeoutMs : streamToolIdleTimeoutMs)
+                        : (Number(configuredNow?.idleTimeoutMs) > 0 ? configuredNow.idleTimeoutMs : streamIdleTimeoutMs)
+                    const currentActivityAt = activeToolNow
+                        ? latestToolActivityAt(session) || Number(session._lastSdkEventAt || currentStartedAt)
+                        : Number(session._lastSdkEventAt || currentStartedAt)
+                    if (Math.max(0, now() - currentActivityAt) < currentWindowMs) {
                         schedule()
                         return
                     }
@@ -141,7 +164,11 @@ export function createSessionInputRuntime({
                 const completedAt = Date.now()
                 session.taskCompletedAt = completedAt
                 const startedAt = Number(session.taskStartedAt || session.taskState?.startedAt || completedAt)
-                updateTaskState(session, sessionId, taskStateForError(new Error(detail), {sdkSessionId: session.lastSessionId, historySessionId: session.lastSessionId, startedAt, completedAt, durationMs: Math.max(0, completedAt - startedAt)}))
+                updateTaskState(session, sessionId, taskStateForError(new Error(detail), {
+                    ...(session.taskState && typeof session.taskState === 'object' ? session.taskState : {}),
+                    sdkSessionId: session.lastSessionId, historySessionId: session.lastSessionId,
+                    startedAt, completedAt, durationMs: Math.max(0, completedAt - startedAt),
+                }))
                 appendSessionEvent(session, 'runtime/failed', {turnId: session.taskState.turnId, code: 'stream_idle_timeout', durationMs: session.taskState.durationMs})
                 getBroadcastTurn()(sessionId, {type: 'error', code: 'stream_idle_timeout', message: detail, durationMs: session.taskState.durationMs, taskState: getTaskStateForClient()(session.taskState)}, timeoutIdentity)
                 broadcastTaskLifecycle(sessionId)
@@ -157,7 +184,7 @@ export function createSessionInputRuntime({
                     const controller = session.queryOpts?.abortController
                     if (controller && !controller.signal.aborted) controller.abort('stream_idle_timeout')
                 }
-            }, Math.min(idleWindowMs, remainingMs))
+            }, Math.min(remainingIdleMs, remainingMs))
             session._streamWatchdogTimer.unref?.()
         }
         schedule()

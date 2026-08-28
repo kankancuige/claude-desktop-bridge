@@ -17,9 +17,9 @@ const desktopRuntimeDeps = {
     broadcastDesktop() {},
 }
 
-function createConnectedRuntime({decisionToResult, settlePending}) {
+function createConnectedRuntime({decisionToResult, settlePending, permissionMode = 'default'} = {}) {
     const wss = new FakeWss()
-    const session = {pending: new Map(), clients: new Set(), mirrors: {}}
+    const session = {pending: new Map(), clients: new Set(), mirrors: {}, permissionMode}
     createWebSocketSessionRuntime({
         ...desktopRuntimeDeps,
         wss, controlClients: new Set(), sessions: new Map([['s', session]]), IM_SOURCES: new Set(),
@@ -100,4 +100,50 @@ test('choice_response 完整时只结算一次并返回 confirmed', async () => 
     await new Promise(resolve => setImmediate(resolve))
     assert.equal(settlements, 1)
     assert.equal(sent.at(-1).code, 'confirmed')
+})
+
+test('切换为全部自动会结算已有权限请求并返回服务端确认', async () => {
+    const settlements = []
+    const {session, ws, sent} = createConnectedRuntime({
+        settlePending: (_sessionId, requestId, result, wonBy) => {
+            settlements.push({requestId, result, wonBy})
+            session.pending.delete(requestId)
+            return true
+        },
+    })
+    session.pending.set('p1', {type: 'permission', toolName: 'Bash', input: {command: 'npm test'}})
+    session.pending.set('c1', {type: 'choice', toolName: 'AskUserQuestion', input: {questions: []}})
+
+    ws.emit('message', Buffer.from(JSON.stringify({type: 'setting_change', permissionMode: 'bypassPermissions'})))
+    await new Promise(resolve => setImmediate(resolve))
+
+    assert.deepEqual(settlements, [{
+        requestId: 'p1', result: {behavior: 'allow', updatedInput: {command: 'npm test'}}, wonBy: 'auto',
+    }])
+    assert.equal(session.pending.has('p1'), false)
+    assert.equal(session.pending.has('c1'), true)
+    assert.deepEqual(sent.find(item => item.type === 'setting_changed'), {
+        type: 'setting_changed', permissionMode: 'bypassPermissions', resolvedRequestIds: ['p1'],
+    })
+})
+
+test('重复选择全部自动仍会幂等结算竞态中遗留的权限请求', async () => {
+    const settlements = []
+    const {session, ws, sent} = createConnectedRuntime({
+        permissionMode: 'bypassPermissions',
+        settlePending: (_sessionId, requestId) => {
+            settlements.push(requestId)
+            session.pending.delete(requestId)
+            return true
+        },
+    })
+    session.pending.set('late-permission', {type: 'permission', toolName: 'Edit', input: {file_path: 'a.txt'}})
+
+    ws.emit('message', Buffer.from(JSON.stringify({type: 'setting_change', permissionMode: 'bypassPermissions'})))
+    await new Promise(resolve => setImmediate(resolve))
+
+    assert.deepEqual(settlements, ['late-permission'])
+    assert.deepEqual(sent.find(item => item.type === 'setting_changed'), {
+        type: 'setting_changed', permissionMode: 'bypassPermissions', resolvedRequestIds: ['late-permission'],
+    })
 })

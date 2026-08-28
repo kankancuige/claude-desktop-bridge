@@ -57,7 +57,9 @@ export function buildContinuationPrompt({originalTask, reason}: {originalTask: s
   const goal = String(originalTask || '').trim() || '当前会话中尚未完成的任务'
   const interruption = reason === 'max_turns'
     ? '上一执行片段达到单次最大轮数'
-    : '上一执行片段异常中断'
+    : reason === 'stopped'
+      ? '上一执行片段由用户暂停'
+      : '上一执行片段异常中断'
   return [
     '继续执行同一个未完成任务，不要把本消息当成新的独立需求。',
     `原始任务：${goal}`,

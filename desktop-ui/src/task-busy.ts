@@ -1,5 +1,5 @@
 const ACTIVE_PARENT_PHASES = new Set(['running', 'reviewing', 'changes_required', 'fixing'])
-const TERMINAL_PARENT_PHASES = new Set(['succeeded', 'incomplete', 'failed', 'review_paused'])
+const TERMINAL_PARENT_PHASES = new Set(['succeeded', 'incomplete', 'failed', 'review_paused', 'stopped', 'interrupted'])
 
 export interface TaskBusyInput {
   lifecycleActive?: unknown

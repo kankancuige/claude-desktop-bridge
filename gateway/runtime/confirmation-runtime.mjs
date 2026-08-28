@@ -1,5 +1,6 @@
 import {buildAgentToolLifecycleEvent} from '../agents/agent-tool-lifecycle.mjs'
 import {randomUUID} from 'node:crypto'
+import {settleSessionToolConfirmation} from '../sessions/session-tool-activity.mjs'
 
 export function normalizeChoiceQuestions(rawQuestions) {
     const seen = new Map()
@@ -28,6 +29,7 @@ export function createConfirmationRuntime({
     now = () => Date.now(),
     timeoutMs = 5 * 60 * 1000,
     requestNamespace = randomUUID(),
+    onSettled = () => {},
 } = {}) {
     if (!sessions || typeof broadcastTurn !== 'function' || typeof broadcast !== 'function'
         || typeof shouldRouteMirror !== 'function') {
@@ -55,6 +57,7 @@ export function createConfirmationRuntime({
         entry.settled = true
         if (entry.timeout) clearTimeout(entry.timeout)
         session.pending.delete(requestId)
+        settleSessionToolConfirmation(session, entry, now())
         const resolvers = Array.isArray(entry.resolvers) && entry.resolvers.length ? entry.resolvers : [entry.resolve]
         for (const resolve of resolvers) {
             try { resolve?.(result) } catch (error) { logger.debug({err: error}, '确认结果释放失败') }
@@ -68,6 +71,7 @@ export function createConfirmationRuntime({
             type: 'confirmation_resolved', requestId,
             confirmationType: entry.type, toolName: entry.toolName,
             decision: result?.behavior || 'unknown', wonBy,
+            pendingCount: session.pending.size,
             turnId: entry.turnId || null,
         }, entry.userId ? {source: entry.source, userId: entry.userId} : null)
         for (const hook of getConfirmHooks() || []) {
@@ -77,6 +81,8 @@ export function createConfirmationRuntime({
             }) }
             catch (error) { logger.debug({err: error}, '确认适配器收口失败') }
         }
+        try { onSettled(sessionId, session, entry, result, wonBy) }
+        catch (error) { logger.debug({err: error}, '确认结算后的运行态刷新失败') }
         const nextPending = [...session.pending.values()].find(item => !item?.settled)
         if (nextPending) broadcastDesktop(sessionId, confirmationRequestEvent(nextPending))
         return true

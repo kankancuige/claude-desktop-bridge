@@ -45,6 +45,7 @@ import {
   removeSessionDraft,
   SESSION_DRAFTS_STORAGE_KEY,
   sessionDraftKey,
+  shouldPresentSessionDraftInComposer,
   shouldRestoreSessionDraft,
   upsertSessionDraft,
   writeSessionDraftStore,
@@ -86,6 +87,7 @@ import {
   type TaskActivityState,
 } from '../task-activity'
 import {isTaskBusy} from '../task-busy'
+import {resolveComposerTaskAction} from '../task-pause-control'
 import {createSessionLifecycleState, reduceSessionLifecycle, wasSessionGeneratingAtSocketClose, type SessionLifecycleState} from '../task-lifecycle'
 import {
   buildContinuationPrompt,
@@ -694,8 +696,16 @@ function messageRenderKey(message: Message): string {
 
 function clearStaleContinuationActions() {
   for (const item of messages.value) {
-    if (item.taskResult?.continuationReason === 'execution_error') item.taskResult.resumable = false
+    if (item.taskResult?.resumable) item.taskResult.resumable = false
   }
+}
+
+/** 可恢复终态必须等待输入框播放按钮，任何队列重放都不能绕过该入口。 */
+function canAutoFlushQueue(
+  taskState: PersistedTaskState | null = tabTaskState.value,
+  lifecycle: SessionLifecycleState = sessionLifecycle.value,
+): boolean {
+  return taskState?.resumable !== true && lifecycle.canContinue !== true
 }
 
 function currentActivityMessage(): Message | null {
@@ -1235,11 +1245,16 @@ function restoreDraftForTab(tab: TabSession): boolean {
   if (!draft || !draft.text.trim() || inputText.value.trim()) return false
   const taskState = tabTaskState.value || tab.state.taskState
   if (!shouldRestoreSessionDraft(draft, taskState)) return false
+  if (!shouldPresentSessionDraftInComposer(draft, taskState)) return false
   inputText.value = draft.text
-  if (draft.interrupted) {
-    messages.value.push({role: 'system', text: '上次任务在这里中断，已恢复未发送内容。请确认后继续发送。', time: Date.now()})
-  }
   return true
+}
+
+function getInterruptedTaskText(tab: TabSession | null | undefined): string {
+  if (!tab) return ''
+  const key = sessionDraftKey(draftIdentity(tab))
+  const draft = key ? getSessionDraft(sessionDraftStore, key) : null
+  return draft?.interrupted ? draft.text.trim() : ''
 }
 
 function clearCompletedTaskDraftForTab(tab: TabSession, taskText: string) {
@@ -1279,6 +1294,7 @@ function writeWorkspaceShellNow() {
         label: tab.label,
         sessionId: state.sessionId,
         historySessionId: tab.historySessionId,
+        taskState: state.taskState as Record<string, unknown> | null,
       }
     })
     writeWorkspaceShell(localStorage, STORAGE_KEY_WORKSPACE, {
@@ -1331,6 +1347,8 @@ async function restoreWorkspaceShell() {
     tab.id = saved.id
     tab.historySessionId = saved.historySessionId
     tab.state.sessionId = saved.sessionId
+    tab.state.taskState = saved.taskState as PersistedTaskState | null
+    if (saved.taskState?.status) tab.state.status = String(saved.taskState.status)
     refreshTabLabel(tab)
     tabSessions.value.push(tab)
   }
@@ -1362,7 +1380,7 @@ async function switchToTab(tabId: string, validateCurrentRuntime = false) {
     let sessionMissing = false
     const checkedRuntimeSessionId = tab.state.sessionId
     try {
-      const check = await apiFetch(`${GW}/api/sessions/${checkedRuntimeSessionId}/exists`)
+      const check = await apiFetch(`${GW}/api/sessions/${checkedRuntimeSessionId}/exists?workDir=${encodeURIComponent(tab.projectPath)}`)
       if (activeTabId.value !== tab.id || tab.state.sessionId !== checkedRuntimeSessionId) return
       const checkData = check.ok ? await check.json() : null
       if (activeTabId.value !== tab.id || tab.state.sessionId !== checkedRuntimeSessionId) return
@@ -1372,8 +1390,11 @@ async function switchToTab(tabId: string, validateCurrentRuntime = false) {
         response: checkData,
         historySessionId: tab.historySessionId,
         fallbackSessionId: checkedRuntimeSessionId,
+        taskState: tab.state.taskState || checkData?.taskState,
       })
       if (recovery.kind === 'recreate') {
+        // 已知 SDK history ID 时必须按该 ID resume；recover-only 不加载 transcript，
+        // 会把重启后的历史会话显示成无上下文并诱发二次点击新建 Tab。
         sessionMissing = true
         throw new Error('Gateway 运行会话已失效')
       }
@@ -1394,6 +1415,13 @@ async function switchToTab(tabId: string, validateCurrentRuntime = false) {
         syncCurrentTabState()
         persistWorkspaceShell()
         showToast('原运行会话无法恢复，请重新发送任务', 6000)
+        return
+      }
+      if (recovery.kind === 'recover') {
+        sessionMissing = false
+        const persistedTaskState = checkData?.taskState
+        if (persistedTaskState && typeof persistedTaskState === 'object') tab.state.taskState = persistedTaskState as PersistedTaskState
+        await _doHandleNewSession(tab.projectPath, encodeProjectName(tab.projectPath), undefined, true, undefined, recovery.sessionId)
         return
       }
       if (recovery.kind === 'unavailable') throw new Error(`Gateway 会话状态不可用（${recovery.reason}）`)
@@ -1473,7 +1501,8 @@ async function switchToTab(tabId: string, validateCurrentRuntime = false) {
   activeSessionId.value = tab.historySessionId
   ws = tab.websocket
   nextTick(() => scrollDown())
-  if (ws?.readyState === WebSocket.OPEN && status.value === 'idle' && msgQueue.value.length > 0) {
+  if (ws?.readyState === WebSocket.OPEN && status.value === 'idle' && msgQueue.value.length > 0
+      && canAutoFlushQueue(tab.state.taskState as PersistedTaskState | null)) {
     void flushMsgQueue()
   }
   // 通知 Gateway 切换 IM 消息注入目标 + 同步镜像开关
@@ -2042,7 +2071,7 @@ interface AgentRun {
   task?: string
   scope?: string
   descriptionSource?: string
-  status: 'spawning' | 'running' | 'paused' | 'done' | 'error'
+  status: 'spawning' | 'running' | 'paused' | 'blocked' | 'done' | 'error'
   spawnTime: number;
   startTime: number;
   doneTime: number
@@ -2170,7 +2199,6 @@ interface WfRunState {
 
 const wfRunState = ref<WfRunState | null>(null)
 const showWfPanel = ref(false)
-const wfNewBudget = ref(0)
 
 // 从 workflow_log 消息中提取 agent 状态和任务描述
 function parseWfAgentLog(msg: string): WfAgentInfo | null {
@@ -2268,9 +2296,6 @@ const msgQueue = ref<QItem[]>([])
 const pendingInputTexts = new Map<string, PendingInput>()
 /** 最近一次 sendMessage 的用户原文，取消任务时回填到输入框 */
 let lastUserMessage = ''
-/** 队列自增 ID 计数器 */
-let queueId = 0
-
 /** 过滤后的项目列表：根据搜索关键词筛选（不区分大小写，匹配 workDir 路径），并排除已隐藏的项目 */
 const filteredProjects = computed(() => {
   const q = projectSearch.value.toLowerCase()
@@ -2746,10 +2771,12 @@ async function handleForkSession(workDir: string, encodedDir: string, sourceSess
   return promise
 }
 
-async function _doHandleNewSession(workDir: string, encodedDir?: string, histSessionId?: string, preserveExistingState = false, forkFrom?: string) {
+async function _doHandleNewSession(workDir: string, encodedDir?: string, histSessionId?: string, preserveExistingState = false, forkFrom?: string, recoverSessionId?: string) {
   syncCurrentTabState()
 
-  const existingTab = forkFrom ? undefined : findSessionTab(
+  const existingTab = recoverSessionId
+    ? tabSessions.value.find(item => item.projectPath.toLowerCase() === workDir.toLowerCase() && item.state.sessionId === recoverSessionId)
+    : forkFrom ? undefined : findSessionTab(
     tabSessions.value.map(item => ({
       ...item,
       gatewaySessionId: item.state.sessionId,
@@ -2811,7 +2838,7 @@ async function _doHandleNewSession(workDir: string, encodedDir?: string, histSes
     // 模型目录已有上下文窗口时，连接建立前先解除未知态；SDK 快照随后会提供精确值。
     if (curModelInfo?.contextWindow) applyKnownContextWindow(curModelInfo.contextWindow)
     const body: any = {
-      ...buildSessionCreateRequest({workDir, resume: histSessionId, forkFrom}),
+      ...buildSessionCreateRequest({workDir, resume: histSessionId, forkFrom, recoverSessionId}),
       ...buildModelSelectionPayload({
         mode: modelMode.value,
         model: model.value,
@@ -3218,21 +3245,59 @@ async function connectControlWS(forceRefresh = false) {
  * WebSocket 生命周期：onopen 标记 connected，onmessage 分发到各 type 处理分支，onclose/onerror 重置状态。
  * 注意：ws 是模块级非响应式变量（let），避免 Vue Proxy 干扰 WebSocket 原生事件。
  */
-function resendPendingInputs(socket: WebSocket, targetSessionId: string): number {
-  const pending = [...pendingInputTexts.values()]
-    .filter(item => item.sessionId === targetSessionId)
-    .sort((a, b) => a.createdAt - b.createdAt)
-  let sent = 0
-  for (const item of pending) {
-    try {
-      socket.send(JSON.stringify(item.payload))
-      sent++
-    } catch (error) {
-      console.warn('重发未确认消息失败，保留到下次重连', error)
-      break
-    }
+function projectSessionInterruption(
+  tab: TabSession | null | undefined,
+  targetSessionId: string,
+  foreground: boolean,
+  detail: string,
+): boolean {
+  if (!tab) return false
+  const pending = [...pendingInputTexts.entries()]
+    .filter(([, item]) => item.sessionId === targetSessionId)
+  const lifecycle = foreground ? sessionLifecycle.value : tab.state.sessionLifecycle
+  const interrupted = wasSessionGeneratingAtSocketClose({
+    foreground,
+    foregroundStatus: status.value,
+    tabStatus: tab.state.status,
+  }) || lifecycle.active || lifecycle.awaitingAcceptance || pending.length > 0
+  if (!interrupted) return false
+
+  const queued = foreground ? msgQueue.value : tab.state.msgQueue
+  const recoveryText = [...new Set([
+    foreground ? lastUserMessage : tab.state.lastUserMessage,
+    ...pending.map(([, item]) => item.text),
+    ...queued.map(item => item.originalText || item.text),
+  ].map(text => String(text || '').trim()).filter(Boolean))].join('\n\n')
+  if (recoveryText) saveDraftForTab(tab, recoveryText, true)
+
+  // 未确认输入的服务端接收结果未知，重连后自动重发可能造成重复副作用。
+  for (const [messageId, item] of pending) {
+    for (const attachment of item.message.attachments || []) attachment.status = 'failed'
+    pendingInputTexts.delete(messageId)
   }
-  return sent
+  tab.state.msgQueue = []
+  tab.state.status = 'idle'
+  tab.state.taskState = {
+    ...(tab.state.taskState || {}),
+    status: 'interrupted',
+    outcome: 'failed',
+    continuationReason: 'execution_error',
+    resumable: true,
+    detail,
+    updatedAt: Date.now(),
+  }
+  tab.state.sessionLifecycle = reduceSessionLifecycle(lifecycle, {
+    type: 'stream_error',
+    taskState: tab.state.taskState,
+  })
+  if (foreground) {
+    msgQueue.value = []
+    status.value = 'idle'
+    tabTaskState.value = tab.state.taskState
+    sessionLifecycle.value = tab.state.sessionLifecycle
+  }
+  persistWorkspaceShell()
+  return true
 }
 
 interface SessionReconnectState {
@@ -3299,14 +3364,12 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
     if (reconnectState?.timer) clearTimeout(reconnectState.timer)
     const reconnectAttempts = reconnectState?.attempts || 0
     if (myTabId) sessionReconnectStates.set(myTabId, {timer: null, delay: 1000, attempts: 0})
-    const resent = resendPendingInputs(thisWs, mySid)
-    if (resent > 0 && tab) tab.state.status = 'thinking'
     // 重连后自动恢复队列中的消息发送（flush 中途断连时回填了队列）
-    if (isFg() && msgQueue.value.length > 0) void flushMsgQueue()
+    if (isFg() && msgQueue.value.length > 0
+        && canAutoFlushQueue(tab?.state.taskState as PersistedTaskState | null)) void flushMsgQueue()
     if (isFg()) {
       connected.value = true
       if (reconnectAttempts > 0) showToast('会话连接已恢复')
-      if (resent > 0) status.value = 'thinking'
       syncPetState('connected', { message: 'Connected', bubble: petPick(BUBBLE_CONNECTED, myProject) })
       const label = resumed
           ? t('sys.connectedResume', {id: sid.slice(0, 8)})
@@ -3433,7 +3496,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         }
         status.value = msg.active === true ? 'thinking' : 'idle'
         if (msg.active !== true && msg.task && typeof msg.task === 'object') restoreDraftForTab(tab)
-        if (msg.active !== true && msg.capabilities?.canSend === true && fg) {
+        if (msg.active !== true && msg.capabilities?.canSend === true && fg && canAutoFlushQueue()) {
           nextTick(() => { void flushMsgQueue() })
         }
         break
@@ -3499,7 +3562,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         if (!snapshotGenerating) restoreDraftForTab(tab)
         taskActivity.value = reconcileTaskActivitySnapshot(taskActivity.value, msg)
         syncTaskActivityMessage()
-        if (msg.taskState?.status === 'interrupted' && msg.taskState?.resumable && fg && !wasThinking
+        if (msg.taskState?.status === 'interrupted' && fg && !wasThinking
             && !messages.value.some(item => item.taskResult?.resumable && item.taskResult.continuationReason === 'execution_error')) {
           const draftKey = sessionDraftKey(draftIdentity(tab))
           const originalTask = (draftKey ? getSessionDraft(sessionDraftStore, draftKey)?.text : '')
@@ -3591,6 +3654,22 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
           : String(msg.message || '设置未应用')
         appendSessionError(detail, {key: `setting-rejected:${String(msg.code || detail)}`, scroll: fg, prefix: '设置失败'})
         if (fg) showToast(detail, 5000)
+        break
+      }
+
+      case 'setting_changed': {
+        if (!['default', 'acceptEdits', 'plan', 'bypassPermissions'].includes(String(msg.permissionMode))) break
+        suppressPermissionSync = true
+        try { permissionMode.value = String(msg.permissionMode) } finally { suppressPermissionSync = false }
+        if (tab) tab.state.permissionMode = String(msg.permissionMode)
+        for (const requestId of Array.isArray(msg.resolvedRequestIds) ? msg.resolvedRequestIds : []) {
+          const id = String(requestId || '')
+          if (!id) continue
+          resolvedConfirmationIds.value.add(id)
+          if (pendingPermission.value?.requestId === id) pendingPermission.value = null
+          if (confirmationSubmitting.value === id) confirmationSubmitting.value = null
+        }
+        syncCurrentTabState()
         break
       }
 
@@ -3699,7 +3778,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
             compact: {trigger: msg.trigger || 'auto'},
           })
         }
-        if (msg.taskState?.status === 'review_paused' && msg.taskState?.resumable && fg
+        if (msg.taskState?.status === 'review_paused' && fg
             && !messages.value.some(item => item.role === 'system' && item.text === String(msg.taskState.detail || ''))) {
           messages.value.push({
             role: 'system',
@@ -3995,7 +4074,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
           if (pendingPermission.value?.requestId === msg.requestId) pendingPermission.value = null
           if (pendingChoice.value?.requestId === msg.requestId) pendingChoice.value = null
           confirmationSubmitting.value = null
-          messages.value.push({role: 'system', text: '确认已提交，AI 正在继续执行', time: Date.now()})
+          messages.value.push({role: 'system', text: '确认已提交，等待 AI 返回进度', time: Date.now()})
         } else {
           confirmationSubmitting.value = null
           showToast(msg.message || '确认请求已失效或已由其他端处理', 5000)
@@ -4125,7 +4204,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
             setTimeout(() => { syncPetState('idle'); petBubble.value = '' }, 3000)
             loadCheckpoints()
             if (showFilePanel.value) loadFileTree()
-            void flushMsgQueue()
+            if (canAutoFlushQueue()) void flushMsgQueue()
           }
         } else if (msg.type === 'task_write_delegated') {
           status.value = 'thinking'
@@ -4167,7 +4246,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         if (msg.taskState && typeof msg.taskState === 'object') tabTaskState.value = msg.taskState as PersistedTaskState
         // 主任务停止会先于 Workflow 子 Agent 的异步终止事件到达；
         // 先收口本地镜像，避免 Query 已关闭但界面仍把 Agent 判为运行中。
-        if (wfRunState.value && (wfRunState.value.status === 'running' || wfRunState.value.status === 'starting')) {
+        if (wfRunState.value && wfRunState.value.status === 'running') {
           wfRunState.value.status = 'paused'
         }
         for (const ag of agentRuns.value) {
@@ -4178,7 +4257,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         }
         messages.value.push({
           role: 'system',
-          text: '任务已停止',
+          text: t('ws.taskPaused'),
           time: Date.now(),
           taskResult: {
             outcome: 'failed', continuationReason: 'stopped', resumable: true, originalTask: lastUserMessage,
@@ -4197,7 +4276,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
         const eventStatus = String(eventTaskState?.status || '')
         const terminalTaskState = ['succeeded', 'failed', 'incomplete', 'interrupted', 'stopped', 'review_paused'].includes(eventStatus)
         const resumableFromState = terminalTaskState
-          ? eventStatus !== 'succeeded' && eventTaskState?.resumable === true
+          ? eventStatus !== 'succeeded'
           : Boolean(tab.historySessionId)
         const detail = msg.message || msg.error || msg.detail || (msg.type === 'stream_error' ? '响应流中断' : '会话执行异常')
         if (eventStatus === 'succeeded') {
@@ -4225,7 +4304,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
           status: 'interrupted',
           outcome: 'failed',
           continuationReason: 'execution_error',
-          resumable: Boolean(tab.historySessionId),
+          resumable: true,
           detail: sessionErrorText(detail),
           updatedAt: Date.now(),
         }
@@ -4238,7 +4317,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
           // 断流错误晚于成功聚合态到达时，历史错误气泡不能继续提供恢复按钮。
           clearStaleContinuationActions()
         }
-        if (fg) void flushMsgQueue()
+        if (fg && canAutoFlushQueue()) void flushMsgQueue()
         if (fg) {
           syncPetState(eventStatus === 'succeeded' ? 'success' : 'error', {
             message: sessionErrorText(detail).slice(0, 40),
@@ -4658,12 +4737,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
     if (ownsTabSocket && tab) tab.websocket = null
     if (ownsForegroundSocket) ws = null
     if (tab) tab.state.connected = false
-    const wasThinking = wasSessionGeneratingAtSocketClose({
-      foreground: isFg(),
-      foregroundStatus: status.value,
-      tabStatus: tab?.state.status,
-    })
-    if (wasThinking && tab) saveDraftForTab(tab, tab.state.lastUserMessage || lastUserMessage || inputText.value, true)
+    projectSessionInterruption(tab, mySid, isFg(), '会话连接中断，任务状态已保留，请从输入框继续。')
     if (isFg()) {
       connected.value = false; status.value = 'idle'
       syncPetState('disconnected', { bubble: petPick(BUBBLE_DISCONNECTED, myProject) })
@@ -4699,6 +4773,7 @@ async function connectWS(sid: string, resumed = false, forceRefresh = false) {
     if (!shouldHandleSessionSocketEvent(ownsTabSocket, ownsForegroundSocket)) return
     if (tab) tab.state.connected = false
     const foreground = isFg()
+    projectSessionInterruption(tab, mySid, foreground, '会话连接异常，任务状态已保留，请从输入框继续。')
     if (foreground) {
       dispatchBridgeNotice(classifyBridgeFailure({source: 'websocket', path: `/ws/${mySid}`, serverCode: 'SESSION_CHANNEL_ERROR'}))
       appendSessionError('会话实时连接发生异常，正在尝试恢复', {key: `ws-error:${mySid}`, prefix: '连接异常'})
@@ -4724,6 +4799,10 @@ async function requireOkResponse(response: Response, fallback: string) {
 }
 
 async function stopWf(mode: 'pause' | 'commit') {
+  if (mode === 'pause') {
+    await cancelTask()
+    return
+  }
   const name = wfRunState.value?.name
   if (!name) return
   try {
@@ -4735,53 +4814,6 @@ async function stopWf(mode: 'pause' | 'commit') {
     await requireOkResponse(response, 'Workflow 操作失败')
   } catch (error) {
     appendSessionError(error, {key: `workflow-stop:${name}:${mode}`, prefix: 'Workflow 操作失败'})
-  }
-}
-
-async function resumeWf() {
-  const name = wfRunState.value?.name
-  if (!name) return
-  const body: any = {sessionId: sessionId.value}
-  if (wfNewBudget.value > 0) body.budgetMax = wfNewBudget.value
-  try {
-    const response = await apiFetch(`${GW}/api/workflows/${encodeURIComponent(name)}/resume`, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(body),
-    })
-    await requireOkResponse(response, 'Workflow 操作失败')
-  } catch (error) {
-    appendSessionError(error, {key: `workflow-resume:${name}`, prefix: 'Workflow 操作失败'})
-  }
-}
-
-async function stopAgent(agentLabel: string) {
-  const name = wfRunState.value?.name
-  if (!name) return
-  try {
-    const response = await apiFetch(`${GW}/api/workflows/${encodeURIComponent(name)}/agents/${encodeURIComponent(agentLabel)}/stop`, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({workflowId: wfRunState.value?.wfId}),
-    })
-    await requireOkResponse(response, 'Agent 操作失败')
-  } catch (error) {
-    appendSessionError(error, {key: `agent-stop:${name}:${agentLabel}`, prefix: 'Agent 操作失败'})
-  }
-}
-
-async function resumeAgent(agentLabel: string) {
-  const name = wfRunState.value?.name
-  if (!name) return
-  try {
-    const response = await apiFetch(`${GW}/api/workflows/${encodeURIComponent(name)}/agents/${encodeURIComponent(agentLabel)}/resume`, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({workflowId: wfRunState.value?.wfId}),
-    })
-    await requireOkResponse(response, 'Agent 操作失败')
-  } catch (error) {
-    appendSessionError(error, {key: `agent-resume:${name}:${agentLabel}`, prefix: 'Agent 操作失败'})
   }
 }
 
@@ -5252,28 +5284,26 @@ function sendSessionPayload(payload: Record<string, unknown>, socket: WebSocket 
   }
 }
 
-async function continueIncompleteTask(message: Message) {
-  const result = message.taskResult
-  if (!result?.resumable || taskBusy.value) return
+async function continuePausedTask() {
+  if (composerTaskAction.value !== 'continue') return
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     showToast(t('ws.notConnected'))
     return
   }
-  const prompt = buildContinuationPrompt({
-    originalTask: result.originalTask,
-    reason: result.continuationReason,
-  })
-  // 界面显示“继续执行”，但保留原始任务作为本地恢复上下文，后续再次中断时仍能生成正确的续跑提示。
-  if (!doSend(t('ws.continueTask'), prompt, undefined, result.originalTask)) {
+  const originalTask = getInterruptedTaskText(activeTab.value)
+    || lastUserMessage
+    || [...messages.value].reverse().find(item => item.taskResult?.resumable)?.taskResult?.originalTask
+    || [...messages.value].reverse().find(item => item.role === 'user')?.text
+    || ''
+  const reason = (tabTaskState.value?.continuationReason || 'stopped') as ContinuationReason
+  const prompt = buildContinuationPrompt({originalTask, reason})
+  if (!doSend(t('ws.continueTask'), prompt, undefined, originalTask)) {
     showToast(t('ws.notConnected'))
-    return
   }
-  result.resumable = false
 }
 
 /**
- * 取消当前任务：发送 stop_generation 指令，重置状态，回填用户原文到输入框。
- * 这样用户无需重新输入即可调整后重试。
+ * 暂停当前任务：取消当前生成并保留中断恢复草稿，输入框保持为空。
  */
 const stoppingTask = ref(false)
 async function cancelTask() {
@@ -5290,7 +5320,6 @@ async function cancelTask() {
     return
   }
   if (sessionId.value) {
-    const restoredAttachments = new Map(pendingAttachments.value.map(a => [a.id, a]))
     const restoredTexts = [
       lastUserMessage,
       ...msgQueue.value.map(item => item.originalText || item.text),
@@ -5298,33 +5327,21 @@ async function cancelTask() {
         .filter(item => item.sessionId === sessionId.value)
         .map(item => item.text),
     ].map(text => String(text || '').trim()).filter(Boolean)
-    for (const item of msgQueue.value) {
-      for (const attachment of item.attachments || []) {
-        if (!attachment.autoGenerated) restoredAttachments.set(attachment.id, attachment)
-      }
-    }
     msgQueue.value = []
     for (const [messageId, pending] of pendingInputTexts) {
       if (pending.sessionId !== sessionId.value) continue
       for (const attachment of pending.message.attachments || []) attachment.status = 'failed'
-      for (const attachment of pending.attachments || []) {
-        if (!attachment.autoGenerated) restoredAttachments.set(attachment.id, attachment)
-      }
       pendingInputTexts.delete(messageId)
     }
-    pendingAttachments.value = [...restoredAttachments.values()]
-    const draftText = [...new Set(restoredTexts)].join('\n\n')
-    if (draftText) {
-      inputText.value = draftText
-      saveDraftForTab(activeTab.value, draftText, true)
-    }
+    pendingAttachments.value = []
+    const pausedTaskText = [...new Set(restoredTexts)].join('\n\n')
+    if (pausedTaskText) saveDraftForTab(activeTab.value, pausedTaskText, true)
   }
   status.value = 'idle'
-  if (lastUserMessage && !inputText.value.trim()) {
-    inputText.value = lastUserMessage
+  inputText.value = ''
+  if (messages.value.at(-1)?.text !== t('ws.taskPaused')) {
+    messages.value.push({role: 'system', text: t('ws.taskPaused'), time: Date.now()})
   }
-  lastUserMessage = ''
-  messages.value.push({role: 'system', text: t('ws.taskCanceled'), time: Date.now()})
   nextTick(() => scrollDown(true))
   stoppingTask.value = false
 }
@@ -5492,7 +5509,7 @@ async function flushMsgQueue() {
   } finally {
     flushingQueue.value = false
     if (activeTabId.value !== ownerTabId && ws?.readyState === WebSocket.OPEN
-        && !taskBusy.value && msgQueue.value.length > 0) {
+        && !taskBusy.value && msgQueue.value.length > 0 && canAutoFlushQueue()) {
       void flushMsgQueue()
     }
   }
@@ -5537,6 +5554,13 @@ const taskBusy = computed(() => isTaskBusy({
   parentPhase: parentTaskUi.value.phase,
   taskStatus: tabTaskState.value?.status,
   flushingQueue: flushingQueue.value,
+}))
+const composerTaskAction = computed(() => resolveComposerTaskAction({
+  busy: taskBusy.value,
+  canContinue: sessionLifecycle.value.canContinue || tabTaskState.value?.resumable === true,
+  taskState: tabTaskState.value,
+  text: inputText.value,
+  attachmentCount: pendingAttachments.value.length,
 }))
 
 // ═══════════════════════════════════════════
@@ -6624,11 +6648,17 @@ const thinkings = computed(() => [
 watch(permissionMode, (newVal, oldVal) => {
   if (suppressPermissionSync) return
   if (newVal === oldVal) return
+  // 新建会话尚未连接时保留本地偏好，创建任务时会随 user_message 发送；
+  // 已有会话但连接断开时必须回滚，避免界面显示的授权级别高于 Gateway 实际状态。
+  const hasSession = Boolean(sessionId.value || activeTab.value?.state.sessionId)
+  if (hasSession && !sendSessionPayload({type: 'setting_change', permissionMode: newVal})) {
+    suppressPermissionSync = true
+    try { permissionMode.value = oldVal } finally { suppressPermissionSync = false }
+    showToast(t('ws.notConnected'))
+    return
+  }
   const tab = activeTab.value
   if (tab) tab.state.permissionMode = newVal
-  if (ws && ws.readyState === 1 && !sendSessionPayload({type: 'setting_change', permissionMode: newVal})) {
-    showToast(t('ws.notConnected'))
-  }
   syncCurrentTabState()
 })
 
@@ -7232,17 +7262,6 @@ const contextOverLimit = computed(() => maxTokens.value > 0 && usage.value.total
                 <span v-if="msg.taskResult?.durationMs" class="task-result-duration">
                   总耗时 {{ formatDuration(msg.taskResult.durationMs) }}
                 </span>
-                <button
-                    v-if="msg.taskResult?.resumable"
-                    class="task-continue-btn"
-                    :disabled="taskBusy"
-                    @click="continueIncompleteTask(msg)"
-                >
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <polyline points="9 18 15 12 9 6"/>
-                  </svg>
-                  {{ t('ws.continueTask') }}
-                </button>
               </div>
             </template>
             <!-- 关键执行节点：每一步独立气泡，后续 progress/delta 不覆盖历史步骤。 -->
@@ -7283,17 +7302,6 @@ const contextOverLimit = computed(() => maxTokens.value > 0 && usage.value.total
                 <span v-if="msg.taskResult?.durationMs" class="task-result-duration">
                   总耗时 {{ formatDuration(msg.taskResult.durationMs) }}
                 </span>
-                <button
-                    v-if="msg.taskResult?.resumable"
-                    class="task-continue-btn"
-                    :disabled="taskBusy"
-                    @click="continueIncompleteTask(msg)"
-                >
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <polyline points="9 18 15 12 9 6"/>
-                  </svg>
-                  {{ t('ws.continueTask') }}
-                </button>
               </div>
             </template>
             <!-- 用户 / AI 消息气泡（含复制/回填按钮、工具调用卡片） -->
@@ -7926,23 +7934,34 @@ const contextOverLimit = computed(() => maxTokens.value > 0 && usage.value.total
                   @paste="onPaste"
                   @input="(e) => { const el = (e.target as HTMLElement); el.style.height = 'auto'; el.style.height = el.scrollHeight + 'px' }"
               ></textarea>
-              <!-- thinking 且输入框为空时：显示红色停止按钮（回填用户原文） -->
+              <!-- 运行中且无新输入时：暂停当前任务。 -->
               <button
-                  v-if="!inputText.trim() && taskBusy"
+                  v-if="composerTaskAction === 'pause'"
                   class="send-btn stop-btn"
                   :disabled="stoppingTask"
                   @click="cancelTask"
-                  :title="t('ws.stopRefill')"
+                  :title="t('ws.pauseTask')"
               >
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                   <rect x="4" y="4" width="16" height="16" rx="3"/>
                 </svg>
               </button>
-              <!-- 有输入内容或非 thinking 时：显示发送按钮（空输入时 disabled） -->
+              <!-- 暂停或异常中断后保持输入框为空，再次点击从同一会话继续。 -->
+              <button
+                  v-else-if="composerTaskAction === 'continue'"
+                  class="send-btn continue-btn"
+                  @click="continuePausedTask"
+                  :title="t('ws.resumeTask')"
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                  <path d="M8 5v14l11-7z"/>
+                </svg>
+              </button>
+              <!-- 有新输入时始终发送新任务；没有操作时保持禁用。 -->
               <button
                   v-else
                   class="send-btn"
-                  :disabled="!inputText.trim() && pendingAttachments.length === 0"
+                  :disabled="composerTaskAction === 'disabled'"
                   @click="sendMessage"
               >
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
@@ -8089,10 +8108,6 @@ const contextOverLimit = computed(() => maxTokens.value > 0 && usage.value.total
               </button>
             </template>
             <template v-else-if="wfRunState.status === 'paused'">
-              <button class="fp-icon-btn" title="恢复" @click="resumeWf()">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-              </button>
-              <input v-model.number="wfNewBudget" type="number" min="0" placeholder="新预算(token)" style="width:90px;font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:4px;background:var(--bg-raised);color:var(--text-primary)"/>
               <button class="fp-icon-btn commit-btn" title="提交当前结果" @click="stopWf('commit')">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
               </button>
@@ -8145,18 +8160,6 @@ const contextOverLimit = computed(() => maxTokens.value > 0 && usage.value.total
                     class="ag-card-time paused">{{ formatDuration(Date.now() - ag.spawnTime) }}</span>
               <span v-else-if="ag.status === 'running' && ag.spawnTime"
                     class="ag-card-time running">{{ formatDuration(Date.now() - ag.spawnTime) }}</span>
-              <!-- 恢复按钮 (仅 workflow 内 paused 的 agent) -->
-              <button v-if="wfRunState && ag.source === 'workflow' && ag.status === 'paused'"
-                      class="fp-icon-btn" style="margin-left:auto;opacity:0.7" title="恢复此 Agent"
-                      @click="resumeAgent(ag.id)">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-              </button>
-              <!-- 单 agent 暂停按钮 (仅 workflow 内 running 的 agent) -->
-              <button v-if="wfRunState && ag.source === 'workflow' && ag.status === 'running'"
-                      class="fp-icon-btn" style="margin-left:auto;opacity:0.7" title="暂停此 Agent"
-                      @click="stopAgent(ag.id)">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
-              </button>
             </div>
             <div v-if="ag.purpose || ag.description || ag.task" class="ag-card-descriptor">
               <div v-if="ag.purpose || ag.description" class="ag-card-desc" :title="ag.purpose || ag.description">
@@ -9614,29 +9617,6 @@ const contextOverLimit = computed(() => maxTokens.value > 0 && usage.value.total
   color: var(--accent-gold);
   font-size: 11px;
   line-height: 1.4;
-}
-
-.task-continue-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  min-height: 28px;
-  border: 1px solid var(--border-hover);
-  border-radius: 4px;
-  padding: 4px 9px;
-  background: var(--bg-hover);
-  color: var(--text-primary);
-  cursor: pointer;
-}
-
-.task-continue-btn:hover:not(:disabled) {
-  border-color: var(--accent-blue);
-  color: var(--accent-blue);
-}
-
-.task-continue-btn:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
 }
 
 .task-result-error {

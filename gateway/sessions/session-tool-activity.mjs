@@ -33,3 +33,17 @@ export function observeSessionToolActivity(session, sdkMsg = {}, clientEvent = n
 export function clearSessionToolActivity(session) {
     if (session?._activeTools instanceof Map) session._activeTools.clear()
 }
+
+/** 确认控制请求完成不一定伴随即时 SDK 消息，需要显式推进活动边界。 */
+export function settleSessionToolConfirmation(session, entry, timestamp = Date.now()) {
+    if (!session || !entry || typeof entry !== 'object') return
+    session._lastSdkEventAt = timestamp
+    if (!(session._activeTools instanceof Map) || !entry.toolUseId) return
+    const key = String(entry.toolUseId)
+    if (entry.type === 'choice' || entry.toolName === 'AskUserQuestion') {
+        session._activeTools.delete(key)
+        return
+    }
+    const active = session._activeTools.get(key)
+    if (active) active.lastProgressAt = timestamp
+}

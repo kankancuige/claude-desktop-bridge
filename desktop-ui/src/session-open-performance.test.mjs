@@ -7,6 +7,10 @@ const sessionCreateSection = source.slice(
   source.indexOf('async function _doHandleNewSession('),
   source.indexOf('/** IM 控制命令处理', source.indexOf('async function _doHandleNewSession(')),
 )
+const switchTabSection = source.slice(
+  source.indexOf('async function switchToTab('),
+  source.indexOf('async function focusSessionForIm(', source.indexOf('async function switchToTab(')),
+)
 
 test('创建新会话后项目扫描在后台执行，不阻塞 connecting 状态收口', () => {
   assert.ok(sessionCreateSection.length > 0, '未找到会话创建流程')
@@ -19,6 +23,23 @@ test('历史预加载失败后按最终会话身份重试，临时失败不伪�
   assert.match(sessionCreateSection, /if \(!historyLoaded && activeTabId\.value === tab\.id && tab\.historySessionId\)/)
   assert.match(sessionCreateSection, /loadHistory\(encodeProjectName\(tab\.projectPath\), tab\.historySessionId, 'replace', true\)/)
   assert.match(source, /if \(!suppressError\) messages\.value\.push\(\{role: 'error', text: t\('err\.historyLoad'\)/)
+})
+
+test('重启后 runtime 丢失时按历史 ID 恢复原 Tab 和上下文', () => {
+  const recreateSection = switchTabSection.slice(
+    switchTabSection.indexOf("if (recovery.kind === 'recreate')"),
+    switchTabSection.indexOf("if (recovery.kind === 'reset')"),
+  )
+  assert.ok(recreateSection.length > 0, '未找到 runtime 重建分支')
+  assert.match(recreateSection, /sessionMissing = true/)
+  assert.doesNotMatch(recreateSection, /_doHandleNewSession\([\s\S]*?undefined,[\s\S]*?checkedRuntimeSessionId\)/)
+
+  const missingRuntimeSection = switchTabSection.slice(
+    switchTabSection.indexOf('if (tab.historySessionId && sessionMissing)'),
+    switchTabSection.indexOf('} else {', switchTabSection.indexOf('if (tab.historySessionId && sessionMissing)')),
+  )
+  assert.match(missingRuntimeSection, /tab\.state\.sessionId = null/)
+  assert.match(missingRuntimeSection, /_doHandleNewSession\(tab\.projectPath, encodeProjectName\(tab\.projectPath\), tab\.historySessionId/)
 })
 
 test('新会话清空旧会话执行态，组件卸载不停止其他会话任务', () => {

@@ -16,6 +16,7 @@ function coordinatorJournalPayload(snapshot, event) {
 }
 
 function postgresProjection(snapshot) {
+    const metadata = snapshot.plan && typeof snapshot.plan === 'object' ? snapshot.plan : {}
     return {
         coordinator: true,
         taskId: snapshot.taskId,
@@ -38,6 +39,11 @@ function postgresProjection(snapshot) {
         startedAt: snapshot.startedAt,
         completedAt: snapshot.completedAt,
         updatedAt: snapshot.updatedAt,
+        title: metadata.title || '',
+        summary: metadata.summary || '',
+        goal: metadata.goal || '',
+        requestText: metadata.requestText || '',
+        source: metadata.source || snapshot.source || 'desktop',
     }
 }
 
@@ -67,6 +73,11 @@ export function createCoordinatorPersistence({repository = null, shadowRepositor
             startedAt: snapshot.startedAt,
             completedAt: snapshot.completedAt,
             updatedAt: snapshot.updatedAt,
+            title: snapshot.plan.title || '',
+            summary: snapshot.plan.summary || '',
+            goal: snapshot.plan.goal || '',
+            requestText: snapshot.plan.requestText || '',
+            source: snapshot.plan.source || snapshot.source || 'desktop',
             state: snapshot,
             eventType: payload.eventType,
             })

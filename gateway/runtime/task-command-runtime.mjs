@@ -61,7 +61,6 @@ export function createTaskCommandRuntime(deps = {}) {
         session._generating = false
         session.activeTurnId = null
         session.activeTurnIdentity = null
-        session._autoContinuationRequest = null
         failPendingSessionInputs?.(sessionId, session, Object.assign(new Error(detail), {code: 'task_start_failed'}))
         const completedAt = Date.now()
         session.taskCompletedAt = completedAt
@@ -77,6 +76,7 @@ export function createTaskCommandRuntime(deps = {}) {
         }
         if (!completionHandled) {
             updateTaskState?.(session, sessionId, {
+                ...(session.taskState && typeof session.taskState === 'object' ? session.taskState : {}),
                 status: 'interrupted', outcome: 'failed', continuationReason: 'execution_error', detail,
                 startedAt: session.taskStartedAt || completedAt, completedAt,
                 durationMs: Math.max(0, completedAt - Number(session.taskStartedAt || completedAt)),
@@ -260,7 +260,6 @@ export function createTaskCommandRuntime(deps = {}) {
             s._taskCompletionSequence = 0
             s._taskWorkflowGate = createTaskWorkflowGate()
             s._internalWorkflowResultTurnId = null
-            s._autoContinuationRequest = null
             s.autoContinuationCount = 0
             s.autoContinuationTurns = 0
             s._lastContextUsageAt = 0
@@ -351,7 +350,7 @@ export function createTaskCommandRuntime(deps = {}) {
         let sdkInputContent = await resolveSdkInputContent(sessionId, s, command.content)
             + (!continuingTaskInput ? buildTaskPitfallReminder(s.taskPitfallReminders) : '')
         if (s.taskContextPlan) updateTaskState(s, sessionId, {...s.taskState, context: s.taskContextPlan})
-        const nextSkillRoute = routeSkills({text: sdkInputContent, workDir: s.workDir, profile: nextProfile})
+        const nextSkillRoute = routeSkills({text: command.content, projectContext: s.projectContext || null, profile: nextProfile})
         const skillRouteChanged = JSON.stringify(nextSkillRoute) !== JSON.stringify(s.skillRoute || [])
         const nextAgentRoute = Array.isArray(s.agentRoute) ? s.agentRoute : []
         const agentRouteChanged = JSON.stringify(nextAgentRoute) !== JSON.stringify(s.loadedAgentRoute || [])

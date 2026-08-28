@@ -13,11 +13,12 @@ test('Coordinator 每个 revision 同时写 PostgreSQL 与 Session Event Journal
     const snapshot = {
         taskId: 'task-1', sessionId: 'session-1', status: 'running', phase: 'implement',
         revision: 3, sequence: 2, startedAt: 1, completedAt: 0, updatedAt: 2,
-        plan: {workDir: 'D:\\work', decision: {modelTier: 'balanced'}, steps: []},
+        plan: {workDir: 'D:\\work', title: '修复登录', summary: '处理登录超时', goal: '修复登录', requestText: '请修复登录', source: 'desktop', decision: {modelTier: 'balanced'}, steps: []},
     }
     assert.equal(persist(snapshot, {type: 'phase/started', stepId: 'step-1'}), true)
     assert.equal(dbWrites.length, 1)
     assert.equal(dbWrites[0].taskKey, 'task-1:coordinator')
+    assert.equal(dbWrites[0].title, '修复登录')
     assert.equal(journalWrites.length, 1)
     assert.equal(journalWrites[0].type, 'task/coordinator-transition')
     assert.equal(journalWrites[0].payload.revision, 3)
@@ -34,7 +35,7 @@ test('Coordinator 可串行影子写入 PostgreSQL，并只保存脱敏投影', 
     })
     const snapshot = {
         taskId: 'task-1', turnId: 'turn-1', sessionId: 'session-1', status: 'running', phase: 'implement', revision: 2, sequence: 1,
-        plan: {workDir: 'D:\\demo', decision: {modelTier: 'balanced'}},
+        plan: {workDir: 'D:\\demo', title: '修复登录', summary: '处理登录超时', goal: '修复登录', requestText: '请修复登录', source: 'desktop', decision: {modelTier: 'balanced'}},
         verification: {status: 'not_started'}, blockers: [], findings: [], agents: {}, workflows: {}, notificationIntentPersisted: false,
         startedAt: 1, completedAt: 0, updatedAt: 2,
     }
@@ -44,4 +45,5 @@ test('Coordinator 可串行影子写入 PostgreSQL，并只保存脱敏投影', 
     assert.equal(shadowWrites[0].state.coordinator, true)
     assert.equal(shadowWrites[0].state.plan, undefined)
     assert.equal(shadowWrites[0].state.taskId, 'task-1')
+    assert.equal(shadowWrites[0].state.title, '修复登录')
 })

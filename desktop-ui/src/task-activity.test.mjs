@@ -83,12 +83,40 @@ test('确认结算只关闭对应的等待步骤，不误关闭并发确认', ()
   let state = reduceTaskActivity(createTaskActivityState(), {type: 'task_started'}, 100)
   state = reduceTaskActivity(state, {type: 'permission_request', requestId: 'p1', toolName: 'Read'}, 200)
   state = reduceTaskActivity(state, {type: 'choice_request', requestId: 'c1', question: '选择方案'}, 300)
+  state = reduceTaskActivity(state, {type: 'stream_waiting', waitingFor: 'permission'}, 350)
   state = reduceTaskActivity(state, {
-    type: 'confirmation_resolved', requestId: 'p1', confirmationType: 'permission', toolName: 'Read', wonBy: 'desktop',
+    type: 'confirmation_resolved', requestId: 'p1', confirmationType: 'permission', toolName: 'Read', wonBy: 'desktop', pendingCount: 1,
   }, 400)
 
   assert.equal(state.entries.find(entry => entry.id === 'waiting:p1').status, 'completed')
   assert.equal(state.entries.find(entry => entry.id === 'waiting:c1').status, 'waiting')
+  assert.equal(state.entries.find(entry => entry.id === 'waiting:stream').status, 'completed')
+  assert.equal(state.title, '等待方案选择')
+})
+
+test('方案确认后只显示等待 Provider 返回，不提前声称已经继续执行', () => {
+  let state = reduceTaskActivity(createTaskActivityState(), {type: 'task_started'}, 100)
+  state = reduceTaskActivity(state, {type: 'choice_request', requestId: 'c1', question: '选择方案'}, 200)
+  state = reduceTaskActivity(state, {type: 'confirmation_resolved', requestId: 'c1', confirmationType: 'choice', wonBy: 'desktop'}, 300)
+  assert.equal(state.phase, 'waiting')
+  assert.equal(state.title, '方案已确认，等待 Provider 返回')
+  assert.equal(state.running, true)
+})
+
+test('权限确认结算会同时关闭旧的权限等待心跳', () => {
+  let state = reduceTaskActivity(createTaskActivityState(), {type: 'task_started'}, 100)
+  state = reduceTaskActivity(state, {type: 'permission_request', requestId: 'p1', toolName: 'Bash'}, 200)
+  state = reduceTaskActivity(state, {
+    type: 'stream_waiting', waitingFor: 'permission', elapsedMs: 15_000, message: '等待工具权限确认',
+  }, 300)
+  state = reduceTaskActivity(state, {
+    type: 'confirmation_resolved', requestId: 'p1', confirmationType: 'permission', toolName: 'Bash', wonBy: 'auto', decision: 'allow', pendingCount: 0,
+  }, 400)
+
+  assert.equal(state.entries.find(entry => entry.id === 'waiting:p1').status, 'completed')
+  assert.equal(state.entries.find(entry => entry.id === 'waiting:stream').status, 'completed')
+  assert.equal(state.phase, 'tool')
+  assert.equal(state.title, '权限已自动允许，正在运行命令')
 })
 
 test('工具摘要会截断并脱敏凭据', () => {

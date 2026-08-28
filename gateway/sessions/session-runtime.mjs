@@ -106,7 +106,6 @@ export function createSessionRuntime({
         autoContinuationTurns: 0,
         _taskRunBudget: createTaskRunBudget(opts.bridgeTaskDecision?.continuationPolicy || {}, opts.bridgeTaskDecision?.executionMode || 'session'),
         _lastContinuationFingerprint: null,
-        _autoContinuationRequest: null,
         _pendingSources: [],
         _pendingTurns: [],
         _pendingInputs: [],

@@ -1264,6 +1264,8 @@ async function executeAgent(prompt, opts, workDir, broadcast, logFn, journalCach
         model: model || undefined,
         maxTurns: maxTurns || DEFAULT_MAX_TURNS,
         permissionMode: permissionMode || 'acceptEdits',
+        text: prompt,
+        targetFiles: Array.isArray(opts.targetFiles) ? opts.targetFiles : [],
         _agentName: agentType || 'general-purpose',
         _depth: 1,
     }

@@ -6,7 +6,10 @@ export class WorkbenchRepository {
         if (!stateStore?.getTaskState || !stateStore?.listTaskStates || !stateStore?.recordTaskTransition) throw new TypeError('Workbench state adapter is required')
         this.#store = stateStore
     }
-    getTask({projectKey, taskKey, taskId} = {}) { return normalizeTask(this.#store.getTaskState(projectKey, taskKey || taskId)) }
+    getTask({projectKey, taskKey, taskId} = {}) {
+        const row = this.#store.getTaskState(projectKey, taskKey || taskId)
+        return normalizeTask(row, taskEventMetadata(this.#store, projectKey, taskKey || taskId))
+    }
     getTaskDetail({projectKey, taskId} = {}) {
         const task = this.getTask({projectKey, taskId})
         if (!task) return null
@@ -15,7 +18,9 @@ export class WorkbenchRepository {
         return {task, events: normalizedEvents, questions: buildTaskQuestions(task, normalizedEvents), agents: task.state?.coordinator?.agents || {}, workflows: task.state?.coordinator?.workflows || {}, verification: task.state?.coordinator?.verification || task.state?.verification || null, report: this.getReport(taskId)}
     }
     listTaskEvents(options = {}) { return this.#store.listTaskEvents ? this.#store.listTaskEvents(options) : [] }
-    listTasks({projectKey = null, activeOnly = false, limit = 100} = {}) { return (this.#store.listTaskStates(projectKey, {activeOnly, limit}) || []).map(normalizeTask) }
+    listTasks({projectKey = null, activeOnly = false, limit = 100} = {}) {
+        return (this.#store.listTaskStates(projectKey, {activeOnly, limit}) || []).map(row => normalizeTask(row, taskEventMetadata(this.#store, row.projectKey || projectKey, row.taskId || row.taskKey)))
+    }
     upsertTask(record = {}) { return this.#store.recordTaskTransition(record) }
     appendTaskEvent(record = {}) { return this.#store.appendTaskEvent ? this.#store.appendTaskEvent(record) : false }
     listReports({projectKey = null, limit = 100} = {}) { return this.#store.listExecutionReports(projectKey, {limit}) }
@@ -32,15 +37,28 @@ export class WorkbenchRepository {
         return this.#store.listVerificationCampaigns(projectKey, {taskId, limit})
     }
 }
-function normalizeTask(row) {
+function taskEventMetadata(store, projectKey, taskId) {
+    if (!store?.listTaskEvents || !projectKey || !taskId) return {}
+    try {
+        const events = store.listTaskEvents({projectKey, taskId, limit: 20})
+        if (events && typeof events.then === 'function') return {}
+        const created = (Array.isArray(events) ? events : []).find(event => event?.eventType === 'task/created')
+        return created?.payload && typeof created.payload === 'object' ? created.payload : {}
+    } catch {
+        return {}
+    }
+}
+
+function normalizeTask(row, eventMetadata = {}) {
     if (!row) return null
     const state = row.state && typeof row.state === 'object' ? row.state : {}
     const plan = state.plan && typeof state.plan === 'object' ? state.plan : {}
     const metadata = state.metadata && typeof state.metadata === 'object' ? state.metadata : {}
-    const title = String(row.title || state.title || metadata.title || plan.title || plan.goal || state.goal || metadata.goal || '').trim().slice(0, 80) || '未命名任务'
-    const summary = String(row.summary || state.summary || metadata.summary || plan.summary || state.detail || state.finalReplyText || '').trim().slice(0, 4000)
-    const goal = String(row.goal || state.goal || metadata.goal || plan.goal || '').trim().slice(0, 8000)
-    const requestText = String(row.requestText || state.requestText || metadata.requestText || plan.requestText || goal || '').trim().slice(0, 12000)
+    const summary = String(row.summary || state.summary || metadata.summary || plan.summary || eventMetadata.summary || state.detail || state.finalReplyText || '').trim().slice(0, 4000)
+    const goal = String(row.goal || state.goal || metadata.goal || plan.goal || eventMetadata.goal || '').trim().slice(0, 8000)
+    const requestText = String(row.requestText || state.requestText || metadata.requestText || plan.requestText || eventMetadata.requestText || goal || '').trim().slice(0, 12000)
+    const rawTitle = String(row.title || state.title || metadata.title || plan.title || eventMetadata.title || '').trim().slice(0, 80)
+    const title = readableTaskTitle(rawTitle, summary, goal, requestText)
     return {
         ...row,
         taskId: row.taskId || state.taskId || row.taskKey || null,
@@ -59,5 +77,12 @@ function normalizeTask(row) {
         execution: row.execution || state.execution || state.coordinator?.execution || null,
         state,
     }
+}
+
+function readableTaskTitle(current, summary, goal, requestText) {
+    if (current && current !== '未命名任务') return current
+    const fallback = [goal, summary, requestText].map(value => String(value || '').trim()).find(Boolean) || ''
+    const firstLine = fallback.split(/\r?\n/).map(line => line.replace(/^\s*(?:#{1,6}\s+|[-*+]\s+)/, '').trim()).find(Boolean) || ''
+    return firstLine.slice(0, 80) || '未命名任务'
 }
 export function createWorkbenchRepository(options = {}) { return new WorkbenchRepository(options) }

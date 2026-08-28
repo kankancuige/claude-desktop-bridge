@@ -1,4 +1,4 @@
-export type AgentCardStatus = 'spawning' | 'running' | 'paused' | 'done' | 'error'
+export type AgentCardStatus = 'spawning' | 'running' | 'paused' | 'blocked' | 'done' | 'error'
 
 export interface WorkflowAgentState {
   status?: AgentCardStatus

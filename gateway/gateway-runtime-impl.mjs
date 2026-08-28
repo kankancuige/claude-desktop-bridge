@@ -27,7 +27,7 @@ import {parseSessionHistory} from './sessions/session-history.mjs'
 import {findSessionTranscript, listProjectTranscriptCandidates, resolveSessionTranscript as resolveSessionTranscriptLocation} from './projects/project-transcript-location.mjs'
 import {removeSessionMapEntry, resolveMappedGatewaySessionId, updateSessionMap} from './sessions/session-map-consistency.mjs'
 import {isUserSessionSource, loadSessionVisibility, markSessionVisible, migrateLegacySessionVisibility, removeSessionVisibility, sessionVisibilitySource, shouldShowSession} from './sessions/session-visibility.mjs'
-import {initialSessionIdentity, resolveSessionCreateMode} from './sessions/session-create-mode.mjs'
+import {initialSessionIdentity, resolveRecoveryRuntimeIdentity, resolveSessionCreateMode} from './sessions/session-create-mode.mjs'
 import {createSessionContextEnvelope, createSessionRuntime} from './sessions/session-runtime.mjs'
 import {createSdkStreamAdapter} from './sessions/sdk-stream-adapter.mjs'
 import {resolveSessionLink} from './sessions/session-link-resolver.mjs'
@@ -67,7 +67,7 @@ import {
     buildCacheInjectionText,
     cacheFilePath
 } from './projects/project-cache.mjs'
-import {buildProjectContext} from './projects/project-context.mjs'
+import {loadOrBuildProjectContext} from './projects/project-context.mjs'
 import {validateProviderUrl, buildProviderModelsUrl, buildProviderFallbackUrls} from './security/provider-url-security.mjs'
 import {upsertAdapterBinding} from './im/adapter-bindings.mjs'
 import {loadPairedUserCount} from './im/paired-users.mjs'
@@ -405,11 +405,20 @@ const PKG_VERSION = (() => {
 })()
 
 const PORT = parseInt(process.env.PORT || '3456', 10)
-// npm 全局包解析: 从 shim 所在目录找到 node_modules/@anthropic-ai/claude-code 下的可用入口
-// 旧版 npm 包提供 cli.js，新版提供 bin/claude.exe (native binary)，二者选其一
+// 默认使用 Agent SDK 配套的 native binary；用户显式设置 CLAUDE_EXE/claudeExe 时仍可覆盖。
+const bundledClaudeExecutable = (() => {
+    const executable = process.platform === 'win32' ? 'claude.exe' : 'claude'
+    const candidates = [
+        join(__dirname, 'node_modules', '@anthropic-ai', `claude-agent-sdk-${process.platform}-${process.arch}`, executable),
+        ...(process.platform === 'linux'
+            ? [join(__dirname, 'node_modules', '@anthropic-ai', `claude-agent-sdk-linux-${process.arch}-musl`, executable)]
+            : []),
+    ]
+    return candidates.find(path => existsSync(path)) || null
+})()
 const claudeExecutableRuntime = createClaudeExecutableRuntime({
     homedir, join, dirname, existsSync, readdirSync, statSync, execSync,
-    loadCliSettings: () => loadCliSettings(), logger: log,
+    loadCliSettings: () => loadCliSettings(), bundledExecutable: bundledClaudeExecutable, logger: log,
 })
 const {resolveFromPkgDir, getClaudeExe, setClaudeExe} = claudeExecutableRuntime
 const MODEL = process.env.ANTHROPIC_MODEL || 'deepseek-v4-pro'
@@ -523,6 +532,7 @@ const {closeSessionRuntime} = sessionResourceRuntime
 const VALID_PERMISSION_MODES = new Set(['default', 'acceptEdits', 'plan', 'bypassPermissions'])
 const VALID_THINKING_LEVELS = new Set(['auto', 'off', 'low', 'medium', 'high', 'xhigh', 'max'])
 const VALID_MODEL_MODES = new Set(['auto', 'fixed'])
+let refreshConfirmationWatchdog = () => {}
 
 // 确认 Runtime 通过惰性依赖连接后续初始化的 IM/广播服务，避免组合根持有确认状态机。
 const confirmationRuntime = createConfirmationRuntime({
@@ -533,6 +543,9 @@ const confirmationRuntime = createConfirmationRuntime({
     broadcastDesktop: (...args) => broadcastDesktop(...args),
     shouldRouteMirror,
     logger: log,
+    onSettled: (sessionId, session, _entry, _result, wonBy) => {
+        if (!['stopped', 'shutdown', 'delete'].includes(wonBy)) refreshConfirmationWatchdog(sessionId, session)
+    },
 })
 const {settlePending: settlePendingRuntime, makeCanUseTool: makeCanUseToolRuntime,
     decisionToResult: decisionToResultRuntime, labelForChoice: labelForChoiceRuntime} = confirmationRuntime
@@ -620,10 +633,6 @@ const resolveSdkInputContent = (...args) => {
     if (!sessionContextRuntime) throw new Error('Session Context Runtime 尚未初始化')
     return sessionContextRuntime.resolveSdkInputContent(...args)
 }
-const startAutoContinuation = (...args) => {
-    if (!sdkStreamRuntime) throw new Error('SDK Stream Runtime 尚未初始化')
-    return sdkStreamRuntime.startAutoContinuation(...args)
-}
 const taskLifecycleRuntime = createTaskLifecycleRuntime({
     sessions,
     createTaskStatePatch,
@@ -635,7 +644,7 @@ const taskLifecycleRuntime = createTaskLifecycleRuntime({
     taskStateForError,
     taskStateForStop,
     resolveTaskPhases,
-    buildProjectContext,
+    buildProjectContext: loadOrBuildProjectContext,
     resolveTaskAgents,
     createTaskPlan,
     getTaskWorkbench: () => taskWorkbench,
@@ -693,6 +702,9 @@ const {
     clearStreamWatchdog,
     armStreamWatchdog,
 } = sessionInputRuntime
+refreshConfirmationWatchdog = (sessionId, session) => {
+    if (session?._generating && session.query) armStreamWatchdog(sessionId, session, session.query)
+}
 const sessionStopRuntime = createSessionStopRuntime({
     sessions,
     getSessionWorkflowStates,
@@ -987,7 +999,7 @@ const {
 } = toolingUpdate
 const {makeQueryOptions} = createQueryOptionsRuntime({
     BRIDGE_HOME, MODEL, VALID_PERMISSION_MODES, VALID_THINKING_LEVELS, VALID_MODEL_MODES,
-    restoreSecretValue, getClaudeExe, normalizeContextProfile, routeSkills,
+    restoreSecretValue, getClaudeExe, normalizeContextProfile, routeSkills, loadOrBuildProjectContext,
     getBuiltinResourceState, ensureBuiltinSkillsAvailable, decideTask, loadAgentDefinitions,
     shouldDeferAutomaticQuery, mapModel, resolveTaskModelRoute, loadWfConfig,
     shouldValidateProviderModel, validateProviderModel, prepareQueryProvider,
@@ -1181,11 +1193,6 @@ const sdkStreamAdapter = createSdkStreamAdapter({
 const sdkStreamRuntimeDependencies = {
     sessions,
     getStateStore: () => bridgeStateDb,
-    sessionCoordinator,
-    PushStream,
-    loadCliSettings,
-    makeQueryOptions,
-    startClaudeAgent,
     log,
     updateTaskCompletion,
     applyTaskCompletionEffects,
@@ -1221,8 +1228,6 @@ const sdkStreamRuntimeDependencies = {
     resolveAutoContinuation,
     maybeUpdateProjectCache,
     finalizeCheckpoint,
-    shouldCaptureTurnCheckpoint,
-    beginTurn,
     resolveFinalReviewPlan,
     canResumeTask,
     deferPrimaryResultForTaskWorkflow,
@@ -1446,7 +1451,7 @@ gatewayRouteContext = {
     BUILTIN_MCP,
     VALID_MODEL_MODES, VALID_PERMISSION_MODES, VALID_THINKING_LEVELS,
     isValidSessionId, isDirectoryPath, crypto, resolve,
-    resolveSessionCreateMode, resolveSessionResume, resolveResumeModel,
+    resolveSessionCreateMode, resolveRecoveryRuntimeIdentity, resolveSessionResume, resolveResumeModel,
     buildSessionStopResponse, shouldDeferAutomaticQuery,
     encodeProjectName, decodeProjectName, openSessionEventJournal, restoreSessionMirrors,
     persistSessionMirrors,
@@ -1486,6 +1491,7 @@ gatewayRouteContext = {
     getUploadDir, prepareUploadDir, prepareSessionUploadDir, cleanupSessionUploads, parseMultipart,
     describeAttachment, isImageAttachment, isBinaryPath, resolveSafe,
     getAdapterHook, confirmHooks, startAdapter, stopAdapter, restartAdapter,
+    sendManualImText,
     clearAdapterPlatformState, listAdapterBindings, loadAdapterConfig, saveAdapterConfig,
     getPersistedPairedUserCount: platform => loadPairedUserCount(BRIDGE_HOME, platform),
     normalizeWeChatBaseUrl, platformEntryFilePath,

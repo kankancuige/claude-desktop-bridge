@@ -114,7 +114,7 @@ export function createTaskStateStorageRuntime({
             status: 'failed',
             outcome: 'failed',
             continuationReason: 'execution_error',
-            resumable: Boolean(state.historySessionId || state.sdkSessionId),
+            resumable: true,
             detail: state.detail || state.finalReplyText,
         }
     }

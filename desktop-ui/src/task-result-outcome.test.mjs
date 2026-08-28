@@ -54,3 +54,9 @@ test('continuation prompt includes original goal and remaining verification', ()
   assert.match(prompt, /构建、测试或运行验证/)
   assert.doesNotMatch(prompt, /^Continue from where you left off\.$/)
 })
+
+test('暂停后的继续提示明确区分用户暂停和异常中断', () => {
+  const prompt = buildContinuationPrompt({originalTask: '继续原任务', reason: 'stopped'})
+  assert.match(prompt, /由用户暂停/)
+  assert.doesNotMatch(prompt, /异常中断/)
+})

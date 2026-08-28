@@ -19,7 +19,7 @@ function resolveTier(decision = {}) {
 
 /**
  * `maxTurns` 是单个 SDK query 的防失控边界，不等同于父任务完成。
- * 只有达到轮数上限时才按任务档位续跑，其他失败必须交给正常错误流程。
+ * 这里仅计算预算和暂停原因，实际是否继续必须由输入框播放按钮触发；其他失败交给正常错误流程。
  */
 export function resolveAutoContinuation({
     result,

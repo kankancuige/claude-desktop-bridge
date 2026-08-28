@@ -56,4 +56,16 @@ test('父任务终态覆盖迟到的 active 快照，但运行中的 Workflow �
     workflowStatus: 'done',
   }), false)
   assert.equal(isTaskBusy({status: 'thinking', activityRunning: true, taskStatus: 'incomplete'}), false)
+  assert.equal(isTaskBusy({
+    lifecycleReceived: true,
+    lifecycleActive: true,
+    taskStatus: 'stopped',
+    workflowStatus: 'paused',
+  }), false)
+  assert.equal(isTaskBusy({
+    lifecycleReceived: true,
+    lifecycleActive: true,
+    taskStatus: 'interrupted',
+    workflowStatus: 'error',
+  }), false)
 })

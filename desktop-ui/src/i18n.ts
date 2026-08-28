@@ -423,7 +423,7 @@ const messages: Record<Locale, Record<string, string>> = {
     // ────────────────────────────────────────────────────────────────────────
     'ws.inputThinking': '思考中... 输入消息将加入队列',
     'ws.inputPlaceholder': '输入消息... (Enter 发送, Shift+Enter 换行, / 命令, # 文件, @ 代理)',
-    'ws.stopRefill': '停止并回填内容',
+    'ws.pauseTask': '暂停任务', 'ws.resumeTask': '继续任务',
     'ws.queueSupplement': '补充指令', 'ws.queuePending': '待发送',
     'ws.injectNow': '中断并注入补充指令', 'ws.sendNow': '立即发送', 'ws.remove': '移除',
     'ws.attachFile': '选择文件',
@@ -439,7 +439,6 @@ const messages: Record<Locale, Record<string, string>> = {
     // ────────────────────────────────────────────────────────────────────────
     // Toast 通知 —— 即时反馈提示（操作结果、状态变更、错误提醒）
     // ────────────────────────────────────────────────────────────────────────
-    'ws.taskCanceled': '任务已取消',
     'ws.allowed': '已允许 {tool}', 'ws.denied': '已拒绝 {tool}',
     'ws.chose': '已选择: {label}',
     'ws.injected': '已注入补充指令',
@@ -590,7 +589,7 @@ const messages: Record<Locale, Record<string, string>> = {
     'sys.taskInterruptedAfterRestart': 'Gateway 重启前任务未结束，已保留会话，可继续执行。',
     'sys.noErrorDetail': '服务未返回更多错误信息',
     'sys.taskIncompleteShort': '任务尚未完成',
-    'ws.continueTask': '继续执行',
+    'ws.continueTask': '继续执行', 'ws.taskPaused': '任务已暂停',
     'sys.reverted': '已撤销到记录点「{prompt}」· 回退 {n} 个文件',
     'sys.revertedSkip': ' · {n} 个不可回退已跳过',
     'sys.committed': '已提交修改 · 新基线含 {n} 个文件，记录点已清空',
@@ -903,7 +902,7 @@ const messages: Record<Locale, Record<string, string>> = {
     // ── Input ──
     'ws.inputThinking': 'Thinking... your message will be queued',
     'ws.inputPlaceholder': 'Type a message... (Enter send, Shift+Enter newline, / cmd, # file, @ agent)',
-    'ws.stopRefill': 'Stop and restore text',
+    'ws.pauseTask': 'Pause task', 'ws.resumeTask': 'Resume task',
     'ws.queueSupplement': 'Supplement', 'ws.queuePending': 'Pending',
     'ws.injectNow': 'Interrupt and inject', 'ws.sendNow': 'Send now', 'ws.remove': 'Remove',
     'ws.attachFile': 'Attach files',
@@ -915,7 +914,6 @@ const messages: Record<Locale, Record<string, string>> = {
     'ws.send': 'Send', 'ws.cancel': 'Cancel',
 
     // ── System / toast ──
-    'ws.taskCanceled': 'Task canceled',
     'ws.allowed': 'Allowed {tool}', 'ws.denied': 'Denied {tool}',
     'ws.chose': 'Chose: {label}',
     'ws.injected': 'Supplement injected',
@@ -1044,7 +1042,7 @@ const messages: Record<Locale, Record<string, string>> = {
     'sys.taskInterruptedAfterRestart': 'The task was interrupted before Gateway restart; the session was preserved and can continue.',
     'sys.noErrorDetail': 'No additional error detail was returned',
     'sys.taskIncompleteShort': 'Task incomplete',
-    'ws.continueTask': 'Continue',
+    'ws.continueTask': 'Continue', 'ws.taskPaused': 'Task paused',
     'sys.reverted': 'Reverted to checkpoint "{prompt}" · {n} files restored',
     'sys.revertedSkip': ' · {n} not revertible skipped',
     'sys.committed': 'Committed · new baseline has {n} files, checkpoints cleared',

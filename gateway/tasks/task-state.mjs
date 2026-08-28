@@ -34,7 +34,7 @@ export function normalizeTaskState(raw = {}, {recoverRunning = false, now = Date
         status = 'interrupted'
         outcome = 'failed'
         reason = 'execution_error'
-        resumable = Boolean(input.historySessionId || input.sdkSessionId || input.resumable)
+        resumable = true
     }
     if (status === 'reviewing' || status === 'changes_required' || status === 'fixing' || status === 'review_paused') {
         // 审查中间态不能在恢复或投影时被误判为成功；保留原阶段供用户继续处理。
@@ -51,6 +51,10 @@ export function normalizeTaskState(raw = {}, {recoverRunning = false, now = Date
     } else if (status === 'interrupted' || status === 'stopped') {
         outcome = 'failed'
         reason = reason || (status === 'stopped' ? 'stopped' : 'execution_error')
+        resumable = true
+    } else if (status === 'failed') {
+        // 失败可能发生在 SDK 建立前、流异常或完成收口期间；统一保留显式继续入口。
+        resumable = true
     }
     const normalized = {
         version: VERSION,
@@ -230,10 +234,11 @@ export function taskStateFromResult(result = {}, identity = {}) {
 
 export function taskStateForStop(identity = {}) {
     return createTaskStatePatch({
+        ...identity,
         status: 'stopped',
         outcome: 'failed',
         continuationReason: 'stopped',
-        resumable: Boolean(identity.sdkSessionId || identity.historySessionId),
+        resumable: true,
         sdkSessionId: identity.sdkSessionId,
         historySessionId: identity.historySessionId || identity.sdkSessionId,
         startedAt: identity.startedAt,
@@ -244,10 +249,11 @@ export function taskStateForStop(identity = {}) {
 
 export function taskStateForError(error, identity = {}) {
     return createTaskStatePatch({
+        ...identity,
         status: 'interrupted',
         outcome: 'failed',
         continuationReason: 'execution_error',
-        resumable: Boolean(identity.sdkSessionId || identity.historySessionId),
+        resumable: true,
         detail: error?.message || error,
         sdkSessionId: identity.sdkSessionId,
         historySessionId: identity.historySessionId || identity.sdkSessionId,

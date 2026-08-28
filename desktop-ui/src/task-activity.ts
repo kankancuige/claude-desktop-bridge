@@ -471,7 +471,9 @@ export function reduceTaskActivity(
 
   if (type === 'confirmation_resolved') {
     const waitingId = `waiting:${eventId(event, 'confirmation')}`
-    state.entries = completeEntries(state.entries, now, entry => entry.id === waitingId)
+    // stream_waiting 是上一次 watchdog 采样，任何确认结算都使它过期；
+    // 其他并发确认仍由各自 requestId 的等待步骤保留。
+    state.entries = completeEntries(state.entries, now, entry => entry.id === waitingId || entry.id === 'waiting:stream')
     const remaining = [...state.entries].reverse().find(entry => entry.kind === 'waiting' && entry.status === 'waiting')
     if (remaining) {
       return activityState(state, 'waiting', true, remaining.title, remaining.detail, type, now)
@@ -494,7 +496,7 @@ export function reduceTaskActivity(
       )
     }
 
-    return activityState(state, 'thinking', true, '方案已确认，正在继续执行', '', type, now)
+    return activityState(state, 'waiting', true, '方案已确认，等待 Provider 返回', '确认结果已提交', type, now)
   }
 
   if (type === 'context_compacting' || type === 'context_compacted') {

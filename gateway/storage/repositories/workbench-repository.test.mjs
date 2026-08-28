@@ -23,3 +23,21 @@ test('Workbench Repository 为旧任务补齐可读元数据并生成有序问�
     assert.deepEqual(detail.questions.map(item => item.turnId), ['t1', 't2'])
     assert.equal(detail.questions[1].text, '补充问题')
 })
+
+test('Workbench Repository 将历史占位标题替换为摘要首行', () => {
+    const stateStore = adapter()
+    stateStore.getTaskState = () => ({projectKey: 'p', taskKey: 's:t2', taskId: 's:t2', status: 'succeeded', state: {title: '未命名任务', summary: '修复任务列表标题\n后续说明'}})
+    const task = createWorkbenchRepository({stateStore}).getTask({projectKey: 'p', taskId: 's:t2'})
+    assert.equal(task.title, '修复任务列表标题')
+})
+
+test('Workbench Repository 从历史 task/created 事件恢复无摘要任务标题', () => {
+    const stateStore = adapter()
+    const row = {projectKey: 'p', taskKey: 's:t3', taskId: 's:t3', status: 'failed', state: {}}
+    stateStore.getTaskState = () => row
+    stateStore.listTaskStates = () => [row]
+    stateStore.listTaskEvents = () => [{eventType: 'task/created', payload: {title: '修复连接超时', summary: '修复连接超时\n补充说明', goal: '修复连接超时', requestText: '请修复连接超时'}}]
+    const task = createWorkbenchRepository({stateStore}).listTasks({projectKey: 'p'})[0]
+    assert.equal(task.title, '修复连接超时')
+    assert.equal(task.requestText, '请修复连接超时')
+})

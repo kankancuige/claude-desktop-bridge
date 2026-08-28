@@ -35,6 +35,7 @@ export function classifySessionExistsResponse(ok: boolean, status: number): 'exi
 export type SessionRuntimeRecoveryDecision =
   | {kind: 'reuse'; sessionId: string}
   | {kind: 'recreate'}
+  | {kind: 'recover'; sessionId: string}
   | {kind: 'reset'}
   | {kind: 'unavailable'; reason: string}
 
@@ -45,16 +46,25 @@ export function decideSessionRuntimeRecovery({
   response,
   historySessionId,
   fallbackSessionId,
+  taskState,
 }: {
   ok: boolean
   status: number
   response: any
   historySessionId?: string | null
   fallbackSessionId?: string | null
+  taskState?: {status?: unknown; resumable?: unknown} | null
 }): SessionRuntimeRecoveryDecision {
   const hasHistory = !!String(historySessionId || '').trim()
   const existsStatus = classifySessionExistsResponse(ok, status)
-  if (existsStatus === 'missing') return {kind: hasHistory ? 'recreate' : 'reset'}
+  if (existsStatus === 'missing' || (existsStatus === 'exists' && response?.persisted === true)) {
+    if (hasHistory) return {kind: 'recreate'}
+    const status = String(taskState?.status || '')
+    const recoverable = taskState?.resumable === true
+      || ['running', 'failed', 'stopped', 'interrupted', 'incomplete', 'review_paused'].includes(status)
+    const fallback = String(fallbackSessionId || '').trim()
+    return recoverable && fallback ? {kind: 'recover', sessionId: fallback} : {kind: 'reset'}
+  }
   if (existsStatus === 'unavailable') return {kind: 'unavailable', reason: `HTTP ${status}`}
   if (response?.exists !== true) return {kind: 'unavailable', reason: 'Gateway 返回了无效的会话状态'}
   if (!runtimeSessionMatchesHistory(historySessionId, response?.historySessionId)) {
@@ -128,4 +138,13 @@ export function shouldRefreshSessionTokenAfterClose(closeCode: number): boolean 
 /** Gateway 用 4000 明确表示运行时会话不存在；必须走历史会话的重建流程，不能重连旧 UUID。 */
 export function shouldRecoverMissingRuntimeSessionAfterClose(closeCode: number): boolean {
   return closeCode === 4000
+}
+
+/**
+ * 运行时丢失后，只有未成功且明确可恢复的任务才能进入 recovery-only 壳。
+ * 成功会话仍按普通历史会话打开，避免把已完成会话误显示为继续任务。
+ */
+export function shouldRecoverPersistedTask(taskState?: {status?: unknown; resumable?: unknown} | null): boolean {
+  if (!taskState || taskState.resumable !== true) return false
+  return String(taskState.status || '') !== 'succeeded'
 }

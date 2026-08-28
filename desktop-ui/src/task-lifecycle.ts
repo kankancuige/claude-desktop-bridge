@@ -83,7 +83,7 @@ export function reduceSessionLifecycle(current: SessionLifecycleState, event: an
         active: false,
         canSend: true,
         canStop: false,
-        canContinue: status !== 'succeeded' && event.taskState?.resumable === true,
+        canContinue: status !== 'succeeded',
         awaitingAcceptance: false,
       }
     }
@@ -91,7 +91,7 @@ export function reduceSessionLifecycle(current: SessionLifecycleState, event: an
   if (['task_completed', 'task_failed', 'task_review_paused', 'task_verification_inconclusive'].includes(event?.type)) {
     // 终态事件本身就是可发送边界。聚合快照可以随后补充能力字段，但不能让旧 active
     // 状态继续锁住输入区，否则任务已完成而输入框仍显示“思考中”。
-    const canContinue = event?.type !== 'task_completed' && event?.taskState?.resumable === true
+    const canContinue = event?.type !== 'task_completed'
     return {...state, received: true, active: false, canSend: true, canStop: false, canContinue, awaitingAcceptance: false}
   }
   return state

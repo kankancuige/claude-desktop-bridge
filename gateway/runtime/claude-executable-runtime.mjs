@@ -8,6 +8,7 @@ export function createClaudeExecutableRuntime({
     statSync,
     execSync,
     loadCliSettings,
+    bundledExecutable = null,
     env = process.env,
     platform = process.platform,
     logger = {debug() {}},
@@ -29,6 +30,8 @@ export function createClaudeExecutableRuntime({
         if (env.CLAUDE_EXE) return (cached = env.CLAUDE_EXE)
         const configured = loadCliSettings()?.claudeExe
         if (configured && existsSync(configured)) return (cached = configured)
+        // 未显式覆盖时使用 SDK 配套 native binary，避免发现旧版 Claude Code。
+        if (bundledExecutable && existsSync(bundledExecutable)) return (cached = bundledExecutable)
         const candidates = []
         const addVersioned = (base, executable) => {
             if (!existsSync(base)) return

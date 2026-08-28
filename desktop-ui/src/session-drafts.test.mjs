@@ -14,6 +14,7 @@ const {
   removeMatchingInterruptedSessionDraft,
   sessionDraftKey,
   shouldRestoreSessionDraft,
+  shouldPresentSessionDraftInComposer,
 } = await import(moduleUrl)
 
 test('损坏或过期的草稿不会影响其他会话', () => {
@@ -63,6 +64,16 @@ test('重启只在服务端确认任务中断且可继续时恢复中断草稿',
   assert.equal(shouldRestoreSessionDraft(interrupted, {status: 'succeeded', resumable: false}), false)
   assert.equal(shouldRestoreSessionDraft(interrupted, {status: 'interrupted', resumable: true}), true)
   assert.equal(shouldRestoreSessionDraft(interrupted, {status: 'stopped', resumable: true}), true)
+  assert.equal(shouldRestoreSessionDraft(interrupted, {status: 'failed', resumable: false}), true)
+})
+
+test('中断任务文本仅作为恢复依据，不自动回填输入框', () => {
+  const unsent = {text: '尚未发送', updatedAt: 1_000, interrupted: false}
+  const interrupted = {text: '上一个任务', updatedAt: 1_001, interrupted: true}
+
+  assert.equal(shouldPresentSessionDraftInComposer(unsent, null), true)
+  assert.equal(shouldPresentSessionDraftInComposer(interrupted, {status: 'stopped', resumable: true}), false)
+  assert.equal(shouldPresentSessionDraftInComposer(interrupted, {status: 'interrupted', resumable: true}), false)
 })
 
 test('成功终态只清理与已完成原任务匹配的中断草稿', () => {

@@ -140,3 +140,48 @@ test('waiting_user 的下一条消息恢复原 Coordinator 并注入 AI，不创
     assert.equal(journal.some(event => event.type === 'task/created'), false)
     assert.equal(pushed[0].message.content[0].text, '选择 A')
 })
+
+test('stopped 终态后的新文本创建新任务且不恢复旧 Coordinator', async () => {
+    const journal = []
+    const initialized = []
+    const resumed = []
+    const routed = []
+    const taskDecision = {version: 1, action: 'execute', complexity: 'simple', risk: 'low', modelTier: 'standard', workflow: false, finalReview: 'none', reasons: [], hardTriggers: [], contextProfile: 'full'}
+    const session = {
+        id: 's4', workDir: 'D:\\work', query: {}, pushStream: {push() {}}, lastSessionId: 'sdk-s4',
+        queryOpts: {model: 'model-a'}, _generating: false, activeTurnId: null, _pendingInputs: [],
+        taskDecision, contextProfile: 'full', skillRoute: [], loadedAgentRoute: [], agentRoute: [],
+        permissionMode: 'default', thinkingLevel: 'auto', modelMode: 'auto', providerBaseUrl: '',
+        taskCompletionTaskId: 'old-task', taskCompletionTurnId: 'old-turn', coordinatorTaskId: 'old-task',
+        taskCompletion: {phase: 'stopped'}, taskState: {status: 'stopped', resumable: true}, projectContext: {frameworks: ['Avalonia']},
+    }
+    const queue = createTaskInputQueue({createId: () => 'new-turn'})
+    const runtime = createTaskCommandRuntime({
+        sessions: new Map([['s4', session]]), taskInputQueue: queue, sessionCoordinator: {setContextPolicy() {}}, IM_SOURCES: new Set(),
+        log: {info() {}, warn() {}, error() {}, debug() {}}, loadCliSettings: () => ({env: {}, model: 'model-a'}), VALID_MODEL_MODES: new Set(['auto', 'fixed']), MODEL: 'model-a',
+        decideTask: () => taskDecision, resolveTurnModelRoute: () => ({model: 'model-a', mode: 'auto', tier: 'standard'}), loadWfConfig: () => ({modelTiers: {}}), validateProviderModel: () => null,
+        acceptSessionInput: (target, source, messageId, userId, decision) => queue.accept(target, {source, messageId, userId, taskDecision: decision}), rollbackSessionInput: (target, accepted) => queue.rollback(target, accepted),
+        appendSessionEvent: (_target, type, payload) => journal.push({type, payload}), markVisibleSession: () => true, isUserSessionSource: () => false,
+        createTaskCompletionState: value => value, createTurnIdentity: () => null, createTaskWorkflowGate: () => ({}),
+        initializeTaskWorkbenchSession: async value => initialized.push(value), getWaitingCoordinatorTask: () => null,
+        resumeWaitingCoordinatorTask: () => { resumed.push('old-task'); return null },
+        userPreferences: {observe: () => []}, updateTaskState: (target, _id, value) => { target.taskState = value }, taskCompletionEventForClient() {},
+        broadcast() {}, resolveSdkInputContent: async (_id, _session, content) => `${content}\n历史 Pitfall: Vue 页面`, buildTaskPitfallReminder: () => '', routeSkills: input => { routed.push(input); return [] }, createSessionContextEnvelope: () => ({}),
+        resolveContextReusePolicy: () => ({mode: 'reuse', reasonCodes: [], cacheEligibility: 'unknown'}), resolveProviderCapabilityProfile: () => ({}), buildModelHandoffPrompt: ({prompt}) => prompt,
+        beginTurn() {}, shouldCaptureTurnCheckpoint: () => false, closeSessionRuntime: async () => {}, startClaudeAgent: () => ({}), PushStream: class {}, loadAgentDefinitions: () => [],
+        getMakeQueryOptions: () => async () => ({}), getStartStreamPump: () => () => {}, failPendingSessionInputs: () => 0, autoTriggerWorkflow: async () => {},
+        armStreamWatchdog() {}, updateTaskCompletion() {}, broadcastTaskLifecycle() {}, clearStreamWatchdog() {},
+    })
+
+    const result = await runtime.submitTaskCommand({sessionId: 's4', source: 'desktop', messageId: 'm4', content: '开始完全不同的新任务', taskText: '开始完全不同的新任务'})
+
+    assert.equal(result.type, 'message_accepted')
+    assert.deepEqual(resumed, [])
+    assert.equal(initialized.length, 1)
+    assert.notEqual(initialized[0].taskId, 'old-task')
+    assert.match(initialized[0].taskId, /^s4:/)
+    assert.equal(journal.some(event => event.type === 'task/created' && event.payload.taskId === initialized[0].taskId), true)
+    assert.equal(journal.some(event => event.type === 'task/input-appended'), false)
+    assert.equal(routed[0].text, '开始完全不同的新任务')
+    assert.equal(routed[0].projectContext, session.projectContext)
+})

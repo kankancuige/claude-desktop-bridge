@@ -166,7 +166,7 @@ window.fetch = async function (input: RequestInfo | URL, init?: RequestInit) {
   return _origFetch(input, init)
 }
 
-export async function apiFetch(url: string, options?: RequestInit): Promise<Response> {
+export async function apiFetch(url: RequestInfo | URL, options?: RequestInit): Promise<Response> {
   return fetch(url, options)
 }
 

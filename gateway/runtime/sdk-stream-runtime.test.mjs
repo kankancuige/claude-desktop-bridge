@@ -23,13 +23,12 @@ test('SDK Stream Runtime 通过显式依赖创建并拒绝缺少边界', () => {
     assert.throws(() => makeRuntime({consumePendingSessionInputOnResult: undefined}), /dependencies are required/)
     const runtime = makeRuntime()
     assert.equal(typeof runtime.startStreamPump, 'function')
-    assert.equal(typeof runtime.startAutoContinuation, 'function')
+    assert.deepEqual(Object.keys(runtime).sort(), ['startStreamPump'])
 })
 
 test('SDK Stream Runtime 对未知 Session 不启动消费循环', async () => {
     const runtime = makeRuntime()
     assert.equal(await runtime.startStreamPump('missing'), undefined)
-    assert.equal(await runtime.startAutoContinuation('missing', null, null), false)
 })
 
 test('SDK result 使用启动后才创建的实时 Workbench 收口主 Agent', async () => {

@@ -29,6 +29,7 @@ test('Session 输入 Runtime 缺少依赖时立即失败', () => {
 
 test('SDK watchdog 在等待授权时不会把活跃任务误判为超时', () => {
     const timers = []
+    let now = 1_000
     const session = {
         query: null,
         _generating: true,
@@ -38,6 +39,7 @@ test('SDK watchdog 在等待授权时不会把活跃任务误判为超时', () =
         taskState: {turnId: 'turn-1'},
         queryOpts: {abortController: new AbortController()},
         pushStream: {close() {}},
+        taskStartedAt: now,
     }
     const query = {close() {}}
     session.query = query
@@ -58,21 +60,29 @@ test('SDK watchdog 在等待授权时不会把活跃任务误判为超时', () =
         appendSessionEvent() {},
         taskStateForClient: value => value,
         broadcastTaskLifecycle() {},
-        setTimer(callback) {
-            const timer = {callback, unref() {}}
+        setTimer(callback, delay) {
+            const timer = {callback, delay, unref() {}}
             timers.push(timer)
             return timer
         },
         clearTimer() {},
+        now: () => now,
     })
 
     runtime.armStreamWatchdog('s1', session, query)
+    now = 1_100
     timers[0].callback()
     assert.equal(failed, 0)
     assert.equal(timers.length, 2)
 
     session.pending.clear()
+    session._lastSdkEventAt = now
+    now = 1_199
     timers[1].callback()
+    assert.equal(failed, 0)
+    assert.equal(timers.length, 3)
+    now = 1_200
+    timers[2].callback()
     assert.equal(failed, 1)
 })
 
@@ -107,6 +117,34 @@ test('SDK watchdog 对活动工具使用更长窗口，并在绝对时限到达�
     now = 1_700
     timers[0].callback()
     assert.equal(failed, 1)
+})
+
+test('SDK watchdog 不会因为无进度的活动工具反复续期', () => {
+    const timers = []
+    let now = 1_000
+    const session = {
+        query: null, _generating: true, activeTurnId: 'turn-1', pending: new Map(), _pendingInputs: [],
+        _activeTools: new Map([['tool-1', {toolName: 'AskUserQuestion', startedAt: now, lastProgressAt: now}]]),
+        taskStartedAt: now, taskState: {turnId: 'turn-1'}, queryOpts: {abortController: new AbortController()}, pushStream: {close() {}},
+    }
+    const query = {close() {}}
+    session.query = query
+    const sessions = new Map([['s1', session]])
+    let failed = 0
+    const runtime = createSessionInputRuntime({
+        taskInputQueue: {drain: () => []}, createTurnIdentity: () => null, selectCancelledTurnInputs: values => values,
+        broadcastTurn() {}, sessions, sessionCoordinator: {clearTimeout() {}, beginTimeout() {}, isTimeoutCurrent: () => true},
+        streamIdleTimeoutMs: 100, streamToolIdleTimeoutMs: 500, streamMaxDurationMs: 2_000,
+        updateTaskCompletion() { failed++; return {effects: []} }, applyTaskCompletionEffects: async () => {},
+        taskStateForError: () => ({}), updateTaskState() {}, appendSessionEvent() {}, taskStateForClient: value => value,
+        broadcastTaskLifecycle() {}, setTimer(callback, delay) { const timer = {callback, delay, unref() {}}; timers.push(timer); return timer },
+        clearTimer() {}, now: () => now,
+    })
+    runtime.armStreamWatchdog('s1', session, query)
+    now = 1_501
+    timers[0].callback()
+    assert.equal(failed, 1)
+    assert.equal(timers.length, 1)
 })
 
 test('SDK 流在等待 Provider 时发送心跳，但不重置 watchdog', () => {

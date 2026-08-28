@@ -11,6 +11,7 @@ const {buildSessionCreateRequest, shouldReuseTabForSessionCreate} = await import
 test('恢复和分支请求字段互不混用', () => {
     assert.deepEqual(buildSessionCreateRequest({workDir: 'D:/work', resume: 'sdk-a'}), {workDir: 'D:/work', resume: 'sdk-a'})
     assert.deepEqual(buildSessionCreateRequest({workDir: 'D:/work', forkFrom: 'sdk-a'}), {workDir: 'D:/work', forkFrom: 'sdk-a'})
+    assert.deepEqual(buildSessionCreateRequest({workDir: 'D:/work', recoverSessionId: 'gw-a'}), {workDir: 'D:/work', recoverSessionId: 'gw-a'})
 })
 
 test('分支必须创建新 tab，恢复可以复用同一历史 tab', () => {
@@ -20,4 +21,5 @@ test('分支必须创建新 tab，恢复可以复用同一历史 tab', () => {
 
 test('同时指定恢复和分支时拒绝构建请求', () => {
     assert.throws(() => buildSessionCreateRequest({workDir: 'D:/work', resume: 'sdk-a', forkFrom: 'sdk-b'}), /不能同时/)
+    assert.throws(() => buildSessionCreateRequest({workDir: 'D:/work', resume: 'sdk-a', recoverSessionId: 'gw-a'}), /不能同时/)
 })

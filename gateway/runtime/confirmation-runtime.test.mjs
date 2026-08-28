@@ -19,6 +19,21 @@ test('confirmation runtime settles pending entries idempotently', async () => {
     runtime.settlePending('s', 'r', {behavior: 'deny'}, 'timeout')
     assert.equal(resolved, 1)
     assert.equal(sent[0][1].type, 'confirmation_resolved')
+    assert.equal(sent[0][1].pendingCount, 0)
+})
+
+test('确认结算后的 onSettled 只在首次成功结算触发，避免重复确认反复续期 watchdog', () => {
+    const session = {pending: new Map(), clients: new Set(), mirrors: {}}
+    const settled = []
+    const runtime = createConfirmationRuntime({
+        sessions: new Map([['s', session]]), broadcastTurn: () => {}, broadcast: () => {},
+        shouldRouteMirror: () => true, onSettled: (...args) => settled.push(args),
+    })
+    session.pending.set('r', {id: 'r', type: 'choice', toolName: 'AskUserQuestion', toolUseId: 'tool-1', input: {}, resolve() {}, settled: false})
+    assert.equal(runtime.settlePending('s', 'r', {behavior: 'allow'}, 'desktop'), true)
+    assert.equal(runtime.settlePending('s', 'r', {behavior: 'deny'}, 'timeout'), false)
+    assert.equal(settled.length, 1)
+    assert.equal(settled[0][2].toolUseId, 'tool-1')
 })
 
 test('并发确认结算后向桌面端重新发布下一条 pending', () => {
@@ -112,6 +127,19 @@ test('确认结果会释放 canUseTool Promise，SDK 可继续下一轮', async 
         },
     })
     assert.equal(sessions.get('s').pending.size, 0)
+})
+
+test('全部自动模式下新的 canUseTool 请求不进入 pending', async () => {
+    const session = {pending: new Map(), clients: new Set(), mirrors: {}, permissionMode: 'bypassPermissions'}
+    const sent = []
+    const runtime = createConfirmationRuntime({
+        sessions: new Map([['s', session]]), broadcastTurn: (_sid, event) => sent.push(event),
+        broadcast: () => {}, shouldRouteMirror: () => true,
+    })
+    const result = await runtime.makeCanUseTool('s')('Bash', {command: 'pwd'}, {toolUseID: 'tool-1'})
+    assert.deepEqual(result, {behavior: 'allow', updatedInput: {command: 'pwd'}})
+    assert.equal(session.pending.size, 0)
+    assert.equal(sent.some(event => event.type === 'permission_request'), false)
 })
 
 test('Gateway Runtime 重建后确认 requestId 仍保持唯一', () => {

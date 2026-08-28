@@ -6,7 +6,7 @@ import {transform} from 'esbuild'
 const source = readFileSync(new URL('./session-selection.ts', import.meta.url), 'utf8')
 const compiled = await transform(source, {loader: 'ts', format: 'esm', target: 'es2022'})
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(compiled.code).toString('base64')}`
-const {classifySessionExistsResponse, decideSessionRuntimeRecovery, isSameSessionSelection, resolveExistingSessionTarget, runtimeSessionMatchesHistory, shouldCloseSocketBeforeConnect, shouldHandleSessionSocketEvent, shouldRecoverMissingRuntimeSessionAfterClose, shouldRefreshSessionTokenAfterClose, shouldReuseConnectedSession, shouldValidateSessionRuntime} = await import(moduleUrl)
+const {classifySessionExistsResponse, decideSessionRuntimeRecovery, isSameSessionSelection, resolveExistingSessionTarget, runtimeSessionMatchesHistory, shouldCloseSocketBeforeConnect, shouldHandleSessionSocketEvent, shouldRecoverMissingRuntimeSessionAfterClose, shouldRecoverPersistedTask, shouldRefreshSessionTokenAfterClose, shouldReuseConnectedSession, shouldValidateSessionRuntime} = await import(moduleUrl)
 
 const connectedSession = {
   requestedWorkDir: 'D:/work',
@@ -83,6 +83,13 @@ test('Gateway 明确拒绝不存在的运行时会话时进入恢复流程', () 
   assert.equal(shouldRecoverMissingRuntimeSessionAfterClose(1006), false)
 })
 
+test('运行时丢失时只有非成功可恢复任务进入 recovery-only', () => {
+  assert.equal(shouldRecoverPersistedTask({status: 'interrupted', resumable: true}), true)
+  assert.equal(shouldRecoverPersistedTask({status: 'failed', resumable: true}), true)
+  assert.equal(shouldRecoverPersistedTask({status: 'succeeded', resumable: true}), false)
+  assert.equal(shouldRecoverPersistedTask({status: 'interrupted', resumable: false}), false)
+})
+
 test('exists 响应提供 Gateway ID 时优先使用实际活跃会话', () => {
   assert.equal(resolveExistingSessionTarget({exists: true, sessionId: 'gw-live'}, 'sdk-live'), 'gw-live')
   assert.equal(resolveExistingSessionTarget({exists: true}, 'gw-fallback'), 'gw-fallback')
@@ -113,13 +120,26 @@ test('运行会话存在时复用 Gateway 返回的实际 ID', () => {
   }), {kind: 'reuse', sessionId: 'gw-live'})
 })
 
-test('运行会话 404 时只在存在 SDK 历史 ID 时重建', () => {
+test('运行会话 404 时按 SDK history 或持久化 Gateway 状态重建', () => {
   assert.deepEqual(decideSessionRuntimeRecovery({
     ok: false, status: 404, response: null, historySessionId: 'sdk-1', fallbackSessionId: 'gw-old',
   }), {kind: 'recreate'})
   assert.deepEqual(decideSessionRuntimeRecovery({
     ok: false, status: 404, response: null, historySessionId: null, fallbackSessionId: 'gw-old',
+    taskState: {status: 'interrupted', resumable: true},
+  }), {kind: 'recover', sessionId: 'gw-old'})
+  assert.deepEqual(decideSessionRuntimeRecovery({
+    ok: false, status: 404, response: null, historySessionId: null, fallbackSessionId: null,
   }), {kind: 'reset'})
+})
+
+test('exists 返回持久化任务状态时恢复 Gateway runtime，不等待 404', () => {
+  assert.deepEqual(decideSessionRuntimeRecovery({
+    ok: true, status: 200,
+    response: {exists: false, persisted: true, sessionId: 'gw-old', taskState: {status: 'interrupted', resumable: true}},
+    historySessionId: null, fallbackSessionId: 'gw-old',
+    taskState: {status: 'interrupted', resumable: true},
+  }), {kind: 'recover', sessionId: 'gw-old'})
 })
 
 test('Gateway 5xx 和畸形 200 响应只重试，不创建重复会话', () => {

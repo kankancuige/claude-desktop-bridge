@@ -1,7 +1,7 @@
 /**
  * SDK Stream Runtime。
  *
- * 负责消费 SDK async iterable、维护回合边界、自动续跑和结果收口。
+ * 负责消费 SDK async iterable、维护回合边界和结果收口。
  * 组合根只通过显式依赖注入提供会话、任务、持久化和广播出口。
  */
 import {createSdkStreamService} from './sdk-stream-service.mjs'
@@ -10,8 +10,8 @@ import {clearSessionToolActivity, observeSessionToolActivity} from '../sessions/
 import {contextUsageEvent} from '../context/context-lifecycle.mjs'
 
 export function createSdkStreamRuntime(deps = {}) {
-    const {sessions, sessionCoordinator, PushStream, loadCliSettings, makeQueryOptions, startClaudeAgent, log, updateTaskCompletion, applyTaskCompletionEffects, broadcastTurn, taskStateForClient, taskStateForError, updateTaskState, failPendingSessionInputs, appendSessionEvent, persistSessionMirrors, persistSdkSessionId, sessionVisibilitySource, getProjectVisibility, markVisibleSession, broadcastDesktop, dynamicCache, builtinCache, persistDynamicCache, taskWorkflowResultIdFromMessage, consumeTaskWorkflowResultTurn, taskInputQueue, IM_SOURCES, createTurnIdentity, loadWfConfig, getWorkflow, runWfScript, finishTaskWorkflowResultTurn, hasPendingTaskWorkflow, consumePendingSessionInputOnResult, sdkStreamAdapter, broadcastTaskLifecycle, classifyTaskResult, resolveAutoContinuation, maybeUpdateProjectCache, finalizeCheckpoint, shouldCaptureTurnCheckpoint, beginTurn, resolveFinalReviewPlan, canResumeTask, deferPrimaryResultForTaskWorkflow, takeDeferredPrimaryResult, taskCompletionEventForClient, taskWorkbench, getTaskWorkbench, taskCoordinator, maybeInjectProjectCache, maybeInjectGitContext, clearTaskWorkflowGate, clearStreamWatchdog, markSessionDeleted, finishImProgressReporters, clearAdapterBindingsForSessions, invalidateProjectsCache, deleteSessionFiles, armStreamWatchdog, withTimeout, getStateStore, getSessionProjectKey, getFocusedSessionId, setFocusedSessionId} = deps
-    if (!sessions || !sessionCoordinator || typeof consumePendingSessionInputOnResult !== 'function'
+    const {sessions, log, updateTaskCompletion, applyTaskCompletionEffects, broadcastTurn, taskStateForClient, taskStateForError, updateTaskState, failPendingSessionInputs, appendSessionEvent, persistSessionMirrors, persistSdkSessionId, sessionVisibilitySource, getProjectVisibility, markVisibleSession, broadcastDesktop, dynamicCache, builtinCache, persistDynamicCache, taskWorkflowResultIdFromMessage, consumeTaskWorkflowResultTurn, taskInputQueue, IM_SOURCES, createTurnIdentity, loadWfConfig, getWorkflow, runWfScript, finishTaskWorkflowResultTurn, hasPendingTaskWorkflow, consumePendingSessionInputOnResult, sdkStreamAdapter, broadcastTaskLifecycle, classifyTaskResult, resolveAutoContinuation, maybeUpdateProjectCache, finalizeCheckpoint, resolveFinalReviewPlan, canResumeTask, deferPrimaryResultForTaskWorkflow, takeDeferredPrimaryResult, taskCompletionEventForClient, taskWorkbench, getTaskWorkbench, taskCoordinator, maybeInjectProjectCache, maybeInjectGitContext, clearTaskWorkflowGate, clearStreamWatchdog, markSessionDeleted, finishImProgressReporters, clearAdapterBindingsForSessions, invalidateProjectsCache, deleteSessionFiles, armStreamWatchdog, withTimeout, getStateStore, getSessionProjectKey, getFocusedSessionId, setFocusedSessionId} = deps
+    if (!sessions || typeof consumePendingSessionInputOnResult !== 'function'
         || typeof broadcastTurn !== 'function'
         || !sdkStreamAdapter || typeof sdkStreamAdapter.toClientEvent !== 'function') {
         throw new TypeError('sdk stream runtime dependencies are required')
@@ -24,92 +24,6 @@ export function createSdkStreamRuntime(deps = {}) {
         logger: log,
     })
     const {refreshContextUsage, recordProviderUsage, beginProviderUsage, finishProviderUsage, failProviderUsage, maybeRefreshContextUsage} = sdkStreamService
-
-async function startAutoContinuation(sessionId, session, request) {
-    if (!session || sessions.get(sessionId) !== session || session._autoContinuationRequest !== request
-        || !request?.prompt || !session.lastSessionId
-        || !['running', 'fixing'].includes(session.taskCompletion?.phase)) return false
-    const rebuild = sessionCoordinator.beginRebuild(session, request.prompt)
-    if (!rebuild.started) return false
-    const rebuildId = rebuild.token
-    const pushStream = new PushStream()
-    const rebuildPromise = (async () => {
-        const cliS = loadCliSettings()
-        session.pushStream = pushStream
-        const bodyOverride = {
-            resume: session.lastSessionId,
-            model: session.queryOpts?.model,
-            modelMode: session.modelMode || 'fixed',
-            taskDecision: session.taskDecision || request.taskDecision || null,
-            permissionMode: session.permissionMode,
-            thinkingLevel: session.thinkingLevel,
-            contextProfile: session.contextProfile || 'full',
-            skillRoute: session.skillRoute || [],
-            modelMeta: session.modelMeta || null,
-            maxContextTokens: session.queryOpts?.bridgeContextSafetyCap || undefined,
-            maxTurns: session.queryOpts?.maxTurns,
-        }
-        if (session.providerBaseUrl) bodyOverride.baseUrl = session.providerBaseUrl
-        if (session.providerApiKey) bodyOverride.apiKey = session.providerApiKey
-        const opts = await makeQueryOptions(bodyOverride, session.workDir, cliS, {}, sessionId)
-        if (!sessionCoordinator.isCurrent(session, rebuildId) || session.pushStream !== pushStream
-            || session._autoContinuationRequest !== request) return false
-        opts.resume = session.lastSessionId
-        session.query = startClaudeAgent(pushStream, opts)
-        session.runtimeEnv = opts.runtimeEnv
-        session.queryOpts = opts
-        session.providerBaseUrl = opts.bridgeProviderBaseUrl || session.providerBaseUrl
-        session.providerApiKey = opts.bridgeProviderApiKey || session.providerApiKey
-        startStreamPump(sessionId)
-        // query 已经接管续跑请求；后续追加消息只通过 _rebuildPromise 排队。
-        session._autoContinuationRequest = null
-        const pending = sessionCoordinator.consumePendingMessages(session, rebuildId)
-        for (const content of pending) {
-            pushStream.push({
-                type: 'user', session_id: sessionId,
-                message: {role: 'user', content: [{type: 'text', text: content}]},
-                parent_tool_use_id: null,
-            })
-            session.hasUserTurns = true
-        }
-        sessionCoordinator.complete(session, rebuildId)
-        return true
-    })().catch(error => {
-        if (!sessionCoordinator.isCurrent(session, rebuildId)) return false
-        session._autoContinuationRequest = null
-        sessionCoordinator.fail(session, rebuildId)
-        session.pushStream = null
-        session.query = null
-        const detail = `自动续跑启动失败：${String(error?.message || error || '未知错误')}`
-        log.error({err: error, sessionId: sessionId?.slice(0, 8)}, detail)
-        const transition = updateTaskCompletion(session, sessionId, {type: 'runtime_failed', detail})
-        void applyTaskCompletionEffects(sessionId, transition.effects).catch(effectError => {
-            log.error({err: effectError, sessionId: sessionId?.slice(0, 8)}, '自动续跑失败后的任务收口失败')
-            broadcastTurn(sessionId, {
-                type: 'error', code: 'auto_continuation_failed', message: detail,
-                durationMs: session.taskState?.durationMs || 0,
-                taskState: taskStateForClient(session.taskState),
-            }, request.identity || session.taskCompletionIdentity || null)
-        })
-        session._generating = false
-        session.activeTurnId = null
-        session.activeTurnIdentity = null
-        const completedAt = Date.now()
-        session.taskCompletedAt = completedAt
-        const startedAt = Number(session.taskStartedAt || session.taskState?.startedAt || completedAt)
-        updateTaskState(session, sessionId, taskStateForError(error, {
-            sdkSessionId: session.lastSessionId,
-            historySessionId: session.lastSessionId,
-            startedAt,
-            completedAt,
-            durationMs: Math.max(0, completedAt - startedAt),
-        }))
-        return false
-    })
-    sessionCoordinator.attachPromise(session, rebuildId, rebuildPromise)
-    await rebuildPromise
-    return Boolean(session.query)
-}
 
 async function startStreamPump(sessionId) {
     const s = sessions.get(sessionId);
@@ -310,49 +224,26 @@ async function startStreamPump(sessionId) {
                     previousFingerprint: s._lastContinuationFingerprint,
                 })
                 if (continuation.shouldContinue) {
-                    try {
-                        maybeUpdateProjectCache(sessionId, s)
-                    } catch (error) {
-                        log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '自动续跑前更新 project-cache 失败')
-                    }
-                    try {
-                        finalizeCheckpoint(sessionId)
-                    } catch (error) {
-                        log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '自动续跑前保存 checkpoint 失败')
-                    }
                     s.autoContinuationCount = continuation.attempt
                     s._taskRunBudget = continuation.budget || s._taskRunBudget
                     s._lastContinuationFingerprint = taskResult.failureFingerprint || null
                     s.autoContinuationTurns = totalTurns
-                    s.lastTaskResult = {
+                    taskResult = {
                         ...taskResult,
-                        subtype: sdkMsg.subtype,
                         resumable: true,
-                        result: `达到单段轮数上限，正在自动续跑（第 ${continuation.attempt}/${continuation.maxAttempts} 次）`,
+                        continuationReason: 'max_turns',
+                        detail: `达到单段轮数上限（第 ${continuation.attempt}/${continuation.maxAttempts} 段），请点击输入框继续按钮。`,
+                        result: sdkMsg.result || sdkMsg.errors?.join('\n') || '',
                         rawResult: sdkMsg.result || sdkMsg.errors?.join('\n') || '',
                         numTurns: totalTurns,
-                        at: Date.now(),
+                        execution: {
+                            mode: continuation.mode,
+                            continuationCount: continuation.attempt,
+                            budget: {...s._taskRunBudget, remaining: continuation.remaining || null},
+                        },
                     }
-                    const continuationIdentity = s.activeTurnIdentity ? {...s.activeTurnIdentity} : s.taskCompletionIdentity || null
-                    s._autoContinuationRequest = {
-                        ...continuation,
-                        taskDecision: completionDecision,
-                        turnId: s.activeTurnId || s.taskCompletionTurnId || null,
-                        source: continuationIdentity?.source || s.lastTurnSource || 'desktop',
-                        userId: continuationIdentity?.userId || null,
-                        identity: continuationIdentity,
-                    }
-                    taskInputQueue.prependInternal(s, {
-                        turnId: s._autoContinuationRequest.turnId,
-                        source: s._autoContinuationRequest.source,
-                        userId: s._autoContinuationRequest.userId,
-                        taskDecision: completionDecision,
-                    })
-                    beginTurn(sessionId, continuation.prompt, {
-                        captureFiles: shouldCaptureTurnCheckpoint(completionDecision),
-                    })
-                    appendSessionEvent(s, 'task/auto-continuing', {
-                        turnId: s._autoContinuationRequest.turnId,
+                    appendSessionEvent(s, 'task/continuation-paused', {
+                        reason: 'max_turns',
                         attempt: continuation.attempt,
                         maxAttempts: continuation.maxAttempts,
                         tier: continuation.tier,
@@ -360,36 +251,6 @@ async function startStreamPump(sessionId) {
                         executionMode: continuation.mode,
                         budget: {remaining: continuation.remaining || null},
                     })
-                    updateTaskState(s, sessionId, {
-                        ...s.taskState,
-                        status: s.taskCompletion?.phase === 'fixing' ? 'fixing' : 'running',
-                        outcome: null,
-                        continuationReason: null,
-                        resumable: true,
-                        numTurns: totalTurns,
-                        detail: `达到单段轮数上限，正在自动续跑（第 ${continuation.attempt}/${continuation.maxAttempts} 次）`,
-                        completedAt: 0,
-                        durationMs: 0,
-                        execution: {
-                            mode: continuation.mode,
-                            continuationCount: continuation.attempt,
-                            budget: {...s._taskRunBudget, remaining: continuation.remaining || null},
-                        },
-                    })
-                    taskCompletionEventForClient(s, sessionId, 'task_auto_continuing', {
-                        attempt: continuation.attempt,
-                        maxAttempts: continuation.maxAttempts,
-                        tier: continuation.tier,
-                        completedTurns: totalTurns,
-                    })
-                    s.turnText = ''
-                    s._generating = false
-                    // 结束已达上限的 SDK 输入流，pump 收口后再用同一 session 重建下一段。
-                    try { s.pushStream?.close() } catch (error) {
-                        log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '自动续跑关闭旧输入流失败')
-                    }
-                    void refreshContextUsage(sessionId, s, 'max-turns')
-                    continue
                 }
                 if (taskResult.outcome === 'incomplete' && taskResult.continuationReason === 'max_turns'
                     && ['session_mode', 'no_progress', 'max_rounds', 'max_tokens', 'max_duration', 'max_retries', 'max_message_hops', 'max_agents'].includes(continuation.reason)) {
@@ -559,6 +420,7 @@ async function startStreamPump(sessionId) {
             failedSession.taskCompletedAt = completedAt
             const startedAt = Number(failedSession.taskStartedAt || failedSession.taskState?.startedAt || completedAt)
             updateTaskState(failedSession, sessionId, taskStateForError(e, {
+                ...(failedSession.taskState && typeof failedSession.taskState === 'object' ? failedSession.taskState : {}),
                 sdkSessionId: failedSession.lastSessionId,
                 historySessionId: failedSession.lastSessionId,
                 startedAt,
@@ -584,19 +446,12 @@ async function startStreamPump(sessionId) {
         if (s2?._streamWatchdogQuery === myQuery) clearStreamWatchdog(s2, myQuery)
         if (s2?.query === myQuery) clearSessionToolActivity(s2)
         if (s2?._streamWatchdogTriggered === myQuery) s2._streamWatchdogTriggered = null
-        const autoContinuationRequest = s2?.query === myQuery ? s2._autoContinuationRequest : null
         // 仅当 query 未被重建替换时才置空，避免覆盖新 pump 持有的 query
         if (s2 && s2.query === myQuery) {
             s2._generating = false
             s2.query = null
-            if (autoContinuationRequest) {
-                try { s2.pushStream?.close() } catch (error) {
-                    log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '关闭已达轮数上限的输入流失败')
-                }
-                s2.pushStream = null
-            }
         }
-        if (s2 && s2.query === null && !autoContinuationRequest && s2._onPumpDone) {
+        if (s2 && s2.query === null && s2._onPumpDone) {
             const onPumpDone = s2._onPumpDone
             s2._onPumpDone = null
             try { onPumpDone() } catch (e) {
@@ -604,7 +459,7 @@ async function startStreamPump(sessionId) {
             }
         }
         // 定时任务临时 session (无固定 sessionId) 完成后自动清理，防止累积
-        if (s2?._autoDelete && !autoContinuationRequest && !s2.clients?.size) {
+        if (s2?._autoDelete && !s2.clients?.size) {
             markSessionDeleted(sessionId)
             finishImProgressReporters(sessionId)
             sessions.delete(sessionId)
@@ -615,13 +470,8 @@ async function startStreamPump(sessionId) {
                 log.warn({err: error, sessionId: sessionId?.slice(0, 8)}, '清理临时 Session 文件失败')
             })
         }
-        if (autoContinuationRequest && sessions.get(sessionId) === s2) {
-            // 立即建立 rebuildPromise，避免用户追加消息与自动续跑各自启动一个 query。
-            void startAutoContinuation(sessionId, s2, autoContinuationRequest)
-        }
     }
 }
 
-
-    return {startStreamPump, startAutoContinuation}
+    return {startStreamPump}
 }

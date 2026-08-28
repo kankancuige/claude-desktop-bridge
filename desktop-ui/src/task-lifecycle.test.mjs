@@ -79,6 +79,19 @@ test('流式响应中断携带终态 taskState 时立即释放 busy 状态', () 
   assert.equal(failed.canContinue, true)
 })
 
+test('旧版中断事件即使缺少可继续标记也统一进入继续状态', () => {
+  const running = createSessionLifecycleState({
+    received: true, active: true, canSend: false, canStop: true,
+  })
+  for (const status of ['failed', 'interrupted', 'stopped', 'incomplete', 'review_paused']) {
+    const terminal = reduceSessionLifecycle(running, {
+      type: 'error', taskState: {status, resumable: false},
+    })
+    assert.equal(terminal.active, false)
+    assert.equal(terminal.canContinue, true, `${status} 应进入继续状态`)
+  }
+})
+
 test('错误事件携带成功终态时不能重新显示继续执行', () => {
   const running = reduceSessionLifecycle(createSessionLifecycleState({
     received: true, active: true, canSend: false, canStop: true,

@@ -45,6 +45,9 @@ export function createTaskLifecycleRuntime({
     function updateTaskState(session, sessionId, next) {
         if (!session) return null
         session.taskState = createTaskStatePatch({
+            // 任务元数据在首个状态投影后仍需贯穿完成、暂停、超时和通知更新，避免后续状态覆盖标题。
+            ...(session.taskMetadata && typeof session.taskMetadata === 'object' ? session.taskMetadata : {}),
+            ...(session.taskState && typeof session.taskState === 'object' ? session.taskState : {}),
             ...(next && typeof next === 'object' ? next : {}),
             permissionMode: next?.permissionMode || session.permissionMode || session.taskState?.permissionMode || 'default',
             model: next?.model || session.queryOpts?.model || session.taskState?.model || null,
@@ -64,12 +67,16 @@ export function createTaskLifecycleRuntime({
         const terminal = ['succeeded', 'failed', 'incomplete', 'review_paused', 'stopped', 'interrupted'].includes(status)
         const completedAt = terminal ? Number(session?.taskCompletedAt || Date.now()) : 0
         return createTaskStatePatch({
+            ...(session?.taskMetadata && typeof session.taskMetadata === 'object' ? session.taskMetadata : {}),
+            ...(session?.taskState && typeof session.taskState === 'object' ? session.taskState : {}),
             status,
             outcome: status === 'succeeded' ? 'succeeded' : status === 'failed' ? 'failed' : status === 'incomplete' ? 'incomplete' : null,
             continuationReason: status === 'failed' || status === 'review_paused'
                 ? 'execution_error'
-                : status === 'incomplete' && /写入权限|write_permission_required/i.test(String(detail || completion.detail || ''))
-                    ? 'write_permission_required' : null,
+                : status === 'incomplete'
+                    ? completion.primaryResult?.continuationReason
+                        || (/写入权限|write_permission_required/i.test(String(detail || completion.detail || '')) ? 'write_permission_required' : null)
+                    : null,
             resumable: !['succeeded'].includes(status) && Boolean(session?.lastSessionId || session?._hasConversation),
             subtype: session?.lastTaskResult?.subtype || null,
             detail: detail || completion.detail || session?.lastTaskResult?.result || '',
@@ -110,7 +117,7 @@ export function createTaskLifecycleRuntime({
         const taskWorkbench = getTaskWorkbench()
         if (!taskWorkbench) throw Object.assign(new Error('Task Workbench Runtime 尚未初始化'), {code: 'TASK_WORKBENCH_UNAVAILABLE'})
         const phasePlan = resolveTaskPhases(decision)
-        const projectContext = phasePlan.requiresProjectContext ? await buildProjectContext(session.workDir, {persist: true}) : null
+        const projectContext = await buildProjectContext(session.workDir, {persist: true})
         const agentRoute = resolveTaskAgents(projectContext || {}, decision).map(item => item.id)
         const metadata = createTaskMetadata({taskText: taskText || goal, content: content || goal, source})
         const plan = createTaskPlan({taskId, turnId, sessionId, source, userId, goal, metadata, workDir: session.workDir, decision, executionMode: decision.executionMode, projectContext, phases: phasePlan.phases, reviewRequired: decision.finalReview !== 'none', acceptanceCriteria: ['完成用户明确要求', '执行与风险相称的验证', '记录未验证风险']})

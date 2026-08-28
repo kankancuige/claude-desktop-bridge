@@ -16,7 +16,6 @@ test('所有 Session 类型共享队列、资源、父任务和生命周期不�
     assert.equal(runtime._taskWorkflowGate.active.size, 0)
     assert.equal(runtime.autoContinuationCount, 0)
     assert.equal(runtime.autoContinuationTurns, 0)
-    assert.equal(runtime._autoContinuationRequest, null)
     assert.equal(runtime.contextEnvelope.resumeMode, 'unavailable')
 })
 

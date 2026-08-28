@@ -6,6 +6,7 @@ export function createQueryOptionsRuntime(deps = {}) {
     const {
         BRIDGE_HOME, MODEL, VALID_PERMISSION_MODES, VALID_THINKING_LEVELS, VALID_MODEL_MODES,
         restoreSecretValue, getClaudeExe, normalizeContextProfile, routeSkills,
+        loadOrBuildProjectContext,
         getBuiltinResourceState, ensureBuiltinSkillsAvailable, decideTask, loadAgentDefinitions,
         shouldDeferAutomaticQuery, mapModel, resolveTaskModelRoute, loadWfConfig,
         shouldValidateProviderModel, validateProviderModel, prepareQueryProvider,
@@ -29,16 +30,27 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
     const permissionMode = normalizePermissionMode(body.permissionMode)
     const requestedMaxTurns = Number(body.maxTurns || cliS.maxTurns || 40)
     const contextProfile = normalizeContextProfile(body.contextProfile)
-    const requestedSkillRoute = Array.isArray(body.skillRoute)
-        ? [...new Set(body.skillRoute.filter(name => typeof name === 'string' && name.length <= 128))]
-        : routeSkills({
-            text: body.text || '',
-            workDir,
-            profile: contextProfile,
-            targetFiles: body.targetFiles || [],
-        })
+    const projectContext = contextProfile === 'light'
+        ? (body.projectContext || null)
+        : typeof loadOrBuildProjectContext === 'function'
+        ? await loadOrBuildProjectContext(workDir, {persist: true})
+        : (body.projectContext || null)
     const builtinSkillsState = getBuiltinResourceState({bridgeHome: BRIDGE_HOME}).filter(item => item.type === 'skill')
     const enabledSkills = new Set(builtinSkillsState.filter(item => item.enabled).map(item => item.id))
+    const rawSkillRoute = Array.isArray(body.skillRoute)
+        ? [...new Set(body.skillRoute.filter(name => typeof name === 'string' && name.length <= 128))]
+        : null
+    const requestedSkillRoute = rawSkillRoute
+        ? routeSkills({
+            text: body.text || '', targetFiles: body.targetFiles || [], projectContext,
+            profile: contextProfile, requestedSkills: rawSkillRoute,
+        })
+        : routeSkills({
+            text: body.text || '',
+            profile: contextProfile,
+            targetFiles: body.targetFiles || [],
+            projectContext,
+        })
     const skillRoute = contextProfile === 'light'
         ? []
         : requestedSkillRoute.filter(name => !builtinSkillsState.some(item => item.id === name) || enabledSkills.has(name))
@@ -47,7 +59,13 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
         log.info({skills: builtinSkills.installed}, 'Bridge 内置 Skill 已准备')
     }
     const taskDecisionForResources = body.taskDecision || (body.text ? decideTask({text: body.text}) : null)
-    const agents = contextProfile === 'full' ? (body._agents || loadAgentDefinitions(taskDecisionForResources, body.projectContext || null)) : {}
+    const agents = contextProfile === 'full' ? (body._agents || loadAgentDefinitions(taskDecisionForResources, projectContext)) : {}
+    log.debug?.({
+        selectedSkills: skillRoute,
+        suppressedSkills: (rawSkillRoute || requestedSkillRoute).filter(name => !skillRoute.includes(name)),
+        frameworks: projectContext?.frameworks || [],
+        manifestCount: projectContext?.manifestFingerprint?.length || 0,
+    }, 'Skill 路由完成')
 
     const requestedModelMode = VALID_MODEL_MODES.has(body.modelMode)
         ? body.modelMode
@@ -283,7 +301,7 @@ async function makeQueryOptions(body, workDir, cliS, extraEnv = {}, sessionId = 
         tools: opts.tools || [], allowedTools: opts.allowedTools || [], mcpServers: Object.keys(opts.mcpServers || {}).sort(),
     })).digest('hex').slice(0, 16)
     opts.bridgeRuleRevision = crypto.createHash('sha256').update(JSON.stringify(opts.systemPrompt || null)).digest('hex').slice(0, 16)
-    opts.bridgeProjectContextRevision = crypto.createHash('sha256').update(JSON.stringify(body.projectContext || null)).digest('hex').slice(0, 16)
+    opts.bridgeProjectContextRevision = crypto.createHash('sha256').update(JSON.stringify(projectContext)).digest('hex').slice(0, 16)
     // SDK 的 Anthropic client 读 process.env(不读 opts.env)，直接设 process.env
     // 不再 restore: 多个 session 共享 process.env，restore 会导致 A 恢复 B 的值
     return opts

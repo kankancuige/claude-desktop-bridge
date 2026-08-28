@@ -107,8 +107,15 @@ export function shouldRestoreSessionDraft(
 ): boolean {
   if (!draft.interrupted) return true
   const status = String(taskState?.status || '')
-  return taskState?.resumable === true
-    && ['failed', 'incomplete', 'interrupted', 'stopped', 'review_paused'].includes(status)
+  return ['failed', 'incomplete', 'interrupted', 'stopped', 'review_paused'].includes(status)
+}
+
+/** 中断任务文本用于恢复，不应伪装成等待发送的用户草稿。 */
+export function shouldPresentSessionDraftInComposer(
+  draft: SessionDraft,
+  taskState: SessionDraftTaskState | null | undefined,
+): boolean {
+  return !draft.interrupted && shouldRestoreSessionDraft(draft, taskState)
 }
 
 export function removeSessionDraft(store: SessionDraftStore, rawKey: string): SessionDraftStore {

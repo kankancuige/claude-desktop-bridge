@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import {createTaskStatePatch, recoverTaskState, isTaskResumable, taskStateForClient, taskStateForInconclusive, taskStateFromResult, taskStateForStop, taskStateFileId, redactTaskDetail} from './task-state.mjs'
+import {createTaskStatePatch, recoverTaskState, isTaskResumable, taskStateForClient, taskStateForError, taskStateForInconclusive, taskStateFromResult, taskStateForStop, taskStateFileId, redactTaskDetail} from './task-state.mjs'
 
 test('success is terminal and never resumable', () => {
     const state = createTaskStatePatch({status: 'succeeded', outcome: 'succeeded', resumable: true, numTurns: 3})
@@ -50,6 +50,29 @@ test('running state becomes an interrupted resumable task after gateway restart'
         review: {round: 0, tier: null, summary: '', blockingCount: 0, blockingFindings: []},
         updatedAt: 123,
     })
+})
+
+test('SDK 会话建立前发生重启、停止或异常也必须保留继续入口', () => {
+    const recovered = recoverTaskState({status: 'running', requestText: '执行原任务'}, {now: 123})
+    assert.equal(recovered.status, 'interrupted')
+    assert.equal(recovered.resumable, true)
+    assert.equal(recovered.requestText, '执行原任务')
+
+    const stopped = taskStateForStop({startedAt: 100, completedAt: 200})
+    assert.equal(stopped.status, 'stopped')
+    assert.equal(stopped.resumable, true)
+
+    const interrupted = taskStateForError(new Error('Provider 初始化失败'))
+    assert.equal(interrupted.status, 'interrupted')
+    assert.equal(interrupted.resumable, true)
+})
+
+test('已接收任务的所有非成功终态统一保持可继续', () => {
+    for (const status of ['failed', 'incomplete', 'review_paused', 'stopped', 'interrupted']) {
+        const state = createTaskStatePatch({status, resumable: false})
+        assert.equal(state.resumable, true, `${status} 应可继续`)
+        assert.equal(isTaskResumable(state), true)
+    }
 })
 
 test('detail is bounded and client projection excludes session identity', () => {

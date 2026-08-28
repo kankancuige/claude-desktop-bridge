@@ -47,7 +47,7 @@ test('确认响应等待 Gateway 回执，且重复 requestId 不会再次弹窗
   assert.match(snapshotSection, /confirmationSubmitting\.value = null/)
   assert.match(source, /answerKey: String\(q\?\.answerKey \|\| `q-\$\{index\}`\)/)
   assert.match(source, /case 'confirmation_response':/)
-  assert.match(source, /确认已提交，AI 正在继续执行/)
+  assert.match(source, /确认已提交，等待 AI 返回进度/)
 })
 
 test('AskUserQuestion 展示全部问题并在答案齐全后一次提交 answers', () => {

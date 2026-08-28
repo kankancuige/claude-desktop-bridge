@@ -64,6 +64,7 @@ test('停止响应明确说明会话是否可以继续', () => {
         resumable: false,
         historySessionId: null,
     })
+    assert.equal(buildSessionStopResponse({}, {stopped: true}).resumable, true)
     assert.equal(buildSessionStopResponse({}, {stopped: true, scope: 'workflow'}).scope, 'workflow')
     assert.equal(buildSessionStopResponse({}, {stopped: true, scope: 'primary'}).scope, 'primary')
 })

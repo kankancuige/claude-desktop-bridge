@@ -51,12 +51,14 @@ export function resolvePrimaryStopTurnId(session) {
 export function buildSessionStopResponse(session, result = {}) {
     const historySessionId = typeof session?.lastSessionId === 'string' && session.lastSessionId
         ? session.lastSessionId
+        : typeof session?.taskState?.historySessionId === 'string' && session.taskState.historySessionId
+            ? session.taskState.historySessionId
         : null
     return {
         stopped: result.stopped === true,
         scope: result.scope === 'primary' ? 'primary' : result.scope === 'workflow' ? 'workflow' : 'none',
         cancelledInputs: Number(result.cancelledInputs || 0),
-        resumable: Boolean(historySessionId),
+        resumable: result.stopped === true && result.resumable !== false,
         historySessionId,
     }
 }

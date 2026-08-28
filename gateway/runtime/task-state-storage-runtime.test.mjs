@@ -33,7 +33,7 @@ test('任务状态存储 Runtime 将疑似断流的 succeeded 纠正为失败', 
     const runtime = makeRuntime({looksLikeIncompleteTransportFailure: () => true})
     const state = runtime.repairPersistedTaskState({status: 'succeeded', detail: '断流'})
     assert.equal(state.status, 'failed')
-    assert.equal(state.resumable, false)
+    assert.equal(state.resumable, true)
 })
 
 test('任务状态存储 Runtime 缺少端口时立即失败', () => {
