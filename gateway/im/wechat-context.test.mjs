@@ -15,4 +15,3 @@ test('空值和超长 token 不进入缓存', () => {
     assert.equal(rememberWeChatContext(contexts, 'user-1', 'x'.repeat(4097)), false)
     assert.equal(resolveWeChatContext(contexts, 'user-1', ''), '')
 })
-

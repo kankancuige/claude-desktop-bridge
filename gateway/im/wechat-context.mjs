@@ -15,4 +15,3 @@ export function resolveWeChatContext(contexts, userId, contextToken) {
     if (current) return current
     return contexts.get(String(userId || '').trim()) || ''
 }
-
