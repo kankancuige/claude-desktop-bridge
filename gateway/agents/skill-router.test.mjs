@@ -38,8 +38,30 @@ test('数字孪生集成任务加载专用 Skill', () => {
 
 test('普通 CAD、GLB Viewer 和前端任务不加载数字孪生 Skill', () => {
     assert.deepEqual(routeSkills({text: '帮我画一个普通 CAD 零件', profile: 'full'}), [])
-    assert.deepEqual(routeSkills({text: '做一个 GLB Viewer 预览页面', profile: 'full'}), ['vue-frontend'])
+    assert.deepEqual(routeSkills({text: '做一个 GLB Viewer 预览页面', profile: 'full'}), [])
+    assert.deepEqual(routeSkills({text: '做一个 GLB Viewer 预览页面', targetFiles: ['src/App.vue'], profile: 'full'}), ['vue-frontend'])
     assert.deepEqual(routeSkills({text: '这个 digital-twin-cad Skill 是干什么的？', profile: 'focused'}), [])
+})
+
+test('项目架构决定 UI Skill，泛词不再猜测框架', () => {
+    const avalonia = {languages: ['C#'], frameworks: ['Avalonia']}
+    const vue = {languages: ['TypeScript'], frameworks: ['Vue 3']}
+    const winforms = {languages: ['C#'], frameworks: ['WinForms']}
+    assert.deepEqual(routeSkills({text: '页面增加主题切换', projectContext: avalonia, profile: 'full'}), ['avalonia-ui'])
+    assert.deepEqual(routeSkills({text: '页面增加主题切换', projectContext: vue, profile: 'full'}), ['vue-frontend'])
+    assert.deepEqual(routeSkills({text: '按钮间距调整', projectContext: winforms, profile: 'full'}), ['ui-winforms'])
+    assert.deepEqual(routeSkills({text: '页面增加主题切换', profile: 'full'}), [])
+})
+
+test('明确否定框架时抑制对应 Skill', () => {
+    assert.deepEqual(routeSkills({text: '这是 Avalonia 项目，不要使用 Vue，修改页面主题', projectContext: {frameworks: ['Avalonia']}, profile: 'full'}), ['avalonia-ui'])
+    assert.deepEqual(routeSkills({text: '这是 C# 项目，不使用 WinForms，调整按钮', projectContext: {frameworks: ['WinForms']}, profile: 'full'}), [])
+    assert.deepEqual(routeSkills({text: '不要使用 Vue，修改组件', profile: 'full'}), [])
+})
+
+test('Skill 注入诊断请求不会再次触发被诊断的 Skill', () => {
+    assert.deepEqual(routeSkills({text: '明明是 C# Avalonia 项目，怎么注入的 Vue3 Skill', projectContext: {frameworks: ['Avalonia']}, profile: 'full'}), [])
+    assert.deepEqual(routeSkills({text: 'Avalonia 项目里提到了 Vue，但目标仍是修改 AXAML 页面', projectContext: {frameworks: ['Avalonia']}, profile: 'full'}), ['avalonia-ui'])
 })
 
 test('数字孪生任务只有明确开发设备连接或驱动时才联合加载设备 Skill', () => {

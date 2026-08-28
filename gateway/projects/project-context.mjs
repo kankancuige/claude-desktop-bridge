@@ -4,7 +4,7 @@ import {basename, dirname, extname, isAbsolute, join, relative, resolve, sep} fr
 import {BRIDGE_HOME} from '../config/bridge-home.mjs'
 import {detectProjectStack} from './project-cache.mjs'
 
-const VERSION = 1
+const VERSION = 2
 const MAX_DEPTH = 3
 const MAX_FILES = 160
 const MAX_MANIFEST_BYTES = 512 * 1024
@@ -76,6 +76,18 @@ function readAllowed(filePath) {
     }
 }
 
+function manifestFingerprint(files, workDir, {includeHash = true} = {}) {
+    return files.map(filePath => {
+        const relPath = relative(workDir, filePath).replace(/\\/g, '/')
+        try {
+            const stat = statSync(filePath)
+            return {path: relPath, size: stat.size, mtimeMs: stat.mtimeMs, sha256: includeHash ? createHash('sha256').update(readFileSync(filePath)).digest('hex') : null}
+        } catch {
+            return {path: relPath, size: -1, mtimeMs: 0, sha256: null}
+        }
+    }).sort((a, b) => a.path.localeCompare(b.path, 'en'))
+}
+
 function pushUnique(target, value) {
     if (value && !target.includes(value)) target.push(value)
 }
@@ -130,6 +142,8 @@ function parseManifest(filePath, workDir, context) {
         pushUnique(context.languages, 'C#')
         if (/<UseWPF>true/i.test(content)) pushUnique(context.frameworks, 'WPF')
         if (/<UseWindowsForms>true/i.test(content)) pushUnique(context.frameworks, 'WinForms')
+        const packageReferences = [...content.matchAll(/<PackageReference\b[^>]*\bInclude\s*=\s*["']([^"']+)["']/gi)].map(match => match[1])
+        if (packageReferences.some(value => /^Avalonia(?:\.|$)/i.test(value)) || /<UseAvalonia>true/i.test(content)) pushUnique(context.frameworks, 'Avalonia')
         context.commands.push(command('build', 'dotnet', ['build', relPath], relPath))
         context.commands.push(command('test', 'dotnet', ['test', relPath, '--no-build'], relPath, 'test'))
     }
@@ -201,11 +215,13 @@ export async function buildProjectContext(workDir, options = {}) {
         commands: [],
         rules: [],
         skills: [],
+        manifestFingerprint: [],
         git: readGitSummary(root),
         generatedAt: Number(options.now?.() ?? Date.now()),
         source: 'bounded-manifest-scan',
     }
     const files = scanAllowedFiles(root, options)
+    context.manifestFingerprint = manifestFingerprint(files, root)
     // 先确定 package manager，再解析 package.json 中的受信命令，避免目录排序改变命令运行器。
     for (const filePath of files.filter(filePath => LOCKFILES.has(basename(filePath)))) parseManifest(filePath, root, context)
     for (const filePath of files.filter(filePath => !LOCKFILES.has(basename(filePath)))) parseManifest(filePath, root, context)
@@ -222,10 +238,16 @@ export function loadProjectContext(workDir, options = {}) {
     if (!root) return null
     try {
         const value = JSON.parse(readFileSync(contextPath(root, options.bridgeHome), 'utf8'))
-        return value?.version === VERSION && value?.workDir === root ? value : null
+        if (value?.version !== VERSION || value?.workDir !== root || !Array.isArray(value.manifestFingerprint)) return null
+        const current = manifestFingerprint(scanAllowedFiles(root, options), root)
+        return JSON.stringify(current) === JSON.stringify(value.manifestFingerprint) ? value : null
     } catch {
         return null
     }
+}
+
+export async function loadOrBuildProjectContext(workDir, options = {}) {
+    return loadProjectContext(workDir, options) || buildProjectContext(workDir, options)
 }
 
 export function saveProjectContext(workDir, context, options = {}) {

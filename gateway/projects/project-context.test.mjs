@@ -3,7 +3,7 @@ import {mkdtempSync, mkdirSync, writeFileSync} from 'node:fs'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import test from 'node:test'
-import {buildProjectContext, loadProjectContext, projectContextCachePath} from './project-context.mjs'
+import {buildProjectContext, loadOrBuildProjectContext, loadProjectContext, projectContextCachePath} from './project-context.mjs'
 
 function fixture(name) {
     return mkdtempSync(join(tmpdir(), `bridge-project-context-${name}-`))
@@ -51,6 +51,16 @@ test('Java Maven 与 C# 项目返回框架和构建命令', async () => {
     assert.deepEqual(csharpContext.commands.map(item => item.kind), ['build', 'test'])
 })
 
+test('Avalonia csproj 识别为 Avalonia 而不是桌面 UI 猜测', async () => {
+    const root = fixture('avalonia')
+    writeFileSync(join(root, 'App.csproj'), '<Project><ItemGroup><PackageReference Include="Avalonia" Version="11.2.0" /><PackageReference Include="Avalonia.Desktop" Version="11.2.0" /></ItemGroup></Project>')
+    const value = await buildProjectContext(root, {persist: false})
+    assert.ok(value.frameworks.includes('Avalonia'))
+    assert.equal(value.frameworks.includes('WinForms'), false)
+    assert.equal(value.manifestFingerprint[0].path, 'App.csproj')
+    assert.equal(typeof value.manifestFingerprint[0].sha256, 'string')
+})
+
 test('扫描跳过构建目录和密钥文件并仅记录规则元数据', async () => {
     const root = fixture('safe')
     mkdirSync(join(root, 'node_modules'), {recursive: true})
@@ -69,4 +79,18 @@ test('上下文可写入 Bridge 私有缓存并恢复', async () => {
     const built = await buildProjectContext(root, {bridgeHome: home})
     assert.ok(projectContextCachePath(root, {bridgeHome: home}).startsWith(home))
     assert.deepEqual(loadProjectContext(root, {bridgeHome: home}), built)
+})
+
+test('受信 Manifest 变化会使缓存失效并重建', async () => {
+    const root = fixture('stale')
+    const home = fixture('home-stale')
+    writeFileSync(join(root, 'App.csproj'), '<Project><PropertyGroup><UseAvalonia>true</UseAvalonia></PropertyGroup></Project>')
+    const built = await loadOrBuildProjectContext(root, {bridgeHome: home, now: () => 1})
+    assert.ok(built.frameworks.includes('Avalonia'))
+    assert.deepEqual(loadProjectContext(root, {bridgeHome: home}), built)
+    writeFileSync(join(root, 'App.csproj'), '<Project><PropertyGroup><UseWindowsForms>true</UseWindowsForms></PropertyGroup></Project>')
+    assert.equal(loadProjectContext(root, {bridgeHome: home}), null)
+    const rebuilt = await loadOrBuildProjectContext(root, {bridgeHome: home, now: () => 2})
+    assert.ok(rebuilt.frameworks.includes('WinForms'))
+    assert.equal(rebuilt.frameworks.includes('Avalonia'), false)
 })
