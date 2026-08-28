@@ -39,6 +39,7 @@ import {PendingConfirmRegistry} from './pending-confirm.mjs'
 import {findLatestAdapterUserForSession} from './adapter-bindings.mjs'
 import {sendTextParts} from './reliable-text.mjs'
 import {BRIDGE_HOME} from '../config/bridge-home.mjs'
+import {rememberWeChatContext, resolveWeChatContext} from './wechat-context.mjs'
 
 const log = createLogger('wechat')
 
@@ -55,6 +56,7 @@ const POLL_TIMEOUT = 35000                        // 长轮询超时(毫秒)，�
 export function startWeChatAdapter(token, {taskCommands, repository, onNotificationStateChange = null} = {}) {
     let botToken, baseUrl
     let stopped = false
+    const contextTokens = new Map()
     let activePollController = null
     const taskAbortController = new AbortController()
     const delayCancels = new Set()
@@ -260,6 +262,7 @@ export function startWeChatAdapter(token, {taskCommands, repository, onNotificat
         if (stopped) return
         const uid = msg.from_user_id
         const ctx = msg.context_token
+        rememberWeChatContext(contextTokens, uid, ctx)
         const messageId = normalizeImMessageId(msg.message_id || msg.msg_id || msg.id)
         const text = extractText(msg)
         if (!text) return
@@ -546,19 +549,19 @@ export function startWeChatAdapter(token, {taskCommands, repository, onNotificat
             const status = classifyWeChatSendStatus(res, d)
             if (!status.ok) {
                 log.error(status, 'sendmessage 返回错误')
-                return false
+                return {sent: false, error: `wechat_ret_${status.ret ?? status.errcode ?? status.status ?? 'unknown'}`}
             }
             log.debug({textLength: text.length}, 'sendMsg ok')
-            return true
+            return {sent: true}
         } catch (e) {
             log.error({err: e}, 'sendmessage 异常')
-            return false
+            return {sent: false, error: String(e?.code || e?.name || 'sendmessage_error').slice(0, 80)}
         }
     }
 
     async function deliverNotification(payload) {
         if (stopped) return false
-        return sendMsg(payload.userId, payload.contextToken || '', payload.text)
+        return sendMsg(payload.userId, resolveWeChatContext(contextTokens, payload.userId, payload.contextToken), payload.text)
     }
 
     const notificationWorker = startNotificationWorker({
@@ -572,13 +575,14 @@ export function startWeChatAdapter(token, {taskCommands, repository, onNotificat
 
     async function sendReliableText(userId, contextToken, text, notificationId = null) {
         if (stopped) return {sent: false, queued: false, error: 'adapter_stopped'}
+        const effectiveContextToken = resolveWeChatContext(contextTokens, userId, contextToken)
         return sendTextParts({
             text,
             split: value => splitTextByUtf8Bytes(value, 3500),
             delay: wait,
             delayMs: 400,
             sendPart: (content, index) => sendOrQueue(outbox, {
-                kind: 'direct', userId, contextToken: contextToken || '', text: content,
+                kind: 'direct', userId, contextToken: effectiveContextToken, text: content,
             }, deliverNotification, {id: notificationId ? `${notificationId}:part:${index + 1}` : undefined}),
         })
     }
@@ -714,9 +718,13 @@ export function startWeChatAdapter(token, {taskCommands, repository, onNotificat
         log.info('适配器已停止')
     }
 
-    function retryNotifications() {
+    async function retryNotifications() {
         const reset = outbox.retryFailed()
-        notificationWorker.flush().catch(error => log.warn({err: error}, '手动重试通知失败'))
+        try {
+            await notificationWorker.flush()
+        } catch (error) {
+            log.warn({err: error}, '手动重试通知失败')
+        }
         return {reset, ...outbox.summary()}
     }
 

@@ -14,12 +14,14 @@ const fakeOutbox = {
     fail: id => { transitions.push(`fail:${id}`); return true },
 }
 assert.deepEqual(await sendOrQueue(fakeOutbox, {text: 'ok'}, async () => true), {sent: true, queued: false, id: 'n1'})
-assert.deepEqual(await sendOrQueue(fakeOutbox, {text: 'retry'}, async () => false), {sent: false, queued: true, id: 'n2'})
+assert.deepEqual(await sendOrQueue(fakeOutbox, {text: 'retry'}, async () => false), {sent: false, queued: true, id: 'n2', error: 'send_failed'})
+assert.deepEqual(await sendOrQueue(fakeOutbox, {text: 'platform-error'}, async () => ({sent: false, error: 'wechat_ret_-2'})), {sent: false, queued: true, id: 'n3', error: 'wechat_ret_-2'})
 assert.deepEqual(queued, [
     {payload: {text: 'ok'}, options: {deferMs: 30_000}, id: 'n1'},
     {payload: {text: 'retry'}, options: {deferMs: 30_000}, id: 'n2'},
+    {payload: {text: 'platform-error'}, options: {deferMs: 30_000}, id: 'n3'},
 ])
-assert.deepEqual(transitions, ['complete:n1', 'fail:n2'])
+assert.deepEqual(transitions, ['complete:n1', 'fail:n2', 'fail:n3'])
 assert.deepEqual(
     await sendOrQueue({enqueue: () => null}, {text: 'disk-full'}, async () => false),
     {sent: false, queued: false, error: 'outbox_persist_failed'},
@@ -82,6 +84,40 @@ assert.equal(workerStateChanges.at(-1).state, 'sent')
 assert.equal(workerStateChanges.at(-1).notificationId, 'task-1:task_completed')
 
 {
+    let releaseFirst
+    const firstDelivery = new Promise(resolve => { releaseFirst = resolve })
+    let deliveryStarted
+    const started = new Promise(resolve => { deliveryStarted = resolve })
+    let dueCalls = 0
+    const delivered = []
+    const retryWorker = startNotificationWorker({
+        outbox: {
+            due: () => ++dueCalls === 1
+                ? [{id: 'first', payload: {text: 'first'}}]
+                : dueCalls === 2 ? [{id: 'retry', payload: {text: 'retry'}}] : [],
+            complete: () => true,
+            fail: () => true,
+            summary: () => ({}),
+        },
+        deliver: async payload => {
+            delivered.push(payload.text)
+            if (payload.text === 'first') {
+                deliveryStarted()
+                await firstDelivery
+            }
+            return true
+        },
+        intervalMs: 60_000,
+    })
+    await started
+    const retryFlush = retryWorker.flush()
+    releaseFirst()
+    await retryFlush
+    retryWorker.stop()
+    assert.deepEqual(delivered, ['first', 'retry'])
+}
+
+{
     const delays = []
     const entries = [
         {id: 'n1', payload: {text: '1'}},
@@ -89,8 +125,12 @@ assert.equal(workerStateChanges.at(-1).notificationId, 'task-1:task_completed')
         {id: 'n3', payload: {text: '3'}},
     ]
     const outbox = {
-        due: () => entries,
-        complete: () => true,
+        due: () => [...entries],
+        complete: id => {
+            const index = entries.findIndex(entry => entry.id === id)
+            if (index >= 0) entries.splice(index, 1)
+            return true
+        },
         fail: () => true,
         status: () => ({state: 'sent', lastError: ''}),
     }
